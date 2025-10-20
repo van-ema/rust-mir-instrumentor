@@ -17,6 +17,6 @@
     // Enable procedural macros (recommended)
     "rust-analyzer.procMacro.enable": true,
     // Use the correct compiler source for rustc_private crates
-    "rust-analyzer.rustc.source": "/Users/emanuelevannacci/rust/Cargo.toml",
+    "rust-analyzer.rustc.source": "discover",
     "rust-analyzer.cargo.buildScripts.enable": true,
 }
