@@ -11,29 +11,54 @@ extern crate rustc_mir_transform;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use rustc_errors::{ColorConfig, emitter::HumanReadableErrorType};
-use rustc_hir::def_id::{DefId, DefIndex, LOCAL_CRATE, LocalDefId};
-use rustc_interface::Config;
+use rustc_errors::{emitter::HumanReadableErrorType, ColorConfig};
+use rustc_hir::def_id::{DefId, DefIndex, LocalDefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_interface::util::rustc_path;
+use rustc_interface::Config;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::{self, ParamEnv, Ty};
-use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::ErrorOutputType;
+use rustc_session::EarlyDiagCtxt;
+use rustc_span::{source_map::Spanned, Span};
 
 struct MyOptimizationPass;
+
+fn find_record_fn<'tcx>(tcx: TyCtxt<'tcx>) -> Option<DefId> {
+    for &cnum in tcx.crates(()) {
+        if tcx.crate_name(cnum).as_str() == "runtime" {
+            let root = DefId {
+                krate: cnum,
+                index: CRATE_DEF_INDEX,
+            };
+            for child in tcx.module_children(root) {
+                if let Some(name) = tcx.opt_item_name(child.res.def_id()) {
+                    if name.as_str() == "__record_ref_creation" {
+                        return Some(child.res.def_id());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 impl MyOptimizationPass {
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         println!("Running MyOptimizationPass on {:?}", body.source.def_id());
 
         // Make sure rustc_span is linked
-        use rustc_span::{Span, source_map::Spanned, symbol::Symbol};
-
-        // Lookup runtime function by diagnostic item name
-        let record_fn_def_id = tcx
-            .get_diagnostic_item(Symbol::intern("record_ref_creation"))
-            .expect("Failed to find `__record_ref_creation` in linked crates");
+        // Resolve the instrumentation function by scanning the loaded `runtime` crate for a
+        // top-level symbol named `__record_ref_creation`.
+        let record_fn_def_id = find_record_fn(tcx).unwrap_or_else(|| {
+            eprintln!("[instrument-mir] Visible extern crates:");
+            for &c in tcx.crates(()) {
+                eprintln!("  - {}", tcx.crate_name(c));
+            }
+            panic!(
+                "Failed to find `__record_ref_creation` in loaded crates. \nMake sure you pass: --extern runtime=target/release/libruntime.rlib and the function is at crate root."
+            );
+        });
 
         for (bb, block_data) in body
             .basic_blocks

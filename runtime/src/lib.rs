@@ -1,8 +1,11 @@
-#![feature(rustc_private)]
-#![feature(rustc_attrs)]
+#![no_std]
 
-#[unsafe(no_mangle)]
-#[rustc_diagnostic_item = "record_ref_creation"]
-pub extern "C" fn __record_ref_creation(ptr: *const u8) {
-    println!("[Runtime] Reference created at address: {:?}", ptr);
+extern crate core;
+
+#[no_mangle]
+pub extern "C" fn __record_ref_creation() {}
+
+/// Force Rust metadata emission (otherwise the crate can get “flattened”)
+pub fn force_linkage() -> usize {
+    core::mem::size_of::<u8>()
 }
