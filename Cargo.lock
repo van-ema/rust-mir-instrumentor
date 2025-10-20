@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+
+[[package]]
 name = "instrument-mir"
 version = "0.1.0"
 
