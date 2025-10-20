@@ -7,3 +7,16 @@ edition = "2021"
 rustc_private = true
 
 [dependencies]
+# Link your runtime crate automatically
+runtime = { path = "../runtime" }
+
+[features]
+default = []
+
+[[bin]]
+name = "instrument-mir"
+path = "src/main.rs"
+
+[[bin]]
+name = "cargo-instrument-mir"
+path = "src/bin/cargo-instrument-mir.rs"

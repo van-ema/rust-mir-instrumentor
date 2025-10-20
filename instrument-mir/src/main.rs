@@ -33,7 +33,7 @@ fn find_record_fn<'tcx>(tcx: TyCtxt<'tcx>) -> Option<DefId> {
             };
             for child in tcx.module_children(root) {
                 if let Some(name) = tcx.opt_item_name(child.res.def_id()) {
-                    if name.as_str() == "__record_ref_creation" {
+                    if name.as_str() == "_record_ref_creation" {
                         return Some(child.res.def_id());
                     }
                 }
@@ -56,7 +56,7 @@ impl MyOptimizationPass {
                 eprintln!("  - {}", tcx.crate_name(c));
             }
             panic!(
-                "Failed to find `__record_ref_creation` in loaded crates. \nMake sure you pass: --extern runtime=target/release/libruntime.rlib and the function is at crate root."
+                "Failed to find `_record_ref_creation` in loaded crates. \nMake sure you pass: --extern runtime=target/release/libruntime.rlib and the function is at crate root."
             );
         });
 

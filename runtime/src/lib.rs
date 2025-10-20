@@ -1,11 +1,10 @@
+// runtime/src/lib.rs
+#![feature(no_core)]
 #![no_std]
 
-extern crate core;
-
-#[no_mangle]
-pub extern "C" fn __record_ref_creation() {}
-
-/// Force Rust metadata emission (otherwise the crate can get “flattened”)
-pub fn force_linkage() -> usize {
-    core::mem::size_of::<u8>()
+// Prevent the function from being optimized away
+#[unsafe(no_mangle)]
+pub extern "C" fn record_ref_creation() {
+    // Minimal no-op body
+    // In a real runtime you could record or log this
 }
