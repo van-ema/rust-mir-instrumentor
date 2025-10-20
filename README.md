@@ -1,12 +1,26 @@
 # rust-mir-instrumentor
 
-## Install
+## Build
 ```
-cargo build --release
-cargo install --path . --bins
+cargo build --release -p runtime
+cargo install --path instrument-mir --bin instrument-mir
+cargo install --path instrument-mir --bin cargo-instrument-mir
 ```
 
 ## Use
+
 ```
-RUSTC_WRAPPER=instrument-mir cargo build
+cargo instrument-mir --bin hello
+```
+
+or
+```
+DYLD_FALLBACK_LIBRARY_PATH="$(rustc --print sysroot)/lib"
+target/release/instrument-mir \
+    --crate-name hello \
+    examples/hello/src/main.rs \
+    --crate-type=bin \
+    --extern runtime=./target/release/deps/libruntime-da7beaa1ec0bf9aa.rmeta \
+    -L target/release \
+    -o hello_instrumented
 ```
