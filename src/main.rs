@@ -25,6 +25,18 @@ struct MyOptimizationPass;
 impl MyOptimizationPass {
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         println!("Running MyOptimizationPass");
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                if let StatementKind::Assign(box (_, Rvalue::Ref(region, borrow_kind, place))) =
+                    &stmt.kind
+                {
+                    println!(
+                        "Reference created in {:?} at statement {}: {:?}, kind={:?}, region={:?}",
+                        bb, stmt_idx, place, borrow_kind, region
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -32,9 +44,7 @@ const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx 
     |tcx, def| {
         let mut body = (rustc_interface::DEFAULT_QUERY_PROVIDERS.optimized_mir)(tcx, def).clone();
 
-        // Create an instance of your optimization pass
         let optimization_pass = MyOptimizationPass;
-        // Run the optimization pass
         optimization_pass.run_pass(tcx, &mut body);
 
         tcx.arena.alloc(body)
