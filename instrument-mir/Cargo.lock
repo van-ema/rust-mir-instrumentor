@@ -5,7 +5,3 @@ version = 4
 [[package]]
 name = "instrument-mir"
 version = "0.1.0"
-
-[[package]]
-name = "runtime"
-version = "0.1.0"

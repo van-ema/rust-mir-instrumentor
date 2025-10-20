@@ -1,0 +1,9 @@
+[package]
+name = "instrument-mir"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[dependencies]
