@@ -1,7 +1,7 @@
 [package]
-name = "runtime"
+name = "lib_hello"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]

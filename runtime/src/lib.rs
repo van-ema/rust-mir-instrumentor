@@ -1,10 +1,7 @@
 // runtime/src/lib.rs
-#![feature(no_core)]
-#![no_std]
+#![allow(unused)]
 
-// Prevent the function from being optimized away
-#[unsafe(no_mangle)]
-pub extern "C" fn record_ref_creation() {
-    // Minimal no-op body
-    // In a real runtime you could record or log this
+#[no_mangle]
+pub extern "C" fn __record_ref_creation(addr: u64) {
+    println!("__record_ref_creation called for address: 0x{:x}", addr);
 }

@@ -1,6 +1,6 @@
 [workspace]
-members = ["examples/hello",
-    "instrument-mir",
+members = ["dynamic_loader","examples/hello",
+    "instrument-mir", "lib_hello",
     "runtime",
 ]
 

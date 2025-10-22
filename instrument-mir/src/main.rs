@@ -2,6 +2,7 @@
 #![allow(unused)]
 #![feature(rustc_private)]
 #![feature(box_patterns)]
+extern crate rustc_abi;
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
@@ -10,118 +11,127 @@ extern crate rustc_middle;
 extern crate rustc_mir_transform;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_target;
 
+use rustc_abi::ExternAbi;
 use rustc_errors::{emitter::HumanReadableErrorType, ColorConfig};
 use rustc_hir::def_id::{DefId, DefIndex, LocalDefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_interface::util::rustc_path;
 use rustc_interface::Config;
+use rustc_middle::mir::interpret::{AllocId, Scalar};
 use rustc_middle::mir::*;
-use rustc_middle::ty::TyCtxt;
-use rustc_middle::ty::{self, ParamEnv, Ty};
+use rustc_middle::mir::{Const, ConstOperand, ConstValue};
+use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
 use rustc_session::config::ErrorOutputType;
 use rustc_session::EarlyDiagCtxt;
 use rustc_span::{source_map::Spanned, Span};
 
-struct MyOptimizationPass;
+use rustc_hir::Safety;
+use rustc_middle::ty::TyKind;
+use rustc_span::symbol::Symbol;
+use std::num::NonZeroU64;
+use std::sync::Mutex;
 
-fn find_record_fn<'tcx>(tcx: TyCtxt<'tcx>) -> Option<DefId> {
-    for &cnum in tcx.crates(()) {
-        if tcx.crate_name(cnum).as_str() == "runtime" {
-            let root = DefId {
-                krate: cnum,
-                index: CRATE_DEF_INDEX,
-            };
-            for child in tcx.module_children(root) {
-                if let Some(name) = tcx.opt_item_name(child.res.def_id()) {
-                    if name.as_str() == "_record_ref_creation" {
-                        return Some(child.res.def_id());
-                    }
-                }
-            }
-        }
-    }
-    None
+extern "C" {
+    fn __record_ref_creation(arg: u64);
 }
+
+struct MyOptimizationPass;
 
 impl MyOptimizationPass {
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         println!("Running MyOptimizationPass on {:?}", body.source.def_id());
 
-        // Make sure rustc_span is linked
-        // Resolve the instrumentation function by scanning the loaded `runtime` crate for a
-        // top-level symbol named `__record_ref_creation`.
-        let record_fn_def_id = find_record_fn(tcx).unwrap_or_else(|| {
-            eprintln!("[instrument-mir] Visible extern crates:");
-            for &c in tcx.crates(()) {
-                eprintln!("  - {}", tcx.crate_name(c));
-            }
-            panic!(
-                "Failed to find `_record_ref_creation` in loaded crates. \nMake sure you pass: --extern runtime=target/release/libruntime.rlib and the function is at crate root."
-            );
-        });
-
-        for (bb, block_data) in body
-            .basic_blocks
-            .as_mut_preserves_cfg()
-            .iter_enumerated_mut()
-        {
-            let mut new_stmts = Vec::new();
-
-            for stmt in block_data.statements.iter() {
-                new_stmts.push(stmt.clone());
-
-                if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, place))) = &stmt.kind {
-                    println!("  Inserting call to record_ref_creation for {:?}", place);
-
-                    // Create operand for the function argument
-                    let arg = Spanned {
-                        node: Operand::Copy(*place),
-                        span: stmt.source_info.span,
-                    };
-
-                    // Create the function operand
-                    let func_operand = Operand::function_handle(
-                        tcx,
-                        record_fn_def_id,
-                        std::iter::empty(),
-                        stmt.source_info.span,
-                    );
-
-                    // Create a temporary for return value (unit)
-                    let tmp_local = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, stmt.source_info.span));
-
-                    // Create a Call terminator
-                    let terminator = Terminator {
-                        source_info: stmt.source_info,
-                        kind: TerminatorKind::Call {
-                            func: func_operand,
-                            args: vec![arg].into_boxed_slice(),
-                            destination: Place::from(tmp_local),
-                            target: Some(bb),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: stmt.source_info.span,
-                        },
-                    };
-
-                    // Create a small new block (not strictly necessary yet)
-                    let new_block = BasicBlockData::new(Some(terminator), false);
-
-                    // For now, just insert a no-op statement to keep MIR consistent
-                    new_stmts.push(Statement::new(
-                        stmt.source_info,
-                        StatementKind::FakeRead(Box::new((
-                            FakeReadCause::ForLet(None),
-                            Place::from(tmp_local),
-                        ))),
-                    ));
+        // We'll collect all insertion points first to avoid borrow issues.
+        let mut insert_points = Vec::new();
+        for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, _))) = &stmt.kind {
+                    insert_points.push((bb, stmt_idx, stmt.source_info));
                 }
             }
-
-            block_data.statements = new_stmts;
         }
+
+        let func_operand_base = {
+            // Lookup the function by name in the HIR crate items, in parallel.
+            let hir_items = tcx.hir_crate_items(());
+            let found = std::sync::Mutex::new(None);
+            hir_items.par_items(|item_id| {
+                let local_def_id = item_id.owner_id.def_id;
+                let name = tcx.item_name(local_def_id.to_def_id());
+                if name.as_str() == "__record_ref_creation" {
+                    *found.lock().unwrap() = Some(local_def_id.to_def_id());
+                }
+                Ok(())
+            });
+            let def_id = found
+                .lock()
+                .unwrap()
+                .expect("missing local '__record_ref_creation' definition");
+            move |sp: Span| Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
+        };
+
+        // Insert in reverse order to not invalidate indices
+        for (bb, stmt_idx, source_info) in insert_points.into_iter().rev() {
+            // 1) Take original terminator and cleanup flag in a short borrow
+            let (orig_term, is_cleanup) = {
+                let bd = &mut body.basic_blocks_mut()[bb];
+                (bd.terminator.take(), bd.is_cleanup)
+            };
+
+            // 2) Build continuation block now (no outstanding borrow of `bb`)
+            let cont_block = {
+                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                body.basic_blocks_mut().push(cont_data)
+            };
+
+            // 3) Build function operand and temp local (no outstanding borrow of `bb`)
+            let func_operand = func_operand_base(source_info.span);
+            let tmp_local = body
+                .local_decls
+                .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+            // 4) Prepare args
+            let arg_operand = Operand::Constant(Box::new(ConstOperand {
+                span: source_info.span,
+                user_ty: None,
+                const_: Const::Val(ConstValue::Scalar(Scalar::from_u64(42)), tcx.types.u64),
+            }));
+            let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                node: arg_operand,
+                span: source_info.span,
+            }]
+            .into_boxed_slice();
+
+            // 5) Build the call terminator
+            let call_term = Terminator {
+                source_info,
+                kind: TerminatorKind::Call {
+                    func: func_operand,
+                    args,
+                    destination: Place::from(tmp_local),
+                    target: Some(cont_block),
+                    unwind: UnwindAction::Continue,
+                    call_source: CallSource::Misc,
+                    fn_span: source_info.span,
+                },
+            };
+
+            // 6) Split off remaining statements and set the block terminator in one borrow
+            let remaining_stmts = {
+                let bd = &mut body.basic_blocks_mut()[bb];
+                let rem = bd.statements.split_off(stmt_idx + 1);
+                bd.terminator = Some(call_term);
+                rem
+            };
+
+            // 7) Now extend the continuation block with the remaining statements
+            body.basic_blocks_mut()[cont_block]
+                .statements
+                .extend(remaining_stmts);
+        }
+
+        println!("{:#?}", body);
     }
 }
 

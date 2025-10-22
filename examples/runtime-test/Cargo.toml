@@ -1,0 +1,14 @@
+[package]
+name = "runtime-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+
+[lib]
+crate-type = ["bin"]
+
+[build]
+rustflags = ["-L", "../../target/release"]
