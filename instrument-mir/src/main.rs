@@ -39,8 +39,79 @@ extern "C" {
 struct MyOptimizationPass;
 
 impl MyOptimizationPass {
+    fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
+        let items = tcx.hir_crate_items(());
+
+        // Use a Mutex to store the result since `par_items` runs in parallel
+        let found = std::sync::Mutex::new(None);
+
+        // Use `par_items` to iterate over the items
+        items
+            .par_items(|item_id| {
+                let local_def_id = item_id.owner_id.def_id;
+                if let Some(name) = tcx.opt_item_name(local_def_id) {
+                    if name.as_str() == target_name {
+                        *found.lock().unwrap() = Some(local_def_id);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap(); // Handle any errors from `par_items`
+
+        // Explicitly drop the MutexGuard before the block ends
+        let result = found.lock().unwrap().clone();
+        result.map(|local_def_id| local_def_id.to_def_id())
+    }
+
+    fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        for &cnum in tcx.crates(()).iter() {
+            let crate_name = tcx.crate_name(cnum);
+            if crate_name.as_str() == "runtime" {
+                println!("Items in runtime crate:");
+                let items = tcx.hir_crate_items(());
+
+                // Use `free_items` to iterate over non-associated items
+                for item_id in items.free_items() {
+                    let def_id = item_id.owner_id.def_id;
+                    if let Some(name) = tcx.opt_item_name(def_id) {
+                        println!(" - Item: {}", name);
+                    } else {
+                        println!(" - Unnamed item: {:?}", def_id);
+                    }
+                    // Print additional debugging information about the item
+                    let item_kind = tcx.def_kind(def_id);
+                    println!("   - DefKind: {:?}", item_kind);
+
+                    let span = tcx.def_span(def_id);
+                    println!("   - Span: {:?}", span);
+                }
+            }
+        }
+    }
+
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        let def_id = body.source.def_id();
+        let def_path = tcx.def_path_str(def_id);
+
+        if def_path.contains("rusteze_monitor") {
+            println!("Skipping optimization for {}", def_path);
+            return;
+        }
+
         println!("Running MyOptimizationPass on {:?}", body.source.def_id());
+        println!("Loaded crates:");
+        for &cnum in tcx.crates(()).iter() {
+            let name = tcx.crate_name(cnum);
+            println!(" - {:?} (cnum: {:?})", name, cnum);
+        }
+
+        self.print_runtime_items(tcx);
+
+        let def_id = self
+            .find_def_id_by_name(tcx, "__record_ref_creation")
+            .expect("missing '__record_ref_creation' definition");
+        let func_operand_base =
+            move |sp: Span| Operand::function_handle(tcx, def_id, std::iter::empty(), sp);
 
         // We'll collect all insertion points first to avoid borrow issues.
         let mut insert_points = Vec::new();
@@ -51,25 +122,6 @@ impl MyOptimizationPass {
                 }
             }
         }
-
-        let func_operand_base = {
-            // Lookup the function by name in the HIR crate items, in parallel.
-            let hir_items = tcx.hir_crate_items(());
-            let found = std::sync::Mutex::new(None);
-            hir_items.par_items(|item_id| {
-                let local_def_id = item_id.owner_id.def_id;
-                let name = tcx.item_name(local_def_id.to_def_id());
-                if name.as_str() == "__record_ref_creation" {
-                    *found.lock().unwrap() = Some(local_def_id.to_def_id());
-                }
-                Ok(())
-            });
-            let def_id = found
-                .lock()
-                .unwrap()
-                .expect("missing local '__record_ref_creation' definition");
-            move |sp: Span| Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
-        };
 
         // Insert in reverse order to not invalidate indices
         for (bb, stmt_idx, source_info) in insert_points.into_iter().rev() {
@@ -131,7 +183,7 @@ impl MyOptimizationPass {
                 .extend(remaining_stmts);
         }
 
-        println!("{:#?}", body);
+        // println!("{:#?}", body);
     }
 }
 
@@ -163,6 +215,7 @@ fn main() {
         color_config: ColorConfig::Auto,
     });
     rustc_driver::init_rustc_env_logger(&handler);
+
     std::process::exit(rustc_driver::catch_with_exit_code(move || {
         let args: Vec<String> = std::env::args().collect();
         rustc_driver::run_compiler(&args, &mut callbacks)
