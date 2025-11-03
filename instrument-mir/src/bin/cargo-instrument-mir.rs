@@ -5,7 +5,7 @@ fn main() -> Result<(), i32> {
     let mut cmd = std::process::Command::new(cargo);
     let driver = env::current_exe().unwrap().with_file_name("instrument-mir");
 
-    // Collect all extra arguments passed after "cargo unsafe-emit"
+    // Collect all extra arguments passed after "cargo instrument-mir"
     let args: Vec<String> = env::args().skip(2).collect();
 
     let status = cmd

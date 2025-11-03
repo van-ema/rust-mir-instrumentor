@@ -19,7 +19,7 @@ dependencies = [
 name = "hello"
 version = "0.1.0"
 dependencies = [
- "runtime",
+ "lib_hello",
 ]
 
 [[package]]

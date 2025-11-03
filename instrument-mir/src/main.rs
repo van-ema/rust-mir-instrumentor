@@ -27,85 +27,167 @@ use rustc_session::EarlyDiagCtxt;
 use rustc_span::{source_map::Spanned, Span};
 
 use rustc_hir::Safety;
+use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::ty::TyKind;
 use rustc_span::symbol::Symbol;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
 
-extern "C" {
-    fn __record_ref_creation(arg: u64);
-}
-
 struct MyOptimizationPass;
 
 impl MyOptimizationPass {
+    // fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
+    //     let items = tcx.hir_crate_items(());
+
+    //     // Use a Mutex to store the result since `par_items` runs in parallel
+    //     let found = std::sync::Mutex::new(None);
+
+    //     // Use `par_items` to iterate over the items
+    //     items
+    //         .par_items(|item_id| {
+    //             let local_def_id = item_id.owner_id.def_id;
+    //             if let Some(name) = tcx.opt_item_name(local_def_id) {
+    //                 if name.as_str() == target_name {
+    //                     *found.lock().unwrap() = Some(local_def_id);
+    //                 }
+    //             }
+    //             Ok(())
+    //         })
+    //         .unwrap(); // Handle any errors from `par_items`
+
+    //     // Explicitly drop the MutexGuard before the block ends
+    //     let result = found.lock().unwrap().clone();
+    //     result.map(|local_def_id| local_def_id.to_def_id())
+    // }
+
+    // fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+    //     for &cnum in tcx.crates(()).iter() {
+    //         let crate_name = tcx.crate_name(cnum);
+    //         if crate_name.as_str() == "runtime" {
+    //             println!("Items in runtime crate:");
+    //             let items = tcx.hir_crate_items(());
+
+    //             // Use `free_items` to iterate over non-associated items
+    //             for item_id in items.free_items() {
+    //                 let def_id = item_id.owner_id.def_id;
+    //                 if let Some(name) = tcx.opt_item_name(def_id) {
+    //                     println!(" - Item: {}", name);
+    //                 } else {
+    //                     println!(" - Unnamed item: {:?}", def_id);
+    //                 }
+    //                 // Print additional debugging information about the item
+    //                 let item_kind = tcx.def_kind(def_id);
+    //                 println!("   - DefKind: {:?}", item_kind);
+
+    //                 let span = tcx.def_span(def_id);
+    //                 println!("   - Span: {:?}", span);
+    //             }
+    //         }
+    //     }
+    // }
+
     fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
-        let items = tcx.hir_crate_items(());
-
-        // Use a Mutex to store the result since `par_items` runs in parallel
-        let found = std::sync::Mutex::new(None);
-
-        // Use `par_items` to iterate over the items
-        items
-            .par_items(|item_id| {
-                let local_def_id = item_id.owner_id.def_id;
-                if let Some(name) = tcx.opt_item_name(local_def_id) {
-                    if name.as_str() == target_name {
-                        *found.lock().unwrap() = Some(local_def_id);
-                    }
-                }
-                Ok(())
-            })
-            .unwrap(); // Handle any errors from `par_items`
-
-        // Explicitly drop the MutexGuard before the block ends
-        let result = found.lock().unwrap().clone();
-        result.map(|local_def_id| local_def_id.to_def_id())
-    }
-
-    fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
         for &cnum in tcx.crates(()).iter() {
             let crate_name = tcx.crate_name(cnum);
             if crate_name.as_str() == "runtime" {
-                println!("Items in runtime crate:");
-                let items = tcx.hir_crate_items(());
-
-                // Use `free_items` to iterate over non-associated items
-                for item_id in items.free_items() {
-                    let def_id = item_id.owner_id.def_id;
-                    if let Some(name) = tcx.opt_item_name(def_id) {
-                        println!(" - Item: {}", name);
-                    } else {
-                        println!(" - Unnamed item: {:?}", def_id);
+                println!("Searching for '{}' in runtime crate:", target_name);
+                let items = tcx.exported_non_generic_symbols(cnum);
+                println!("Found {} items", items.len());
+                for (symbol, _) in items {
+                    match symbol {
+                        ExportedSymbol::NonGeneric(def_id) | ExportedSymbol::Generic(def_id, _) => {
+                            if let Some(name) = tcx.opt_item_name(*def_id) {
+                                println!(" - Checking item: {}", name);
+                                if name.as_str() == target_name {
+                                    println!(" - Match found for '{}'", target_name);
+                                    return Some(*def_id);
+                                }
+                            } else {
+                                println!(" - Unnamed item: {:?}", def_id);
+                            }
+                        }
+                        ExportedSymbol::NoDefId(symbol_name) => {
+                            println!(" - Symbol without DefId: {:?}", symbol_name);
+                        }
+                        ExportedSymbol::DropGlue(ty) => {
+                            println!(" - DropGlue for type: {:?}", ty);
+                        }
+                        ExportedSymbol::AsyncDropGlueCtorShim(ty) => {
+                            println!(" - AsyncDropGlueCtorShim for type: {:?}", ty);
+                        }
+                        ExportedSymbol::AsyncDropGlue(def_id, ty) => {
+                            println!(" - AsyncDropGlue for DefId: {:?}, type: {:?}", def_id, ty);
+                        }
+                        ExportedSymbol::ThreadLocalShim(def_id) => {
+                            println!(" - ThreadLocalShim for DefId: {:?}", def_id);
+                        }
+                        _ => {
+                            println!(" - Unhandled ExportedSymbol variant");
+                        }
                     }
-                    // Print additional debugging information about the item
-                    let item_kind = tcx.def_kind(def_id);
-                    println!("   - DefKind: {:?}", item_kind);
-
-                    let span = tcx.def_span(def_id);
-                    println!("   - Span: {:?}", span);
                 }
             }
         }
+        println!("No match found for '{}'", target_name);
+        None
     }
+
+    // fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+    //     for &cnum in tcx.crates(()).iter() {
+    //         let crate_name = tcx.crate_name(cnum);
+    //         if crate_name.as_str() == "runtime" {
+    //             println!("Items in runtime crate:");
+    //             let items = tcx.exported_non_generic_symbols(cnum);
+    //             println!("Found {} items", items.len());
+    //             for (symbol, _) in items {
+    //                 match symbol {
+    //                     ExportedSymbol::NonGeneric(def_id) => {
+    //                         if let Some(name) = tcx.opt_item_name(*def_id) {
+    //                             println!(" - Item: {}", name);
+    //                         } else {
+    //                             println!(" - Unnamed item: {:?}", def_id);
+    //                         }
+    //                     }
+    //                     _ => {}
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
 
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let def_id = body.source.def_id();
         let def_path = tcx.def_path_str(def_id);
 
-        if def_path.contains("rusteze_monitor") {
+        if def_path.contains("runtime") {
             println!("Skipping optimization for {}", def_path);
             return;
         }
 
-        println!("Running MyOptimizationPass on {:?}", body.source.def_id());
+        let crate_name = tcx.crate_name(def_id.krate);
+
+        // Skip the `runtime` crate
+        if crate_name.as_str() == "runtime" {
+            println!(
+                "Skipping optimization for item in runtime crate: {:?}",
+                def_id
+            );
+            return;
+        }
+
+        println!(
+            "Running MyOptimizationPass on {:?} {:?}",
+            body.source.def_id(),
+            def_path
+        );
+
         println!("Loaded crates:");
         for &cnum in tcx.crates(()).iter() {
             let name = tcx.crate_name(cnum);
             println!(" - {:?} (cnum: {:?})", name, cnum);
         }
 
-        self.print_runtime_items(tcx);
+        // self.print_runtime_items(tcx);
 
         let def_id = self
             .find_def_id_by_name(tcx, "__record_ref_creation")
@@ -215,9 +297,12 @@ fn main() {
         color_config: ColorConfig::Auto,
     });
     rustc_driver::init_rustc_env_logger(&handler);
-
     std::process::exit(rustc_driver::catch_with_exit_code(move || {
-        let args: Vec<String> = std::env::args().collect();
+        let mut args: Vec<String> = std::env::args().collect();
+        let runtime_path = "/Users/emanuelevannacci/github/rust-mir-instrumentor/target/release";
+        args.push(format!("-L{runtime_path}"));
+        args.push(format!("--extern=runtime={runtime_path}/libruntime.rlib"));
+        args.push("-Zcrate-attr=force_runtime!(runtime::__record_ref_creation)".into());
         rustc_driver::run_compiler(&args, &mut callbacks)
     }))
 }
