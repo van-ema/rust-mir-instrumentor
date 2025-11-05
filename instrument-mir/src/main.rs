@@ -206,64 +206,64 @@ impl MyOptimizationPass {
         }
 
         // Insert in reverse order to not invalidate indices
-        for (bb, stmt_idx, source_info) in insert_points.into_iter().rev() {
-            // 1) Take original terminator and cleanup flag in a short borrow
-            let (orig_term, is_cleanup) = {
-                let bd = &mut body.basic_blocks_mut()[bb];
-                (bd.terminator.take(), bd.is_cleanup)
-            };
+        // for (bb, stmt_idx, source_info) in insert_points.into_iter().rev() {
+        //     // 1) Take original terminator and cleanup flag in a short borrow
+        //     let (orig_term, is_cleanup) = {
+        //         let bd = &mut body.basic_blocks_mut()[bb];
+        //         (bd.terminator.take(), bd.is_cleanup)
+        //     };
 
-            // 2) Build continuation block now (no outstanding borrow of `bb`)
-            let cont_block = {
-                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
-                body.basic_blocks_mut().push(cont_data)
-            };
+        //     // 2) Build continuation block now (no outstanding borrow of `bb`)
+        //     let cont_block = {
+        //         let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+        //         body.basic_blocks_mut().push(cont_data)
+        //     };
 
-            // 3) Build function operand and temp local (no outstanding borrow of `bb`)
-            let func_operand = func_operand_base(source_info.span);
-            let tmp_local = body
-                .local_decls
-                .push(LocalDecl::new(tcx.types.unit, source_info.span));
+        //     // 3) Build function operand and temp local (no outstanding borrow of `bb`)
+        //     let func_operand = func_operand_base(source_info.span);
+        //     let tmp_local = body
+        //         .local_decls
+        //         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-            // 4) Prepare args
-            let arg_operand = Operand::Constant(Box::new(ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::Val(ConstValue::Scalar(Scalar::from_u64(42)), tcx.types.u64),
-            }));
-            let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                node: arg_operand,
-                span: source_info.span,
-            }]
-            .into_boxed_slice();
+        //     // 4) Prepare args
+        //     let arg_operand = Operand::Constant(Box::new(ConstOperand {
+        //         span: source_info.span,
+        //         user_ty: None,
+        //         const_: Const::Val(ConstValue::Scalar(Scalar::from_u64(42)), tcx.types.u64),
+        //     }));
+        //     let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+        //         node: arg_operand,
+        //         span: source_info.span,
+        //     }]
+        //     .into_boxed_slice();
 
-            // 5) Build the call terminator
-            let call_term = Terminator {
-                source_info,
-                kind: TerminatorKind::Call {
-                    func: func_operand,
-                    args,
-                    destination: Place::from(tmp_local),
-                    target: Some(cont_block),
-                    unwind: UnwindAction::Continue,
-                    call_source: CallSource::Misc,
-                    fn_span: source_info.span,
-                },
-            };
+        //     // 5) Build the call terminator
+        //     let call_term = Terminator {
+        //         source_info,
+        //         kind: TerminatorKind::Call {
+        //             func: func_operand,
+        //             args,
+        //             destination: Place::from(tmp_local),
+        //             target: Some(cont_block),
+        //             unwind: UnwindAction::Continue,
+        //             call_source: CallSource::Misc,
+        //             fn_span: source_info.span,
+        //         },
+        //     };
 
-            // 6) Split off remaining statements and set the block terminator in one borrow
-            let remaining_stmts = {
-                let bd = &mut body.basic_blocks_mut()[bb];
-                let rem = bd.statements.split_off(stmt_idx + 1);
-                bd.terminator = Some(call_term);
-                rem
-            };
+        //     // 6) Split off remaining statements and set the block terminator in one borrow
+        //     let remaining_stmts = {
+        //         let bd = &mut body.basic_blocks_mut()[bb];
+        //         let rem = bd.statements.split_off(stmt_idx + 1);
+        //         bd.terminator = Some(call_term);
+        //         rem
+        //     };
 
-            // 7) Now extend the continuation block with the remaining statements
-            body.basic_blocks_mut()[cont_block]
-                .statements
-                .extend(remaining_stmts);
-        }
+        //     // 7) Now extend the continuation block with the remaining statements
+        //     body.basic_blocks_mut()[cont_block]
+        //         .statements
+        //         .extend(remaining_stmts);
+        // }
 
         // println!("{:#?}", body);
     }
@@ -300,9 +300,11 @@ fn main() {
     std::process::exit(rustc_driver::catch_with_exit_code(move || {
         let mut args: Vec<String> = std::env::args().collect();
         let runtime_path = "/Users/emanuelevannacci/github/rust-mir-instrumentor/target/release";
+        args.push("-Zunstable-options".to_string()); // Add this line
         args.push(format!("-L{runtime_path}"));
-        args.push(format!("--extern=runtime={runtime_path}/libruntime.rlib"));
-        args.push("-Zcrate-attr=force_runtime!(runtime::__record_ref_creation)".into());
+        args.push(format!(
+            "--extern=force:runtime={runtime_path}/libruntime.rlib"
+        ));
         rustc_driver::run_compiler(&args, &mut callbacks)
     }))
 }

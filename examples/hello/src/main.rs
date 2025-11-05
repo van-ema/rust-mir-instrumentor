@@ -1,5 +1,3 @@
-use runtime as _;
-
 use lib_hello;
 
 fn main() {

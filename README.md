@@ -37,3 +37,12 @@ target/release/instrument-mir \
     -L target/release \
     -o hello_instrumented
 ```
+
+## Work in progress
+We can force loading extern crate with
+
+```
+--extern=force:runtime={runtime_path}/libruntime.rlib
+```
+
+

@@ -6,6 +6,14 @@
 // #[cfg(not(target_os = "invalid_os"))]
 // pub fn __force_link_runtime() {}
 
+#[macro_export]
+macro_rules! force_runtime {
+    ($sym:path) => {
+        #[used]
+        static _FORCE_RUNTIME: fn(u64) = $sym;
+    };
+}
+
 #[no_mangle]
 #[rustc_diagnostic_item = "mir_runtime_record_ref_creation"]
 pub extern "C" fn __record_ref_creation(addr: u64) {
