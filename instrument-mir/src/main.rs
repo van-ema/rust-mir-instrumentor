@@ -207,8 +207,8 @@ impl MyOptimizationPass {
         let mut insert_points = Vec::new();
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
-                if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, _))) = &stmt.kind {
-                    insert_points.push((bb, stmt_idx, stmt.source_info));
+                if let StatementKind::Assign(box (place, Rvalue::Ref(_, _, _))) = &stmt.kind {
+                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone()));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
                         bb, stmt_idx, stmt
@@ -225,7 +225,7 @@ impl MyOptimizationPass {
         }
 
         // Insert in reverse order to not invalidate indices
-        for (bb, stmt_idx, source_info) in insert_points.into_iter().rev() {
+        for (bb, stmt_idx, source_info, place) in insert_points.into_iter().rev() {
             let (orig_term, is_cleanup) = {
                 let bd = &mut body.basic_blocks_mut()[bb];
                 let term = bd.terminator.take();
@@ -248,11 +248,7 @@ impl MyOptimizationPass {
                 .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
             // Prepare args
-            let arg_operand = Operand::Constant(Box::new(ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::Val(ConstValue::Scalar(Scalar::from_u64(42)), tcx.types.u64),
-            }));
+            let arg_operand = Operand::Copy(place);
 
             let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
                 node: arg_operand,
