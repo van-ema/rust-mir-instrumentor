@@ -20,7 +20,13 @@ fn main() -> Result<(), i32> {
 
     if let Some(path) = mir_out {
         let rf = format!("--mir-out={}", path);
-        cmd.env("RUSTFLAGS", rf);
+        let existing = env::var("RUSTFLAGS").unwrap_or_default();
+        let new_rf = if existing.is_empty() {
+            rf.clone()
+        } else {
+            format!("{} {}", existing, rf)
+        };
+        cmd.env("RUSTFLAGS", new_rf);
     }
     let status = cmd
         .arg("build")
