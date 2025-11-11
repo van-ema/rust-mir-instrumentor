@@ -210,10 +210,16 @@ impl MyOptimizationPass {
                 if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, _))) = &stmt.kind {
                     insert_points.push((bb, stmt_idx, stmt.source_info));
                     println!(
-                        "Found ref creation at block {:?}, stmt idx {}",
-                        bb, stmt_idx
+                        "Found ref creation at block {:?}, stmt idx {}: {:?}",
+                        bb, stmt_idx, stmt
                     );
-                    println!("Statement: {:?}", stmt);
+                }
+                if let StatementKind::Assign(box (_, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind
+                {
+                    println!(
+                        "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
+                        bb, stmt_idx, stmt, mutbl, src_place
+                    );
                 }
             }
         }

@@ -10,8 +10,7 @@ cargo install --path instrument-mir --bin cargo-instrument-mir
 ## Use
 
 ```
-cargo instrument-mir --bin hello
-```
+CARGO_TARGET_DIR=my_build  cargo instrument-mir --mir-out=./out.mir -p hello --release```
 
 Linux:
 ```
