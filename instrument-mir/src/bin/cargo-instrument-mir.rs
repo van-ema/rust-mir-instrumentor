@@ -6,8 +6,22 @@ fn main() -> Result<(), i32> {
     let driver = env::current_exe().unwrap().with_file_name("instrument-mir");
 
     // Collect all extra arguments passed after "cargo instrument-mir"
-    let args: Vec<String> = env::args().skip(2).collect();
+    let mut args: Vec<String> = env::args().skip(2).collect();
+    let mut mir_out: Option<String> = None;
 
+    args.retain(|arg| {
+        if let Some(v) = arg.strip_prefix("--mir-out=") {
+            mir_out = Some(v.to_string());
+            false
+        } else {
+            true
+        }
+    });
+
+    if let Some(path) = mir_out {
+        let rf = format!("--mir-out={}", path);
+        cmd.env("RUSTFLAGS", rf);
+    }
     let status = cmd
         .arg("build")
         .env("RUSTC", driver)

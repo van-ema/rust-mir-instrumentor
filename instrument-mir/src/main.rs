@@ -21,17 +21,25 @@ use rustc_interface::Config;
 use rustc_middle::mir::interpret::{AllocId, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
-use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
+use rustc_middle::ty::{self, print, ParamEnv, Ty, TyCtxt};
 use rustc_session::config::ErrorOutputType;
 use rustc_session::EarlyDiagCtxt;
 use rustc_span::{source_map::Spanned, Span};
 
 use rustc_hir::Safety;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
+use rustc_middle::mir::pretty::write_mir_fn;
 use rustc_middle::ty::TyKind;
 use rustc_span::symbol::Symbol;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
+
+use std::fs::File;
+use std::io::BufWriter;
+use std::io::Write;
+use std::sync::OnceLock;
+
+static MIR_OUT: OnceLock<String> = OnceLock::new();
 
 struct MyOptimizationPass;
 
@@ -201,6 +209,11 @@ impl MyOptimizationPass {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 if let StatementKind::Assign(box (_, Rvalue::Ref(_, _, _))) = &stmt.kind {
                     insert_points.push((bb, stmt_idx, stmt.source_info));
+                    println!(
+                        "Found ref creation at block {:?}, stmt idx {}",
+                        bb, stmt_idx
+                    );
+                    println!("Statement: {:?}", stmt);
                 }
             }
         }
@@ -276,6 +289,21 @@ const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx 
         let optimization_pass = MyOptimizationPass;
         optimization_pass.run_pass(tcx, &mut body);
 
+        if let Some(path) = MIR_OUT.get() {
+            let mut extra = |_, _: &mut dyn std::io::Write| Ok(());
+            let file = File::create(path).unwrap();
+            let mut writer = BufWriter::new(file);
+            write_mir_fn(
+                tcx,
+                &body,
+                &mut extra,
+                &mut writer,
+                rustc_middle::mir::pretty::PrettyPrintMirOptions::from_cli(tcx),
+            )
+            .unwrap();
+            writer.flush().unwrap();
+        }
+
         tcx.arena.alloc(body)
     };
 
@@ -299,12 +327,29 @@ fn main() {
     rustc_driver::init_rustc_env_logger(&handler);
     std::process::exit(rustc_driver::catch_with_exit_code(move || {
         let mut args: Vec<String> = std::env::args().collect();
+
+        let mut mir_out: Option<String> = None;
+
+        args.retain(|arg| {
+            if let Some(rest) = arg.strip_prefix("--mir-out=") {
+                mir_out = Some(rest.to_string());
+                false
+            } else {
+                true
+            }
+        });
+
+        if let Some(p) = mir_out {
+            MIR_OUT.set(p).unwrap();
+        }
+
         let runtime_path = "/Users/emanuelevannacci/github/rust-mir-instrumentor/target/release";
-        args.push("-Zunstable-options".to_string()); // Add this line
+        args.push("-Zunstable-options".to_string());
         args.push(format!("-L{runtime_path}"));
         args.push(format!(
             "--extern=force:runtime={runtime_path}/libruntime.rlib"
         ));
+        // args.push("-Zdump-mir=main".to_string());
         rustc_driver::run_compiler(&args, &mut callbacks)
     }))
 }
