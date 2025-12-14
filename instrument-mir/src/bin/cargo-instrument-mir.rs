@@ -18,11 +18,32 @@ fn main() -> Result<(), i32> {
         }
     });
 
+    let mut runtime_path: Option<String> = None;
+
+    args.retain(|arg| {
+        if let Some(v) = arg.strip_prefix("--runtime-path=") {
+            runtime_path = Some(v.to_string());
+            false
+        } else {
+            true
+        }
+    });
+
+    // Pass custom driver flags through RUSTFLAGS so Cargo forwards them to RUSTC=instrument-mir.
+    let mut extra_rf: Vec<String> = Vec::new();
+
     if let Some(path) = mir_out {
-        let rf = format!("--mir-out={}", path);
+        extra_rf.push(format!("--mir-out={}", path));
+    }
+    if let Some(path) = runtime_path {
+        extra_rf.push(format!("--runtime-path={}", path));
+    }
+
+    if !extra_rf.is_empty() {
+        let rf = extra_rf.join(" ");
         let existing = env::var("RUSTFLAGS").unwrap_or_default();
         let new_rf = if existing.is_empty() {
-            rf.clone()
+            rf
         } else {
             format!("{} {}", existing, rf)
         };

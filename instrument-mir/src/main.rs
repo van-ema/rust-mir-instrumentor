@@ -323,16 +323,35 @@ fn main() {
             }
         });
 
+        let mut runtime_path: Option<String> = None;
+
+        args.retain(|arg| {
+            if let Some(rest) = arg.strip_prefix("--runtime-path=") {
+                runtime_path = Some(rest.to_string());
+                false
+            } else {
+                true
+            }
+        });
+
         if let Some(p) = mir_out {
             MIR_OUT.set(p).unwrap();
         }
 
-        let runtime_path = "/Users/emanuelevannacci/github/rust-mir-instrumentor/target/release";
-        args.push("-Zunstable-options".to_string());
-        args.push(format!("-L{runtime_path}"));
-        args.push(format!(
-            "--extern=force:runtime={runtime_path}/libruntime.rlib"
-        ));
+        // Cargo probes the compiler with `-vV` (verbose version) before building.
+        // That invocation won't carry our custom flags, so we must not require them.
+        let is_version_probe = args.iter().any(|a| a == "-vV" || a == "-V" || a == "--version");
+
+        if let Some(runtime_path) = runtime_path {
+            args.push("-Zunstable-options".to_string());
+            args.push(format!("-L{}", runtime_path));
+            args.push(format!(
+                "--extern=force:runtime={}/libruntime.rlib",
+                runtime_path
+            ));
+        } else if !is_version_probe {
+            panic!("missing --runtime-path argument (pass it via `cargo instrument-mir --runtime-path=...`)");
+        }
         // args.push("-Zdump-mir=main".to_string());
         rustc_driver::run_compiler(&args, &mut callbacks)
     }))
