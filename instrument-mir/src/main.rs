@@ -44,29 +44,6 @@ static MIR_OUT: OnceLock<String> = OnceLock::new();
 struct MyOptimizationPass;
 
 impl MyOptimizationPass {
-    // fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
-    //     let items = tcx.hir_crate_items(());
-
-    //     // Use a Mutex to store the result since `par_items` runs in parallel
-    //     let found = std::sync::Mutex::new(None);
-
-    //     // Use `par_items` to iterate over the items
-    //     items
-    //         .par_items(|item_id| {
-    //             let local_def_id = item_id.owner_id.def_id;
-    //             if let Some(name) = tcx.opt_item_name(local_def_id) {
-    //                 if name.as_str() == target_name {
-    //                     *found.lock().unwrap() = Some(local_def_id);
-    //                 }
-    //             }
-    //             Ok(())
-    //         })
-    //         .unwrap(); // Handle any errors from `par_items`
-
-    //     // Explicitly drop the MutexGuard before the block ends
-    //     let result = found.lock().unwrap().clone();
-    //     result.map(|local_def_id| local_def_id.to_def_id())
-    // }
 
     // fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
     //     for &cnum in tcx.crates(()).iter() {
@@ -139,29 +116,6 @@ impl MyOptimizationPass {
         println!("No match found for '{}'", target_name);
         None
     }
-
-    // fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
-    //     for &cnum in tcx.crates(()).iter() {
-    //         let crate_name = tcx.crate_name(cnum);
-    //         if crate_name.as_str() == "runtime" {
-    //             println!("Items in runtime crate:");
-    //             let items = tcx.exported_non_generic_symbols(cnum);
-    //             println!("Found {} items", items.len());
-    //             for (symbol, _) in items {
-    //                 match symbol {
-    //                     ExportedSymbol::NonGeneric(def_id) => {
-    //                         if let Some(name) = tcx.opt_item_name(*def_id) {
-    //                             println!(" - Item: {}", name);
-    //                         } else {
-    //                             println!(" - Unnamed item: {:?}", def_id);
-    //                         }
-    //                     }
-    //                     _ => {}
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 
     fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let def_id = body.source.def_id();
@@ -247,8 +201,27 @@ impl MyOptimizationPass {
                 .local_decls
                 .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-            // Prepare args
-            let arg_operand = Operand::Copy(place);
+            // Compute the address that the newly-created reference points to.
+            // `place` is the LHS of the ref assignment (e.g., `_7` in `_7 = &_5`), so its type is `&T`.
+            // We convert that pointer-like value into a stable integer address (usize) for the runtime hook.
+            let addr_local = body
+                .local_decls
+                .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+            let addr_stmt = Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(addr_local),
+                    Rvalue::Cast(
+                        CastKind::PointerExposeProvenance,
+                        Operand::Copy(place),
+                        tcx.types.usize,
+                    ),
+                ))),
+            );
+
+            // Prepare args: pass the computed address
+            let arg_operand = Operand::Copy(Place::from(addr_local));
 
             let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
                 node: arg_operand,
@@ -274,6 +247,11 @@ impl MyOptimizationPass {
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let rem = bd.statements.split_off(stmt_idx + 1);
+
+                // Insert the address-computation statement right after the original ref creation.
+                bd.statements.push(addr_stmt);
+
+                // Then replace the terminator with our call.
                 bd.terminator = Some(call_term);
                 rem
             };
