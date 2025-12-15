@@ -44,32 +44,31 @@ static MIR_OUT: OnceLock<String> = OnceLock::new();
 struct MyOptimizationPass;
 
 impl MyOptimizationPass {
-
-    // fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
-    //     for &cnum in tcx.crates(()).iter() {
-    //         let crate_name = tcx.crate_name(cnum);
-    //         if crate_name.as_str() == "runtime" {
-    //             println!("Items in runtime crate:");
-    //             let items = tcx.hir_crate_items(());
-
-    //             // Use `free_items` to iterate over non-associated items
-    //             for item_id in items.free_items() {
-    //                 let def_id = item_id.owner_id.def_id;
-    //                 if let Some(name) = tcx.opt_item_name(def_id) {
-    //                     println!(" - Item: {}", name);
-    //                 } else {
-    //                     println!(" - Unnamed item: {:?}", def_id);
-    //                 }
-    //                 // Print additional debugging information about the item
-    //                 let item_kind = tcx.def_kind(def_id);
-    //                 println!("   - DefKind: {:?}", item_kind);
-
-    //                 let span = tcx.def_span(def_id);
-    //                 println!("   - Span: {:?}", span);
-    //             }
-    //         }
-    //     }
-    // }
+    /*
+    fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        for &cnum in tcx.crates(()).iter() {
+            let crate_name = tcx.crate_name(cnum);
+            if crate_name.as_str() == "runtime" {
+                println!("Items in runtime crate:");
+                let items = tcx.hir_crate_items(());
+                // Use `free_items` to iterate over non-associated items
+                for item_id in items.free_items() {
+                    let def_id = item_id.owner_id.def_id;
+                    if let Some(name) = tcx.opt_item_name(def_id) {
+                        println!(" - Item: {}", name);
+                    } else {
+                        println!(" - Unnamed item: {:?}", def_id);
+                    }
+                    // Print additional debugging information about the item
+                    let item_kind = tcx.def_kind(def_id);
+                    println!("   - DefKind: {:?}", item_kind);
+                    let span = tcx.def_span(def_id);
+                    println!("   - Span: {:?}", span);
+                }
+            }
+        }
+    }
+    */
 
     fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
         for &cnum in tcx.crates(()).iter() {
@@ -161,8 +160,8 @@ impl MyOptimizationPass {
         let mut insert_points = Vec::new();
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
-                if let StatementKind::Assign(box (place, Rvalue::Ref(_, _, _))) = &stmt.kind {
-                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone()));
+                if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, _))) = &stmt.kind {
+                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), *bk));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
                         bb, stmt_idx, stmt
@@ -179,7 +178,7 @@ impl MyOptimizationPass {
         }
 
         // Insert in reverse order to not invalidate indices
-        for (bb, stmt_idx, source_info, place) in insert_points.into_iter().rev() {
+        for (bb, stmt_idx, source_info, place, borrow_kind) in insert_points.into_iter().rev() {
             let (orig_term, is_cleanup) = {
                 let bd = &mut body.basic_blocks_mut()[bb];
                 let term = bd.terminator.take();
@@ -220,13 +219,33 @@ impl MyOptimizationPass {
                 ))),
             );
 
-            // Prepare args: pass the computed address
-            let arg_operand = Operand::Copy(Place::from(addr_local));
+            // Prepare args: pass the computed address and a mutability flag (0 = shared, 1 = mut)
+            let arg_addr = Operand::Copy(Place::from(addr_local));
 
-            let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                node: arg_operand,
+            let is_mut_u8: u8 = match borrow_kind {
+                BorrowKind::Mut { .. } => 1,
+                _ => 0,
+            };
+
+            let arg_mut = Operand::Constant(Box::new(ConstOperand {
                 span: source_info.span,
-            }]
+                user_ty: None,
+                const_: Const::Val(
+                    ConstValue::Scalar(Scalar::from_u8(is_mut_u8)),
+                    tcx.types.u8,
+                ),
+            }));
+
+            let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                Spanned {
+                    node: arg_addr,
+                    span: source_info.span,
+                },
+                Spanned {
+                    node: arg_mut,
+                    span: source_info.span,
+                },
+            ]
             .into_boxed_slice();
 
             // Build the call terminator
@@ -340,7 +359,9 @@ fn main() {
 
         // Cargo probes the compiler with `-vV` (verbose version) before building.
         // That invocation won't carry our custom flags, so we must not require them.
-        let is_version_probe = args.iter().any(|a| a == "-vV" || a == "-V" || a == "--version");
+        let is_version_probe = args
+            .iter()
+            .any(|a| a == "-vV" || a == "-V" || a == "--version");
 
         if let Some(runtime_path) = runtime_path {
             args.push("-Zunstable-options".to_string());
