@@ -150,25 +150,41 @@ impl MyOptimizationPass {
 
         // self.print_runtime_items(tcx);
 
-        let def_id = self
+        let def_id_ref = self
             .find_def_id_by_name(tcx, "__record_ref_creation")
             .expect("missing '__record_ref_creation' definition");
-        let func_operand_base =
-            move |sp: Span| Operand::function_handle(tcx, def_id, std::iter::empty(), sp);
+        let def_id_raw = self
+            .find_def_id_by_name(tcx, "__record_raw_ptr_creation")
+            .expect("missing '__record_raw_ptr_creation' definition");
+
+        let func_operand_ref =
+            move |sp: Span| Operand::function_handle(tcx, def_id_ref, std::iter::empty(), sp);
+        let func_operand_raw =
+            move |sp: Span| Operand::function_handle(tcx, def_id_raw, std::iter::empty(), sp);
 
         // We'll collect all insertion points first to avoid borrow issues.
+        #[derive(Copy, Clone, Debug)]
+        enum CreationKind {
+            Ref(BorrowKind),
+            Raw { is_mut: bool },
+        }
+
         let mut insert_points = Vec::new();
+
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, _))) = &stmt.kind {
-                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), *bk));
+                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), CreationKind::Ref(*bk)));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
                         bb, stmt_idx, stmt
                     );
                 }
-                if let StatementKind::Assign(box (_, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind
-                {
+
+                // Raw pointer creation: e.g., `_3 = &raw const _1;` or `_3 = &raw mut _1;`
+                if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind {
+                    let is_mut = matches!(*mutbl, RawPtrKind::Mut);
+                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), CreationKind::Raw { is_mut }));
                     println!(
                         "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
                         bb, stmt_idx, stmt, mutbl, src_place
@@ -178,7 +194,7 @@ impl MyOptimizationPass {
         }
 
         // Insert in reverse order to not invalidate indices
-        for (bb, stmt_idx, source_info, place, borrow_kind) in insert_points.into_iter().rev() {
+        for (bb, stmt_idx, source_info, place, creation_kind) in insert_points.into_iter().rev() {
             let (orig_term, is_cleanup) = {
                 let bd = &mut body.basic_blocks_mut()[bb];
                 let term = bd.terminator.take();
@@ -195,7 +211,10 @@ impl MyOptimizationPass {
             };
 
             // Build function operand and temp local (no outstanding borrow of `bb`)
-            let func_operand = func_operand_base(source_info.span);
+            let func_operand = match creation_kind {
+                CreationKind::Ref(_) => func_operand_ref(source_info.span),
+                CreationKind::Raw { .. } => func_operand_raw(source_info.span),
+            };
             let tmp_local = body
                 .local_decls
                 .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -222,9 +241,12 @@ impl MyOptimizationPass {
             // Prepare args: pass the computed address and a mutability flag (0 = shared, 1 = mut)
             let arg_addr = Operand::Copy(Place::from(addr_local));
 
-            let is_mut_u8: u8 = match borrow_kind {
-                BorrowKind::Mut { .. } => 1,
-                _ => 0,
+            let is_mut_u8: u8 = match creation_kind {
+                CreationKind::Ref(borrow_kind) => match borrow_kind {
+                    BorrowKind::Mut { .. } => 1,
+                    _ => 0,
+                },
+                CreationKind::Raw { is_mut } => if is_mut { 1 } else { 0 },
             };
 
             let arg_mut = Operand::Constant(Box::new(ConstOperand {
