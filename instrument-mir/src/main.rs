@@ -39,7 +39,23 @@ use std::io::BufWriter;
 use std::io::Write;
 use std::sync::OnceLock;
 
-static MIR_OUT: OnceLock<String> = OnceLock::new();
+static MIR_OUT_BEFORE: OnceLock<String> = OnceLock::new();
+static MIR_OUT_AFTER: OnceLock<String> = OnceLock::new();
+
+fn prefixed_path(base: &str, prefix: &str) -> String {
+    use std::path::{Path, PathBuf};
+
+    let p = Path::new(base);
+    let parent = p.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mir.txt".to_string());
+
+    let mut out: PathBuf = parent.to_path_buf();
+    out.push(format!("{}{}", prefix, file_name));
+    out.to_string_lossy().to_string()
+}
 
 struct MyOptimizationPass;
 
@@ -174,7 +190,13 @@ impl MyOptimizationPass {
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, _))) = &stmt.kind {
-                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), CreationKind::Ref(*bk)));
+                    insert_points.push((
+                        bb,
+                        stmt_idx,
+                        stmt.source_info,
+                        place.clone(),
+                        CreationKind::Ref(*bk),
+                    ));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
                         bb, stmt_idx, stmt
@@ -182,9 +204,17 @@ impl MyOptimizationPass {
                 }
 
                 // Raw pointer creation: e.g., `_3 = &raw const _1;` or `_3 = &raw mut _1;`
-                if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind {
+                if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) =
+                    &stmt.kind
+                {
                     let is_mut = matches!(*mutbl, RawPtrKind::Mut);
-                    insert_points.push((bb, stmt_idx, stmt.source_info, place.clone(), CreationKind::Raw { is_mut }));
+                    insert_points.push((
+                        bb,
+                        stmt_idx,
+                        stmt.source_info,
+                        place.clone(),
+                        CreationKind::Raw { is_mut },
+                    ));
                     println!(
                         "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
                         bb, stmt_idx, stmt, mutbl, src_place
@@ -246,16 +276,19 @@ impl MyOptimizationPass {
                     BorrowKind::Mut { .. } => 1,
                     _ => 0,
                 },
-                CreationKind::Raw { is_mut } => if is_mut { 1 } else { 0 },
+                CreationKind::Raw { is_mut } => {
+                    if is_mut {
+                        1
+                    } else {
+                        0
+                    }
+                }
             };
 
             let arg_mut = Operand::Constant(Box::new(ConstOperand {
                 span: source_info.span,
                 user_ty: None,
-                const_: Const::Val(
-                    ConstValue::Scalar(Scalar::from_u8(is_mut_u8)),
-                    tcx.types.u8,
-                ),
+                const_: Const::Val(ConstValue::Scalar(Scalar::from_u8(is_mut_u8)), tcx.types.u8),
             }));
 
             let args: Box<[Spanned<Operand<'tcx>>]> = vec![
@@ -311,10 +344,27 @@ const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx 
     |tcx, def| {
         let mut body = (rustc_interface::DEFAULT_QUERY_PROVIDERS.optimized_mir)(tcx, def).clone();
 
+        // Write MIR before running our optimization/instrumentation.
+        if let Some(path) = MIR_OUT_BEFORE.get() {
+            let mut extra = |_, _: &mut dyn std::io::Write| Ok(());
+            let file = File::create(path).unwrap();
+            let mut writer = BufWriter::new(file);
+            write_mir_fn(
+                tcx,
+                &body,
+                &mut extra,
+                &mut writer,
+                rustc_middle::mir::pretty::PrettyPrintMirOptions::from_cli(tcx),
+            )
+            .unwrap();
+            writer.flush().unwrap();
+        }
+
         let optimization_pass = MyOptimizationPass;
         optimization_pass.run_pass(tcx, &mut body);
 
-        if let Some(path) = MIR_OUT.get() {
+        // Write MIR after running our optimization/instrumentation.
+        if let Some(path) = MIR_OUT_AFTER.get() {
             let mut extra = |_, _: &mut dyn std::io::Write| Ok(());
             let file = File::create(path).unwrap();
             let mut writer = BufWriter::new(file);
@@ -376,7 +426,10 @@ fn main() {
         });
 
         if let Some(p) = mir_out {
-            MIR_OUT.set(p).unwrap();
+            let before = prefixed_path(&p, "before.");
+            let after = prefixed_path(&p, "after.");
+            MIR_OUT_BEFORE.set(before).unwrap();
+            MIR_OUT_AFTER.set(after).unwrap();
         }
 
         // Cargo probes the compiler with `-vV` (verbose version) before building.
