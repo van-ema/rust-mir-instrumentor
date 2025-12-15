@@ -1,5 +1,6 @@
 [workspace]
 members = ["dynamic_loader","examples/hello",
+    "examples/mutable_ref_test",
     "instrument-mir", "lib_hello",
     "runtime",
 ]
