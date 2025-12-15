@@ -1,5 +1,16 @@
-
 [package]
 name = "raw_pointer_test"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "raw_pointer_test"
+path = "src/main.rs"
+
+[[bin]]
+name = "raw_pointer_mut_test"
+path = "src/bin/mut_raw.rs"
+
+# expected:
+# [[bin]] name = "raw_pointer_test"
+# [[bin]] name = "raw_pointer_mut_test"
