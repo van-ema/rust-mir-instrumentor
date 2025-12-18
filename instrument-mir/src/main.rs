@@ -9,6 +9,7 @@ extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_transform;
+use std::collections::HashMap;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
@@ -180,22 +181,23 @@ impl MyOptimizationPass {
 
         // We'll collect all insertion points first to avoid borrow issues.
         #[derive(Copy, Clone, Debug)]
-        enum CreationKind {
-            Ref(BorrowKind),
-            Raw { is_mut: bool },
+        enum CreationKind<'tcx> {
+            Ref { bk: BorrowKind, src: Place<'tcx> },
+            Raw { is_mut: bool, src: Place<'tcx> },
         }
 
-        let mut insert_points = Vec::new();
+        let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, CreationKind<'tcx>)> = Vec::new();
+        let mut tag_of_local: HashMap<Local, Local> = HashMap::new();
 
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
-                if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, _))) = &stmt.kind {
+                if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
                     insert_points.push((
                         bb,
                         stmt_idx,
                         stmt.source_info,
                         place.clone(),
-                        CreationKind::Ref(*bk),
+                        CreationKind::Ref { bk: *bk, src: src_place.clone() },
                     ));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
@@ -213,7 +215,7 @@ impl MyOptimizationPass {
                         stmt_idx,
                         stmt.source_info,
                         place.clone(),
-                        CreationKind::Raw { is_mut },
+                        CreationKind::Raw { is_mut, src: src_place.clone() },
                     ));
                     println!(
                         "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
@@ -240,14 +242,21 @@ impl MyOptimizationPass {
                 body.basic_blocks_mut().push(cont_data)
             };
 
-            // Build function operand and temp local (no outstanding borrow of `bb`)
+            // Build function operand and tag destination local (no outstanding borrow of `bb`)
             let func_operand = match creation_kind {
-                CreationKind::Ref(_) => func_operand_ref(source_info.span),
+                CreationKind::Ref { .. } => func_operand_ref(source_info.span),
                 CreationKind::Raw { .. } => func_operand_raw(source_info.span),
             };
-            let tmp_local = body
+
+            // Destination local receives the returned tag (u64).
+            let tag_local = body
                 .local_decls
-                .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+            // Best-effort: remember that the LHS local now carries `tag_local`.
+            if let Some(lhs_local) = place.as_local() {
+                tag_of_local.insert(lhs_local, tag_local);
+            }
 
             // Compute the address that the newly-created reference points to.
             // `place` is the LHS of the ref assignment (e.g., `_7` in `_7 = &_5`), so its type is `&T`.
@@ -272,11 +281,11 @@ impl MyOptimizationPass {
             let arg_addr = Operand::Copy(Place::from(addr_local));
 
             let is_mut_u8: u8 = match creation_kind {
-                CreationKind::Ref(borrow_kind) => match borrow_kind {
+                CreationKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
                     BorrowKind::Mut { .. } => 1,
                     _ => 0,
                 },
-                CreationKind::Raw { is_mut } => {
+                CreationKind::Raw { is_mut, .. } => {
                     if is_mut {
                         1
                     } else {
@@ -291,6 +300,26 @@ impl MyOptimizationPass {
                 const_: Const::Val(ConstValue::Scalar(Scalar::from_u8(is_mut_u8)), tcx.types.u8),
             }));
 
+            // Best-effort parent tag: if this creation is from a deref of an existing pointer local,
+            // pass that local's tag; otherwise pass 0.
+            let arg_parent: Operand<'tcx> = match &creation_kind {
+                CreationKind::Ref { src, .. } | CreationKind::Raw { src, .. } => {
+                    let base = src.local;
+                    if let Some(tl) = tag_of_local.get(&base) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: source_info.span,
+                            user_ty: None,
+                            const_: Const::Val(
+                                ConstValue::Scalar(Scalar::from_u64(0)),
+                                tcx.types.u64,
+                            ),
+                        }))
+                    }
+                }
+            };
+
             let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                 Spanned {
                     node: arg_addr,
@@ -298,6 +327,10 @@ impl MyOptimizationPass {
                 },
                 Spanned {
                     node: arg_mut,
+                    span: source_info.span,
+                },
+                Spanned {
+                    node: arg_parent,
                     span: source_info.span,
                 },
             ]
@@ -309,7 +342,7 @@ impl MyOptimizationPass {
                 kind: TerminatorKind::Call {
                     func: func_operand,
                     args,
-                    destination: Place::from(tmp_local),
+                    destination: Place::from(tag_local),
                     target: Some(cont_block),
                     unwind: UnwindAction::Continue,
                     call_source: CallSource::Misc,
