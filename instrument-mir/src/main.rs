@@ -22,7 +22,7 @@ use rustc_interface::Config;
 use rustc_middle::mir::interpret::{AllocId, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
-use rustc_middle::ty::{self, print, ParamEnv, Ty, TyCtxt};
+use rustc_middle::ty::{self, print, ParamEnv, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
 use rustc_session::config::ErrorOutputType;
 use rustc_session::EarlyDiagCtxt;
 use rustc_span::{source_map::Spanned, Span};
@@ -173,31 +173,69 @@ impl MyOptimizationPass {
         let def_id_raw = self
             .find_def_id_by_name(tcx, "__record_raw_ptr_creation")
             .expect("missing '__record_raw_ptr_creation' definition");
+        let def_id_alloc = self
+            .find_def_id_by_name(tcx, "__rz_record_alloc")
+            .expect("missing '__rz_record_alloc' definition");
 
         let func_operand_ref =
             move |sp: Span| Operand::function_handle(tcx, def_id_ref, std::iter::empty(), sp);
         let func_operand_raw =
             move |sp: Span| Operand::function_handle(tcx, def_id_raw, std::iter::empty(), sp);
+        let func_operand_alloc =
+            move |sp: Span| Operand::function_handle(tcx, def_id_alloc, std::iter::empty(), sp);
 
         // We'll collect all insertion points first to avoid borrow issues.
         #[derive(Copy, Clone, Debug)]
-        enum CreationKind<'tcx> {
+        enum InstrKind<'tcx> {
             Ref { bk: BorrowKind, src: Place<'tcx> },
             Raw { is_mut: bool, src: Place<'tcx> },
+            /// Stack allocation lifetime event for a MIR local.
+            StackAlloc { local: Local, live: bool, size: usize },
         }
 
-        let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, CreationKind<'tcx>)> = Vec::new();
+        let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
         let mut tag_of_local: HashMap<Local, Local> = HashMap::new();
 
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                // Stack allocation lifetime: StorageLive/StorageDead.
+                match stmt.kind {
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        if local != RETURN_PLACE {
+                            let live = matches!(stmt.kind, StatementKind::StorageLive(_));
+                            let ty = body.local_decls[local].ty;
+
+                            // On nightly-2025-08-01, `tcx.layout_of` expects a `PseudoCanonicalInput<Ty>`.
+                            // For MIR locals, `TypingEnv::fully_monomorphized()` is sufficient.
+                            let size = {
+                                let input = PseudoCanonicalInput {
+                                    typing_env: TypingEnv::fully_monomorphized(),
+                                    value: ty,
+                                };
+                                tcx.layout_of(input)
+                                    .ok()
+                                    .map(|l| l.size.bytes() as usize)
+                                    .unwrap_or(0)
+                            };
+
+                            insert_points.push((
+                                bb,
+                                stmt_idx,
+                                stmt.source_info,
+                                Place::from(local),
+                                InstrKind::StackAlloc { local, live, size },
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
                     insert_points.push((
                         bb,
                         stmt_idx,
                         stmt.source_info,
                         place.clone(),
-                        CreationKind::Ref { bk: *bk, src: src_place.clone() },
+                        InstrKind::Ref { bk: *bk, src: src_place.clone() },
                     ));
                     println!(
                         "Found ref creation at block {:?}, stmt idx {}: {:?}",
@@ -215,7 +253,7 @@ impl MyOptimizationPass {
                         stmt_idx,
                         stmt.source_info,
                         place.clone(),
-                        CreationKind::Raw { is_mut, src: src_place.clone() },
+                        InstrKind::Raw { is_mut, src: src_place.clone() },
                     ));
                     println!(
                         "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
@@ -244,8 +282,9 @@ impl MyOptimizationPass {
 
             // Build function operand and tag destination local (no outstanding borrow of `bb`)
             let func_operand = match creation_kind {
-                CreationKind::Ref { .. } => func_operand_ref(source_info.span),
-                CreationKind::Raw { .. } => func_operand_raw(source_info.span),
+                InstrKind::Ref { .. } => func_operand_ref(source_info.span),
+                InstrKind::Raw { .. } => func_operand_raw(source_info.span),
+                InstrKind::StackAlloc { .. } => func_operand_alloc(source_info.span),
             };
 
             // Destination local receives the returned tag (u64).
@@ -253,88 +292,162 @@ impl MyOptimizationPass {
                 .local_decls
                 .push(LocalDecl::new(tcx.types.u64, source_info.span));
 
-            // Best-effort: remember that the LHS local now carries `tag_local`.
-            if let Some(lhs_local) = place.as_local() {
-                tag_of_local.insert(lhs_local, tag_local);
+            // Best-effort: remember that the LHS local now carries `tag_local` (only for pointer locals).
+            match creation_kind {
+                InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
+                    if let Some(lhs_local) = place.as_local() {
+                        tag_of_local.insert(lhs_local, tag_local);
+                    }
+                }
+                InstrKind::StackAlloc { .. } => {}
             }
 
             // Compute the address that the newly-created reference points to.
-            // `place` is the LHS of the ref assignment (e.g., `_7` in `_7 = &_5`), so its type is `&T`.
-            // We convert that pointer-like value into a stable integer address (usize) for the runtime hook.
+            // For StackAlloc we need the address of the local's storage slot, not the pointee address.
+            // We compute: tmp_ptr = &raw const <local>; addr = expose_provenance(tmp_ptr).
             let addr_local = body
                 .local_decls
                 .push(LocalDecl::new(tcx.types.usize, source_info.span));
 
-            let addr_stmt = Statement::new(
-                source_info,
-                StatementKind::Assign(Box::new((
-                    Place::from(addr_local),
-                    Rvalue::Cast(
-                        CastKind::PointerExposeProvenance,
-                        Operand::Copy(place),
-                        tcx.types.usize,
-                    ),
-                ))),
-            );
+            let (addr_stmt1_opt, addr_stmt2) = match creation_kind {
+                InstrKind::StackAlloc { local, .. } => {
+                    let local_ty = body.local_decls[local].ty;
+                    let ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
+                    let tmp_ptr = body
+                        .local_decls
+                        .push(LocalDecl::new(ptr_ty, source_info.span));
 
-            // Prepare args: pass the computed address and a mutability flag (0 = shared, 1 = mut)
-            let arg_addr = Operand::Copy(Place::from(addr_local));
+                    let s1 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(tmp_ptr),
+                            Rvalue::RawPtr(RawPtrKind::Const, Place::from(local)),
+                        ))),
+                    );
 
-            let is_mut_u8: u8 = match creation_kind {
-                CreationKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
-                    BorrowKind::Mut { .. } => 1,
-                    _ => 0,
-                },
-                CreationKind::Raw { is_mut, .. } => {
-                    if is_mut {
-                        1
-                    } else {
-                        0
-                    }
+                    let s2 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(addr_local),
+                            Rvalue::Cast(
+                                CastKind::PointerExposeProvenance,
+                                Operand::Copy(Place::from(tmp_ptr)),
+                                tcx.types.usize,
+                            ),
+                        ))),
+                    );
+
+                    (Some(s1), s2)
+                }
+                _ => {
+                    let s2 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(addr_local),
+                            Rvalue::Cast(
+                                CastKind::PointerExposeProvenance,
+                                Operand::Copy(place),
+                                tcx.types.usize,
+                            ),
+                        ))),
+                    );
+                    (None, s2)
                 }
             };
 
-            let arg_mut = Operand::Constant(Box::new(ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::Val(ConstValue::Scalar(Scalar::from_u8(is_mut_u8)), tcx.types.u8),
-            }));
+            let arg_addr = Operand::Copy(Place::from(addr_local));
 
-            // Best-effort parent tag: if this creation is from a deref of an existing pointer local,
-            // pass that local's tag; otherwise pass 0.
-            let arg_parent: Operand<'tcx> = match &creation_kind {
-                CreationKind::Ref { src, .. } | CreationKind::Raw { src, .. } => {
-                    let base = src.local;
-                    if let Some(tl) = tag_of_local.get(&base) {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        Operand::Constant(Box::new(ConstOperand {
+            let (args, dest_place) = match creation_kind {
+                InstrKind::StackAlloc { size, live, .. } => {
+                    // __rz_record_alloc(base_addr, size, live) -> ()
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let arg_size = Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
+                            tcx.types.usize,
+                        ),
+                    }));
+
+                    let arg_live = Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u8(if live { 1 } else { 0 })),
+                            tcx.types.u8,
+                        ),
+                    }));
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size, span: source_info.span },
+                        Spanned { node: arg_live, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+                _ => {
+                    // Ref/Raw creation: (pointee_addr, is_mut, parent_tag) -> tag
+                    let is_mut_u8: u8 = match creation_kind {
+                        InstrKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
+                            BorrowKind::Mut { .. } => 1,
+                            _ => 0,
+                        },
+                        InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
+                        InstrKind::StackAlloc { .. } => 0,
+                    };
+
+                    let arg_mut = Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u8(is_mut_u8)),
+                            tcx.types.u8,
+                        ),
+                    }));
+
+                    // Best-effort parent tag: use the base local's tag if known, else 0.
+                    let arg_parent: Operand<'tcx> = match &creation_kind {
+                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                            let base = src.local;
+                            if let Some(tl) = tag_of_local.get(&base) {
+                                Operand::Copy(Place::from(*tl))
+                            } else {
+                                Operand::Constant(Box::new(ConstOperand {
+                                    span: source_info.span,
+                                    user_ty: None,
+                                    const_: Const::Val(
+                                        ConstValue::Scalar(Scalar::from_u64(0)),
+                                        tcx.types.u64,
+                                    ),
+                                }))
+                            }
+                        }
+                        InstrKind::StackAlloc { .. } => Operand::Constant(Box::new(ConstOperand {
                             span: source_info.span,
                             user_ty: None,
                             const_: Const::Val(
                                 ConstValue::Scalar(Scalar::from_u64(0)),
                                 tcx.types.u64,
                             ),
-                        }))
-                    }
+                        })),
+                    };
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_mut, span: source_info.span },
+                        Spanned { node: arg_parent, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tag_local))
                 }
             };
-
-            let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                Spanned {
-                    node: arg_addr,
-                    span: source_info.span,
-                },
-                Spanned {
-                    node: arg_mut,
-                    span: source_info.span,
-                },
-                Spanned {
-                    node: arg_parent,
-                    span: source_info.span,
-                },
-            ]
-            .into_boxed_slice();
 
             // Build the call terminator
             let call_term = Terminator {
@@ -342,7 +455,7 @@ impl MyOptimizationPass {
                 kind: TerminatorKind::Call {
                     func: func_operand,
                     args,
-                    destination: Place::from(tag_local),
+                    destination: dest_place,
                     target: Some(cont_block),
                     unwind: UnwindAction::Continue,
                     call_source: CallSource::Misc,
@@ -355,8 +468,11 @@ impl MyOptimizationPass {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let rem = bd.statements.split_off(stmt_idx + 1);
 
-                // Insert the address-computation statement right after the original ref creation.
-                bd.statements.push(addr_stmt);
+                // Insert the address-computation statement(s) right after the original statement.
+                if let Some(s1) = addr_stmt1_opt {
+                    bd.statements.push(s1);
+                }
+                bd.statements.push(addr_stmt2);
 
                 // Then replace the terminator with our call.
                 bd.terminator = Some(call_term);
