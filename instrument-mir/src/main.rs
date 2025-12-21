@@ -176,6 +176,9 @@ impl MyOptimizationPass {
         let def_id_alloc = self
             .find_def_id_by_name(tcx, "__rz_record_alloc")
             .expect("missing '__rz_record_alloc' definition");
+        let def_id_write = self
+            .find_def_id_by_name(tcx, "__rz_ptr_write")
+            .expect("missing '__rz_ptr_write' definition");
 
         let func_operand_ref =
             move |sp: Span| Operand::function_handle(tcx, def_id_ref, std::iter::empty(), sp);
@@ -183,6 +186,8 @@ impl MyOptimizationPass {
             move |sp: Span| Operand::function_handle(tcx, def_id_raw, std::iter::empty(), sp);
         let func_operand_alloc =
             move |sp: Span| Operand::function_handle(tcx, def_id_alloc, std::iter::empty(), sp);
+        let func_operand_write =
+            move |sp: Span| Operand::function_handle(tcx, def_id_write, std::iter::empty(), sp);
 
         // We'll collect all insertion points first to avoid borrow issues.
         #[derive(Copy, Clone, Debug)]
@@ -191,6 +196,8 @@ impl MyOptimizationPass {
             Raw { is_mut: bool, src: Place<'tcx> },
             /// Stack allocation lifetime event for a MIR local.
             StackAlloc { local: Local, live: bool, size: usize },
+            /// A write through a dereferenced pointer local (e.g., `*_p = ...` or `(*p).field = ...`).
+            PtrWrite { ptr_local: Local },
         }
 
         let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
@@ -229,6 +236,32 @@ impl MyOptimizationPass {
                     }
                     _ => {}
                 }
+                // Pointer write: any assignment whose LHS place begins with a Deref projection.
+                if let StatementKind::Assign(box (lhs_place, _rhs)) = &stmt.kind {
+                    let is_deref_write = lhs_place
+                        .projection
+                        .iter()
+                        .next()
+                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                    if is_deref_write {
+                        let ptr_local = lhs_place.local;
+                        // We pass the base pointer local as `place` so address computation can expose provenance of the pointer value.
+                        insert_points.push((
+                            bb,
+                            stmt_idx,
+                            stmt.source_info,
+                            Place::from(ptr_local),
+                            InstrKind::PtrWrite { ptr_local },
+                        ));
+                    }
+                }
+                // NOTE: We intentionally operate on *optimized MIR*. This means some semantic pointer writes
+                // like `*p = v` can be optimized into plain local assignments (e.g., `_x = v`) and will not appear
+                // as an LHS `Deref` store anymore. 
+                // TODO: Address precision: `PtrWrite` currently reports `addr = expose_provenance(ptr_local)`
+                // (the pointer value). This is fine for `*p = ...`, but for interior stores like `(*p).field = ...`
+                // or indexing, the true store address is `base + offset` from projections after `Deref`. We should
+                // eventually compute and pass the real accessed address.
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
                     insert_points.push((
                         bb,
@@ -285,6 +318,7 @@ impl MyOptimizationPass {
                 InstrKind::Ref { .. } => func_operand_ref(source_info.span),
                 InstrKind::Raw { .. } => func_operand_raw(source_info.span),
                 InstrKind::StackAlloc { .. } => func_operand_alloc(source_info.span),
+                InstrKind::PtrWrite { .. } => func_operand_write(source_info.span),
             };
 
             // Destination local receives the returned tag (u64).
@@ -299,7 +333,7 @@ impl MyOptimizationPass {
                         tag_of_local.insert(lhs_local, tag_local);
                     }
                 }
-                InstrKind::StackAlloc { .. } => {}
+                InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } => {}
             }
 
             // Compute the address that the newly-created reference points to.
@@ -391,6 +425,43 @@ impl MyOptimizationPass {
 
                     (args, Place::from(tmp_unit))
                 }
+                InstrKind::PtrWrite { ptr_local } => {
+                    // __rz_ptr_write(tag, addr, size) -> ()
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_of_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: source_info.span,
+                            user_ty: None,
+                            const_: Const::Val(
+                                ConstValue::Scalar(Scalar::from_u64(0)),
+                                tcx.types.u64,
+                            ),
+                        }))
+                    };
+
+                    let arg_size0 = Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u64(0)),
+                            tcx.types.usize,
+                        ),
+                    }));
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size0, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
                 _ => {
                     // Ref/Raw creation: (pointee_addr, is_mut, parent_tag) -> tag
                     let is_mut_u8: u8 = match creation_kind {
@@ -400,6 +471,7 @@ impl MyOptimizationPass {
                         },
                         InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
                         InstrKind::StackAlloc { .. } => 0,
+                        InstrKind::PtrWrite { .. } => 0,
                     };
 
                     let arg_mut = Operand::Constant(Box::new(ConstOperand {
@@ -428,7 +500,7 @@ impl MyOptimizationPass {
                                 }))
                             }
                         }
-                        InstrKind::StackAlloc { .. } => Operand::Constant(Box::new(ConstOperand {
+                        InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } => Operand::Constant(Box::new(ConstOperand {
                             span: source_info.span,
                             user_ty: None,
                             const_: Const::Val(

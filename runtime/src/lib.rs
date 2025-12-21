@@ -93,6 +93,55 @@ pub extern "C" fn __rz_dump_state() {
     println!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
 }
 
+/// Record/validate a write through a tracked pointer tag.
+/// For now this performs only best-effort checks:
+///  - tag must exist
+///  - if an allocation record exists at exactly `addr`, it must be live
+///  - if both alloc and tag have epochs, they must match
+#[no_mangle]
+pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    let tmap = tags().lock().unwrap();
+    let Some(tmeta) = tmap.get(&tag) else {
+        println!("[rusteze-runtime] WRITE: unknown tag={} addr=0x{:x} size={}", tag, addr, size);
+        return;
+    };
+
+    // Best-effort exact-base allocation lookup (will be extended to range lookup).
+    let amap = allocs().lock().unwrap();
+    if let Some(ameta) = amap.get(&addr) {
+        if !ameta.live {
+            println!(
+                "[rusteze-runtime] WRITE: use-after-dead tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
+                tag,
+                addr,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind
+            );
+            return;
+        }
+        if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+            println!(
+                "[rusteze-runtime] WRITE: stale-pointer epoch mismatch tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
+                tag,
+                addr,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind
+            );
+            return;
+        }
+    }
+
+    println!(
+        "[rusteze-runtime] WRITE: ok tag={} addr=0x{:x} size={} kind={:?}",
+        tag,
+        addr,
+        size,
+        tmeta.kind
+    );
+}
+
 #[macro_export]
 macro_rules! force_runtime {
     ($sym:path) => {
