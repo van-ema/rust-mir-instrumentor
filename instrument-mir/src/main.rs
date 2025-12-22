@@ -9,7 +9,7 @@ extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_transform;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
@@ -208,7 +208,14 @@ impl MyOptimizationPass {
         }
 
         let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
-        let mut tag_of_local: HashMap<Local, Local> = HashMap::new();
+
+        // Stable mapping: for each pointer local (e.g., `_2`), allocate exactly one u64 local to hold its tag.
+        // This avoids ordering issues when inserting instrumentation in reverse order.
+        let mut tag_local_for_ptr_local: HashMap<Local, Local> = HashMap::new();
+
+        // During the scan we must not mutate `body` while iterating basic blocks.
+        // Collect pointer locals first, then allocate their tag locals afterwards.
+        let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
 
         for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
@@ -270,6 +277,9 @@ impl MyOptimizationPass {
                 // or indexing, the true store address is `base + offset` from projections after `Deref`. We should
                 // eventually compute and pass the real accessed address.
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
+                    if let Some(lhs_local) = place.as_local() {
+                        ptr_locals_needing_tag.insert(lhs_local);
+                    }
                     insert_points.push((
                         bb,
                         stmt_idx,
@@ -287,6 +297,9 @@ impl MyOptimizationPass {
                 if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) =
                     &stmt.kind
                 {
+                    if let Some(lhs_local) = place.as_local() {
+                        ptr_locals_needing_tag.insert(lhs_local);
+                    }
                     let is_mut = matches!(*mutbl, RawPtrKind::Mut);
                     insert_points.push((
                         bb,
@@ -301,7 +314,7 @@ impl MyOptimizationPass {
                     );
                 }
             }
-            // Coarse pointer-use: if a pointer-typed local appears as a call argument, emit a telemetry event.
+            // Coarse pointer-use: if a pointer-typed local appears as a call argument, emit a generic ptr use event.
             if let Some(term) = &block_data.terminator {
                 if let TerminatorKind::Call { args, .. } = &term.kind {
                     for a in args.iter() {
@@ -325,6 +338,17 @@ impl MyOptimizationPass {
                         }
                     }
                 }
+            }
+        }
+
+        // Allocate one stable tag local per pointer local we detected as being created (Ref/Raw).
+        // Do this after scanning to avoid borrowing `body` mutably while iterating basic blocks.
+        for ptr_local in ptr_locals_needing_tag.drain() {
+            if !tag_local_for_ptr_local.contains_key(&ptr_local) {
+                let t = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, rustc_span::DUMMY_SP));
+                tag_local_for_ptr_local.insert(ptr_local, t);
             }
         }
 
@@ -354,20 +378,22 @@ impl MyOptimizationPass {
                 InstrKind::PtrUse { .. } => func_operand_use(source_info.span),
             };
 
-            // Destination local receives the returned tag (u64).
-            let tag_local = body
-                .local_decls
-                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-
-            // Best-effort: remember that the LHS local now carries `tag_local` (only for pointer locals).
-            match creation_kind {
+            // For Ref/Raw creation we write the returned tag into the preallocated tag-local for the destination.
+            // For other instrumentation kinds we do not create/update tags here.
+            let tag_local: Option<Local> = match creation_kind {
                 InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
                     if let Some(lhs_local) = place.as_local() {
-                        tag_of_local.insert(lhs_local, tag_local);
+                        Some(
+                            *tag_local_for_ptr_local
+                                .get(&lhs_local)
+                                .expect("missing preallocated tag local for pointer destination"),
+                        )
+                    } else {
+                        None
                     }
                 }
-                InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } | InstrKind::PtrUse { .. } => {}
-            }
+                _ => None,
+            };
 
             // Compute the address that the newly-created reference points to.
             // For StackAlloc we need the address of the local's storage slot, not the pointee address.
@@ -464,7 +490,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_of_local.get(&ptr_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         Operand::Constant(Box::new(ConstOperand {
@@ -502,7 +528,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_of_local.get(&ptr_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         Operand::Constant(Box::new(ConstOperand {
@@ -549,7 +575,7 @@ impl MyOptimizationPass {
                     let arg_parent: Operand<'tcx> = match &creation_kind {
                         InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
                             let base = src.local;
-                            if let Some(tl) = tag_of_local.get(&base) {
+                            if let Some(tl) = tag_local_for_ptr_local.get(&base) {
                                 Operand::Copy(Place::from(*tl))
                             } else {
                                 Operand::Constant(Box::new(ConstOperand {
@@ -579,7 +605,8 @@ impl MyOptimizationPass {
                     ]
                     .into_boxed_slice();
 
-                    (args, Place::from(tag_local))
+                    let dst = tag_local.expect("missing tag_local for ref/raw creation");
+                    (args, Place::from(dst))
                 }
             };
 
