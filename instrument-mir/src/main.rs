@@ -179,6 +179,9 @@ impl MyOptimizationPass {
         let def_id_write = self
             .find_def_id_by_name(tcx, "__rz_ptr_write")
             .expect("missing '__rz_ptr_write' definition");
+        let def_id_use = self
+            .find_def_id_by_name(tcx, "__rz_ptr_use")
+            .expect("missing '__rz_ptr_use' definition");
 
         let func_operand_ref =
             move |sp: Span| Operand::function_handle(tcx, def_id_ref, std::iter::empty(), sp);
@@ -188,6 +191,8 @@ impl MyOptimizationPass {
             move |sp: Span| Operand::function_handle(tcx, def_id_alloc, std::iter::empty(), sp);
         let func_operand_write =
             move |sp: Span| Operand::function_handle(tcx, def_id_write, std::iter::empty(), sp);
+        let func_operand_use =
+            move |sp: Span| Operand::function_handle(tcx, def_id_use, std::iter::empty(), sp);
 
         // We'll collect all insertion points first to avoid borrow issues.
         #[derive(Copy, Clone, Debug)]
@@ -198,6 +203,8 @@ impl MyOptimizationPass {
             StackAlloc { local: Local, live: bool, size: usize },
             /// A write through a dereferenced pointer local (e.g., `*_p = ...` or `(*p).field = ...`).
             PtrWrite { ptr_local: Local },
+            /// Coarse pointer-use telemetry: a pointer-typed local appears in a call argument.
+            PtrUse { ptr_local: Local },
         }
 
         let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
@@ -225,13 +232,13 @@ impl MyOptimizationPass {
                                     .unwrap_or(0)
                             };
 
-                            insert_points.push((
-                                bb,
-                                stmt_idx,
-                                stmt.source_info,
-                                Place::from(local),
-                                InstrKind::StackAlloc { local, live, size },
-                            ));
+                            // insert_points.push((
+                            //     bb,
+                            //     stmt_idx,
+                            //     stmt.source_info,
+                            //     Place::from(local),
+                            //     InstrKind::StackAlloc { local, live, size },
+                            // ));
                         }
                     }
                     _ => {}
@@ -294,6 +301,31 @@ impl MyOptimizationPass {
                     );
                 }
             }
+            // Coarse pointer-use: if a pointer-typed local appears as a call argument, emit a telemetry event.
+            if let Some(term) = &block_data.terminator {
+                if let TerminatorKind::Call { args, .. } = &term.kind {
+                    for a in args.iter() {
+                        let op = &a.node;
+                        let pl: Option<Place<'tcx>> = match op {
+                            Operand::Copy(p) | Operand::Move(p) => Some(*p),
+                            _ => None,
+                        };
+                        if let Some(p) = pl {
+                            let ty = body.local_decls[p.local].ty;
+                            let is_ptr = matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
+                            if is_ptr {
+                                insert_points.push((
+                                    bb,
+                                    block_data.statements.len(), // insert right before terminator
+                                    term.source_info,
+                                    Place::from(p.local),
+                                    InstrKind::PtrUse { ptr_local: p.local },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Insert in reverse order to not invalidate indices
@@ -319,6 +351,7 @@ impl MyOptimizationPass {
                 InstrKind::Raw { .. } => func_operand_raw(source_info.span),
                 InstrKind::StackAlloc { .. } => func_operand_alloc(source_info.span),
                 InstrKind::PtrWrite { .. } => func_operand_write(source_info.span),
+                InstrKind::PtrUse { .. } => func_operand_use(source_info.span),
             };
 
             // Destination local receives the returned tag (u64).
@@ -333,7 +366,7 @@ impl MyOptimizationPass {
                         tag_of_local.insert(lhs_local, tag_local);
                     }
                 }
-                InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } => {}
+                InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } | InstrKind::PtrUse { .. } => {}
             }
 
             // Compute the address that the newly-created reference points to.
@@ -462,6 +495,34 @@ impl MyOptimizationPass {
 
                     (args, Place::from(tmp_unit))
                 }
+
+                InstrKind::PtrUse { ptr_local } => {
+                    // __rz_ptr_use(tag, addr) -> ()
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_of_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: source_info.span,
+                            user_ty: None,
+                            const_: Const::Val(
+                                ConstValue::Scalar(Scalar::from_u64(0)),
+                                tcx.types.u64,
+                            ),
+                        }))
+                    };
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
                 _ => {
                     // Ref/Raw creation: (pointee_addr, is_mut, parent_tag) -> tag
                     let is_mut_u8: u8 = match creation_kind {
@@ -472,6 +533,7 @@ impl MyOptimizationPass {
                         InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
                         InstrKind::StackAlloc { .. } => 0,
                         InstrKind::PtrWrite { .. } => 0,
+                        InstrKind::PtrUse { .. } => 0,
                     };
 
                     let arg_mut = Operand::Constant(Box::new(ConstOperand {
@@ -500,7 +562,7 @@ impl MyOptimizationPass {
                                 }))
                             }
                         }
-                        InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } => Operand::Constant(Box::new(ConstOperand {
+                        InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } | InstrKind::PtrUse { .. } => Operand::Constant(Box::new(ConstOperand {
                             span: source_info.span,
                             user_ty: None,
                             const_: Const::Val(
@@ -538,9 +600,18 @@ impl MyOptimizationPass {
             // Split off remaining statements and set the block terminator in one borrow
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                let rem = bd.statements.split_off(stmt_idx + 1);
 
-                // Insert the address-computation statement(s) right after the original statement.
+                // If `stmt_idx` points *past the last statement* (i.e., insertion right before the terminator),
+                // we must split at `stmt_idx` rather than `stmt_idx + 1`.
+                let split_at = if stmt_idx >= bd.statements.len() {
+                    stmt_idx
+                } else {
+                    stmt_idx + 1
+                };
+
+                let rem = bd.statements.split_off(split_at);
+
+                // Insert the address-computation statement(s) at the insertion point.
                 if let Some(s1) = addr_stmt1_opt {
                     bd.statements.push(s1);
                 }

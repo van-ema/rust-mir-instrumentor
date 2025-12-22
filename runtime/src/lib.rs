@@ -221,3 +221,33 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
     );
     tag
 }
+
+/// Generic pointer-use event (coarse).
+///
+/// a pointer value was used/observed, but we did not (yet) classify it as a read or write.
+///
+/// `addr` is the pointer value (exposed provenance), not an interior offset.
+#[no_mangle]
+pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
+    if tag == 0 {
+        println!(
+            "[rusteze-runtime] USE: untagged ptr addr=0x{:x} (likely untracked/propagation missing)",
+            addr
+        );
+        return;
+    }
+
+    let tmap = tags().lock().unwrap();
+    if let Some(tmeta) = tmap.get(&tag) {
+        println!(
+            "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={}",
+            tag,
+            addr,
+            tmeta.kind,
+            tmeta.alloc_epoch,
+            tmeta.parent
+        );
+    } else {
+        println!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);
+    }
+}
