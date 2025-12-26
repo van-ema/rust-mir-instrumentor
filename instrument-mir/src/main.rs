@@ -201,8 +201,9 @@ impl MyOptimizationPass {
             Raw { is_mut: bool, src: Place<'tcx> },
             /// Stack allocation lifetime event for a MIR local.
             StackAlloc { local: Local, live: bool, size: usize },
-            /// A write through a dereferenced pointer local (e.g., `*_p = ...` or `(*p).field = ...`).
-            PtrWrite { ptr_local: Local },
+            /// A write through a pointer local.
+            /// `size` is best-effort (0 = unknown).
+            PtrWrite { ptr_local: Local, size: usize },
             /// Coarse pointer-use telemetry: a pointer-typed local appears in a call argument.
             PtrUse { ptr_local: Local },
         }
@@ -217,7 +218,7 @@ impl MyOptimizationPass {
         // Collect pointer locals first, then allocate their tag locals afterwards.
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
 
-        for (bb, block_data) in body.basic_blocks.as_mut_preserves_cfg().iter_enumerated() {
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 // Stack allocation lifetime: StorageLive/StorageDead.
                 match stmt.kind {
@@ -259,13 +260,13 @@ impl MyOptimizationPass {
                         .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
                     if is_deref_write {
                         let ptr_local = lhs_place.local;
-                        // We pass the base pointer local as `place` so address computation can expose provenance of the pointer value.
+                        // Use size=0 for unknown size in deref writes.
                         insert_points.push((
                             bb,
                             stmt_idx,
                             stmt.source_info,
                             Place::from(ptr_local),
-                            InstrKind::PtrWrite { ptr_local },
+                            InstrKind::PtrWrite { ptr_local, size: 0 },
                         ));
                     }
                 }
@@ -314,9 +315,60 @@ impl MyOptimizationPass {
                     );
                 }
             }
-            // Coarse pointer-use: if a pointer-typed local appears as a call argument, emit a generic ptr use event.
+            // Calls: in optimized MIR, certain writes appear only as intrinsic calls (e.g., volatile_store).
+            // We classify those as writes, and we also emit coarse PtrUse telemetry for any pointer args.
             if let Some(term) = &block_data.terminator {
-                if let TerminatorKind::Call { args, .. } = &term.kind {
+                if let TerminatorKind::Call { func, args, .. } = &term.kind {
+                    // Detect `std::intrinsics::volatile_store::<T>(dst, val)` and classify as a write.
+                    let mut is_volatile_store = false;
+                    let mut classified_ptr_local: Option<Local> = None;
+                    if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
+                        let path = tcx.def_path_str(*callee_def_id);
+                        if path.contains("intrinsics::volatile_store") {
+                            is_volatile_store = true;
+                        }
+                    }
+
+                    if is_volatile_store {
+                        // Arg0 is the destination pointer.
+                        if let Some(first) = args.get(0) {
+                            let op0 = &first.node;
+                            let pl0: Option<Place<'tcx>> = match op0 {
+                                Operand::Copy(p) | Operand::Move(p) => Some(*p),
+                                _ => None,
+                            };
+                            if let Some(p0) = pl0 {
+                                classified_ptr_local = Some(p0.local);
+                                // Best-effort size_of::<T> from the raw pointer type *const/*mut T.
+                                let mut size = 0usize;
+                                let ty0 = body.local_decls[p0.local].ty;
+                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                    let input = PseudoCanonicalInput {
+                                        typing_env: TypingEnv::fully_monomorphized(),
+                                        value: *pointee_ty,
+                                    };
+                                    size = tcx
+                                        .layout_of(input)
+                                        .ok()
+                                        .map(|l| l.size.bytes() as usize)
+                                        .unwrap_or(0);
+                                }
+
+                                insert_points.push((
+                                    bb,
+                                    block_data.statements.len(), // insert right before terminator
+                                    term.source_info,
+                                    Place::from(p0.local),
+                                    InstrKind::PtrWrite {
+                                        ptr_local: p0.local,
+                                        size,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+
+                    // Coarse pointer-use telemetry for any pointer-typed locals in call arguments.
                     for a in args.iter() {
                         let op = &a.node;
                         let pl: Option<Place<'tcx>> = match op {
@@ -327,6 +379,12 @@ impl MyOptimizationPass {
                             let ty = body.local_decls[p.local].ty;
                             let is_ptr = matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
                             if is_ptr {
+                                // Avoid double-reporting: if this call site was classified as a write on arg0,
+                                // do not also emit the coarse PtrUse for the same pointer local.
+                                if classified_ptr_local == Some(p.local) {
+                                    continue;
+                                }
+
                                 insert_points.push((
                                     bb,
                                     block_data.statements.len(), // insert right before terminator
@@ -484,7 +542,7 @@ impl MyOptimizationPass {
 
                     (args, Place::from(tmp_unit))
                 }
-                InstrKind::PtrWrite { ptr_local } => {
+                InstrKind::PtrWrite { ptr_local, size } => {
                     // __rz_ptr_write(tag, addr, size) -> ()
                     let tmp_unit = body
                         .local_decls
@@ -507,7 +565,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                         user_ty: None,
                         const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u64(0)),
+                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
                             tcx.types.usize,
                         ),
                     }));
