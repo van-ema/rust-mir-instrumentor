@@ -514,6 +514,11 @@ impl MyOptimizationPass {
         for (bb, stmt_idx, source_info, place, creation_kind) in insert_points.into_iter().rev() {
             // Tag propagation is a local assignment (no runtime call). Insert it and continue.
             if let InstrKind::TagProp { dst, src } = creation_kind {
+                println!(
+                    "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
+                    dst,
+                    src
+                );
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&dst)
                     .expect("missing tag local for TagProp dst");
