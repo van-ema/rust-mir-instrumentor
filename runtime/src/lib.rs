@@ -72,13 +72,26 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         size,
     });
 
-    // If we are transitioning from dead -> live, bump epoch to disambiguate reuse.
     let new_live = live != 0;
-    if new_live && !entry.live {
+
+    // We treat `epoch` as an allocation-instance counter for a given base address.
+    // When an allocation dies (e.g., StorageDead / dealloc), we bump the epoch so that
+    // any previously-created pointers that captured the old epoch become stale.
+    //
+    // Rationale: stack slots (and freed heap addresses) may be reused later at the same
+    // numeric address; the epoch lets us disambiguate "same address, different instance".
+    if !new_live && entry.live {
         entry.epoch = entry.epoch.wrapping_add(1);
     }
 
+    // Mark new liveness state.
     entry.live = new_live;
+
+    // If this is the first time we see this allocation and it's live, initialize epoch to 1.
+    if entry.epoch == 0 && entry.live {
+        entry.epoch = 1;
+    }
+
     // Keep the largest known size if size changes.
     if size != 0 {
         entry.size = entry.size.max(size);
