@@ -179,6 +179,9 @@ impl MyOptimizationPass {
         let def_id_write = self
             .find_def_id_by_name(tcx, "__rz_ptr_write")
             .expect("missing '__rz_ptr_write' definition");
+        let def_id_read = self
+            .find_def_id_by_name(tcx, "__rz_ptr_read")
+            .expect("missing '__rz_ptr_read' definition");
         let def_id_use = self
             .find_def_id_by_name(tcx, "__rz_ptr_use")
             .expect("missing '__rz_ptr_use' definition");
@@ -191,6 +194,8 @@ impl MyOptimizationPass {
             move |sp: Span| Operand::function_handle(tcx, def_id_alloc, std::iter::empty(), sp);
         let func_operand_write =
             move |sp: Span| Operand::function_handle(tcx, def_id_write, std::iter::empty(), sp);
+        let func_operand_read =
+            move |sp: Span| Operand::function_handle(tcx, def_id_read, std::iter::empty(), sp);
         let func_operand_use =
             move |sp: Span| Operand::function_handle(tcx, def_id_use, std::iter::empty(), sp);
 
@@ -204,6 +209,9 @@ impl MyOptimizationPass {
             /// A write through a pointer local.
             /// `size` is best-effort (0 = unknown).
             PtrWrite { ptr_local: Local, size: usize },
+            /// A read through a pointer local.
+            /// `size` is best-effort (0 = unknown).
+            PtrRead { ptr_local: Local, size: usize },
             /// Coarse pointer-use telemetry: a pointer-typed local appears in a call argument.
             PtrUse { ptr_local: Local },
         }
@@ -319,13 +327,18 @@ impl MyOptimizationPass {
             // We classify those as writes, and we also emit coarse PtrUse telemetry for any pointer args.
             if let Some(term) = &block_data.terminator {
                 if let TerminatorKind::Call { func, args, .. } = &term.kind {
-                    // Detect `std::intrinsics::volatile_store::<T>(dst, val)` and classify as a write.
+                    // Detect `std::intrinsics::volatile_{store,load}::<T>` and classify as write/read.
                     let mut is_volatile_store = false;
-                    let mut classified_ptr_local: Option<Local> = None;
+                    let mut is_volatile_load = false;
+                    let mut classified_write_ptr_local: Option<Local> = None;
+                    let mut classified_read_ptr_local: Option<Local> = None;
                     if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
                         let path = tcx.def_path_str(*callee_def_id);
                         if path.contains("intrinsics::volatile_store") {
                             is_volatile_store = true;
+                        }
+                        if path.contains("intrinsics::volatile_load") {
+                            is_volatile_load = true;
                         }
                     }
 
@@ -338,7 +351,7 @@ impl MyOptimizationPass {
                                 _ => None,
                             };
                             if let Some(p0) = pl0 {
-                                classified_ptr_local = Some(p0.local);
+                                classified_write_ptr_local = Some(p0.local);
                                 // Best-effort size_of::<T> from the raw pointer type *const/*mut T.
                                 let mut size = 0usize;
                                 let ty0 = body.local_decls[p0.local].ty;
@@ -368,6 +381,45 @@ impl MyOptimizationPass {
                         }
                     }
 
+                    if is_volatile_load {
+                        // Arg0 is the source pointer.
+                        if let Some(first) = args.get(0) {
+                            let op0 = &first.node;
+                            let pl0: Option<Place<'tcx>> = match op0 {
+                                Operand::Copy(p) | Operand::Move(p) => Some(*p),
+                                _ => None,
+                            };
+                            if let Some(p0) = pl0 {
+                                classified_read_ptr_local = Some(p0.local);
+                                // Best-effort size_of::<T> from the raw pointer type *const/*mut T.
+                                let mut size = 0usize;
+                                let ty0 = body.local_decls[p0.local].ty;
+                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                    let input = PseudoCanonicalInput {
+                                        typing_env: TypingEnv::fully_monomorphized(),
+                                        value: *pointee_ty,
+                                    };
+                                    size = tcx
+                                        .layout_of(input)
+                                        .ok()
+                                        .map(|l| l.size.bytes() as usize)
+                                        .unwrap_or(0);
+                                }
+
+                                insert_points.push((
+                                    bb,
+                                    block_data.statements.len(), // insert right before terminator
+                                    term.source_info,
+                                    Place::from(p0.local),
+                                    InstrKind::PtrRead {
+                                        ptr_local: p0.local,
+                                        size,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+
                     // Coarse pointer-use telemetry for any pointer-typed locals in call arguments.
                     for a in args.iter() {
                         let op = &a.node;
@@ -379,9 +431,11 @@ impl MyOptimizationPass {
                             let ty = body.local_decls[p.local].ty;
                             let is_ptr = matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
                             if is_ptr {
-                                // Avoid double-reporting: if this call site was classified as a write on arg0,
+                                // Avoid double-reporting: if this call site was classified as a write or read on arg0,
                                 // do not also emit the coarse PtrUse for the same pointer local.
-                                if classified_ptr_local == Some(p.local) {
+                                if classified_write_ptr_local == Some(p.local)
+                                    || classified_read_ptr_local == Some(p.local)
+                                {
                                     continue;
                                 }
 
@@ -433,6 +487,7 @@ impl MyOptimizationPass {
                 InstrKind::Raw { .. } => func_operand_raw(source_info.span),
                 InstrKind::StackAlloc { .. } => func_operand_alloc(source_info.span),
                 InstrKind::PtrWrite { .. } => func_operand_write(source_info.span),
+                InstrKind::PtrRead { .. } => func_operand_read(source_info.span),
                 InstrKind::PtrUse { .. } => func_operand_use(source_info.span),
             };
 
@@ -509,6 +564,43 @@ impl MyOptimizationPass {
             let arg_addr = Operand::Copy(Place::from(addr_local));
 
             let (args, dest_place) = match creation_kind {
+                InstrKind::PtrRead { ptr_local, size } => {
+                    // __rz_ptr_read(tag, addr, size) -> ()
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: source_info.span,
+                            user_ty: None,
+                            const_: Const::Val(
+                                ConstValue::Scalar(Scalar::from_u64(0)),
+                                tcx.types.u64,
+                            ),
+                        }))
+                    };
+
+                    let arg_size0 = Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
+                            tcx.types.usize,
+                        ),
+                    }));
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size0, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
                 InstrKind::StackAlloc { size, live, .. } => {
                     // __rz_record_alloc(base_addr, size, live) -> ()
                     let tmp_unit = body
@@ -617,6 +709,7 @@ impl MyOptimizationPass {
                         InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
                         InstrKind::StackAlloc { .. } => 0,
                         InstrKind::PtrWrite { .. } => 0,
+                        InstrKind::PtrRead { .. } => 0,
                         InstrKind::PtrUse { .. } => 0,
                     };
 
@@ -646,7 +739,10 @@ impl MyOptimizationPass {
                                 }))
                             }
                         }
-                        InstrKind::StackAlloc { .. } | InstrKind::PtrWrite { .. } | InstrKind::PtrUse { .. } => Operand::Constant(Box::new(ConstOperand {
+                        InstrKind::StackAlloc { .. }
+                        | InstrKind::PtrWrite { .. }
+                        | InstrKind::PtrRead { .. }
+                        | InstrKind::PtrUse { .. } => Operand::Constant(Box::new(ConstOperand {
                             span: source_info.span,
                             user_ty: None,
                             const_: Const::Val(
