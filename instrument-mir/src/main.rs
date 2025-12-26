@@ -60,7 +60,605 @@ fn prefixed_path(base: &str, prefix: &str) -> String {
 
 struct MyOptimizationPass;
 
+#[derive(Copy, Clone, Debug)]
+enum InstrKind<'tcx> {
+    Ref { bk: BorrowKind, src: Place<'tcx> },
+    Raw { is_mut: bool, src: Place<'tcx> },
+    /// Stack allocation lifetime event for a MIR local.
+    StackAlloc { local: Local, live: bool, size: usize },
+    /// A write through a pointer local.
+    /// `size` is best-effort (0 = unknown).
+    PtrWrite { ptr_local: Local, size: usize },
+    /// A read through a pointer local.
+    /// `size` is best-effort (0 = unknown).
+    PtrRead { ptr_local: Local, size: usize },
+    /// Coarse pointer-use work tracking: a pointer-typed local appears in a call argument.
+    PtrUse { ptr_local: Local },
+    /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
+    /// This is a local tag assignment, not a runtime hook.
+    TagProp { dst: Local, src: Local },
+}
+
+#[derive(Clone, Debug)]
+struct InsertPoint<'tcx> {
+    bb: BasicBlock,
+    stmt_idx: usize,
+    source_info: SourceInfo,
+    place: Place<'tcx>,
+    kind: InstrKind<'tcx>,
+}
+
+#[derive(Clone, Debug)]
+struct ScanResult<'tcx> {
+    insert_points: Vec<InsertPoint<'tcx>>,
+    ptr_locals_needing_tag: HashSet<Local>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Hooks {
+    def_id_ref: DefId,
+    def_id_raw: DefId,
+    def_id_alloc: DefId,
+    def_id_write: DefId,
+    def_id_read: DefId,
+    def_id_use: DefId,
+}
+
 impl MyOptimizationPass {
+    fn is_ptr_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+    }
+
+    fn place_from_operand<'tcx>(&self, op: &Operand<'tcx>) -> Option<Place<'tcx>> {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    fn const_u64<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span, v: u64) -> Operand<'tcx> {
+        Operand::Constant(Box::new(ConstOperand {
+            span,
+            user_ty: None,
+            const_: Const::Val(ConstValue::Scalar(Scalar::from_u64(v)), tcx.types.u64),
+        }))
+    }
+
+    fn const_usize<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span, v: usize) -> Operand<'tcx> {
+        Operand::Constant(Box::new(ConstOperand {
+            span,
+            user_ty: None,
+            const_: Const::Val(
+                ConstValue::Scalar(Scalar::from_u64(v as u64)),
+                tcx.types.usize,
+            ),
+        }))
+    }
+
+    fn const_u8<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span, v: u8) -> Operand<'tcx> {
+        Operand::Constant(Box::new(ConstOperand {
+            span,
+            user_ty: None,
+            const_: Const::Val(ConstValue::Scalar(Scalar::from_u8(v)), tcx.types.u8),
+        }))
+    }
+
+    fn layout_size_bytes<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> usize {
+        let input = PseudoCanonicalInput {
+            typing_env: TypingEnv::fully_monomorphized(),
+            value: ty,
+        };
+        tcx.layout_of(input)
+            .ok()
+            .map(|l| l.size.bytes() as usize)
+            .unwrap_or(0)
+    }
+
+    fn scan_body<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> ScanResult<'tcx> {
+        let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
+        let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
+
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                // Stack allocation lifetime: StorageLive/StorageDead.
+                match stmt.kind {
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        if local != RETURN_PLACE {
+                            // We currently keep stack alloc instrumentation disabled.
+                            // If re-enabled, use `layout_size_bytes(tcx, ty)` here.
+                            let _live = matches!(stmt.kind, StatementKind::StorageLive(_));
+                            let _ty = body.local_decls[local].ty;
+                            let _size = self.layout_size_bytes(tcx, _ty);
+                            let _ = (_live, _size); // silence unused warnings if toggled
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Pointer write: any assignment whose LHS place begins with a Deref projection.
+                if let StatementKind::Assign(box (lhs_place, _rhs)) = &stmt.kind {
+                    let is_deref_write = lhs_place
+                        .projection
+                        .iter()
+                        .next()
+                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                    if is_deref_write {
+                        let ptr_local = lhs_place.local;
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            source_info: stmt.source_info,
+                            place: Place::from(ptr_local),
+                            kind: InstrKind::PtrWrite { ptr_local, size: 0 },
+                        });
+                    }
+                }
+
+                // Tag propagation across pointer-to-pointer casts and plain copies/moves of pointer locals.
+                if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+                    if let Some(dst_local) = dst_place.as_local() {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        if self.is_ptr_ty(dst_ty) {
+                            let src_local_opt: Option<Local> = match rvalue {
+                                Rvalue::Use(op) => self
+                                    .place_from_operand(op)
+                                    .and_then(|p| p.as_local()),
+                                Rvalue::Cast(CastKind::PtrToPtr, op, _to_ty) => self
+                                    .place_from_operand(op)
+                                    .and_then(|p| p.as_local()),
+                                _ => None,
+                            };
+
+                            if let Some(src_local) = src_local_opt {
+                                let src_ty = body.local_decls[src_local].ty;
+                                if self.is_ptr_ty(src_ty) {
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    ptr_locals_needing_tag.insert(src_local);
+
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Ref creation
+                if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
+                    if let Some(lhs_local) = place.as_local() {
+                        ptr_locals_needing_tag.insert(lhs_local);
+                    }
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
+                    });
+                }
+
+                // Raw pointer creation
+                if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind {
+                    if let Some(lhs_local) = place.as_local() {
+                        ptr_locals_needing_tag.insert(lhs_local);
+                    }
+                    let is_mut = matches!(*mutbl, RawPtrKind::Mut);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::Raw { is_mut, src: src_place.clone() },
+                    });
+                }
+            }
+
+            // Calls: classify volatile_{store,load} and coarse PtrUse for pointer args.
+            if let Some(term) = &block_data.terminator {
+                if let TerminatorKind::Call { func, args, .. } = &term.kind {
+                    let mut is_volatile_store = false;
+                    let mut is_volatile_load = false;
+
+                    if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
+                        let path = tcx.def_path_str(*callee_def_id);
+                        is_volatile_store = path.contains("intrinsics::volatile_store");
+                        is_volatile_load = path.contains("intrinsics::volatile_load");
+                    }
+
+                    let mut classified_write_ptr_local: Option<Local> = None;
+                    let mut classified_read_ptr_local: Option<Local> = None;
+
+                    if is_volatile_store {
+                        if let Some(first) = args.get(0) {
+                            if let Some(p0) = self.place_from_operand(&first.node) {
+                                classified_write_ptr_local = Some(p0.local);
+                                let mut size = 0usize;
+                                let ty0 = body.local_decls[p0.local].ty;
+                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    source_info: term.source_info,
+                                    place: Place::from(p0.local),
+                                    kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
+                                });
+                            }
+                        }
+                    }
+
+                    if is_volatile_load {
+                        if let Some(first) = args.get(0) {
+                            if let Some(p0) = self.place_from_operand(&first.node) {
+                                classified_read_ptr_local = Some(p0.local);
+                                let mut size = 0usize;
+                                let ty0 = body.local_decls[p0.local].ty;
+                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    source_info: term.source_info,
+                                    place: Place::from(p0.local),
+                                    kind: InstrKind::PtrRead { ptr_local: p0.local, size },
+                                });
+                            }
+                        }
+                    }
+
+                    for a in args.iter() {
+                        if let Some(p) = self.place_from_operand(&a.node) {
+                            let ty = body.local_decls[p.local].ty;
+                            if self.is_ptr_ty(ty) {
+                                if classified_write_ptr_local == Some(p.local)
+                                    || classified_read_ptr_local == Some(p.local)
+                                {
+                                    continue;
+                                }
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    source_info: term.source_info,
+                                    place: Place::from(p.local),
+                                    kind: InstrKind::PtrUse { ptr_local: p.local },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ScanResult { insert_points, ptr_locals_needing_tag }
+    }
+
+    fn allocate_tag_locals<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        ptrs: HashSet<Local>,
+    ) -> HashMap<Local, Local> {
+        let mut tag_local_for_ptr_local: HashMap<Local, Local> = HashMap::new();
+        for ptr_local in ptrs.into_iter() {
+            if !tag_local_for_ptr_local.contains_key(&ptr_local) {
+                let t = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, rustc_span::DUMMY_SP));
+                tag_local_for_ptr_local.insert(ptr_local, t);
+            }
+        }
+        tag_local_for_ptr_local
+    }
+
+    fn func_operand_for<'tcx>(&self, tcx: TyCtxt<'tcx>, hooks: Hooks, kind: &InstrKind<'tcx>, sp: Span) -> Operand<'tcx> {
+        let def_id = match kind {
+            InstrKind::Ref { .. } => hooks.def_id_ref,
+            InstrKind::Raw { .. } => hooks.def_id_raw,
+            InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
+            InstrKind::PtrWrite { .. } => hooks.def_id_write,
+            InstrKind::PtrRead { .. } => hooks.def_id_read,
+            InstrKind::PtrUse { .. } => hooks.def_id_use,
+            InstrKind::TagProp { .. } => hooks.def_id_use, // unreachable in practice
+        };
+        Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
+    }
+
+    fn insert_instrumentation<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        insert_points: Vec<InsertPoint<'tcx>>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        hooks: Hooks,
+    ) {
+        for ip in insert_points.into_iter().rev() {
+            let bb = ip.bb;
+            let stmt_idx = ip.stmt_idx;
+            let source_info = ip.source_info;
+            let place = ip.place;
+            let creation_kind = ip.kind;
+
+            if let InstrKind::TagProp { dst, src } = creation_kind {
+                println!(
+                    "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
+                    dst,
+                    src
+                );
+                let dst_tag = *tag_local_for_ptr_local
+                    .get(&dst)
+                    .expect("missing tag local for TagProp dst");
+
+                let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
+                    Operand::Copy(Place::from(*src_tag))
+                } else {
+                    self.const_u64(tcx, source_info.span, 0)
+                };
+
+                let prop_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(dst_tag),
+                        Rvalue::Use(src_op),
+                    ))),
+                );
+
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                let insert_at = if stmt_idx >= bd.statements.len() {
+                    bd.statements.len()
+                } else {
+                    stmt_idx + 1
+                };
+                bd.statements.insert(insert_at, prop_stmt);
+                continue;
+            }
+
+            let (orig_term, is_cleanup) = {
+                let bd = &mut body.basic_blocks_mut()[bb];
+                let term = bd.terminator.take();
+                let cleanup = bd.is_cleanup;
+                (term, cleanup)
+            };
+
+            let cont_block = {
+                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                body.basic_blocks_mut().push(cont_data)
+            };
+
+            let func_operand = self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
+
+            let tag_local: Option<Local> = match creation_kind {
+                InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
+                    if let Some(lhs_local) = place.as_local() {
+                        Some(
+                            *tag_local_for_ptr_local
+                                .get(&lhs_local)
+                                .expect("missing preallocated tag local for pointer destination"),
+                        )
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let addr_local = body
+                .local_decls
+                .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+            let (addr_stmt1_opt, addr_stmt2) = match creation_kind {
+                InstrKind::StackAlloc { local, .. } => {
+                    let local_ty = body.local_decls[local].ty;
+                    let ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
+                    let tmp_ptr = body
+                        .local_decls
+                        .push(LocalDecl::new(ptr_ty, source_info.span));
+
+                    let s1 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(tmp_ptr),
+                            Rvalue::RawPtr(RawPtrKind::Const, Place::from(local)),
+                        ))),
+                    );
+
+                    let s2 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(addr_local),
+                            Rvalue::Cast(
+                                CastKind::PointerExposeProvenance,
+                                Operand::Copy(Place::from(tmp_ptr)),
+                                tcx.types.usize,
+                            ),
+                        ))),
+                    );
+
+                    (Some(s1), s2)
+                }
+                _ => {
+                    let s2 = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(addr_local),
+                            Rvalue::Cast(
+                                CastKind::PointerExposeProvenance,
+                                Operand::Copy(place),
+                                tcx.types.usize,
+                            ),
+                        ))),
+                    );
+                    (None, s2)
+                }
+            };
+
+            let arg_addr = Operand::Copy(Place::from(addr_local));
+
+            let (args, dest_place) = match creation_kind {
+                InstrKind::PtrRead { ptr_local, size } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
+                    let arg_size0 = self.const_usize(tcx, source_info.span, size);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size0, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::StackAlloc { size, live, .. } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let arg_size = self.const_usize(tcx, source_info.span, size);
+                    let arg_live = self.const_u8(tcx, source_info.span, if live { 1 } else { 0 });
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size, span: source_info.span },
+                        Spanned { node: arg_live, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::PtrWrite { ptr_local, size } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
+                    let arg_size0 = self.const_usize(tcx, source_info.span, size);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size0, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::PtrUse { ptr_local } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                _ => {
+                    let is_mut_u8: u8 = match creation_kind {
+                        InstrKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
+                            BorrowKind::Mut { .. } => 1,
+                            _ => 0,
+                        },
+                        InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
+                        _ => 0,
+                    };
+
+                    let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
+
+                    let arg_parent: Operand<'tcx> = match &creation_kind {
+                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                            let base = src.local;
+                            if let Some(tl) = tag_local_for_ptr_local.get(&base) {
+                                Operand::Copy(Place::from(*tl))
+                            } else {
+                                self.const_u64(tcx, source_info.span, 0)
+                            }
+                        }
+                        _ => self.const_u64(tcx, source_info.span, 0),
+                    };
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_mut, span: source_info.span },
+                        Spanned { node: arg_parent, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    let dst = tag_local.expect("missing tag_local for ref/raw creation");
+                    (args, Place::from(dst))
+                }
+            };
+
+            let call_term = Terminator {
+                source_info,
+                kind: TerminatorKind::Call {
+                    func: func_operand,
+                    args,
+                    destination: dest_place,
+                    target: Some(cont_block),
+                    unwind: UnwindAction::Continue,
+                    call_source: CallSource::Misc,
+                    fn_span: source_info.span,
+                },
+            };
+
+            let remaining_stmts = {
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+
+                let split_at = if stmt_idx >= bd.statements.len() {
+                    stmt_idx
+                } else {
+                    stmt_idx + 1
+                };
+
+                let rem = bd.statements.split_off(split_at);
+
+                if let Some(s1) = addr_stmt1_opt {
+                    bd.statements.push(s1);
+                }
+                bd.statements.push(addr_stmt2);
+
+                bd.terminator = Some(call_term);
+                rem
+            };
+
+            body.basic_blocks_mut()[cont_block]
+                .statements
+                .extend(remaining_stmts);
+        }
+    }
     /*
     fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
         for &cnum in tcx.crates(()).iter() {
@@ -186,720 +784,18 @@ impl MyOptimizationPass {
             .find_def_id_by_name(tcx, "__rz_ptr_use")
             .expect("missing '__rz_ptr_use' definition");
 
-        let func_operand_ref =
-            move |sp: Span| Operand::function_handle(tcx, def_id_ref, std::iter::empty(), sp);
-        let func_operand_raw =
-            move |sp: Span| Operand::function_handle(tcx, def_id_raw, std::iter::empty(), sp);
-        let func_operand_alloc =
-            move |sp: Span| Operand::function_handle(tcx, def_id_alloc, std::iter::empty(), sp);
-        let func_operand_write =
-            move |sp: Span| Operand::function_handle(tcx, def_id_write, std::iter::empty(), sp);
-        let func_operand_read =
-            move |sp: Span| Operand::function_handle(tcx, def_id_read, std::iter::empty(), sp);
-        let func_operand_use =
-            move |sp: Span| Operand::function_handle(tcx, def_id_use, std::iter::empty(), sp);
+        let hooks = Hooks {
+            def_id_ref,
+            def_id_raw,
+            def_id_alloc,
+            def_id_write,
+            def_id_read,
+            def_id_use,
+        };
 
-        // We'll collect all insertion points first to avoid borrow issues.
-        #[derive(Copy, Clone, Debug)]
-        enum InstrKind<'tcx> {
-            Ref { bk: BorrowKind, src: Place<'tcx> },
-            Raw { is_mut: bool, src: Place<'tcx> },
-            /// Stack allocation lifetime event for a MIR local.
-            StackAlloc { local: Local, live: bool, size: usize },
-            /// A write through a pointer local.
-            /// `size` is best-effort (0 = unknown).
-            PtrWrite { ptr_local: Local, size: usize },
-            /// A read through a pointer local.
-            /// `size` is best-effort (0 = unknown).
-            PtrRead { ptr_local: Local, size: usize },
-            /// Coarse pointer-use telemetry: a pointer-typed local appears in a call argument.
-            PtrUse { ptr_local: Local },
-            /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
-            /// This is a local tag assignment, not a runtime hook.
-            TagProp { dst: Local, src: Local },
-        }
-
-        let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
-
-        // Stable mapping: for each pointer local (e.g., `_2`), allocate exactly one u64 local to hold its tag.
-        // This avoids ordering issues when inserting instrumentation in reverse order.
-        let mut tag_local_for_ptr_local: HashMap<Local, Local> = HashMap::new();
-
-        // During the scan we must not mutate `body` while iterating basic blocks.
-        // Collect pointer locals first, then allocate their tag locals afterwards.
-        let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
-
-        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
-            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
-                // Stack allocation lifetime: StorageLive/StorageDead.
-                match stmt.kind {
-                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                        if local != RETURN_PLACE {
-                            let live = matches!(stmt.kind, StatementKind::StorageLive(_));
-                            let ty = body.local_decls[local].ty;
-
-                            // On nightly-2025-08-01, `tcx.layout_of` expects a `PseudoCanonicalInput<Ty>`.
-                            // For MIR locals, `TypingEnv::fully_monomorphized()` is sufficient.
-                            let size = {
-                                let input = PseudoCanonicalInput {
-                                    typing_env: TypingEnv::fully_monomorphized(),
-                                    value: ty,
-                                };
-                                tcx.layout_of(input)
-                                    .ok()
-                                    .map(|l| l.size.bytes() as usize)
-                                    .unwrap_or(0)
-                            };
-
-                            // insert_points.push((
-                            //     bb,
-                            //     stmt_idx,
-                            //     stmt.source_info,
-                            //     Place::from(local),
-                            //     InstrKind::StackAlloc { local, live, size },
-                            // ));
-                        }
-                    }
-                    _ => {}
-                }
-                // Pointer write: any assignment whose LHS place begins with a Deref projection.
-                // NOTE: We intentionally operate on *optimized MIR*. This means some semantic pointer writes
-                // like `*p = v` can be optimized into plain local assignments (e.g., `_x = v`) and will not appear
-                // as an LHS `Deref` store anymore. 
-                // TODO: Address precision: `PtrWrite` currently reports `addr = expose_provenance(ptr_local)`
-                // (the pointer value). This is fine for `*p = ...`, but for interior stores like `(*p).field = ...`
-                // or indexing, the true store address is `base + offset` from projections after `Deref`. We should
-                // eventually compute and pass the real accessed address.
-                if let StatementKind::Assign(box (lhs_place, _rhs)) = &stmt.kind {
-                    let is_deref_write = lhs_place
-                        .projection
-                        .iter()
-                        .next()
-                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
-                    if is_deref_write {
-                        let ptr_local = lhs_place.local;
-                        // Use size=0 for unknown size in deref writes.
-                        insert_points.push((
-                            bb,
-                            stmt_idx,
-                            stmt.source_info,
-                            Place::from(ptr_local),
-                            InstrKind::PtrWrite { ptr_local, size: 0 },
-                        ));
-                    }
-                }
-                // Tag propagation: handle `_dst = copy/move _src` and `_dst = (copy/move _src) as *const/*mut U (PtrToPtr)`.
-                // This ensures derived pointer locals keep a non-zero tag.
-                if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
-                    if let Some(dst_local) = dst_place.as_local() {
-                        let dst_ty = body.local_decls[dst_local].ty;
-                        let dst_is_ptr = matches!(dst_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
-                        if dst_is_ptr {
-                            // Extract a source local if the rvalue is a plain use or a PtrToPtr cast.
-                            let src_local_opt: Option<Local> = match rvalue {
-                                Rvalue::Use(op) => match op {
-                                    Operand::Copy(p) | Operand::Move(p) => p.as_local(),
-                                    _ => None,
-                                },
-                                Rvalue::Cast(CastKind::PtrToPtr, op, _to_ty) => match op {
-                                    Operand::Copy(p) | Operand::Move(p) => p.as_local(),
-                                    _ => None,
-                                },
-                                _ => None,
-                            };
-
-                            if let Some(src_local) = src_local_opt {
-                                let src_ty = body.local_decls[src_local].ty;
-                                let src_is_ptr = matches!(src_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
-                                if src_is_ptr {
-                                    // Ensure both locals have tag locals allocated.
-                                    ptr_locals_needing_tag.insert(dst_local);
-                                    ptr_locals_needing_tag.insert(src_local);
-
-                                    insert_points.push((
-                                        bb,
-                                        stmt_idx,
-                                        stmt.source_info,
-                                        Place::from(dst_local),
-                                        InstrKind::TagProp {
-                                            dst: dst_local,
-                                            src: src_local,
-                                        },
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
-                    if let Some(lhs_local) = place.as_local() {
-                        ptr_locals_needing_tag.insert(lhs_local);
-                    }
-                    insert_points.push((
-                        bb,
-                        stmt_idx,
-                        stmt.source_info,
-                        place.clone(),
-                        InstrKind::Ref { bk: *bk, src: src_place.clone() },
-                    ));
-                    println!(
-                        "Found ref creation at block {:?}, stmt idx {}: {:?}",
-                        bb, stmt_idx, stmt
-                    );
-                }
-
-                // Raw pointer creation: e.g., `_3 = &raw const _1;` or `_3 = &raw mut _1;`
-                if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) =
-                    &stmt.kind
-                {
-                    if let Some(lhs_local) = place.as_local() {
-                        ptr_locals_needing_tag.insert(lhs_local);
-                    }
-                    let is_mut = matches!(*mutbl, RawPtrKind::Mut);
-                    insert_points.push((
-                        bb,
-                        stmt_idx,
-                        stmt.source_info,
-                        place.clone(),
-                        InstrKind::Raw { is_mut, src: src_place.clone() },
-                    ));
-                    println!(
-                        "Found raw pointer creation at block {:?}, stmt idx {}: {:?} = &raw {:?} {:?}",
-                        bb, stmt_idx, stmt, mutbl, src_place
-                    );
-                }
-            }
-            // Calls: in optimized MIR, certain writes appear only as intrinsic calls (e.g., volatile_store).
-            // We classify those as writes, and we also emit coarse PtrUse telemetry for any pointer args.
-            if let Some(term) = &block_data.terminator {
-                if let TerminatorKind::Call { func, args, .. } = &term.kind {
-                    // Detect `std::intrinsics::volatile_{store,load}::<T>` and classify as write/read.
-                    let mut is_volatile_store = false;
-                    let mut is_volatile_load = false;
-                    let mut classified_write_ptr_local: Option<Local> = None;
-                    let mut classified_read_ptr_local: Option<Local> = None;
-                    if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
-                        let path = tcx.def_path_str(*callee_def_id);
-                        if path.contains("intrinsics::volatile_store") {
-                            is_volatile_store = true;
-                        }
-                        if path.contains("intrinsics::volatile_load") {
-                            is_volatile_load = true;
-                        }
-                    }
-
-                    if is_volatile_store {
-                        // Arg0 is the destination pointer.
-                        if let Some(first) = args.get(0) {
-                            let op0 = &first.node;
-                            let pl0: Option<Place<'tcx>> = match op0 {
-                                Operand::Copy(p) | Operand::Move(p) => Some(*p),
-                                _ => None,
-                            };
-                            if let Some(p0) = pl0 {
-                                classified_write_ptr_local = Some(p0.local);
-                                // Best-effort size_of::<T> from the raw pointer type *const/*mut T.
-                                let mut size = 0usize;
-                                let ty0 = body.local_decls[p0.local].ty;
-                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                    let input = PseudoCanonicalInput {
-                                        typing_env: TypingEnv::fully_monomorphized(),
-                                        value: *pointee_ty,
-                                    };
-                                    size = tcx
-                                        .layout_of(input)
-                                        .ok()
-                                        .map(|l| l.size.bytes() as usize)
-                                        .unwrap_or(0);
-                                }
-
-                                insert_points.push((
-                                    bb,
-                                    block_data.statements.len(), // insert right before terminator
-                                    term.source_info,
-                                    Place::from(p0.local),
-                                    InstrKind::PtrWrite {
-                                        ptr_local: p0.local,
-                                        size,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-
-                    if is_volatile_load {
-                        // Arg0 is the source pointer.
-                        if let Some(first) = args.get(0) {
-                            let op0 = &first.node;
-                            let pl0: Option<Place<'tcx>> = match op0 {
-                                Operand::Copy(p) | Operand::Move(p) => Some(*p),
-                                _ => None,
-                            };
-                            if let Some(p0) = pl0 {
-                                classified_read_ptr_local = Some(p0.local);
-                                // Best-effort size_of::<T> from the raw pointer type *const/*mut T.
-                                let mut size = 0usize;
-                                let ty0 = body.local_decls[p0.local].ty;
-                                if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                    let input = PseudoCanonicalInput {
-                                        typing_env: TypingEnv::fully_monomorphized(),
-                                        value: *pointee_ty,
-                                    };
-                                    size = tcx
-                                        .layout_of(input)
-                                        .ok()
-                                        .map(|l| l.size.bytes() as usize)
-                                        .unwrap_or(0);
-                                }
-
-                                insert_points.push((
-                                    bb,
-                                    block_data.statements.len(), // insert right before terminator
-                                    term.source_info,
-                                    Place::from(p0.local),
-                                    InstrKind::PtrRead {
-                                        ptr_local: p0.local,
-                                        size,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-
-                    // Coarse pointer-use telemetry for any pointer-typed locals in call arguments.
-                    for a in args.iter() {
-                        let op = &a.node;
-                        let pl: Option<Place<'tcx>> = match op {
-                            Operand::Copy(p) | Operand::Move(p) => Some(*p),
-                            _ => None,
-                        };
-                        if let Some(p) = pl {
-                            let ty = body.local_decls[p.local].ty;
-                            let is_ptr = matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
-                            if is_ptr {
-                                // Avoid double-reporting: if this call site was classified as a write or read on arg0,
-                                // do not also emit the coarse PtrUse for the same pointer local.
-                                if classified_write_ptr_local == Some(p.local)
-                                    || classified_read_ptr_local == Some(p.local)
-                                {
-                                    continue;
-                                }
-
-                                insert_points.push((
-                                    bb,
-                                    block_data.statements.len(), // insert right before terminator
-                                    term.source_info,
-                                    Place::from(p.local),
-                                    InstrKind::PtrUse { ptr_local: p.local },
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Allocate one stable tag local per pointer local we detected as being created (Ref/Raw).
-        // Do this after scanning to avoid borrowing `body` mutably while iterating basic blocks.
-        for ptr_local in ptr_locals_needing_tag.drain() {
-            if !tag_local_for_ptr_local.contains_key(&ptr_local) {
-                let t = body
-                    .local_decls
-                    .push(LocalDecl::new(tcx.types.u64, rustc_span::DUMMY_SP));
-                tag_local_for_ptr_local.insert(ptr_local, t);
-            }
-        }
-
-        // Insert in reverse order to not invalidate indices
-        for (bb, stmt_idx, source_info, place, creation_kind) in insert_points.into_iter().rev() {
-            // Tag propagation is a local assignment (no runtime call). Insert it and continue.
-            if let InstrKind::TagProp { dst, src } = creation_kind {
-                println!(
-                    "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
-                    dst,
-                    src
-                );
-                let dst_tag = *tag_local_for_ptr_local
-                    .get(&dst)
-                    .expect("missing tag local for TagProp dst");
-
-                let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
-                    Operand::Copy(Place::from(*src_tag))
-                } else {
-                    Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u64(0)),
-                            tcx.types.u64,
-                        ),
-                    }))
-                };
-
-                let prop_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(dst_tag),
-                        Rvalue::Use(src_op),
-                    ))),
-                );
-
-                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                let insert_at = if stmt_idx >= bd.statements.len() {
-                    bd.statements.len()
-                } else {
-                    stmt_idx + 1
-                };
-                bd.statements.insert(insert_at, prop_stmt);
-                continue;
-            }
-            let (orig_term, is_cleanup) = {
-                let bd = &mut body.basic_blocks_mut()[bb];
-                let term = bd.terminator.take();
-                let cleanup = bd.is_cleanup;
-                (term, cleanup)
-            };
-
-            println!("Terminator at block {:?}: {:?}", bb, orig_term);
-
-            // Build continuation block now (no outstanding borrow of `bb`)
-            let cont_block = {
-                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
-                body.basic_blocks_mut().push(cont_data)
-            };
-
-            // Build function operand and tag destination local (no outstanding borrow of `bb`)
-            let func_operand = match creation_kind {
-                InstrKind::Ref { .. } => func_operand_ref(source_info.span),
-                InstrKind::Raw { .. } => func_operand_raw(source_info.span),
-                InstrKind::StackAlloc { .. } => func_operand_alloc(source_info.span),
-                InstrKind::PtrWrite { .. } => func_operand_write(source_info.span),
-                InstrKind::PtrRead { .. } => func_operand_read(source_info.span),
-                InstrKind::PtrUse { .. } => func_operand_use(source_info.span),
-                InstrKind::TagProp { .. } => unreachable!("TagProp is handled earlier via continue"),
-            };
-
-            // For Ref/Raw creation we write the returned tag into the preallocated tag-local for the destination.
-            // For other instrumentation kinds we do not create/update tags here.
-            let tag_local: Option<Local> = match creation_kind {
-                InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
-                    if let Some(lhs_local) = place.as_local() {
-                        Some(
-                            *tag_local_for_ptr_local
-                                .get(&lhs_local)
-                                .expect("missing preallocated tag local for pointer destination"),
-                        )
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
-            // Compute the address that the newly-created reference points to.
-            // For StackAlloc we need the address of the local's storage slot, not the pointee address.
-            // We compute: tmp_ptr = &raw const <local>; addr = expose_provenance(tmp_ptr).
-            let addr_local = body
-                .local_decls
-                .push(LocalDecl::new(tcx.types.usize, source_info.span));
-
-            let (addr_stmt1_opt, addr_stmt2) = match creation_kind {
-                InstrKind::StackAlloc { local, .. } => {
-                    let local_ty = body.local_decls[local].ty;
-                    let ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
-                    let tmp_ptr = body
-                        .local_decls
-                        .push(LocalDecl::new(ptr_ty, source_info.span));
-
-                    let s1 = Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(tmp_ptr),
-                            Rvalue::RawPtr(RawPtrKind::Const, Place::from(local)),
-                        ))),
-                    );
-
-                    let s2 = Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(addr_local),
-                            Rvalue::Cast(
-                                CastKind::PointerExposeProvenance,
-                                Operand::Copy(Place::from(tmp_ptr)),
-                                tcx.types.usize,
-                            ),
-                        ))),
-                    );
-
-                    (Some(s1), s2)
-                }
-                _ => {
-                    let s2 = Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(addr_local),
-                            Rvalue::Cast(
-                                CastKind::PointerExposeProvenance,
-                                Operand::Copy(place),
-                                tcx.types.usize,
-                            ),
-                        ))),
-                    );
-                    (None, s2)
-                }
-            };
-
-            let arg_addr = Operand::Copy(Place::from(addr_local));
-
-            let (args, dest_place) = match creation_kind {
-                InstrKind::PtrRead { ptr_local, size } => {
-                    // __rz_ptr_read(tag, addr, size) -> ()
-                    let tmp_unit = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
-
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        Operand::Constant(Box::new(ConstOperand {
-                            span: source_info.span,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_u64(0)),
-                                tcx.types.u64,
-                            ),
-                        }))
-                    };
-
-                    let arg_size0 = Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
-                            tcx.types.usize,
-                        ),
-                    }));
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned { node: tag_op, span: source_info.span },
-                        Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_size0, span: source_info.span },
-                    ]
-                    .into_boxed_slice();
-
-                    (args, Place::from(tmp_unit))
-                }
-                InstrKind::StackAlloc { size, live, .. } => {
-                    // __rz_record_alloc(base_addr, size, live) -> ()
-                    let tmp_unit = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
-
-                    let arg_size = Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
-                            tcx.types.usize,
-                        ),
-                    }));
-
-                    let arg_live = Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u8(if live { 1 } else { 0 })),
-                            tcx.types.u8,
-                        ),
-                    }));
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_size, span: source_info.span },
-                        Spanned { node: arg_live, span: source_info.span },
-                    ]
-                    .into_boxed_slice();
-
-                    (args, Place::from(tmp_unit))
-                }
-                InstrKind::PtrWrite { ptr_local, size } => {
-                    // __rz_ptr_write(tag, addr, size) -> ()
-                    let tmp_unit = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
-
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        Operand::Constant(Box::new(ConstOperand {
-                            span: source_info.span,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_u64(0)),
-                                tcx.types.u64,
-                            ),
-                        }))
-                    };
-
-                    let arg_size0 = Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u64(size as u64)),
-                            tcx.types.usize,
-                        ),
-                    }));
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned { node: tag_op, span: source_info.span },
-                        Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_size0, span: source_info.span },
-                    ]
-                    .into_boxed_slice();
-
-                    (args, Place::from(tmp_unit))
-                }
-
-                InstrKind::PtrUse { ptr_local } => {
-                    // __rz_ptr_use(tag, addr) -> ()
-                    let tmp_unit = body
-                        .local_decls
-                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
-
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        Operand::Constant(Box::new(ConstOperand {
-                            span: source_info.span,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_u64(0)),
-                                tcx.types.u64,
-                            ),
-                        }))
-                    };
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned { node: tag_op, span: source_info.span },
-                        Spanned { node: arg_addr, span: source_info.span },
-                    ]
-                    .into_boxed_slice();
-
-                    (args, Place::from(tmp_unit))
-                }
-                _ => {
-                    // Ref/Raw creation: (pointee_addr, is_mut, parent_tag) -> tag
-                    let is_mut_u8: u8 = match creation_kind {
-                        InstrKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
-                            BorrowKind::Mut { .. } => 1,
-                            _ => 0,
-                        },
-                        InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
-                        InstrKind::StackAlloc { .. } => 0,
-                        InstrKind::PtrWrite { .. } => 0,
-                        InstrKind::PtrRead { .. } => 0,
-                        InstrKind::PtrUse { .. } => 0,
-                        InstrKind::TagProp { .. } => 0,
-                    };
-
-                    let arg_mut = Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        user_ty: None,
-                        const_: Const::Val(
-                            ConstValue::Scalar(Scalar::from_u8(is_mut_u8)),
-                            tcx.types.u8,
-                        ),
-                    }));
-
-                    // Best-effort parent tag: use the base local's tag if known, else 0.
-                    let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
-                            let base = src.local;
-                            if let Some(tl) = tag_local_for_ptr_local.get(&base) {
-                                Operand::Copy(Place::from(*tl))
-                            } else {
-                                Operand::Constant(Box::new(ConstOperand {
-                                    span: source_info.span,
-                                    user_ty: None,
-                                    const_: Const::Val(
-                                        ConstValue::Scalar(Scalar::from_u64(0)),
-                                        tcx.types.u64,
-                                    ),
-                                }))
-                            }
-                        }
-                        InstrKind::StackAlloc { .. }
-                        | InstrKind::PtrWrite { .. }
-                        | InstrKind::PtrRead { .. }
-                        | InstrKind::PtrUse { .. }
-                        | InstrKind::TagProp { .. } => Operand::Constant(Box::new(ConstOperand {
-                            span: source_info.span,
-                            user_ty: None,
-                            const_: Const::Val(
-                                ConstValue::Scalar(Scalar::from_u64(0)),
-                                tcx.types.u64,
-                            ),
-                        })),
-                    };
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_mut, span: source_info.span },
-                        Spanned { node: arg_parent, span: source_info.span },
-                    ]
-                    .into_boxed_slice();
-
-                    let dst = tag_local.expect("missing tag_local for ref/raw creation");
-                    (args, Place::from(dst))
-                }
-            };
-
-            // Build the call terminator
-            let call_term = Terminator {
-                source_info,
-                kind: TerminatorKind::Call {
-                    func: func_operand,
-                    args,
-                    destination: dest_place,
-                    target: Some(cont_block),
-                    unwind: UnwindAction::Continue,
-                    call_source: CallSource::Misc,
-                    fn_span: source_info.span,
-                },
-            };
-
-            // Split off remaining statements and set the block terminator in one borrow
-            let remaining_stmts = {
-                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-
-                // If `stmt_idx` points *past the last statement* (i.e., insertion right before the terminator),
-                // we must split at `stmt_idx` rather than `stmt_idx + 1`.
-                let split_at = if stmt_idx >= bd.statements.len() {
-                    stmt_idx
-                } else {
-                    stmt_idx + 1
-                };
-
-                let rem = bd.statements.split_off(split_at);
-
-                // Insert the address-computation statement(s) at the insertion point.
-                if let Some(s1) = addr_stmt1_opt {
-                    bd.statements.push(s1);
-                }
-                bd.statements.push(addr_stmt2);
-
-                // Then replace the terminator with our call.
-                bd.terminator = Some(call_term);
-                rem
-            };
-
-            // Extend the continuation block with the remaining statements
-            body.basic_blocks_mut()[cont_block]
-                .statements
-                .extend(remaining_stmts);
-        }
-
-        // println!("{:#?}", body);
+        let scan = self.scan_body(tcx, body);
+        let tag_local_for_ptr_local = self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag);
+        self.insert_instrumentation(tcx, body, scan.insert_points, &tag_local_for_ptr_local, hooks);
     }
 }
 
