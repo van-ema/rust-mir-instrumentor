@@ -1,7 +1,7 @@
 [workspace]
 members = ["dynamic_loader","examples/hello",
     "examples/mutable_ref_test",
-    "examples/raw_pointer_test", "examples/simple_raw_write", "examples/volatile_ro_rw",
+    "examples/raw_pointer_test", "examples/simple_raw_write", "examples/stack_reuse", "examples/volatile_ro_rw",
     "instrument-mir", "lib_hello",
     "runtime",
 ]
