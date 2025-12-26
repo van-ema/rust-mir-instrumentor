@@ -214,6 +214,9 @@ impl MyOptimizationPass {
             PtrRead { ptr_local: Local, size: usize },
             /// Coarse pointer-use telemetry: a pointer-typed local appears in a call argument.
             PtrUse { ptr_local: Local },
+            /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
+            /// This is a local tag assignment, not a runtime hook.
+            TagProp { dst: Local, src: Local },
         }
 
         let mut insert_points: Vec<(BasicBlock, usize, SourceInfo, Place<'tcx>, InstrKind<'tcx>)> = Vec::new();
@@ -260,6 +263,13 @@ impl MyOptimizationPass {
                     _ => {}
                 }
                 // Pointer write: any assignment whose LHS place begins with a Deref projection.
+                // NOTE: We intentionally operate on *optimized MIR*. This means some semantic pointer writes
+                // like `*p = v` can be optimized into plain local assignments (e.g., `_x = v`) and will not appear
+                // as an LHS `Deref` store anymore. 
+                // TODO: Address precision: `PtrWrite` currently reports `addr = expose_provenance(ptr_local)`
+                // (the pointer value). This is fine for `*p = ...`, but for interior stores like `(*p).field = ...`
+                // or indexing, the true store address is `base + offset` from projections after `Deref`. We should
+                // eventually compute and pass the real accessed address.
                 if let StatementKind::Assign(box (lhs_place, _rhs)) = &stmt.kind {
                     let is_deref_write = lhs_place
                         .projection
@@ -278,13 +288,49 @@ impl MyOptimizationPass {
                         ));
                     }
                 }
-                // NOTE: We intentionally operate on *optimized MIR*. This means some semantic pointer writes
-                // like `*p = v` can be optimized into plain local assignments (e.g., `_x = v`) and will not appear
-                // as an LHS `Deref` store anymore. 
-                // TODO: Address precision: `PtrWrite` currently reports `addr = expose_provenance(ptr_local)`
-                // (the pointer value). This is fine for `*p = ...`, but for interior stores like `(*p).field = ...`
-                // or indexing, the true store address is `base + offset` from projections after `Deref`. We should
-                // eventually compute and pass the real accessed address.
+                // Tag propagation: handle `_dst = copy/move _src` and `_dst = (copy/move _src) as *const/*mut U (PtrToPtr)`.
+                // This ensures derived pointer locals keep a non-zero tag.
+                if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+                    if let Some(dst_local) = dst_place.as_local() {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        let dst_is_ptr = matches!(dst_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
+                        if dst_is_ptr {
+                            // Extract a source local if the rvalue is a plain use or a PtrToPtr cast.
+                            let src_local_opt: Option<Local> = match rvalue {
+                                Rvalue::Use(op) => match op {
+                                    Operand::Copy(p) | Operand::Move(p) => p.as_local(),
+                                    _ => None,
+                                },
+                                Rvalue::Cast(CastKind::PtrToPtr, op, _to_ty) => match op {
+                                    Operand::Copy(p) | Operand::Move(p) => p.as_local(),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+
+                            if let Some(src_local) = src_local_opt {
+                                let src_ty = body.local_decls[src_local].ty;
+                                let src_is_ptr = matches!(src_ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..));
+                                if src_is_ptr {
+                                    // Ensure both locals have tag locals allocated.
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    ptr_locals_needing_tag.insert(src_local);
+
+                                    insert_points.push((
+                                        bb,
+                                        stmt_idx,
+                                        stmt.source_info,
+                                        Place::from(dst_local),
+                                        InstrKind::TagProp {
+                                            dst: dst_local,
+                                            src: src_local,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
                     if let Some(lhs_local) = place.as_local() {
                         ptr_locals_needing_tag.insert(lhs_local);
@@ -466,6 +512,42 @@ impl MyOptimizationPass {
 
         // Insert in reverse order to not invalidate indices
         for (bb, stmt_idx, source_info, place, creation_kind) in insert_points.into_iter().rev() {
+            // Tag propagation is a local assignment (no runtime call). Insert it and continue.
+            if let InstrKind::TagProp { dst, src } = creation_kind {
+                let dst_tag = *tag_local_for_ptr_local
+                    .get(&dst)
+                    .expect("missing tag local for TagProp dst");
+
+                let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
+                    Operand::Copy(Place::from(*src_tag))
+                } else {
+                    Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        user_ty: None,
+                        const_: Const::Val(
+                            ConstValue::Scalar(Scalar::from_u64(0)),
+                            tcx.types.u64,
+                        ),
+                    }))
+                };
+
+                let prop_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(dst_tag),
+                        Rvalue::Use(src_op),
+                    ))),
+                );
+
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                let insert_at = if stmt_idx >= bd.statements.len() {
+                    bd.statements.len()
+                } else {
+                    stmt_idx + 1
+                };
+                bd.statements.insert(insert_at, prop_stmt);
+                continue;
+            }
             let (orig_term, is_cleanup) = {
                 let bd = &mut body.basic_blocks_mut()[bb];
                 let term = bd.terminator.take();
@@ -489,6 +571,7 @@ impl MyOptimizationPass {
                 InstrKind::PtrWrite { .. } => func_operand_write(source_info.span),
                 InstrKind::PtrRead { .. } => func_operand_read(source_info.span),
                 InstrKind::PtrUse { .. } => func_operand_use(source_info.span),
+                InstrKind::TagProp { .. } => unreachable!("TagProp is handled earlier via continue"),
             };
 
             // For Ref/Raw creation we write the returned tag into the preallocated tag-local for the destination.
@@ -711,6 +794,7 @@ impl MyOptimizationPass {
                         InstrKind::PtrWrite { .. } => 0,
                         InstrKind::PtrRead { .. } => 0,
                         InstrKind::PtrUse { .. } => 0,
+                        InstrKind::TagProp { .. } => 0,
                     };
 
                     let arg_mut = Operand::Constant(Box::new(ConstOperand {
@@ -742,7 +826,8 @@ impl MyOptimizationPass {
                         InstrKind::StackAlloc { .. }
                         | InstrKind::PtrWrite { .. }
                         | InstrKind::PtrRead { .. }
-                        | InstrKind::PtrUse { .. } => Operand::Constant(Box::new(ConstOperand {
+                        | InstrKind::PtrUse { .. }
+                        | InstrKind::TagProp { .. } => Operand::Constant(Box::new(ConstOperand {
                             span: source_info.span,
                             user_ty: None,
                             const_: Const::Val(
