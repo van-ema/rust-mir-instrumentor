@@ -164,12 +164,17 @@ impl MyOptimizationPass {
                 match stmt.kind {
                     StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
                         if local != RETURN_PLACE {
-                            // We currently keep stack alloc instrumentation disabled.
-                            // If re-enabled, use `layout_size_bytes(tcx, ty)` here.
-                            let _live = matches!(stmt.kind, StatementKind::StorageLive(_));
-                            let _ty = body.local_decls[local].ty;
-                            let _size = self.layout_size_bytes(tcx, _ty);
-                            let _ = (_live, _size); // silence unused warnings if toggled
+                            let live = matches!(stmt.kind, StatementKind::StorageLive(_));
+                            let ty = body.local_decls[local].ty;
+                            let size = self.layout_size_bytes(tcx, ty);
+
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                source_info: stmt.source_info,
+                                place: Place::from(local),
+                                kind: InstrKind::StackAlloc { local, live, size },
+                            });
                         }
                     }
                     _ => {}
@@ -206,14 +211,12 @@ impl MyOptimizationPass {
                                     .and_then(|p| p.as_local()),
 
                                 // Common form used around deref-based ops.
-                                Rvalue::CopyForDeref(op) => self
-                                    .place_from_operand(op)
-                                    .and_then(|p| p.as_local()),
+                                Rvalue::CopyForDeref(p) => p.as_local(),
 
                                 // Pointer-to-pointer and pointer coercions/transmutes.
                                 Rvalue::Cast(
                                     CastKind::PtrToPtr
-                                    | CastKind::PointerCoercion
+                                    | CastKind::PointerCoercion(_, _)
                                     | CastKind::Transmute,
                                     op,
                                     _to_ty,
