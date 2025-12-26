@@ -9,37 +9,35 @@ cargo install --path instrument-mir --bin cargo-instrument-mir
 
 ## Use
 
-```
+```bash
 cargo instrument-mir --mir-out=./out.mir -p hello --release
 ```
 
+You can specify output MIR files with `--mir-out` and provide a runtime path with `--runtime-path`.
 
-Linux:
-```
-DYLD_FALLBACK_LIBRARY_PATH="$(rustc --print sysroot)/lib"
-LD_LIBRARY_PATH="$(rustc --print sysroot)/lib" \
-target/release/instrument-mir \
-    --crate-name hello \
-    examples/hello/src/main.rs \
-    --crate-type=bin \
-    --extern runtime=./target/release/libruntime.rlib \
-    -L target/release \
-    -o hello_instrumented
-```
+## Stack allocation tracking (filtered vs all)
 
-on MacOs
-```
-DYLD_FALLBACK_LIBRARY_PATH="$(rustc --print sysroot)/lib"
-target/release/instrument-mir \
-    --crate-name hello \
-    examples/hello/src/main.rs \
-    --crate-type=bin \
-    --extern runtime=./target/release/deps/libruntime-da7beaa1ec0bf9aa.rmeta \
-    -L target/release \
-    -o hello_instrumented
+By default, the instrumentor records stack allocation lifetime events (`StorageLive` / `StorageDead`) **only for "interesting" locals** to reduce noise and overhead. A local is considered interesting when its address is taken (e.g., via `&T` / `&raw`), or when optimized MIR introduces common pointer-related temporaries/casts around it.
+
+If you want maximum coverage (useful when debugging or when validating against tricky MIR patterns), you can force the instrumentor to record `StorageLive` / `StorageDead` for **all locals** by setting `RZ_STACK_ALLOCS`:
+
+```bash
+
+# Instrument stack allocs for all locals (higher overhead, more logs)
+RZ_STACK_ALLOCS=all cargo instrument-mir ...
+
+# Equivalent values:
+RZ_STACK_ALLOCS=1 cargo instrument-mir ...
+RZ_STACK_ALLOCS=true cargo instrument-mir ...
 ```
 
-## Work in progress
+Notes:
+- The toggle affects only stack allocation lifetime tracking; pointer creation/use tracking is unchanged.
+- The "all" mode can produce many more `__rz_record_alloc` events, especially in code that uses formatting/panic paths.
+
+
+
+## Notes
 We can force loading extern crate with
 
 ```

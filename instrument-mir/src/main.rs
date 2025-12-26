@@ -158,12 +158,71 @@ impl MyOptimizationPass {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
 
+        // Filter: only track stack locals that are likely to matter for unsafe behavior.
+        // Heuristic: instrument StorageLive/StorageDead only for locals whose address is taken
+        // to create a reference or raw pointer (i.e., appear as the base local in `Rvalue::Ref`
+        // or `Rvalue::RawPtr`). This dramatically reduces noise from compiler-introduced temporaries.
+        let mut interesting_stack_locals: HashSet<Local> = HashSet::new();
+        for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
+            for stmt in block_data.statements.iter() {
+                if let StatementKind::Assign(box (_dst, rv)) = &stmt.kind {
+                    match rv {
+                        // Direct address taking.
+                        Rvalue::Ref(_, _bk, src_place) => {
+                            if src_place.local != RETURN_PLACE {
+                                interesting_stack_locals.insert(src_place.local);
+                            }
+                        }
+                        Rvalue::RawPtr(_mutbl, src_place) => {
+                            if src_place.local != RETURN_PLACE {
+                                interesting_stack_locals.insert(src_place.local);
+                            }
+                        }
+
+                        // Common deref-related temporary; treat the source local as interesting.
+                        Rvalue::CopyForDeref(p) => {
+                            if p.local != RETURN_PLACE {
+                                interesting_stack_locals.insert(p.local);
+                            }
+                        }
+
+                        // Pointer-related casts/coercions that often show up in optimized MIR.
+                        // If the operand comes from a local place, mark that local as interesting.
+                        Rvalue::Cast(
+                            CastKind::PtrToPtr
+                            | CastKind::PointerCoercion(_, _)
+                            | CastKind::Transmute
+                            | CastKind::PointerExposeProvenance,
+                            op,
+                            _to_ty,
+                        ) => {
+                            if let Some(src_place) = self.place_from_operand(op) {
+                                if src_place.local != RETURN_PLACE {
+                                    interesting_stack_locals.insert(src_place.local);
+                                }
+                            }
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Two-tier strategy: by default we filter stack alloc events to reduce noise.
+        // Set `RZ_STACK_ALLOCS=all` (or 1/true) to instrument StorageLive/StorageDead for all locals.
+        let track_all_stack_allocs = std::env::var("RZ_STACK_ALLOCS")
+            .map(|v| v == "all" || v == "ALL" || v == "1" || v == "true" || v == "TRUE")
+            .unwrap_or(false);
+
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 // Stack allocation lifetime: StorageLive/StorageDead.
                 match stmt.kind {
                     StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                        if local != RETURN_PLACE {
+                        if local != RETURN_PLACE
+                            && (track_all_stack_allocs || interesting_stack_locals.contains(&local))
+                        {
                             let live = matches!(stmt.kind, StatementKind::StorageLive(_));
                             let ty = body.local_decls[local].ty;
                             let size = self.layout_size_bytes(tcx, ty);
@@ -338,6 +397,7 @@ impl MyOptimizationPass {
                                 {
                                     continue;
                                 }
+                                ptr_locals_needing_tag.insert(p.local);
                                 insert_points.push(InsertPoint {
                                     bb,
                                     stmt_idx: block_data.statements.len(),
