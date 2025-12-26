@@ -200,12 +200,25 @@ impl MyOptimizationPass {
                         let dst_ty = body.local_decls[dst_local].ty;
                         if self.is_ptr_ty(dst_ty) {
                             let src_local_opt: Option<Local> = match rvalue {
+                                // Plain copy/move of a pointer local.
                                 Rvalue::Use(op) => self
                                     .place_from_operand(op)
                                     .and_then(|p| p.as_local()),
-                                Rvalue::Cast(CastKind::PtrToPtr, op, _to_ty) => self
+
+                                // Common form used around deref-based ops.
+                                Rvalue::CopyForDeref(op) => self
                                     .place_from_operand(op)
                                     .and_then(|p| p.as_local()),
+
+                                // Pointer-to-pointer and pointer coercions/transmutes.
+                                Rvalue::Cast(
+                                    CastKind::PtrToPtr
+                                    | CastKind::PointerCoercion
+                                    | CastKind::Transmute,
+                                    op,
+                                    _to_ty,
+                                ) => self.place_from_operand(op).and_then(|p| p.as_local()),
+
                                 _ => None,
                             };
 
