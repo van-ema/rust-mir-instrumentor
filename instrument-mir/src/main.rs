@@ -36,6 +36,7 @@ use std::num::NonZeroU64;
 use std::sync::Mutex;
 
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::BufWriter;
 use std::io::Write;
 use std::sync::OnceLock;
@@ -397,6 +398,10 @@ impl MyOptimizationPass {
                                 {
                                     continue;
                                 }
+                                // IMPORTANT: Ensure pointer-typed call arguments get an associated tag local.
+                                // Without this, PtrUse events at call boundaries would often observe tag=0,
+                                // because the pointer local was never marked as needing a tag. We treat
+                                // passing a pointer into a function as a coarse "use"/escape boundary.
                                 ptr_locals_needing_tag.insert(p.local);
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -882,8 +887,17 @@ const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx 
         // Write MIR before running our optimization/instrumentation.
         if let Some(path) = MIR_OUT_BEFORE.get() {
             let mut extra = |_, _: &mut dyn std::io::Write| Ok(());
-            let file = File::create(path).unwrap();
+            let def_path = tcx.def_path_str(body.source.def_id());
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
             let mut writer = BufWriter::new(file);
+
+            writeln!(&mut writer, "\n\n// ===== MIR BEFORE: {} =====", def_path).unwrap();
+
             write_mir_fn(
                 tcx,
                 &body,
@@ -901,8 +915,17 @@ const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx 
         // Write MIR after running our optimization/instrumentation.
         if let Some(path) = MIR_OUT_AFTER.get() {
             let mut extra = |_, _: &mut dyn std::io::Write| Ok(());
-            let file = File::create(path).unwrap();
+            let def_path = tcx.def_path_str(body.source.def_id());
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
             let mut writer = BufWriter::new(file);
+
+            writeln!(&mut writer, "\n\n// ===== MIR AFTER: {} =====", def_path).unwrap();
+
             write_mir_fn(
                 tcx,
                 &body,
