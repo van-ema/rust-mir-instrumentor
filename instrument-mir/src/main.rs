@@ -1030,31 +1030,6 @@ impl MyOptimizationPass {
                 .extend(remaining_stmts);
         }
     }
-    /*
-    fn print_runtime_items<'tcx>(&self, tcx: TyCtxt<'tcx>) {
-        for &cnum in tcx.crates(()).iter() {
-            let crate_name = tcx.crate_name(cnum);
-            if crate_name.as_str() == "runtime" {
-                println!("Items in runtime crate:");
-                let items = tcx.hir_crate_items(());
-                // Use `free_items` to iterate over non-associated items
-                for item_id in items.free_items() {
-                    let def_id = item_id.owner_id.def_id;
-                    if let Some(name) = tcx.opt_item_name(def_id) {
-                        println!(" - Item: {}", name);
-                    } else {
-                        println!(" - Unnamed item: {:?}", def_id);
-                    }
-                    // Print additional debugging information about the item
-                    let item_kind = tcx.def_kind(def_id);
-                    println!("   - DefKind: {:?}", item_kind);
-                    let span = tcx.def_span(def_id);
-                    println!("   - Span: {:?}", span);
-                }
-            }
-        }
-    }
-    */
 
     fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
         for &cnum in tcx.crates(()).iter() {

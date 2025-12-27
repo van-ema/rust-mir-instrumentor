@@ -3,3 +3,7 @@ pub fn hello() {
     let y = &x; // This creates a reference -> should trigger instrumentation
     println!("{}", y);
 }
+
+fn main() {
+    hello();
+}

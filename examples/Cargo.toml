@@ -1,0 +1,55 @@
+[package]
+name = "examples"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lib_hello = { path = "../lib_hello" }
+
+[[bin]]
+name = "call_arg_offset"
+path = "call_arg_offset.rs"
+
+[[bin]]
+name = "cast_call_arg"
+path = "cast_call_arg.rs"
+
+[[bin]]
+name = "hello"
+path = "hello.rs"
+
+[[bin]]
+name = "hello_lib"
+path = "hello_lib.rs"
+
+[[bin]]
+name = "mutable_ref_test"
+path = "mutable_ref_test.rs"
+
+[[bin]]
+name = "ptr_arg_use"
+path = "ptr_arg_use.rs"
+
+[[bin]]
+name = "raw_pointer_test"
+path = "raw_pointer_test.rs"
+
+[[bin]]
+name = "raw_pointer_mut_test"
+path = "raw_pointer_mut_test.rs"
+
+[[bin]]
+name = "simple_raw_write"
+path = "simple_raw_write.rs"
+
+[[bin]]
+name = "stack_reuse"
+path = "stack_reuse.rs"
+
+[[bin]]
+name = "volatile_ro_rw"
+path = "volatile_ro_rw.rs"
+
+[[bin]]
+name = "call_arg_wrap_offset"
+path = "call_arg_wrap_offset.rs"

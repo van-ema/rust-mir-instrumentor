@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hello"
+name = "examples"
 version = "0.1.0"
 dependencies = [
  "lib_hello",
@@ -44,31 +44,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mutable_ref_test"
-version = "0.1.0"
-
-[[package]]
-name = "ptr_arg_use"
-version = "0.1.0"
-
-[[package]]
-name = "raw_pointer_test"
-version = "0.1.0"
-
-[[package]]
 name = "runtime"
-version = "0.1.0"
-
-[[package]]
-name = "simple_raw_write"
-version = "0.1.0"
-
-[[package]]
-name = "stack_reuse"
-version = "0.1.0"
-
-[[package]]
-name = "volatile_ro_rw"
 version = "0.1.0"
 
 [[package]]

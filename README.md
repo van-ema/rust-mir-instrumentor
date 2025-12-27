@@ -10,10 +10,13 @@ cargo install --path instrument-mir --bin cargo-instrument-mir
 ## Use
 
 ```bash
-cargo instrument-mir --mir-out=./out.mir -p hello --release
+cargo build -p runtime --release
+cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p examples --bin hello --release
+./target/release/hello
 ```
 
 You can specify output MIR files with `--mir-out` and provide a runtime path with `--runtime-path`.
+Note: `cargo instrument-mir` only builds the binary; run the produced binary directly (do not use `cargo run`).
 
 ## Stack allocation tracking (filtered vs all)
 
@@ -43,5 +46,4 @@ We can force loading extern crate with
 ```
 --extern=force:runtime={runtime_path}/libruntime.rlib
 ```
-
 

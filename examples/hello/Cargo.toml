@@ -1,7 +1,0 @@
-[package]
-name = "hello"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-lib_hello = { path = "../../lib_hello"}
