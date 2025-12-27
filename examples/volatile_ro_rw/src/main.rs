@@ -12,6 +12,6 @@ fn main() {
         // READ via *const
         let y = ptr::read_volatile(pc);
 
-        println!("x=0x{:x} y=0x{:x}", x, y);
+        // println!("x=0x{:x} y=0x{:x}", x, y);
     }
 }
