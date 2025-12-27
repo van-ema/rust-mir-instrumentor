@@ -18,6 +18,23 @@ cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p exampl
 You can specify output MIR files with `--mir-out` and provide a runtime path with `--runtime-path`.
 Note: `cargo instrument-mir` only builds the binary; run the produced binary directly (do not use `cargo run`).
 
+## Makefile shortcuts
+
+```bash
+# Build + instrument an example (debug by default)
+make instrument EXAMPLE=hello
+
+# Run the instrumented example
+make run EXAMPLE=hello
+
+# Clean + rebuild + instrument
+make rebuild EXAMPLE=hello
+
+# Release profile
+make instrument EXAMPLE=hello PROFILE=release
+make run EXAMPLE=hello PROFILE=release
+```
+
 ## Stack allocation tracking (filtered vs all)
 
 By default, the instrumentor records stack allocation lifetime events (`StorageLive` / `StorageDead`) **only for "interesting" locals** to reduce noise and overhead. A local is considered interesting when its address is taken (e.g., via `&T` / `&raw`), or when optimized MIR introduces common pointer-related temporaries/casts around it.
@@ -46,4 +63,3 @@ We can force loading extern crate with
 ```
 --extern=force:runtime={runtime_path}/libruntime.rlib
 ```
-
