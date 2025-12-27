@@ -176,6 +176,35 @@ impl MyOptimizationPass {
             .unwrap_or(0)
     }
 
+    /// If `fat_local` is a fat pointer local (e.g. `&[T]`), try to find a thin "base" pointer local
+    /// it was coerced from via `PointerCoercion(Unsize, ...)` in the *same basic block*.
+    ///
+    /// This is a best-effort workaround to propagate tags through patterns like:
+    ///   _3 = move _4 as &[i32] (PointerCoercion(Unsize, Implicit));
+    ///   _2 = core::slice::<impl [i32]>::as_ptr(move _3);
+    fn backtrack_unsize_base_local<'tcx>(
+        &self,
+        fat_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        for stmt in statements.iter().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+            if place.as_local() != Some(fat_local) {
+                continue;
+            }
+
+            if let Rvalue::Cast(CastKind::PointerCoercion(_, _), op, _) = rvalue {
+                if let Some(src_place) = self.place_from_operand(op) {
+                    return Some(src_place.local);
+                }
+            }
+
+            // Stop once we found the most recent definition of `fat_local`, even if it wasn't an unsize cast.
+            return None;
+        }
+        None
+    }
+
     fn scan_body<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> ScanResult<'tcx> {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
@@ -414,23 +443,40 @@ impl MyOptimizationPass {
                         let dst_ty = body.local_decls[dst_local].ty;
                         if self.is_thin_ptr_ty(tcx, dst_ty) {
                             // Best-effort: use the first argument as the "base" pointer.
+                            // If it's a fat pointer local (e.g. `&[T]`), try to backtrack to the
+                            // thin local it was coerced from via `PointerCoercion(Unsize, ...)`
+                            // in the same basic block (common for `arr.as_ptr()` lowering).
+                            let mut src_local_opt: Option<Local> = None;
+
                             if let Some(first) = args.get(0) {
-                                if let Some(src_place) = self.place_from_operand(&first.node) {
-                                    let src_local = src_place.local;
-                                    let src_ty = body.local_decls[src_local].ty;
-                                    if self.is_thin_ptr_ty(tcx, src_ty) {
-                                        ptr_locals_needing_tag.insert(dst_local);
-                                        ptr_locals_needing_tag.insert(src_local);
-                                        insert_points.push(InsertPoint {
-                                            bb,
-                                            // Insert right before the call terminator (end of statements).
-                                            stmt_idx: block_data.statements.len(),
-                                            source_info: term.source_info,
-                                            place: Place::from(dst_local),
-                                            kind: InstrKind::TagProp { dst: dst_local, src: src_local },
-                                        });
+                                if let Some(arg_place) = self.place_from_operand(&first.node) {
+                                    let arg_local = arg_place.local;
+                                    let arg_ty = body.local_decls[arg_local].ty;
+
+                                    if self.is_thin_ptr_ty(tcx, arg_ty) {
+                                        src_local_opt = Some(arg_local);
+                                    } else if let Some(base_local) =
+                                        self.backtrack_unsize_base_local(arg_local, &block_data.statements)
+                                    {
+                                        let base_ty = body.local_decls[base_local].ty;
+                                        if self.is_thin_ptr_ty(tcx, base_ty) {
+                                            src_local_opt = Some(base_local);
+                                        }
                                     }
                                 }
+                            }
+
+                            if let Some(src_local) = src_local_opt {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                ptr_locals_needing_tag.insert(src_local);
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    // Insert right before the call terminator (end of statements).
+                                    stmt_idx: block_data.statements.len(),
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                });
                             }
                         }
                     }
