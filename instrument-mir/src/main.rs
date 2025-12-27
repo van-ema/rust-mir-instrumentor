@@ -438,6 +438,54 @@ impl MyOptimizationPass {
         tag_local_for_ptr_local
     }
 
+    fn init_tag_locals_to_zero<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+    ) {
+        // Initialize tag locals at function entry so we never read uninitialized tag values
+        // (which would show up as `unknown tag=<garbage>` in the runtime).
+        //
+        // This does NOT solve inter-procedural tag passing/retagging yet; it just ensures the
+        // default is `0` ("untagged") rather than uninitialized memory.
+        let entry_bb = START_BLOCK;
+        let source_info = SourceInfo {
+            span: rustc_span::DUMMY_SP,
+            scope: OUTERMOST_SOURCE_SCOPE,
+        };
+
+        let mut init_stmts: Vec<Statement<'tcx>> = Vec::new();
+        for (_ptr_local, tag_local) in tag_local_for_ptr_local.iter() {
+            // Ensure the tag local is live, then initialize it to 0 ("untagged").
+            init_stmts.push(Statement::new(source_info, StatementKind::StorageLive(*tag_local)));
+
+            let zero: Operand<'tcx> = self.const_u64(tcx, source_info.span, 0);
+            init_stmts.push(Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(*tag_local),
+                    Rvalue::Use(zero),
+                ))),
+            ));
+        }
+
+        // Insert right after the initial StorageLive prologue in the entry block.
+        // This avoids reordering rustc's own prologue statements and ensures our locals
+        // are considered live before we assign to them.
+        let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[entry_bb];
+
+        let mut insert_at = 0usize;
+        while insert_at < bd.statements.len() {
+            match bd.statements[insert_at].kind {
+                StatementKind::StorageLive(_) => insert_at += 1,
+                _ => break,
+            }
+        }
+
+        bd.statements.splice(insert_at..insert_at, init_stmts);
+    }
+
     fn func_operand_for<'tcx>(&self, tcx: TyCtxt<'tcx>, hooks: Hooks, kind: &InstrKind<'tcx>, sp: Span) -> Operand<'tcx> {
         let def_id = match kind {
             InstrKind::Ref { .. } => hooks.def_id_ref,
@@ -875,8 +923,21 @@ impl MyOptimizationPass {
         };
 
         let scan = self.scan_body(tcx, body);
-        let tag_local_for_ptr_local = self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag);
-        self.insert_instrumentation(tcx, body, scan.insert_points, &tag_local_for_ptr_local, hooks);
+        let tag_local_for_ptr_local =
+            self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag);
+
+        self.insert_instrumentation(
+            tcx,
+            body,
+            scan.insert_points,
+            &tag_local_for_ptr_local,
+            hooks,
+        );
+
+        // Avoid reading uninitialized tag locals in callees: default them to 0 ("untagged").
+        // IMPORTANT: do this AFTER insert_instrumentation so we don't invalidate `stmt_idx`
+        // computed by scan_body for START_BLOCK (bb0).
+        self.init_tag_locals_to_zero(tcx, body, &tag_local_for_ptr_local);
     }
 }
 
