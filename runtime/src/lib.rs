@@ -52,6 +52,7 @@ pub struct TagMeta {
 
 static ALLOCS: OnceLock<Mutex<HashMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
+static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<HashMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -59,6 +60,10 @@ fn allocs() -> &'static Mutex<HashMap<usize, AllocMeta>> {
 
 fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
     TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
+    CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Record (or update) allocation metadata. The key is the base address.
@@ -202,6 +207,25 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         size,
         tmeta.kind
     );
+}
+
+/// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
+#[no_mangle]
+pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
+    call_arg_tags()
+        .lock()
+        .unwrap()
+        .insert((callee_id, arg_index, addr), tag);
+}
+
+/// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
+#[no_mangle]
+pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
+    call_arg_tags()
+        .lock()
+        .unwrap()
+        .remove(&(callee_id, arg_index, addr))
+        .unwrap_or(0)
 }
 
 #[macro_export]

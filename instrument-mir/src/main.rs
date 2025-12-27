@@ -27,7 +27,7 @@ use rustc_session::config::ErrorOutputType;
 use rustc_session::EarlyDiagCtxt;
 use rustc_span::{source_map::Spanned, Span};
 
-use rustc_hir::Safety;
+use rustc_hir::{Mutability, Safety};
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::pretty::write_mir_fn;
 use rustc_middle::ty::TyKind;
@@ -78,6 +78,10 @@ enum InstrKind<'tcx> {
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
     TagProp { dst: Local, src: Local },
+    /// Caller-side tag push for pointer arguments to a direct call.
+    CallArgPush { callee_id: u64, arg_index: u64, ptr_local: Local },
+    /// Callee-side retagging of pointer arguments from the runtime side-channel.
+    ArgRetag { callee_id: u64, arg_index: u64, ptr_local: Local },
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +107,17 @@ struct Hooks {
     def_id_write: DefId,
     def_id_read: DefId,
     def_id_use: DefId,
+    def_id_push_call_arg_tag: DefId,
+    def_id_take_call_arg_tag: DefId,
 }
 
 impl MyOptimizationPass {
     fn is_ptr_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+    }
+
+    fn callee_id_u64(&self, def_id: DefId) -> u64 {
+        ((def_id.krate.as_u32() as u64) << 32) | (def_id.index.as_u32() as u64)
     }
 
     fn place_from_operand<'tcx>(&self, op: &Operand<'tcx>) -> Option<Place<'tcx>> {
@@ -215,6 +225,41 @@ impl MyOptimizationPass {
         let track_all_stack_allocs = std::env::var("RZ_STACK_ALLOCS")
             .map(|v| v == "all" || v == "ALL" || v == "1" || v == "true" || v == "TRUE")
             .unwrap_or(false);
+
+        let entry_bb = START_BLOCK;
+        let entry_bd = &body.basic_blocks[entry_bb];
+        let mut entry_insert_at = 0usize;
+        while entry_insert_at < entry_bd.statements.len() {
+            match entry_bd.statements[entry_insert_at].kind {
+                StatementKind::StorageLive(_) => entry_insert_at += 1,
+                _ => break,
+            }
+        }
+
+        let entry_source_info = SourceInfo {
+            span: rustc_span::DUMMY_SP,
+            scope: OUTERMOST_SOURCE_SCOPE,
+        };
+        let callee_id = self.callee_id_u64(body.source.def_id());
+        
+        for (arg_index, arg_local) in body.args_iter().enumerate() {
+            let arg_ty = body.local_decls[arg_local].ty;
+            if self.is_ptr_ty(arg_ty) {
+                // Callee-side retagging: use the caller-pushed tag as parent at entry.
+                ptr_locals_needing_tag.insert(arg_local);
+                insert_points.push(InsertPoint {
+                    bb: entry_bb,
+                    stmt_idx: entry_insert_at,
+                    source_info: entry_source_info,
+                    place: Place::from(arg_local),
+                    kind: InstrKind::ArgRetag {
+                        callee_id,
+                        arg_index: arg_index as u64,
+                        ptr_local: arg_local,
+                    },
+                });
+            }
+        }
 
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
@@ -339,11 +384,13 @@ impl MyOptimizationPass {
                 if let TerminatorKind::Call { func, args, .. } = &term.kind {
                     let mut is_volatile_store = false;
                     let mut is_volatile_load = false;
+                    let mut callee_id_opt: Option<u64> = None;
 
                     if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
                         let path = tcx.def_path_str(*callee_def_id);
                         is_volatile_store = path.contains("intrinsics::volatile_store");
                         is_volatile_load = path.contains("intrinsics::volatile_load");
+                        callee_id_opt = Some(self.callee_id_u64(*callee_def_id));
                     }
 
                     let mut classified_write_ptr_local: Option<Local> = None;
@@ -389,10 +436,25 @@ impl MyOptimizationPass {
                         }
                     }
 
-                    for a in args.iter() {
+                    for (arg_index, a) in args.iter().enumerate() {
                         if let Some(p) = self.place_from_operand(&a.node) {
                             let ty = body.local_decls[p.local].ty;
                             if self.is_ptr_ty(ty) {
+                                if let Some(callee_id) = callee_id_opt {
+                                    // Caller-side push: this tag is the parent for callee ArgRetag.
+                                    ptr_locals_needing_tag.insert(p.local);
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx: block_data.statements.len(),
+                                        source_info: term.source_info,
+                                        place: Place::from(p.local),
+                                        kind: InstrKind::CallArgPush {
+                                            callee_id,
+                                            arg_index: arg_index as u64,
+                                            ptr_local: p.local,
+                                        },
+                                    });
+                                }
                                 if classified_write_ptr_local == Some(p.local)
                                     || classified_read_ptr_local == Some(p.local)
                                 {
@@ -443,12 +505,13 @@ impl MyOptimizationPass {
         tcx: TyCtxt<'tcx>,
         body: &mut Body<'tcx>,
         tag_local_for_ptr_local: &HashMap<Local, Local>,
+        skip_ptr_locals: &HashSet<Local>,
     ) {
         // Initialize tag locals at function entry so we never read uninitialized tag values
         // (which would show up as `unknown tag=<garbage>` in the runtime).
         //
-        // This does NOT solve inter-procedural tag passing/retagging yet; it just ensures the
-        // default is `0` ("untagged") rather than uninitialized memory.
+        // This does NOT solve inter-procedural tag passing/retagging by itself; it just ensures
+        // the default is `0` ("untagged") rather than uninitialized memory.
         let entry_bb = START_BLOCK;
         let source_info = SourceInfo {
             span: rustc_span::DUMMY_SP,
@@ -456,7 +519,15 @@ impl MyOptimizationPass {
         };
 
         let mut init_stmts: Vec<Statement<'tcx>> = Vec::new();
-        for (_ptr_local, tag_local) in tag_local_for_ptr_local.iter() {
+        for (ptr_local, tag_local) in tag_local_for_ptr_local.iter() {
+            // Argument tags are set by ArgRetag at entry; avoid overwriting them with zero.
+            if skip_ptr_locals.contains(ptr_local) {
+                init_stmts.push(Statement::new(
+                    source_info,
+                    StatementKind::StorageLive(*tag_local),
+                ));
+                continue;
+            }
             // Ensure the tag local is live, then initialize it to 0 ("untagged").
             init_stmts.push(Statement::new(source_info, StatementKind::StorageLive(*tag_local)));
 
@@ -495,6 +566,8 @@ impl MyOptimizationPass {
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
             InstrKind::TagProp { .. } => hooks.def_id_use, // unreachable in practice
+            InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
+            InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
         };
         Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
     }
@@ -545,6 +618,146 @@ impl MyOptimizationPass {
                     stmt_idx + 1
                 };
                 bd.statements.insert(insert_at, prop_stmt);
+                continue;
+            }
+
+            if let InstrKind::ArgRetag {
+                callee_id,
+                arg_index,
+                ptr_local,
+            } = creation_kind
+            {
+                let tag_local = *tag_local_for_ptr_local
+                    .get(&ptr_local)
+                    .expect("missing tag local for ArgRetag");
+
+                // Take the caller-pushed tag first, then create a fresh tag for this argument.
+                let (record_def_id, is_mut_u8) = match body.local_decls[ptr_local].ty.kind() {
+                    TyKind::Ref(_, _ty, mutbl) => {
+                        let is_mut = matches!(mutbl, Mutability::Mut);
+                        (hooks.def_id_ref, if is_mut { 1 } else { 0 })
+                    }
+                    TyKind::RawPtr(_ty, mutbl) => {
+                        let is_mut = matches!(mutbl, Mutability::Mut);
+                        (hooks.def_id_raw, if is_mut { 1 } else { 0 })
+                    }
+                    _ => panic!("ArgRetag on non-pointer local"),
+                };
+
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let parent_tag_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+                let addr_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(addr_local),
+                        Rvalue::Cast(
+                            CastKind::PointerExposeProvenance,
+                            Operand::Copy(Place::from(ptr_local)),
+                            tcx.types.usize,
+                        ),
+                    ))),
+                );
+
+                let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
+                let arg_index = self.const_u64(tcx, source_info.span, arg_index);
+                let arg_addr = Operand::Copy(Place::from(addr_local));
+
+                let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned { node: arg_callee, span: source_info.span },
+                    Spanned { node: arg_index, span: source_info.span },
+                    Spanned { node: arg_addr, span: source_info.span },
+                ]
+                .into_boxed_slice();
+
+                let args_record: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned { node: Operand::Copy(Place::from(addr_local)), span: source_info.span },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, is_mut_u8),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(parent_tag_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = {
+                    let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    body.basic_blocks_mut().push(cont_data)
+                };
+
+                let record_func = Operand::function_handle(
+                    tcx,
+                    record_def_id,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let record_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: record_func,
+                        args: args_record,
+                        destination: Place::from(tag_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                let retag_block = {
+                    let retag_data = BasicBlockData::new(Some(record_term), is_cleanup);
+                    body.basic_blocks_mut().push(retag_data)
+                };
+
+                let take_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_take_call_arg_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: take_func,
+                        args: args_take,
+                        destination: Place::from(parent_tag_local),
+                        target: Some(retag_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(addr_stmt);
+                    bd.terminator = Some(take_term);
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
                 continue;
             }
 
@@ -688,6 +901,35 @@ impl MyOptimizationPass {
                         Spanned { node: tag_op, span: source_info.span },
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_size0, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::CallArgPush {
+                    callee_id,
+                    arg_index,
+                    ptr_local,
+                } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
+                    let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
+                    let arg_index = self.const_u64(tcx, source_info.span, arg_index);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_callee, span: source_info.span },
+                        Spanned { node: arg_index, span: source_info.span },
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: tag_op, span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -912,6 +1154,12 @@ impl MyOptimizationPass {
         let def_id_use = self
             .find_def_id_by_name(tcx, "__rz_ptr_use")
             .expect("missing '__rz_ptr_use' definition");
+        let def_id_push_call_arg_tag = self
+            .find_def_id_by_name(tcx, "__rz_push_call_arg_tag")
+            .expect("missing '__rz_push_call_arg_tag' definition");
+        let def_id_take_call_arg_tag = self
+            .find_def_id_by_name(tcx, "__rz_take_call_arg_tag")
+            .expect("missing '__rz_take_call_arg_tag' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -920,6 +1168,8 @@ impl MyOptimizationPass {
             def_id_write,
             def_id_read,
             def_id_use,
+            def_id_push_call_arg_tag,
+            def_id_take_call_arg_tag,
         };
 
         let scan = self.scan_body(tcx, body);
@@ -937,7 +1187,15 @@ impl MyOptimizationPass {
         // Avoid reading uninitialized tag locals in callees: default them to 0 ("untagged").
         // IMPORTANT: do this AFTER insert_instrumentation so we don't invalidate `stmt_idx`
         // computed by scan_body for START_BLOCK (bb0).
-        self.init_tag_locals_to_zero(tcx, body, &tag_local_for_ptr_local);
+        let mut arg_ptr_locals: HashSet<Local> = HashSet::new();
+        for arg_local in body.args_iter() {
+            let arg_ty = body.local_decls[arg_local].ty;
+            if self.is_ptr_ty(arg_ty) {
+                arg_ptr_locals.insert(arg_local);
+            }
+        }
+
+        self.init_tag_locals_to_zero(tcx, body, &tag_local_for_ptr_local, &arg_ptr_locals);
     }
 }
 
