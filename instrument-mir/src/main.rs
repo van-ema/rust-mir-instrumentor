@@ -381,7 +381,7 @@ impl MyOptimizationPass {
 
             // Calls: classify volatile_{store,load} and coarse PtrUse for pointer args.
             if let Some(term) = &block_data.terminator {
-                if let TerminatorKind::Call { func, args, .. } = &term.kind {
+                if let TerminatorKind::Call { func, args, destination, .. } = &term.kind {
                     let mut is_volatile_store = false;
                     let mut is_volatile_load = false;
                     let mut callee_id_opt: Option<u64> = None;
@@ -391,6 +391,37 @@ impl MyOptimizationPass {
                         is_volatile_store = path.contains("intrinsics::volatile_store");
                         is_volatile_load = path.contains("intrinsics::volatile_load");
                         callee_id_opt = Some(self.callee_id_u64(*callee_def_id));
+                    }
+
+                    // Tag propagation through pointer-returning calls.
+                    //
+                    // Optimized MIR often lowers pointer arithmetic like `p.offset(k)` /
+                    // `p.wrapping_offset(k)` into a call terminator that returns a new pointer local.
+                    // Without propagation here, that returned pointer local keeps the default tag=0
+                    // and later appears as "untagged" when used or passed across a call boundary.
+                    if let Some(dst_local) = destination.as_local() {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        if self.is_ptr_ty(dst_ty) {
+                            // Best-effort: use the first argument as the "base" pointer.
+                            if let Some(first) = args.get(0) {
+                                if let Some(src_place) = self.place_from_operand(&first.node) {
+                                    let src_local = src_place.local;
+                                    let src_ty = body.local_decls[src_local].ty;
+                                    if self.is_ptr_ty(src_ty) {
+                                        ptr_locals_needing_tag.insert(dst_local);
+                                        ptr_locals_needing_tag.insert(src_local);
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            // Insert right before the call terminator (end of statements).
+                                            stmt_idx: block_data.statements.len(),
+                                            source_info: term.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     let mut classified_write_ptr_local: Option<Local> = None;
