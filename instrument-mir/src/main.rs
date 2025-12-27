@@ -444,14 +444,22 @@ impl MyOptimizationPass {
         let mut callee_id_opt: Option<u64> = None;
 
         if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
-            let path = tcx.def_path_str(*callee_def_id);
-            is_volatile_store = path.contains("intrinsics::volatile_store")
-                || path.contains("core::ptr::write_volatile")
-                || path.contains("std::ptr::write_volatile");
-            is_volatile_load = path.contains("intrinsics::volatile_load")
-                || path.contains("core::ptr::read_volatile")
-                || path.contains("std::ptr::read_volatile");
             callee_id_opt = Some(self.callee_id_u64(*callee_def_id));
+
+            // Option B: classify only true Rust intrinsics (no wrapper/libc lists).
+            // Depending on toolchain/optimization, MIR may refer to intrinsics via
+            // `core::intrinsics::*` or `std::intrinsics::*`.
+            let path = tcx.def_path_str(*callee_def_id);
+            if path.starts_with("core::intrinsics::") || path.starts_with("std::intrinsics::") {
+                // Prefer the intrinsic item name rather than the full path.
+                // `item_name` returns a `Symbol`; avoid borrowing `&str` from a temporary.
+                let name_sym: rustc_span::symbol::Symbol = tcx.item_name(*callee_def_id);
+                match name_sym.as_str() {
+                    "volatile_store" => is_volatile_store = true,
+                    "volatile_load" => is_volatile_load = true,
+                    _ => {}
+                }
+            }
         }
         (is_volatile_store, is_volatile_load, callee_id_opt)
     }

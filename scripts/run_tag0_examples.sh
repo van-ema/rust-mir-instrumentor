@@ -54,6 +54,38 @@ else
   "${CARGO}" build -p runtime
 fi
 
+panic_re='internal compiler error|thread .* panicked|panicked at'
+failures=()
+
+run_checked() {
+  local label="$1"
+  shift
+  local log_file
+  log_file="$(mktemp -t run_tag0_examples.XXXXXX)"
+
+  set +e
+  "$@" 2>&1 | tee "${log_file}"
+  local status="${PIPESTATUS[0]}"
+  set -e
+
+  local bad=0
+  if (( status != 0 )); then
+    bad=1
+  fi
+  if grep -E -q "${panic_re}" "${log_file}"; then
+    bad=1
+  fi
+
+  if (( bad != 0 )); then
+    echo "==> ${label} failed (exit ${status})" >&2
+    rm -f "${log_file}"
+    return 1
+  fi
+
+  rm -f "${log_file}"
+  return 0
+}
+
 shopt -s nullglob
 tag0_manifests=(examples/tag0_*/Cargo.toml)
 
@@ -83,7 +115,20 @@ for manifest in "${tag0_manifests[@]}"; do
   if (( $# )); then
     instr_cmd+=("$@")
   fi
-  "${instr_cmd[@]}"
+  if ! run_checked "instrument ${pkg_name}" "${instr_cmd[@]}"; then
+    failures+=("${pkg_name}:instrument")
+    continue
+  fi
   echo "==> running ${pkg_name}"
-  "./${bin_dir}/${pkg_name}"
+  if ! run_checked "run ${pkg_name}" "./${bin_dir}/${pkg_name}"; then
+    failures+=("${pkg_name}:run")
+  fi
 done
+
+if (( ${#failures[@]} )); then
+  printf '%s\n' "Failures:" >&2
+  for failure in "${failures[@]}"; do
+    printf ' - %s\n' "${failure}" >&2
+  done
+  exit 1
+fi
