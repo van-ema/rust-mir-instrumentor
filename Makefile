@@ -30,7 +30,7 @@ tools:
 	$(CARGO) install --path instrument-mir --bin cargo-instrument-mir
 
 instrument: clean-mir clean tools runtime
-	$(CARGO) instrument-mir --runtime-path=$(RUNTIME_PATH) --mir-out=$(MIR_OUT) -p examples --bin $(EXAMPLE) $(PROFILE_FLAG) $(EXTRA_ARGS)
+	$(CARGO) instrument-mir --runtime-path=$(RUNTIME_PATH) --mir-out=$(MIR_OUT) -p $(EXAMPLE) $(PROFILE_FLAG) $(EXTRA_ARGS)
 
 run:
 	$(BIN_PATH)

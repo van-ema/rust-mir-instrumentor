@@ -11,7 +11,7 @@ cargo install --path instrument-mir --bin cargo-instrument-mir
 
 ```bash
 cargo build -p runtime --release
-cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p examples --bin hello --release
+cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p hello --bin hello --release
 ./target/release/hello
 ```
 

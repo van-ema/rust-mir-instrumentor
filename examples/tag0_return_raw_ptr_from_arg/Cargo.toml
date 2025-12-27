@@ -1,0 +1,6 @@
+[package]
+name = "tag0_return_raw_ptr_from_arg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

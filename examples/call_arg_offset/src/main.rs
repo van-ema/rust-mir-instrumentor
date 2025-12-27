@@ -1,4 +1,4 @@
-unsafe fn callee(p: *const i32) { std::ptr::read_volatile(p); }
+unsafe fn callee(p: *const i32) { unsafe { std::ptr::read_volatile(p); } }
 
 fn main() {
     let x = 1;

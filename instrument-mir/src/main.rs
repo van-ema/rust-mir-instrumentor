@@ -112,8 +112,19 @@ struct Hooks {
 }
 
 impl MyOptimizationPass {
-    fn is_ptr_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
-        matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+    /// Return true only for *thin* pointers (single-word), i.e. `&T` / `*const T` / `*mut T`
+    /// where the pointer value is a single scalar. Fat pointers like `&[T]`, `&str`, and trait
+    /// objects carry metadata and lower to a ScalarPair; casting them with
+    /// `PointerExposeProvenance` currently triggers an ICE in codegen.
+    fn is_thin_ptr_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Ref(..) | TyKind::RawPtr(..) => {
+                let ptr_bytes = tcx.data_layout.pointer_size().bytes() as usize;
+                // Use layout size of the pointer type itself: thin ptr == pointer size; fat ptr == 2*ptr size (on 64-bit).
+                self.layout_size_bytes(tcx, ty) == ptr_bytes
+            }
+            _ => false,
+        }
     }
 
     fn callee_id_u64(&self, def_id: DefId) -> u64 {
@@ -244,7 +255,7 @@ impl MyOptimizationPass {
         
         for (arg_index, arg_local) in body.args_iter().enumerate() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_ptr_ty(arg_ty) {
+            if self.is_thin_ptr_ty(tcx, arg_ty) {
                 // Callee-side retagging: use the caller-pushed tag as parent at entry.
                 ptr_locals_needing_tag.insert(arg_local);
                 insert_points.push(InsertPoint {
@@ -308,7 +319,7 @@ impl MyOptimizationPass {
                 if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
                     if let Some(dst_local) = dst_place.as_local() {
                         let dst_ty = body.local_decls[dst_local].ty;
-                        if self.is_ptr_ty(dst_ty) {
+                        if self.is_thin_ptr_ty(tcx, dst_ty) {
                             let src_local_opt: Option<Local> = match rvalue {
                                 // Plain copy/move of a pointer local.
                                 Rvalue::Use(op) => self
@@ -332,7 +343,7 @@ impl MyOptimizationPass {
 
                             if let Some(src_local) = src_local_opt {
                                 let src_ty = body.local_decls[src_local].ty;
-                                if self.is_ptr_ty(src_ty) {
+                                if self.is_thin_ptr_ty(tcx, src_ty) {
                                     ptr_locals_needing_tag.insert(dst_local);
                                     ptr_locals_needing_tag.insert(src_local);
 
@@ -401,13 +412,13 @@ impl MyOptimizationPass {
                     // and later appears as "untagged" when used or passed across a call boundary.
                     if let Some(dst_local) = destination.as_local() {
                         let dst_ty = body.local_decls[dst_local].ty;
-                        if self.is_ptr_ty(dst_ty) {
+                        if self.is_thin_ptr_ty(tcx, dst_ty) {
                             // Best-effort: use the first argument as the "base" pointer.
                             if let Some(first) = args.get(0) {
                                 if let Some(src_place) = self.place_from_operand(&first.node) {
                                     let src_local = src_place.local;
                                     let src_ty = body.local_decls[src_local].ty;
-                                    if self.is_ptr_ty(src_ty) {
+                                    if self.is_thin_ptr_ty(tcx, src_ty) {
                                         ptr_locals_needing_tag.insert(dst_local);
                                         ptr_locals_needing_tag.insert(src_local);
                                         insert_points.push(InsertPoint {
@@ -470,7 +481,7 @@ impl MyOptimizationPass {
                     for (arg_index, a) in args.iter().enumerate() {
                         if let Some(p) = self.place_from_operand(&a.node) {
                             let ty = body.local_decls[p.local].ty;
-                            if self.is_ptr_ty(ty) {
+                            if self.is_thin_ptr_ty(tcx, ty) {
                                 if let Some(callee_id) = callee_id_opt {
                                     // Caller-side push: this tag is the parent for callee ArgRetag.
                                     ptr_locals_needing_tag.insert(p.local);
@@ -1196,7 +1207,7 @@ impl MyOptimizationPass {
         let mut arg_ptr_locals: HashSet<Local> = HashSet::new();
         for arg_local in body.args_iter() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_ptr_ty(arg_ty) {
+            if self.is_thin_ptr_ty(tcx, arg_ty) {
                 arg_ptr_locals.insert(arg_local);
             }
         }

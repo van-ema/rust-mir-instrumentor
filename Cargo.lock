@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "call_arg_offset"
+version = "0.1.0"
+
+[[package]]
+name = "call_arg_wrap_offset"
+version = "0.1.0"
+
+[[package]]
+name = "cast_call_arg"
+version = "0.1.0"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16,11 +28,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "examples"
+name = "hello"
 version = "0.1.0"
 dependencies = [
  "lib_hello",
 ]
+
+[[package]]
+name = "hello_lib"
+version = "0.1.0"
 
 [[package]]
 name = "instrument-mir"
@@ -44,7 +60,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "mutable_ref_test"
+version = "0.1.0"
+
+[[package]]
+name = "ptr_arg_use"
+version = "0.1.0"
+
+[[package]]
+name = "raw_pointer_mut_test"
+version = "0.1.0"
+
+[[package]]
+name = "raw_pointer_test"
+version = "0.1.0"
+
+[[package]]
 name = "runtime"
+version = "0.1.0"
+
+[[package]]
+name = "simple_raw_write"
+version = "0.1.0"
+
+[[package]]
+name = "stack_reuse"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_call_arg_offset_add_sub"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_call_arg_wrapping_offset"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_cast_then_call"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_copy_chain_then_call"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_return_raw_ptr_from_arg"
+version = "0.1.0"
+
+[[package]]
+name = "tag0_return_ref_created_in_callee"
+version = "0.1.0"
+
+[[package]]
+name = "volatile_ro_rw"
 version = "0.1.0"
 
 [[package]]
