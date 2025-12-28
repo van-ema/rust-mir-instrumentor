@@ -72,13 +72,18 @@ fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
 }
 
 #[inline(never)]
-fn rz_violation(kind: &str, msg: String) -> ! {
-    // Keep the report on stderr so it is visible even if stdout is buffered.
+fn rz_violation(kind: &str, msg: String) {
+    // Always print the report
     eprintln!(
         "\n================ RUSTEZE VIOLATION ================\n{kind}\n{msg}\n===================================================\n"
     );
-    // Enable backtraces with `RUST_BACKTRACE=1`.
-    panic!("rusteze violation: {kind}");
+
+    // Fail-fast only if requested
+    let failfast = std::env::var("RUSTEZE_FAILFAST").ok().map_or(false, |v| v != "0");
+    if failfast {
+        // Enable backtraces with `RUST_BACKTRACE=1`
+        panic!("rusteze violation: {kind}");
+    }
 }
 
 /// Record (or update) allocation metadata. The key is the base address.
@@ -146,6 +151,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             "UNKNOWN_TAG",
             format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
         );
+        return;
     };
 
     // Best-effort exact-base allocation lookup (will be extended to range lookup).
@@ -163,6 +169,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     tmeta.pointee_addr
                 ),
             );
+            return;
         }
         if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
             rz_violation(
@@ -176,6 +183,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     tmeta.pointee_addr
                 ),
             );
+            return;
         }
     }
 
@@ -201,6 +209,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             "UNKNOWN_TAG",
             format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
         );
+        return;
     };
 
     // Best-effort exact-base allocation lookup (will be extended to range lookup).
@@ -218,6 +227,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     tmeta.pointee_addr
                 ),
             );
+            return;
         }
         if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
             rz_violation(
@@ -231,6 +241,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     tmeta.pointee_addr
                 ),
             );
+            return;
         }
     }
 
