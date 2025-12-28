@@ -53,6 +53,7 @@ pub struct TagMeta {
 static ALLOCS: OnceLock<Mutex<HashMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
+static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<HashMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -64,6 +65,10 @@ fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
+    RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Record (or update) allocation metadata. The key is the base address.
@@ -226,6 +231,18 @@ pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
         .unwrap()
         .remove(&(callee_id, arg_index, addr))
         .unwrap_or(0)
+}
+
+/// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
+#[no_mangle]
+pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
+    ret_tags().lock().unwrap().insert((callee_id, addr), tag);
+}
+
+/// Take (consume) a pushed return-tag for a callee/return-address pair.
+#[no_mangle]
+pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
+    ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0)
 }
 
 #[macro_export]
