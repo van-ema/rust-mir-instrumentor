@@ -1369,10 +1369,16 @@ impl MyOptimizationPass {
                 },
             };
 
+            let insert_before = matches!(
+                creation_kind,
+                InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
+            );
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
 
                 let split_at = if stmt_idx >= bd.statements.len() {
+                    stmt_idx
+                } else if insert_before {
                     stmt_idx
                 } else {
                     stmt_idx + 1
