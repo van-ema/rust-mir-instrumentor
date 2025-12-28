@@ -35,6 +35,28 @@ make instrument EXAMPLE=hello PROFILE=release
 make run EXAMPLE=hello PROFILE=release
 ```
 
+## Env
+### Runtime
+
+- **`RUSTEZE_FAILFAST`**: control violation handling
+  - unset / `0` → log and continue (default)
+  - non-zero → panic (recommended for fuzzing)
+
+  ```bash
+  RUSTEZE_FAILFAST=1 RUST_BACKTRACE=1 ./target/debug/my_binary
+  ```
+
+### Instrumentation
+
+- **`RZ_STACK_ALLOCS`**: stack allocation tracking scope
+  - unset → only "interesting" locals (default)
+  - `all`, `1`, `true` → all locals
+
+  ```bash
+  RZ_STACK_ALLOCS=all cargo instrument-mir ...
+  ```
+
+
 ## Stack allocation tracking (filtered vs all)
 
 By default, the instrumentor records stack allocation lifetime events (`StorageLive` / `StorageDead`) **only for "interesting" locals** to reduce noise and overhead. A local is considered interesting when its address is taken (e.g., via `&T` / `&raw`), or when optimized MIR introduces common pointer-related temporaries/casts around it.
