@@ -71,6 +71,16 @@ fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[inline(never)]
+fn rz_violation(kind: &str, msg: String) -> ! {
+    // Keep the report on stderr so it is visible even if stdout is buffered.
+    eprintln!(
+        "\n================ RUSTEZE VIOLATION ================\n{kind}\n{msg}\n===================================================\n"
+    );
+    // Enable backtraces with `RUST_BACKTRACE=1`.
+    panic!("rusteze violation: {kind}");
+}
+
 /// Record (or update) allocation metadata. The key is the base address.
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
@@ -132,34 +142,40 @@ pub extern "C" fn __rz_dump_state() {
 pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
-        println!("[rusteze-runtime] WRITE: unknown tag={} addr=0x{:x} size={}", tag, addr, size);
-        return;
+        rz_violation(
+            "UNKNOWN_TAG",
+            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+        );
     };
 
     // Best-effort exact-base allocation lookup (will be extended to range lookup).
     let amap = allocs().lock().unwrap();
     if let Some(ameta) = amap.get(&addr) {
         if !ameta.live {
-            println!(
-                "[rusteze-runtime] WRITE: use-after-dead tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
-                tag,
-                addr,
-                ameta.epoch,
-                tmeta.alloc_epoch,
-                tmeta.kind
+            rz_violation(
+                "USE_AFTER_DEAD",
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.epoch,
+                    tmeta.alloc_epoch,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
             );
-            return;
         }
         if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-            println!(
-                "[rusteze-runtime] WRITE: stale-pointer epoch mismatch tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
-                tag,
-                addr,
-                ameta.epoch,
-                tmeta.alloc_epoch,
-                tmeta.kind
+            rz_violation(
+                "STALE_POINTER_EPOCH_MISMATCH",
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.epoch,
+                    tmeta.alloc_epoch,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
             );
-            return;
         }
     }
 
@@ -181,34 +197,40 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
-        println!("[rusteze-runtime] READ: unknown tag={} addr=0x{:x} size={}", tag, addr, size);
-        return;
+        rz_violation(
+            "UNKNOWN_TAG",
+            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+        );
     };
 
     // Best-effort exact-base allocation lookup (will be extended to range lookup).
     let amap = allocs().lock().unwrap();
     if let Some(ameta) = amap.get(&addr) {
         if !ameta.live {
-            println!(
-                "[rusteze-runtime] READ: use-after-dead tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
-                tag,
-                addr,
-                ameta.epoch,
-                tmeta.alloc_epoch,
-                tmeta.kind
+            rz_violation(
+                "USE_AFTER_DEAD",
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.epoch,
+                    tmeta.alloc_epoch,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
             );
-            return;
         }
         if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-            println!(
-                "[rusteze-runtime] READ: stale-pointer epoch mismatch tag={} addr=0x{:x} alloc_epoch={} tag_epoch={} kind={:?}",
-                tag,
-                addr,
-                ameta.epoch,
-                tmeta.alloc_epoch,
-                tmeta.kind
+            rz_violation(
+                "STALE_POINTER_EPOCH_MISMATCH",
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.epoch,
+                    tmeta.alloc_epoch,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
             );
-            return;
         }
     }
 
