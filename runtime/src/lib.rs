@@ -85,19 +85,26 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     let new_live = live != 0;
 
     // We treat `epoch` as an allocation-instance counter for a given base address.
-    // When an allocation dies (e.g., StorageDead / dealloc), we bump the epoch so that
-    // any previously-created pointers that captured the old epoch become stale.
-    //
-    // Rationale: stack slots (and freed heap addresses) may be reused later at the same
-    // numeric address; the epoch lets us disambiguate "same address, different instance".
+    // We must bump it not only on death, but also on reuse (dead -> live), otherwise
+    // a later allocation at the same numeric address could "revive" stale pointers.
+
+    // Death transition: live -> dead
     if !new_live && entry.live {
         entry.epoch = entry.epoch.wrapping_add(1);
+    }
+
+    // Reuse/birth transition: dead -> live at an address we've seen before.
+    // If we already had a nonzero epoch, bump it so this is a fresh instance.
+    if new_live && !entry.live {
+        if entry.epoch != 0 {
+            entry.epoch = entry.epoch.wrapping_add(1);
+        }
     }
 
     // Mark new liveness state.
     entry.live = new_live;
 
-    // If this is the first time we see this allocation and it's live, initialize epoch to 1.
+    // First observation: if epoch is still 0 and it's live, initialize epoch to 1.
     if entry.epoch == 0 && entry.live {
         entry.epoch = 1;
     }
@@ -259,14 +266,25 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
 
-    // Best-effort: if we have an allocation record at exactly this base address, capture its epoch.
-    // (A richer allocator model can later map interior pointers to base allocations.)
-    let alloc_epoch = allocs()
-        .lock()
-        .unwrap()
-        .get(&pointee_addr)
-        .map(|m| m.epoch)
-        .unwrap_or(0);
+    // IMPORTANT: On retagging/reborrows (parent_tag != 0), we must NOT refresh alloc_epoch by
+    // consulting the current allocation map, because the same numeric address can be reused by
+    // a different stack frame. Derived tags should inherit the snapshot from their parent tag.
+    let alloc_epoch = if parent_tag != 0 {
+        tags()
+            .lock()
+            .unwrap()
+            .get(&parent_tag)
+            .map(|p| p.alloc_epoch)
+            .unwrap_or(0)
+    } else {
+        // Root creation: best-effort snapshot from current allocation state.
+        allocs()
+            .lock()
+            .unwrap()
+            .get(&pointee_addr)
+            .map(|m| m.epoch)
+            .unwrap_or(0)
+    };
 
     tags().lock().unwrap().insert(
         tag,
@@ -296,12 +314,24 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
 
-    let alloc_epoch = allocs()
-        .lock()
-        .unwrap()
-        .get(&pointee_addr)
-        .map(|m| m.epoch)
-        .unwrap_or(0);
+    // IMPORTANT: On retagging/derived pointers (derived_from != 0), do NOT refresh alloc_epoch
+    // from the current allocation map. Inherit it from the parent tag to keep the original
+    // allocation-instance snapshot and make stack-slot reuse detectable as stale pointers.
+    let alloc_epoch = if derived_from != 0 {
+        tags()
+            .lock()
+            .unwrap()
+            .get(&derived_from)
+            .map(|p| p.alloc_epoch)
+            .unwrap_or(0)
+    } else {
+        allocs()
+            .lock()
+            .unwrap()
+            .get(&pointee_addr)
+            .map(|m| m.epoch)
+            .unwrap_or(0)
+    };
 
     tags().lock().unwrap().insert(
         tag,

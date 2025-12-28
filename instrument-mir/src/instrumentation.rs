@@ -43,6 +43,7 @@ enum InstrKind<'tcx> {
 struct InsertPoint<'tcx> {
     bb: BasicBlock,
     stmt_idx: usize,
+    insert_before: bool,
     source_info: SourceInfo,
     place: Place<'tcx>,
     kind: InstrKind<'tcx>,
@@ -255,6 +256,7 @@ impl MyOptimizationPass {
                 insert_points.push(InsertPoint {
                     bb: entry_bb,
                     stmt_idx: entry_stmt_idx,
+                    insert_before: false,
                     source_info: entry_source_info,
                     place: Place::from(arg_local),
                     kind: InstrKind::ArgRetag {
@@ -293,6 +295,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx,
+                        insert_before: false,
                         source_info: stmt.source_info,
                         place: Place::from(local),
                         kind: InstrKind::StackAlloc { local, live, size },
@@ -328,6 +331,7 @@ impl MyOptimizationPass {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx,
+                            insert_before: false,
                             source_info: stmt.source_info,
                             place: Place::from(ptr_local),
                             kind: InstrKind::PtrRead { ptr_local, size },
@@ -349,6 +353,7 @@ impl MyOptimizationPass {
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx,
+                    insert_before: false,
                     source_info: stmt.source_info,
                     place: Place::from(ptr_local),
                     kind: InstrKind::PtrWrite { ptr_local, size: 0 },
@@ -385,6 +390,7 @@ impl MyOptimizationPass {
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx,
+                                insert_before: false,
                                 source_info: stmt.source_info,
                                 place: Place::from(dst_local),
                                 kind: InstrKind::TagProp { dst: dst_local, src: src_local },
@@ -403,6 +409,7 @@ impl MyOptimizationPass {
             insert_points.push(InsertPoint {
                 bb,
                 stmt_idx,
+                insert_before: false,
                 source_info: stmt.source_info,
                 place: place.clone(),
                 kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
@@ -418,6 +425,7 @@ impl MyOptimizationPass {
             insert_points.push(InsertPoint {
                 bb,
                 stmt_idx,
+                insert_before: false,
                 source_info: stmt.source_info,
                 place: place.clone(),
                 kind: InstrKind::Raw { is_mut, src: src_place.clone() },
@@ -501,6 +509,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
+                        insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(dst_local),
                         kind: InstrKind::TagProp { dst: dst_local, src: src_local },
@@ -524,6 +533,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
+                        insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(p0.local),
                         kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
@@ -544,6 +554,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
+                        insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(p0.local),
                         kind: InstrKind::PtrRead { ptr_local: p0.local, size },
@@ -561,6 +572,7 @@ impl MyOptimizationPass {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
+                            insert_before: false,
                             source_info: term.source_info,
                             place: Place::from(p.local),
                             kind: InstrKind::CallArgPush {
@@ -579,6 +591,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
+                        insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(p.local),
                         kind: InstrKind::PtrUse { ptr_local: p.local },
@@ -596,6 +609,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
+                        insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(dst_local),
                         kind: InstrKind::RetTake { callee_id, dst_local },
@@ -609,6 +623,42 @@ impl MyOptimizationPass {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
 
+        let mut explicitly_tracked: HashSet<Local> = HashSet::new();
+        for block_data in body.basic_blocks.iter() {
+            for stmt in block_data.statements.iter() {
+                match stmt.kind {
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        explicitly_tracked.insert(local);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut arg_locals: HashSet<Local> = HashSet::new();
+        for arg_local in body.args_iter() {
+            arg_locals.insert(arg_local);
+        }
+
+        let mut fallback_locals: Vec<(Local, usize)> = Vec::new();
+        for local in body.local_decls.indices() {
+            if local == RETURN_PLACE {
+                continue;
+            }
+            if arg_locals.contains(&local) {
+                continue;
+            }
+            if explicitly_tracked.contains(&local) {
+                continue;
+            }
+            let ty = body.local_decls[local].ty;
+            let size = self.layout_size_bytes(tcx, ty);
+            if size == 0 {
+                continue;
+            }
+            fallback_locals.push((local, size));
+        }
+
         let interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
         let track_all_stack_allocs = self.track_all_stack_allocs_flag();
 
@@ -620,6 +670,12 @@ impl MyOptimizationPass {
             &mut ptr_locals_needing_tag,
             entry_insert_at,
         );
+
+        let entry_source_info = SourceInfo {
+            span: rustc_span::DUMMY_SP,
+            scope: OUTERMOST_SOURCE_SCOPE,
+        };
+        let mut return_sites: Vec<(BasicBlock, SourceInfo, usize)> = Vec::new();
 
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
@@ -660,14 +716,58 @@ impl MyOptimizationPass {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
+                            insert_before: false,
                             source_info: term.source_info,
                             place: Place::from(RETURN_PLACE),
                             kind: InstrKind::RetPush { callee_id, ptr_local: RETURN_PLACE },
                         });
                     }
+                    return_sites.push((bb, term.source_info, block_data.statements.len()));
                 }
             }
         }
+
+        // IMPORTANT ORDERING NOTE:
+        // `StackAlloc` is implemented via terminator-splitting (calls in fresh blocks).
+        // If we insert multiple terminator-splitting hooks at the same location, the *last applied*
+        // hook will execute *first*.
+        //
+        // `insert_instrumentation` iterates `insert_points` in reverse, meaning:
+        //   - earlier items in `insert_points` are applied later
+        //   - and therefore execute earlier
+        //
+        // To ensure fallback entry alloc tracking runs at real function entry (after prologue) and
+        // before other inserted hooks, we PREPEND these InsertPoints.
+        let mut fallback_entry_points: Vec<InsertPoint<'tcx>> = Vec::new();
+        let mut fallback_return_points: Vec<InsertPoint<'tcx>> = Vec::new();
+
+        for (local, size) in fallback_locals.iter().copied() {
+            fallback_entry_points.push(InsertPoint {
+                bb: START_BLOCK,
+                stmt_idx: entry_insert_at,
+                // Insert after rustc's StorageLive prologue statements.
+                insert_before: false,
+                source_info: entry_source_info,
+                place: Place::from(local),
+                kind: InstrKind::StackAlloc { local, live: true, size },
+            });
+
+            for (ret_bb, ret_source_info, ret_stmt_idx) in return_sites.iter().copied() {
+                fallback_return_points.push(InsertPoint {
+                    bb: ret_bb,
+                    stmt_idx: ret_stmt_idx,
+                    insert_before: false,
+                    source_info: ret_source_info,
+                    place: Place::from(local),
+                    kind: InstrKind::StackAlloc { local, live: false, size },
+                });
+            }
+        }
+
+        // Prepend entry fallback points so they are applied last (and execute first) during insertion.
+        insert_points.splice(0..0, fallback_entry_points);
+        // Append return points normally; they stay associated with return blocks.
+        insert_points.extend(fallback_return_points);
 
         ScanResult { insert_points, ptr_locals_needing_tag }
     }
@@ -1369,15 +1469,17 @@ impl MyOptimizationPass {
                 },
             };
 
-            let insert_before = matches!(
-                creation_kind,
-                InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
-            );
+            let insert_before = ip.insert_before
+                || matches!(
+                    creation_kind,
+                    InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
+                );
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
 
-                let split_at = if stmt_idx >= bd.statements.len() {
-                    stmt_idx
+                let len = bd.statements.len();
+                let split_at = if stmt_idx >= len {
+                    len
                 } else if insert_before {
                     stmt_idx
                 } else {
