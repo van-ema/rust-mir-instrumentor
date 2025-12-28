@@ -33,6 +33,10 @@ enum InstrKind<'tcx> {
     CallArgPush { callee_id: u64, arg_index: u64, ptr_local: Local },
     /// Callee-side retagging of pointer arguments from the runtime side-channel.
     ArgRetag { callee_id: u64, arg_index: u64, ptr_local: Local },
+    /// Callee-side: push the tag for a returned pointer right before `Return`.
+    RetPush { callee_id: u64, ptr_local: Local },
+    /// Caller-side: take the pushed return tag after a call that returns a pointer.
+    RetTake { callee_id: u64, dst_local: Local },
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +64,8 @@ struct Hooks {
     def_id_use: DefId,
     def_id_push_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
+    def_id_push_ret_tag: DefId,
+    def_id_take_ret_tag: DefId,
 }
 
 impl MyOptimizationPass {
@@ -294,6 +300,41 @@ impl MyOptimizationPass {
                 }
             }
             _ => {}
+        }
+
+        // Pointer read: plain deref load in a statement, e.g. `_dst = copy (*p)` or `_dst = move (*p)`.
+        // This is not a call/intrinsic, so we must classify it explicitly as a READ.
+        if let StatementKind::Assign(box (lhs_place, rhs)) = &stmt.kind {
+            if let Rvalue::Use(op) = rhs {
+                let deref_place: Option<&Place<'tcx>> = match op {
+                    Operand::Copy(p) | Operand::Move(p) => Some(p),
+                    _ => None,
+                };
+
+                if let Some(p) = deref_place {
+                    let is_deref_read = p
+                        .projection
+                        .iter()
+                        .next()
+                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                    if is_deref_read {
+                        let ptr_local = p.local;
+
+                        // Best-effort size: use the destination local's type size (0 if unknown).
+                        let lhs_ty = body.local_decls[lhs_place.local].ty;
+                        let size = self.layout_size_bytes(tcx, lhs_ty);
+
+                        ptr_locals_needing_tag.insert(ptr_local);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            source_info: stmt.source_info,
+                            place: Place::from(ptr_local),
+                            kind: InstrKind::PtrRead { ptr_local, size },
+                        });
+                    }
+                }
+            }
         }
 
         // Pointer write: any assignment whose LHS place begins with a Deref projection.
@@ -545,6 +586,23 @@ impl MyOptimizationPass {
                 }
             }
         }
+
+        // Caller-side return-tag recovery: if the call returns a thin pointer into a local, take the tag.
+        if let Some(dst_local) = destination.as_local() {
+            let dst_ty = body.local_decls[dst_local].ty;
+            if self.is_thin_ptr_ty(tcx, dst_ty) {
+                if let Some(callee_id) = callee_id_opt {
+                    ptr_locals_needing_tag.insert(dst_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        source_info: term.source_info,
+                        place: Place::from(dst_local),
+                        kind: InstrKind::RetTake { callee_id, dst_local },
+                    });
+                }
+            }
+        }
     }
 
     fn scan_body<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> ScanResult<'tcx> {
@@ -593,6 +651,20 @@ impl MyOptimizationPass {
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
                     );
+                }
+
+                if let TerminatorKind::Return = &term.kind {
+                    if self.is_thin_ptr_ty(tcx, body.return_ty()) {
+                        let callee_id = self.callee_id_u64(body.source.def_id());
+                        ptr_locals_needing_tag.insert(RETURN_PLACE);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            source_info: term.source_info,
+                            place: Place::from(RETURN_PLACE),
+                            kind: InstrKind::RetPush { callee_id, ptr_local: RETURN_PLACE },
+                        });
+                    }
                 }
             }
         }
@@ -686,6 +758,8 @@ impl MyOptimizationPass {
             InstrKind::TagProp { .. } => hooks.def_id_use, // unreachable in practice
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
             InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
+            InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
+            InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag,
         };
         Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
     }
@@ -704,6 +778,178 @@ impl MyOptimizationPass {
             let source_info = ip.source_info;
             let place = ip.place;
             let creation_kind = ip.kind;
+
+            // Caller-side: take return tag after a call returned a thin pointer into `dst_local`.
+            // This must run after the call, so we rewrite the call's target to a fresh block that
+            // performs `__rz_take_ret_tag` and then jumps to the original target.
+            if let InstrKind::RetTake { callee_id, dst_local } = creation_kind {
+                let dst_tag = *tag_local_for_ptr_local
+                    .get(&dst_local)
+                    .expect("missing tag local for RetTake");
+
+                let is_cleanup = body.basic_blocks[bb].is_cleanup;
+
+                let (orig_target, call_source, fn_span) = {
+                    let term = body.basic_blocks_mut()[bb]
+                        .terminator
+                        .as_mut()
+                        .expect("missing terminator for RetTake");
+                    match &mut term.kind {
+                        TerminatorKind::Call { target, call_source, fn_span, .. } => {
+                            let tgt = target.expect("call without target for RetTake");
+                            (tgt, *call_source, *fn_span)
+                        }
+                        _ => panic!("RetTake expected a Call terminator"),
+                    }
+                };
+
+                // New block that runs after the call returns.
+                let take_bb = body.basic_blocks_mut().push(BasicBlockData::new(None, is_cleanup));
+
+                // Redirect original call to take_bb.
+                {
+                    let term = body.basic_blocks_mut()[bb]
+                        .terminator
+                        .as_mut()
+                        .expect("missing terminator for RetTake");
+                    if let TerminatorKind::Call { target, .. } = &mut term.kind {
+                        *target = Some(take_bb);
+                    }
+                }
+
+                // addr_local = expose_provenance(dst_local)
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let addr_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(addr_local),
+                        Rvalue::Cast(
+                            CastKind::PointerExposeProvenance,
+                            Operand::Copy(Place::from(dst_local)),
+                            tcx.types.usize,
+                        ),
+                    ))),
+                );
+
+                let take_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_take_ret_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+
+                let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: take_func,
+                        args: args_take,
+                        destination: Place::from(dst_tag),
+                        target: Some(orig_target),
+                        unwind: UnwindAction::Continue,
+                        call_source,
+                        fn_span,
+                    },
+                };
+
+                let take_bd = &mut body.basic_blocks_mut()[take_bb];
+                take_bd.statements.push(addr_stmt);
+                take_bd.terminator = Some(take_term);
+
+                continue;
+            }
+
+            // Callee-side: push the return tag immediately before the `Return` terminator.
+            if let InstrKind::RetPush { callee_id, ptr_local } = creation_kind {
+                let tag_local = *tag_local_for_ptr_local
+                    .get(&ptr_local)
+                    .expect("missing tag local for RetPush");
+
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let addr_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(addr_local),
+                        Rvalue::Cast(
+                            CastKind::PointerExposeProvenance,
+                            Operand::Copy(Place::from(ptr_local)),
+                            tcx.types.usize,
+                        ),
+                    ))),
+                );
+
+                let push_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_push_ret_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+
+                let args_push: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(tag_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let call_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: push_func,
+                        args: args_push,
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                let bd = &mut body.basic_blocks_mut()[bb];
+                // Put the address computation in the current block, then call push, then jump to old Return.
+                bd.statements.push(addr_stmt);
+                bd.terminator = Some(call_term);
+                continue;
+            }
 
             if let InstrKind::TagProp { dst, src } = creation_kind {
                 println!(
@@ -1253,6 +1499,12 @@ impl MyOptimizationPass {
         let def_id_take_call_arg_tag = self
             .find_def_id_by_name(tcx, "__rz_take_call_arg_tag")
             .expect("missing '__rz_take_call_arg_tag' definition");
+        let def_id_push_ret_tag = self
+            .find_def_id_by_name(tcx, "__rz_push_ret_tag")
+            .expect("missing '__rz_push_ret_tag' definition");
+        let def_id_take_ret_tag = self
+            .find_def_id_by_name(tcx, "__rz_take_ret_tag")
+            .expect("missing '__rz_take_ret_tag' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -1263,6 +1515,8 @@ impl MyOptimizationPass {
             def_id_use,
             def_id_push_call_arg_tag,
             def_id_take_call_arg_tag,
+            def_id_push_ret_tag,
+            def_id_take_ret_tag,
         };
 
         let scan = self.scan_body(tcx, body);

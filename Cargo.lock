@@ -76,6 +76,14 @@ name = "raw_pointer_test"
 version = "0.1.0"
 
 [[package]]
+name = "ret_ptr_basic"
+version = "0.1.0"
+
+[[package]]
+name = "ret_ptr_local"
+version = "0.1.0"
+
+[[package]]
 name = "runtime"
 version = "0.1.0"
 
