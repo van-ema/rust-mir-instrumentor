@@ -7,6 +7,14 @@ name = "call_arg_offset"
 version = "0.1.0"
 
 [[package]]
+name = "call_arg_offset_add_sub"
+version = "0.1.0"
+
+[[package]]
+name = "call_arg_plain_read"
+version = "0.1.0"
+
+[[package]]
 name = "call_arg_wrap_offset"
 version = "0.1.0"
 
@@ -19,6 +27,10 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "deref_write_and_read"
+version = "0.1.0"
 
 [[package]]
 name = "dynamic_loader"
@@ -60,11 +72,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "memcpy_copy_nonoverlapping"
+version = "0.1.0"
+
+[[package]]
+name = "memset_write_bytes"
+version = "0.1.0"
+
+[[package]]
 name = "mutable_ref_test"
 version = "0.1.0"
 
 [[package]]
+name = "plain_read_wrappers"
+version = "0.1.0"
+
+[[package]]
+name = "plain_write_wrappers"
+version = "0.1.0"
+
+[[package]]
 name = "ptr_arg_use"
+version = "0.1.0"
+
+[[package]]
+name = "ptr_arith_add_sub_offset"
 version = "0.1.0"
 
 [[package]]
@@ -81,6 +113,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ret_ptr_local"
+version = "0.1.0"
+
+[[package]]
+name = "ret_ptr_local_uad"
 version = "0.1.0"
 
 [[package]]
@@ -121,6 +157,10 @@ version = "0.1.0"
 
 [[package]]
 name = "volatile_ro_rw"
+version = "0.1.0"
+
+[[package]]
+name = "volatile_wrappers"
 version = "0.1.0"
 
 [[package]]

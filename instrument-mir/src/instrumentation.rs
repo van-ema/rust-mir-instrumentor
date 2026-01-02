@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
@@ -114,6 +114,27 @@ impl MyOptimizationPass {
                 self.layout_size_bytes(tcx, ty) == ptr_bytes
             }
             _ => false,
+        }
+    }
+
+    /// Whether to warn about unknown (unclassified) direct calls that may read/write memory via pointers.
+    /// Default: enabled. Set `RZ_WARN_UNKNOWN_CALLS=0` to disable.
+    fn warn_unknown_calls_enabled(&self) -> bool {
+        std::env::var("RZ_WARN_UNKNOWN_CALLS")
+            .ok()
+            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    /// Print an "unknown call" warning once per callee def-path to avoid spam.
+    fn warn_unknown_call_once(&self, def_path: &str) {
+        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let set = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = set.lock().unwrap();
+        if guard.insert(def_path.to_string()) {
+            eprintln!(
+                "[rusteze][warn] unclassified direct call with pointer effects: {} (consider adding a wrapper/intrinsic classifier or instrumenting that crate)",
+                def_path
+            );
         }
     }
 
@@ -648,16 +669,110 @@ impl MyOptimizationPass {
         (is_store, is_load)
     }
 
+    /// Recognize non-volatile std/core ptr load/store wrappers.
+    ///
+    /// These are *memory effects* even though the MIR often does not contain an explicit `(*p)`.
+    /// We classify them so we can emit PtrRead/PtrWrite hooks.
+    ///
+    /// Covered (monomorphized paths included):
+    ///   - core::ptr::read / std::ptr::read
+    ///   - core::ptr::read_unaligned / std::ptr::read_unaligned
+    ///   - core::ptr::write / std::ptr::write
+    ///   - core::ptr::write_unaligned / std::ptr::write_unaligned
+    fn classify_std_ptr_plain_wrapper(&self, def_path: &str) -> (bool, bool) {
+        let mut is_store = false;
+        let mut is_load = false;
+
+        // Examples of def_path_str():
+        //   "core::ptr::read"
+        //   "std::ptr::write"
+        //   "core::ptr::read_unaligned::<u64>"
+        //   "std::ptr::write_unaligned::<i32>"
+        if def_path.contains("::ptr::read_unaligned") {
+            is_load = true;
+        } else if def_path.contains("::ptr::read") {
+            is_load = true;
+        } else if def_path.contains("::ptr::write_unaligned") {
+            is_store = true;
+        } else if def_path.contains("::ptr::write") {
+            is_store = true;
+        }
+
+        (is_store, is_load)
+    }
+
+    /// Recognize memcpy/memmove/memset-like intrinsics and thin std/core wrappers.
+    /// Returns (is_memcpy, is_memset).
+    fn classify_mem_intrinsic_or_wrapper(&self, def_path: &str) -> (bool, bool) {
+        // Intrinsics:
+        //   core::intrinsics::copy
+        //   core::intrinsics::copy_nonoverlapping
+        //   core::intrinsics::write_bytes
+        // Wrappers (common):
+        //   core::ptr::copy
+        //   core::ptr::copy_nonoverlapping
+        //   core::ptr::write_bytes
+        //   std::ptr::copy
+        //   std::ptr::copy_nonoverlapping
+        //   std::ptr::write_bytes
+        let is_copy = def_path.contains("::intrinsics::copy")
+            || def_path.contains("::ptr::copy")
+            || def_path.contains("::ptr::copy_nonoverlapping")
+            || def_path.contains("::intrinsics::copy_nonoverlapping");
+        let is_memset = def_path.contains("::intrinsics::write_bytes")
+            || def_path.contains("::ptr::write_bytes");
+        (is_copy, is_memset)
+    }
+
+    /// Best-effort: compute byte size for memory ops given a pointer operand local and a count operand.
+    /// If count is not a constant or pointee size is unknown, returns 0.
+    fn memop_size_bytes<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        count_op: &Operand<'tcx>,
+    ) -> usize {
+        let pointee_size = match body.local_decls[ptr_local].ty.kind() {
+            TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            _ => 0,
+        };
+        if pointee_size == 0 {
+            return 0;
+        }
+
+        // Try to extract constant count.
+        let count: Option<u64> = match count_op {
+            Operand::Constant(c) => {
+                match c.const_.try_to_scalar() {
+                    Some(s) => s.to_u64().discard_err(),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+
+        count
+            .and_then(|c| (c as usize).checked_mul(pointee_size))
+            .unwrap_or(0)
+    }
+
     /// Recognize std/core pointer-derivation wrappers that return a pointer derived from
     /// a base pointer argument (typically arg0). We treat these like pointer arithmetic,
     /// i.e. the result gets a fresh tag derived from the base tag.
+    ///
+    /// Expanded to include slice/Vec pointer-extraction wrappers, which also derive a pointer from a fat pointer.
     fn is_std_ptr_derive_wrapper(&self, def_path: &str) -> bool {
-        // Examples (monomorphized):
+        // Pointer-derivation wrappers: these produce a pointer derived from a base pointer/slice.
+        // We treat them like pointer arithmetic (fresh tag with parent linkage).
+        //
+        // Common pointer arithmetic wrappers (monomorphized):
         //   "core::ptr::const_ptr::<impl *const T>::add"
         //   "core::ptr::mut_ptr::<impl *mut T>::offset"
         //   "std::ptr::const_ptr::<impl *const T>::wrapping_add"
         //   "core::ptr::wrapping_offset" (older paths)
-        def_path.contains("::ptr::")
+        let is_ptr_arith = def_path.contains("::ptr::")
             && (def_path.contains("::add")
                 || def_path.contains("::sub")
                 || def_path.contains("::offset")
@@ -667,7 +782,21 @@ impl MyOptimizationPass {
                 || def_path.contains("::byte_add")
                 || def_path.contains("::byte_sub")
                 || def_path.contains("::wrapping_byte_add")
-                || def_path.contains("::wrapping_byte_sub"))
+                || def_path.contains("::wrapping_byte_sub"));
+
+        // Slice/Vec pointer extraction wrappers (these also *derive* a pointer from a fat pointer):
+        //   "core::slice::<impl [T]>::as_ptr"
+        //   "core::slice::<impl [T]>::as_mut_ptr"
+        //   "alloc::vec::Vec::<T>::as_ptr"
+        //   "alloc::vec::Vec::<T>::as_mut_ptr"
+        // Note: we keep this string-based to work across monomorphization/inlining.
+        let is_slice_ptr = def_path.contains("::slice::<impl [")
+            && (def_path.contains("::as_ptr") || def_path.contains("::as_mut_ptr"));
+
+        let is_vec_ptr = def_path.contains("alloc::vec::Vec")
+            && (def_path.contains("::as_ptr") || def_path.contains("::as_mut_ptr"));
+
+        is_ptr_arith || is_slice_ptr || is_vec_ptr
     }
 
     fn is_volatile<'tcx>(
@@ -724,11 +853,60 @@ impl MyOptimizationPass {
         ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
         let (is_volatile_store, is_volatile_load) = self.is_volatile(tcx, body, func);
+        let mut is_plain_store = false;
+        let mut is_plain_load = false;
+        if let Some((callee_def_id, _)) = self.direct_callee(tcx, body, func) {
+            let path = tcx.def_path_str(callee_def_id);
+            (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(&path);
+        }
         let callee_opt = self.direct_callee(tcx, body, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
+
+        // Warn when we see a *direct* call that likely has pointer-based memory effects,
+        // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
+        // This helps avoid silently missing std/core/dep wrappers.
+        if self.warn_unknown_calls_enabled() {
+            if let Some((callee_def_id, _cid)) = callee_opt {
+                let def_path = tcx.def_path_str(callee_def_id);
+
+                // Does the call take any thin pointer argument?
+                let mut has_ptr_arg = false;
+                for a in args.iter() {
+                    if let Some(p) = self.place_from_operand(&a.node) {
+                        let ty = body.local_decls[p.local].ty;
+                        if self.is_thin_ptr_ty(tcx, ty) {
+                            has_ptr_arg = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Does the call return a thin pointer into a local?
+                let returns_ptr = destination
+                    .as_local()
+                    .is_some_and(|dl| self.is_thin_ptr_ty(tcx, body.local_decls[dl].ty));
+
+                if (has_ptr_arg || returns_ptr) && !callee_instrumented {
+                    // Known classifications we already handle:
+                    let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&def_path);
+                    let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&def_path);
+                    let known = is_volatile_store
+                        || is_volatile_load
+                        || is_plain_store
+                        || is_plain_load
+                        || is_copy
+                        || is_memset
+                        || is_ptr_derive_call;
+
+                    if !known {
+                        self.warn_unknown_call_once(&def_path);
+                    }
+                }
+            }
+        }
 
         // Pointer-result handling for calls:
         // - If the callee is instrumented, we rely on RetTake/RetPush, so we do not also TagProp/PtrDerive.
@@ -833,6 +1011,72 @@ impl MyOptimizationPass {
         let mut classified_write_ptr_local: Option<Local> = None;
         let mut classified_read_ptr_local: Option<Local> = None;
 
+        // Memcpy/memset-style operations (intrinsics and std/core wrappers).
+        // These are real READ/WRITE effects even when there is no explicit `(*p)` deref in MIR.
+        // We handle them here so the runtime sees READ/WRITE, not only coarse USE.
+        if let Some((callee_def_id, _)) = callee_opt {
+            let path = tcx.def_path_str(callee_def_id);
+            let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&path);
+
+            if is_copy {
+                // Signature convention we assume (matches core::intrinsics and ptr wrappers):
+                //   copy::<T>(src: *const T, dst: *mut T, count: usize)
+                //   copy_nonoverlapping::<T>(src: *const T, dst: *mut T, count: usize)
+                if args.len() >= 3 {
+                    let src_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                    let dst_local = args.get(1).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                    let count_op = &args[2].node;
+
+                    if let Some(src) = src_local {
+                        classified_read_ptr_local = Some(src);
+                        ptr_locals_needing_tag.insert(src);
+                        let size = self.memop_size_bytes(tcx, body, src, count_op);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(src),
+                            kind: InstrKind::PtrRead { ptr_local: src, size },
+                        });
+                    }
+                    if let Some(dst) = dst_local {
+                        classified_write_ptr_local = Some(dst);
+                        ptr_locals_needing_tag.insert(dst);
+                        let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(dst),
+                            kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                        });
+                    }
+                }
+            } else if is_memset {
+                // Signature convention:
+                //   write_bytes::<T>(dst: *mut T, val: u8, count: usize)
+                if args.len() >= 3 {
+                    let dst_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                    let count_op = &args[2].node;
+                    if let Some(dst) = dst_local {
+                        classified_write_ptr_local = Some(dst);
+                        ptr_locals_needing_tag.insert(dst);
+                        let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(dst),
+                            kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                        });
+                    }
+                }
+            }
+        }
+
         if is_volatile_store {
             if let Some(first) = args.get(0) {
                 if let Some(p0) = self.place_from_operand(&first.node) {
@@ -863,6 +1107,60 @@ impl MyOptimizationPass {
                     if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
                         size = self.layout_size_bytes(tcx, *pointee_ty);
                     }
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(p0.local),
+                        kind: InstrKind::PtrRead { ptr_local: p0.local, size },
+                    });
+                }
+            }
+        }
+
+        // Non-volatile core/std ptr wrappers: treat as real READ/WRITE effects.
+        // `ptr::read*` reads from arg0; `ptr::write*` writes to arg0.
+        if is_plain_store {
+            if let Some(first) = args.get(0) {
+                if let Some(p0) = self.place_from_operand(&first.node) {
+                    classified_write_ptr_local = Some(p0.local);
+                    ptr_locals_needing_tag.insert(p0.local);
+
+                    let mut size = 0usize;
+                    let ty0 = body.local_decls[p0.local].ty;
+                    match ty0.kind() {
+                        TyKind::RawPtr(pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
+                        TyKind::Ref(_, pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
+                        _ => {}
+                    }
+
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(p0.local),
+                        kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
+                    });
+                }
+            }
+        }
+
+        if is_plain_load {
+            if let Some(first) = args.get(0) {
+                if let Some(p0) = self.place_from_operand(&first.node) {
+                    classified_read_ptr_local = Some(p0.local);
+                    ptr_locals_needing_tag.insert(p0.local);
+
+                    let mut size = 0usize;
+                    let ty0 = body.local_decls[p0.local].ty;
+                    match ty0.kind() {
+                        TyKind::RawPtr(pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
+                        TyKind::Ref(_, pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
+                        _ => {}
+                    }
+
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -1389,11 +1687,11 @@ impl MyOptimizationPass {
             }
 
             if let InstrKind::TagProp { dst, src } = creation_kind {
-                println!(
-                    "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
-                    dst,
-                    src
-                );
+                // println!(
+                //     "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
+                //     dst,
+                //     src
+                // );
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&dst)
                     .expect("missing tag local for TagProp dst");

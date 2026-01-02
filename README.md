@@ -36,29 +36,17 @@ make run EXAMPLE=hello PROFILE=release
 ```
 
 ## Env
+
 ### Runtime
-
-- **`RUSTEZE_FAILFAST`**: control violation handling
-  - unset / `0` → log and continue (default)
-  - non-zero → panic (recommended for fuzzing)
-
-  ```bash
-  RUSTEZE_FAILFAST=1 RUST_BACKTRACE=1 ./target/debug/my_binary
-  ```
+- `RUSTEZE_FAILFAST`: If non-zero, panic on violation; default is log-and-continue.
 
 ### Instrumentation
-
-- **`RZ_STACK_ALLOCS`**: stack allocation tracking scope
-  - unset → only "interesting" locals (default)
-  - `all`, `1`, `true` → all locals
-
-  ```bash
-  RZ_STACK_ALLOCS=all cargo instrument-mir ...
-  ```
-
-- **`RZ_INSTRUMENTED_CRATES`**: comma-separated allowlist of dependency crate names to treat as instrumented for call-boundary tag passing (in addition to the current crate).
-- **`RZ_INSTRUMENT_ALL_DEPS`**: when non-zero/true, treat all non-std/non-runtime dependency crates as instrumented for call-boundary tag passing.
-- **`RZ_PRINT_CRATES`**: when non-zero/true, print the crate graph once during compilation and indicate which crates are considered instrumented.
+- `RZ_STACK_ALLOCS`: Track stack allocation for all locals if set (`all`, `1`, `true`); default is only "interesting" locals.
+- `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
+- `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all non-std/non-runtime dependency crates as instrumented.
+- `RZ_PRINT_CRATES`: If non-zero/true, print the crate graph and show which crates are instrumented.
+- `RZ_FILTER_STDLIB_USES`: If set to `0` or `false`, do not filter out coarse pointer-use hooks from std/core/alloc; default is enabled.
+- `RZ_WARN_UNKNOWN_CALLS`: If set to `0` or `false`, suppress warnings about unknown direct calls with pointer effects; default is enabled.
 
 ### Call-argument tag buffering
 
