@@ -56,6 +56,19 @@ make run EXAMPLE=hello PROFILE=release
   RZ_STACK_ALLOCS=all cargo instrument-mir ...
   ```
 
+- **`RZ_INSTRUMENTED_CRATES`**: comma-separated allowlist of dependency crate names to treat as instrumented for call-boundary tag passing (in addition to the current crate).
+- **`RZ_INSTRUMENT_ALL_DEPS`**: when non-zero/true, treat all non-std/non-runtime dependency crates as instrumented for call-boundary tag passing.
+- **`RZ_PRINT_CRATES`**: when non-zero/true, print the crate graph once during compilation and indicate which crates are considered instrumented.
+
+### Call-argument tag buffering
+
+To prevent unbounded memory growth when pointer-argument tags are pushed but never taken (for example, calls into uninstrumented external crates), the runtime employs a bounded ring buffer. Each pushed entry is stored in a fixed-size circular buffer, while a small hashmap maps `(callee_id, arg_index, addr)` to the buffer slot for efficient O(1) lookup on tag retrieval. When the ring buffer wraps around, overwritten entries are evicted from the hashmap, ensuring memory usage remains bounded. This design achieves O(1) push and take operations in the common case and remains robust under fuzzing and partial instrumentation.
+
+### Example
+
+```bash
+RZ_INSTRUMENT_ALL_DEPS=1 RZ_PRINT_CRATES=1 make instrument EXAMPLE=tag0_return_raw_ptr_from_arg
+```
 
 ## Stack allocation tracking (filtered vs all)
 

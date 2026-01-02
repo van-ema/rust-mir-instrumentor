@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
-use rustc_hir::def_id::DefId;
+use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret::Scalar;
@@ -29,6 +30,9 @@ enum InstrKind<'tcx> {
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
     TagProp { dst: Local, src: Local },
+    /// Fresh tag for a derived pointer value (pointer arithmetic like add/sub/offset).
+    /// Emits a runtime raw-pointer creation hook with `parent=tag(src)` and assigns into `tag(dst)`.
+    PtrDerive { dst: Local, src: Local, is_mut: bool },
     /// Caller-side tag push for pointer arguments to a direct call.
     CallArgPush { callee_id: u64, arg_index: u64, ptr_local: Local },
     /// Callee-side retagging of pointer arguments from the runtime side-channel.
@@ -70,6 +74,34 @@ struct Hooks {
 }
 
 impl MyOptimizationPass {
+    /// Whether we should suppress coarse PtrUse hooks originating from std/core/alloc.
+    /// Default: enabled. Set `RZ_FILTER_STDLIB_USES=0` to disable.
+    fn filter_stdlib_uses_enabled(&self) -> bool {
+        std::env::var("RZ_FILTER_STDLIB_USES")
+            .ok()
+            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    /// Best-effort check: does this span come from the Rust std/core/alloc sources?
+    /// This is used to suppress noisy PtrUse hooks for std wrappers (e.g. println!).
+    fn span_is_stdlib<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span) -> bool {
+        let sm = tcx.sess.source_map();
+        let filename = sm.span_to_filename(span);
+        // `FileName` is not `Display` on this nightly; use `Debug` formatting.
+        let s = format!("{:?}", filename);
+
+        // Matches typical rustup toolchain paths and in-tree paths.
+        s.contains("/lib/rustlib/src/rust/library/std/")
+            || s.contains("/lib/rustlib/src/rust/library/core/")
+            || s.contains("/lib/rustlib/src/rust/library/alloc/")
+            || s.contains("/rust/library/std/")
+            || s.contains("/rust/library/core/")
+            || s.contains("/rust/library/alloc/")
+            || s.contains("/rust/library/proc_macro/")
+            || s.contains("/library/std/")
+            || s.contains("/library/core/")
+            || s.contains("/library/alloc/")
+    }
     /// Return true only for *thin* pointers (single-word), i.e. `&T` / `*const T` / `*mut T`
     /// where the pointer value is a single scalar. Fat pointers like `&[T]`, `&str`, and trait
     /// objects carry metadata and lower to a ScalarPair; casting them with
@@ -87,6 +119,119 @@ impl MyOptimizationPass {
 
     fn callee_id_u64(&self, def_id: DefId) -> u64 {
         ((def_id.krate.as_u32() as u64) << 32) | (def_id.index.as_u32() as u64)
+    }
+
+    fn parse_instrumented_crates_env(&self) -> Option<HashSet<String>> {
+        let raw = std::env::var("RZ_INSTRUMENTED_CRATES").ok()?;
+        let mut set = HashSet::new();
+        for part in raw.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            // Allow either '-' or '_' in names; rustc uses '_' for crate_name().
+            set.insert(p.replace('-', "_"));
+        }
+        Some(set)
+    }
+
+    fn is_std_like_crate_name(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "core"
+                | "alloc"
+                | "std"
+                | "proc_macro"
+                | "test"
+                | "panic_abort"
+                | "panic_unwind"
+                | "compiler_builtins"
+                | "unwind"
+                | "cfg_if"
+        )
+    }
+
+    fn instrumented_crates_cached<'tcx>(&self, tcx: TyCtxt<'tcx>) -> &'static HashSet<String> {
+        static INSTRUMENTED: OnceLock<HashSet<String>> = OnceLock::new();
+
+        INSTRUMENTED.get_or_init(|| {
+            // Priority 1: explicit allowlist
+            if let Some(env_set) = self.parse_instrumented_crates_env() {
+                return env_set;
+            }
+
+            // Priority 2: optional "instrument all deps" mode.
+            let instrument_all_deps = std::env::var("RZ_INSTRUMENT_ALL_DEPS")
+                .ok()
+                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+
+            if !instrument_all_deps {
+                // Default: only current crate is assumed instrumented,
+                return HashSet::new();
+            }
+
+            // Priority 3: instrument all non-std-like dependencies.
+            let mut set = HashSet::new();
+            for &cnum in tcx.crates(()).iter() {
+                let name = tcx.crate_name(cnum).as_str().to_string();
+                if name == "runtime" {
+                    continue;
+                }
+                if self.is_std_like_crate_name(&name) {
+                    continue;
+                }
+                set.insert(name);
+            }
+            set
+        })
+    }
+
+    fn maybe_print_crate_graph<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        static PRINTED: OnceLock<()> = OnceLock::new();
+        if PRINTED.get().is_some() {
+            return;
+        }
+
+        let print = std::env::var("RZ_PRINT_CRATES")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+
+        if !print {
+            return;
+        }
+
+        // Mark as printed once.
+        let _ = PRINTED.set(());
+
+        let allow = self.instrumented_crates_cached(tcx);
+        eprintln!("[rusteze] crates in compilation graph:");
+        for &cnum in tcx.crates(()).iter() {
+            let name = tcx.crate_name(cnum).as_str().to_string();
+            let flag = if allow.contains(&name) { "instrumented" } else { "dep" };
+            eprintln!("  - {} ({})", name, flag);
+        }
+        eprintln!("[rusteze] note: current crate is always treated as instrumented; set RZ_INSTRUMENTED_CRATES or RZ_INSTRUMENT_ALL_DEPS=1 to include deps.");
+    }
+
+    fn is_instrumented_callee<'tcx>(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+        // Optionally print the crate graph once per compilation.
+        self.maybe_print_crate_graph(tcx);
+
+        // Never consider the runtime crate instrumented (avoid recursion).
+        let crate_name_sym = tcx.crate_name(def_id.krate);
+        let crate_name = crate_name_sym.as_str();
+        if crate_name == "runtime" {
+            return false;
+        }
+
+        // Always treat the local crate as instrumented.
+        if def_id.krate == LOCAL_CRATE {
+            return true;
+        }
+
+        // Optional allowlist (RZ_INSTRUMENTED_CRATES) or "instrument all deps" mode (RZ_INSTRUMENT_ALL_DEPS=1).
+        let allow = self.instrumented_crates_cached(tcx);
+        allow.contains(crate_name)
     }
 
     fn place_from_operand<'tcx>(&self, op: &Operand<'tcx>) -> Option<Place<'tcx>> {
@@ -401,6 +546,51 @@ impl MyOptimizationPass {
             }
         }
 
+        // Fresh tag on pointer arithmetic: derived pointers (add/sub/offset) get a new tag
+        // with parent linkage to the base pointer tag.
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+            if let Some(dst_local) = dst_place.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    let (binop, lhs_op) = match rvalue {
+                        Rvalue::BinaryOp(op, box (lhs, _rhs)) => (Some(*op), Some(lhs)),
+                        // Newer nightlies no longer have `Rvalue::CheckedBinaryOp`. The checked/overflowing
+                        // forms lower to regular `BinaryOp` + extra logic, so handling `BinaryOp` is enough
+                        // for our pointer-derive tagging purposes here.
+                        _ => (None, None),
+                    };
+
+                    if let (Some(op), Some(lhs)) = (binop, lhs_op) {
+                        if matches!(op, BinOp::Add | BinOp::Sub) {
+                            if let Some(src_place) = self.place_from_operand(lhs) {
+                                let src_local = src_place.local;
+                                let src_ty = body.local_decls[src_local].ty;
+                                if self.is_thin_ptr_ty(tcx, src_ty) {
+                                    let is_mut = match dst_ty.kind() {
+                                        TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                        TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                        _ => false,
+                                    };
+
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    ptr_locals_needing_tag.insert(src_local);
+
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::PtrDerive { dst: dst_local, src: src_local, is_mut },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Ref creation
         if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
             if let Some(lhs_local) = place.as_local() {
@@ -433,35 +623,91 @@ impl MyOptimizationPass {
         }
     }
 
-    fn classify_call<'tcx>(
+
+    /// Recognize `core/std::ptr::{read_volatile,write_volatile}` wrappers.
+    ///
+    /// We want to treat these as READ/WRITE even before they inline down to
+    /// `core::intrinsics::{volatile_load,volatile_store}`.
+    fn classify_std_ptr_volatile_wrapper(&self, def_path: &str) -> (bool, bool) {
+        let mut is_store = false;
+        let mut is_load = false;
+
+        // Examples of def_path_str():
+        //   "core::ptr::read_volatile"
+        //   "std::ptr::write_volatile"
+        //   "core::ptr::read_volatile::<i32>"
+        //   "std::ptr::write_volatile::<u64>"
+        //
+        // We keep this purely string-based so it works uniformly across inlining/monomorphization.
+        if def_path.contains("::ptr::read_volatile") {
+            is_load = true;
+        } else if def_path.contains("::ptr::write_volatile") {
+            is_store = true;
+        }
+
+        (is_store, is_load)
+    }
+
+    /// Recognize std/core pointer-derivation wrappers that return a pointer derived from
+    /// a base pointer argument (typically arg0). We treat these like pointer arithmetic,
+    /// i.e. the result gets a fresh tag derived from the base tag.
+    fn is_std_ptr_derive_wrapper(&self, def_path: &str) -> bool {
+        // Examples (monomorphized):
+        //   "core::ptr::const_ptr::<impl *const T>::add"
+        //   "core::ptr::mut_ptr::<impl *mut T>::offset"
+        //   "std::ptr::const_ptr::<impl *const T>::wrapping_add"
+        //   "core::ptr::wrapping_offset" (older paths)
+        def_path.contains("::ptr::")
+            && (def_path.contains("::add")
+                || def_path.contains("::sub")
+                || def_path.contains("::offset")
+                || def_path.contains("::wrapping_add")
+                || def_path.contains("::wrapping_sub")
+                || def_path.contains("::wrapping_offset")
+                || def_path.contains("::byte_add")
+                || def_path.contains("::byte_sub")
+                || def_path.contains("::wrapping_byte_add")
+                || def_path.contains("::wrapping_byte_sub"))
+    }
+
+    fn is_volatile<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         func: &Operand<'tcx>,
-    ) -> (bool, bool, Option<u64>) {
+    ) -> (bool, bool) {
         let mut is_volatile_store = false;
         let mut is_volatile_load = false;
-        let mut callee_id_opt: Option<u64> = None;
 
         if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
-            callee_id_opt = Some(self.callee_id_u64(*callee_def_id));
-
-            // Option B: classify only true Rust intrinsics (no wrapper/libc lists).
-            // Depending on toolchain/optimization, MIR may refer to intrinsics via
-            // `core::intrinsics::*` or `std::intrinsics::*`.
+            // Fast path for intrinsics (these are the "real" volatile ops once inlined).
             let path = tcx.def_path_str(*callee_def_id);
             if path.starts_with("core::intrinsics::") || path.starts_with("std::intrinsics::") {
-                // Prefer the intrinsic item name rather than the full path.
-                // `item_name` returns a `Symbol`; avoid borrowing `&str` from a temporary.
                 let name_sym: rustc_span::symbol::Symbol = tcx.item_name(*callee_def_id);
                 match name_sym.as_str() {
                     "volatile_store" => is_volatile_store = true,
                     "volatile_load" => is_volatile_load = true,
                     _ => {}
                 }
+                return (is_volatile_store, is_volatile_load);
             }
+            (is_volatile_store, is_volatile_load) = self.classify_std_ptr_volatile_wrapper(&path);
         }
-        (is_volatile_store, is_volatile_load, callee_id_opt)
+
+        (is_volatile_store, is_volatile_load)
+    }
+
+    fn direct_callee<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        func: &Operand<'tcx>,
+    ) -> Option<(DefId, u64)> {
+        if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
+            let cid = self.callee_id_u64(*callee_def_id);
+            return Some((*callee_def_id, cid));
+        }
+        None
     }
 
     fn scan_call_terminator<'tcx>(
@@ -477,43 +723,109 @@ impl MyOptimizationPass {
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
-        let (is_volatile_store, is_volatile_load, callee_id_opt) = self.classify_call(tcx, body, func);
+        let (is_volatile_store, is_volatile_load) = self.is_volatile(tcx, body, func);
+        let callee_opt = self.direct_callee(tcx, body, func);
+        let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
+        let callee_instrumented = callee_opt
+            .map(|(did, _)| self.is_instrumented_callee(tcx, did))
+            .unwrap_or(false);
 
-        // Tag propagation through pointer-returning calls.
-        if let Some(dst_local) = destination.as_local() {
-            let dst_ty = body.local_decls[dst_local].ty;
-            if self.is_thin_ptr_ty(tcx, dst_ty) {
-                let mut src_local_opt: Option<Local> = None;
+        // Pointer-result handling for calls:
+        // - If the callee is instrumented, we rely on RetTake/RetPush, so we do not also TagProp/PtrDerive.
+        // - If the callee is *not* instrumented (e.g. std/core wrappers), we best-effort propagate tags locally.
+        //   In particular, pointer-derivation wrappers (add/sub/offset/...) should produce a *fresh* tag.
+        if !callee_instrumented {
+            if let Some(dst_local) = destination.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    let mut src_local_opt: Option<Local> = None;
 
-                if let Some(first) = args.get(0) {
-                    if let Some(arg_place) = self.place_from_operand(&first.node) {
-                        let arg_local = arg_place.local;
-                        let arg_ty = body.local_decls[arg_local].ty;
+                    if let Some(first) = args.get(0) {
+                        if let Some(arg_place) = self.place_from_operand(&first.node) {
+                            let arg_local = arg_place.local;
+                            let arg_ty = body.local_decls[arg_local].ty;
 
-                        if self.is_thin_ptr_ty(tcx, arg_ty) {
-                            src_local_opt = Some(arg_local);
-                        } else if let Some(base_local) =
-                            self.backtrack_unsize_base_local(arg_local, &block_data.statements)
-                        {
-                            let base_ty = body.local_decls[base_local].ty;
-                            if self.is_thin_ptr_ty(tcx, base_ty) {
-                                src_local_opt = Some(base_local);
+                            if self.is_thin_ptr_ty(tcx, arg_ty) {
+                                src_local_opt = Some(arg_local);
+                            } else if let Some(base_local) =
+                                self.backtrack_unsize_base_local(arg_local, &block_data.statements)
+                            {
+                                let base_ty = body.local_decls[base_local].ty;
+                                if self.is_thin_ptr_ty(tcx, base_ty) {
+                                    src_local_opt = Some(base_local);
+                                }
                             }
                         }
                     }
-                }
 
-                if let Some(src_local) = src_local_opt {
-                    ptr_locals_needing_tag.insert(dst_local);
-                    ptr_locals_needing_tag.insert(src_local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(dst_local),
-                        kind: InstrKind::TagProp { dst: dst_local, src: src_local },
-                    });
+                    if let Some(src_local) = src_local_opt {
+                        ptr_locals_needing_tag.insert(dst_local);
+                        ptr_locals_needing_tag.insert(src_local);
+
+                        // Decide whether this call is a pointer-deriving wrapper that should get a fresh tag.
+                        let mut is_ptr_derive_call = false;
+                        if let Some((callee_def_id, _cid)) = callee_opt {
+                            let path = tcx.def_path_str(callee_def_id);
+                            is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&path);
+                        }
+
+                        if is_ptr_derive_call {
+                            // Fresh tag derived from the base pointer tag.
+                            let is_mut = match dst_ty.kind() {
+                                TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                _ => false,
+                            };
+
+                            // IMPORTANT: for ptr-derivation wrappers (add/sub/offset/...), the destination local
+                            // is only initialized *after* the call returns. We must therefore insert the PtrDerive
+                            // hook in the call's `target` block, not in the call block itself, otherwise we
+                            // expose provenance of an uninitialized local and record a garbage pointee address.
+                            let call_target_bb: Option<BasicBlock> = match &term.kind {
+                                TerminatorKind::Call { target, .. } => *target,
+                                _ => None,
+                            };
+
+                            if let Some(tgt_bb) = call_target_bb {
+                                insert_points.push(InsertPoint {
+                                    bb: tgt_bb,
+                                    stmt_idx: 0,
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::PtrDerive {
+                                        dst: dst_local,
+                                        src: src_local,
+                                        is_mut,
+                                    },
+                                });
+                            } else {
+                                // Fallback (should not happen for normal calls): keep the old placement.
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::PtrDerive {
+                                        dst: dst_local,
+                                        src: src_local,
+                                        is_mut,
+                                    },
+                                });
+                            }
+                        } else {
+                            // Plain propagation: dst gets the same tag as src.
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -567,7 +879,34 @@ impl MyOptimizationPass {
             if let Some(p) = self.place_from_operand(&a.node) {
                 let ty = body.local_decls[p.local].ty;
                 if self.is_thin_ptr_ty(tcx, ty) {
-                    if let Some(callee_id) = callee_id_opt {
+                    if callee_instrumented {
+                        if let Some(callee_id) = callee_id_opt {
+                            ptr_locals_needing_tag.insert(p.local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(p.local),
+                                kind: InstrKind::CallArgPush {
+                                    callee_id,
+                                    arg_index: arg_index as u64,
+                                    ptr_local: p.local,
+                                },
+                            });
+                        }
+                    }
+                    if classified_write_ptr_local == Some(p.local)
+                        || classified_read_ptr_local == Some(p.local)
+                    {
+                        continue;
+                    }
+                    // suppress noisy PtrUse hooks coming from std/core/alloc spans
+                    // (e.g., println! machinery). This keeps user-code propagation bugs visible
+                    // while avoiding "untagged USE" spam from std wrappers until we instrument std.
+                    if !(self.filter_stdlib_uses_enabled()
+                        && self.span_is_stdlib(tcx, term.source_info.span))
+                    {
                         ptr_locals_needing_tag.insert(p.local);
                         insert_points.push(InsertPoint {
                             bb,
@@ -575,27 +914,9 @@ impl MyOptimizationPass {
                             insert_before: false,
                             source_info: term.source_info,
                             place: Place::from(p.local),
-                            kind: InstrKind::CallArgPush {
-                                callee_id,
-                                arg_index: arg_index as u64,
-                                ptr_local: p.local,
-                            },
+                            kind: InstrKind::PtrUse { ptr_local: p.local },
                         });
                     }
-                    if classified_write_ptr_local == Some(p.local)
-                        || classified_read_ptr_local == Some(p.local)
-                    {
-                        continue;
-                    }
-                    ptr_locals_needing_tag.insert(p.local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(p.local),
-                        kind: InstrKind::PtrUse { ptr_local: p.local },
-                    });
                 }
             }
         }
@@ -604,16 +925,18 @@ impl MyOptimizationPass {
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
             if self.is_thin_ptr_ty(tcx, dst_ty) {
-                if let Some(callee_id) = callee_id_opt {
-                    ptr_locals_needing_tag.insert(dst_local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(dst_local),
-                        kind: InstrKind::RetTake { callee_id, dst_local },
-                    });
+                if callee_instrumented {
+                    if let Some(callee_id) = callee_id_opt {
+                        ptr_locals_needing_tag.insert(dst_local);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(dst_local),
+                            kind: InstrKind::RetTake { callee_id, dst_local },
+                        });
+                    }
                 }
             }
         }
@@ -640,6 +963,19 @@ impl MyOptimizationPass {
             arg_locals.insert(arg_local);
         }
 
+        // Fallback stack locals:
+        // Some locals never get explicit `StorageLive/StorageDead` in optimized MIR
+        // (e.g. temporaries or values kept live for the whole function).
+        // If such a local is used to create or derive a pointer (including via calls),
+        // we would otherwise never record an allocation epoch for it, which causes
+        // use-after-dead and stale-pointer checks to silently miss.
+        // 
+        // To handle this, we conservatively treat these locals as "always-live":
+        //  - record a StackAlloc(live=true) at function entry
+        //  - record a StackAlloc(live=false) at every return site
+        //
+        // This is a fallback mechanism; precise lifetime tracking via explicit
+        // StorageLive/StorageDead takes precedence when available.
         let mut fallback_locals: Vec<(Local, usize)> = Vec::new();
         for local in body.local_decls.indices() {
             if local == RETURN_PLACE {
@@ -855,7 +1191,8 @@ impl MyOptimizationPass {
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
-            InstrKind::TagProp { .. } => hooks.def_id_use, // unreachable in practice
+            InstrKind::TagProp { .. } => hooks.def_id_use, // should never become a call (handled as a plain Assign)
+            InstrKind::PtrDerive { .. } => hooks.def_id_raw,
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
             InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
@@ -1251,6 +1588,11 @@ impl MyOptimizationPass {
                         None
                     }
                 }
+                InstrKind::PtrDerive { dst, .. } => Some(
+                    *tag_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing preallocated tag local for PtrDerive destination"),
+                ),
                 _ => None,
             };
 
@@ -1420,6 +1762,29 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
+                InstrKind::PtrDerive { dst, src, is_mut } => {
+                    let dst_tag = *tag_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing tag local for PtrDerive dst");
+
+                    let parent_tag_op: Operand<'tcx> =
+                        if let Some(tl) = tag_local_for_ptr_local.get(&src) {
+                            Operand::Copy(Place::from(*tl))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        };
+
+                    let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_mut, span: source_info.span },
+                        Spanned { node: parent_tag_op, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(dst_tag))
+                }
                 _ => {
                     let is_mut_u8: u8 = match creation_kind {
                         InstrKind::Ref { bk: borrow_kind, .. } => match borrow_kind {
@@ -1504,42 +1869,68 @@ impl MyOptimizationPass {
     }
 
     fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
+        let debug = std::env::var("RZ_DEBUG_SYMBOL_LOOKUP")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+
         for &cnum in tcx.crates(()).iter() {
             let crate_name = tcx.crate_name(cnum);
             if crate_name.as_str() == "runtime" {
-                println!("Searching for '{}' in runtime crate:", target_name);
+                if debug {
+                    println!("Searching for '{}' in runtime crate:", target_name);
+                }
                 let items = tcx.exported_non_generic_symbols(cnum);
-                println!("Found {} items", items.len());
+                if debug {
+                    println!("Found {} items", items.len());
+                }
                 for (symbol, _) in items {
                     match symbol {
                         ExportedSymbol::NonGeneric(def_id) | ExportedSymbol::Generic(def_id, _) => {
                             if let Some(name) = tcx.opt_item_name(*def_id) {
-                                println!(" - Checking item: {}", name);
+                                if debug {
+                                    println!(" - Checking item: {}", name);
+                                }
                                 if name.as_str() == target_name {
-                                    println!(" - Match found for '{}'", target_name);
+                                    if debug {
+                                        println!(" - Match found for '{}'", target_name);
+                                    }
                                     return Some(*def_id);
                                 }
                             } else {
-                                println!(" - Unnamed item: {:?}", def_id);
+                                if debug {
+                                    println!(" - Unnamed item: {:?}", def_id);
+                                }
                             }
                         }
                         ExportedSymbol::NoDefId(symbol_name) => {
-                            println!(" - Symbol without DefId: {:?}", symbol_name);
+                            if debug {
+                                println!(" - Symbol without DefId: {:?}", symbol_name);
+                            }
                         }
                         ExportedSymbol::DropGlue(ty) => {
-                            println!(" - DropGlue for type: {:?}", ty);
+                            if debug {
+                                println!(" - DropGlue for type: {:?}", ty);
+                            }
                         }
                         ExportedSymbol::AsyncDropGlueCtorShim(ty) => {
-                            println!(" - AsyncDropGlueCtorShim for type: {:?}", ty);
+                            if debug {
+                                println!(" - AsyncDropGlueCtorShim for type: {:?}", ty);
+                            }
                         }
                         ExportedSymbol::AsyncDropGlue(def_id, ty) => {
-                            println!(" - AsyncDropGlue for DefId: {:?}, type: {:?}", def_id, ty);
+                            if debug {
+                                println!(" - AsyncDropGlue for DefId: {:?}, type: {:?}", def_id, ty);
+                            }
                         }
                         ExportedSymbol::ThreadLocalShim(def_id) => {
-                            println!(" - ThreadLocalShim for DefId: {:?}", def_id);
+                            if debug {
+                                println!(" - ThreadLocalShim for DefId: {:?}", def_id);
+                            }
                         }
                         _ => {
-                            println!(" - Unhandled ExportedSymbol variant");
+                            if debug {
+                                println!(" - Unhandled ExportedSymbol variant");
+                            }
                         }
                     }
                 }
@@ -1575,11 +1966,6 @@ impl MyOptimizationPass {
             def_path
         );
 
-        println!("Loaded crates:");
-        for &cnum in tcx.crates(()).iter() {
-            let name = tcx.crate_name(cnum);
-            println!(" - {:?} (cnum: {:?})", name, cnum);
-        }
 
         // self.print_runtime_items(tcx);
 

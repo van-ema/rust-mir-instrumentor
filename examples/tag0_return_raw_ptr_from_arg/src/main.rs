@@ -10,5 +10,5 @@ fn main() {
     let p: *const i32 = &x as *const i32;
     let q = unsafe { callee(p) };
     let v = unsafe { ptr::read_volatile(q) };
-    println!("value = {}", v);
+    // println!("value = {}", v);
 }
