@@ -908,6 +908,10 @@ impl MyOptimizationPass {
             }
         }
 
+        let mut classified_write_ptr_local: Option<Local> = None;
+        let mut classified_read_ptr_local: Option<Local> = None;
+        let mut classified_derive_ptr_local: Option<Local> = None;
+
         // Pointer-result handling for calls:
         // - If the callee is instrumented, we rely on RetTake/RetPush, so we do not also TagProp/PtrDerive.
         // - If the callee is *not* instrumented (e.g. std/core wrappers), we best-effort propagate tags locally.
@@ -948,6 +952,11 @@ impl MyOptimizationPass {
                         }
 
                         if is_ptr_derive_call {
+                            // This call derives a new pointer from `src_local` (e.g. add/sub/offset/as_ptr).
+                            // We will emit a PtrDerive hook for the result, so suppress the redundant coarse PtrUse
+                            // for the base pointer argument.
+                            classified_derive_ptr_local = Some(src_local);
+
                             // Fresh tag derived from the base pointer tag.
                             let is_mut = match dst_ty.kind() {
                                 TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -1007,9 +1016,6 @@ impl MyOptimizationPass {
                 }
             }
         }
-
-        let mut classified_write_ptr_local: Option<Local> = None;
-        let mut classified_read_ptr_local: Option<Local> = None;
 
         // Memcpy/memset-style operations (intrinsics and std/core wrappers).
         // These are real READ/WRITE effects even when there is no explicit `(*p)` deref in MIR.
@@ -1196,6 +1202,7 @@ impl MyOptimizationPass {
                     }
                     if classified_write_ptr_local == Some(p.local)
                         || classified_read_ptr_local == Some(p.local)
+                        || classified_derive_ptr_local == Some(p.local)
                     {
                         continue;
                     }
