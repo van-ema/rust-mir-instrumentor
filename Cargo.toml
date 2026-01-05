@@ -7,6 +7,8 @@ members = [
     "examples/call_arg_wrap_offset",
     "examples/cast_call_arg",
     "examples/deref_write_and_read",
+    "examples/ext_dep_call/app",
+    "examples/ext_dep_call/dep",
     "examples/hello",
     "examples/hello_lib",
     "examples/memcpy_copy_nonoverlapping",
