@@ -7,6 +7,58 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum LogLevel {
+    Warn,
+    Info,
+    Trace,
+}
+
+fn rz_log_level() -> LogLevel {
+    match std::env::var("RZ_LOG")
+        .unwrap_or_else(|_| "warn".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "trace" => LogLevel::Trace,
+        "info" => LogLevel::Info,
+        _ => LogLevel::Warn,
+    }
+}
+
+#[inline]
+fn rz_log_enabled(level: LogLevel) -> bool {
+    rz_log_level() >= level
+}
+
+// Lightweight logging macros.
+// Usage: rz_warn!("..."); rz_info!("... {}", x); rz_trace!("..." );
+macro_rules! rz_log {
+    ($lvl:expr, $($arg:tt)*) => {{
+        if rz_log_enabled($lvl) {
+            println!($($arg)*);
+        }
+    }};
+}
+
+macro_rules! rz_warn {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Warn, $($arg)*)
+    };
+}
+
+macro_rules! rz_info {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Info, $($arg)*)
+    };
+}
+
+macro_rules! rz_trace {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Trace, $($arg)*)
+    };
+}
+
 
 static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
 
@@ -135,7 +187,7 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
 pub extern "C" fn __rz_dump_state() {
     let a = allocs().lock().unwrap();
     let t = tags().lock().unwrap();
-    println!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
+    rz_info!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
 }
 
 /// Record/validate a write through a tracked pointer tag.
@@ -187,7 +239,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    println!(
+    rz_info!(
         "[rusteze-runtime] WRITE: ok tag={} addr=0x{:x} size={} kind={:?}",
         tag,
         addr,
@@ -245,7 +297,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    println!(
+    rz_info!(
         "[rusteze-runtime] READ: ok tag={} addr=0x{:x} size={} kind={:?}",
         tag,
         addr,
@@ -334,9 +386,12 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
         PtrKind::RefMut => "mut",
         _ => "?",
     };
-    println!(
+    rz_trace!(
         "__record_ref_creation called: tag={}, parent={}, pointee=0x{:x}, kind={}",
-        tag, parent_tag, pointee_addr, kind_str
+        tag,
+        parent_tag,
+        pointee_addr,
+        kind_str
     );
     tag
 }
@@ -381,9 +436,12 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
         PtrKind::RawMut => "mut",
         _ => "?",
     };
-    println!(
+    rz_trace!(
         "__record_raw_ptr_creation called: tag={}, from={}, pointee=0x{:x}, kind={}",
-        tag, derived_from, pointee_addr, kind_str
+        tag,
+        derived_from,
+        pointee_addr,
+        kind_str
     );
     tag
 }
@@ -396,7 +454,7 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
 #[no_mangle]
 pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
     if tag == 0 {
-        println!(
+        rz_trace!(
             "[rusteze-runtime] USE: untagged ptr addr=0x{:x} (likely untracked/propagation missing)",
             addr
         );
@@ -405,7 +463,7 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
 
     let tmap = tags().lock().unwrap();
     if let Some(tmeta) = tmap.get(&tag) {
-        println!(
+        rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={}",
             tag,
             addr,
@@ -414,6 +472,6 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
             tmeta.parent
         );
     } else {
-        println!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);
+        rz_trace!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);
     }
 }

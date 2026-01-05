@@ -13,6 +13,41 @@ use rustc_span::{source_map::Spanned, Span};
 
 pub(crate) struct MyOptimizationPass;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum PassLogLevel {
+    Warn,
+    Info,
+    Trace,
+}
+
+// Lightweight logging macros for the compiler pass.
+// These avoid repeating `if self.log_enabled(...) { eprintln!(...) }`.
+macro_rules! rz_pass_log {
+    ($pass:expr, $lvl:expr, $($arg:tt)*) => {{
+        if ($pass).log_enabled($lvl) {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
+macro_rules! rz_pass_warn {
+    ($pass:expr, $($arg:tt)*) => {
+        rz_pass_log!($pass, PassLogLevel::Warn, $($arg)*)
+    };
+}
+
+macro_rules! rz_pass_info {
+    ($pass:expr, $($arg:tt)*) => {
+        rz_pass_log!($pass, PassLogLevel::Info, $($arg)*)
+    };
+}
+
+macro_rules! rz_pass_trace {
+    ($pass:expr, $($arg:tt)*) => {
+        rz_pass_log!($pass, PassLogLevel::Trace, $($arg)*)
+    };
+}
+
 #[derive(Copy, Clone, Debug)]
 enum InstrKind<'tcx> {
     Ref { bk: BorrowKind, src: Place<'tcx> },
@@ -74,6 +109,22 @@ struct Hooks {
 }
 
 impl MyOptimizationPass {
+    fn log_level(&self) -> PassLogLevel {
+        match std::env::var("RZ_LOG")
+            .unwrap_or_else(|_| "warn".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "trace" => PassLogLevel::Trace,
+            "info" => PassLogLevel::Info,
+            _ => PassLogLevel::Warn,
+        }
+    }
+
+    fn log_enabled(&self, level: PassLogLevel) -> bool {
+        self.log_level() >= level
+    }
+
     /// Whether we should suppress coarse PtrUse hooks originating from std/core/alloc.
     /// Default: enabled. Set `RZ_FILTER_STDLIB_USES=0` to disable.
     fn filter_stdlib_uses_enabled(&self) -> bool {
@@ -131,7 +182,8 @@ impl MyOptimizationPass {
         let set = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
         let mut guard = set.lock().unwrap();
         if guard.insert(def_path.to_string()) {
-            eprintln!(
+            rz_pass_warn!(
+                self,
                 "[rusteze][warn] unclassified direct call with pointer effects: {} (consider adding a wrapper/intrinsic classifier or instrumenting that crate)",
                 def_path
             );
