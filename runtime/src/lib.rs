@@ -4,7 +4,7 @@
 #![allow(internal_features)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -31,8 +31,7 @@ fn rz_log_enabled(level: LogLevel) -> bool {
     rz_log_level() >= level
 }
 
-// Lightweight logging macros.
-// Usage: rz_warn!("..."); rz_info!("... {}", x); rz_trace!("..." );
+
 macro_rules! rz_log {
     ($lvl:expr, $($arg:tt)*) => {{
         if rz_log_enabled($lvl) {
@@ -102,13 +101,13 @@ pub struct TagMeta {
     pub alloc_epoch: u64,
 }
 
-static ALLOCS: OnceLock<Mutex<HashMap<usize, AllocMeta>>> = OnceLock::new();
+static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
 
-fn allocs() -> &'static Mutex<HashMap<usize, AllocMeta>> {
-    ALLOCS.get_or_init(|| Mutex::new(HashMap::new()))
+fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
+    ALLOCS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
@@ -121,6 +120,32 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
 
 fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Find the allocation whose range [base, base+size) contains `addr`.
+/// Returns (base, meta) if found.
+#[inline]
+fn find_alloc_containing<'a>(
+    amap: &'a BTreeMap<usize, AllocMeta>,
+    addr: usize,
+) -> Option<(usize, &'a AllocMeta)> {
+    let (base, meta) = amap.range(..=addr).next_back()?;
+    let size = meta.size;
+
+    if size == 0 {
+        // Unknown-size allocations: only treat as containing if addr == base.
+        if *base == addr {
+            return Some((*base, meta));
+        }
+        return None;
+    }
+
+    let end = base.checked_add(size)?;
+    if addr < end {
+        Some((*base, meta))
+    } else {
+        None
+    }
 }
 
 #[inline(never)]
@@ -206,30 +231,85 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         return;
     };
 
-    // Best-effort exact-base allocation lookup (will be extended to range lookup).
+    // Range-based allocation lookup.
     let amap = allocs().lock().unwrap();
-    if let Some(ameta) = amap.get(&addr) {
-        if !ameta.live {
+    let alloc_opt = find_alloc_containing(&amap, addr);
+
+    let Some((base, ameta)) = alloc_opt else {
+        rz_violation(
+            "WILD_POINTER",
+            format!(
+                "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no allocation contains this address) kind={:?} parent={} pointee=0x{:x}",
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    };
+
+    if !ameta.live {
+        rz_violation(
+            "USE_AFTER_DEAD",
+            format!(
+                "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                ameta.size,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    }
+
+    if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            format!(
+                "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                ameta.size,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    }
+
+    // OOB check if both the access size and allocation size are known.
+    if size != 0 && ameta.size != 0 {
+        let end = match addr.checked_add(size) {
+            Some(e) => e,
+            None => {
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    format!(
+                        "WRITE via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={} pointee=0x{:x}",
+                        ameta.size,
+                        tmeta.kind,
+                        tmeta.parent,
+                        tmeta.pointee_addr
+                    ),
+                );
+                return;
+            }
+        };
+
+        let alloc_end = match base.checked_add(ameta.size) {
+            Some(e) => e,
+            None => usize::MAX,
+        };
+
+        if end > alloc_end {
             rz_violation(
-                "USE_AFTER_DEAD",
+                "OUT_OF_BOUNDS",
                 format!(
-                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
-                    ameta.epoch,
-                    tmeta.alloc_epoch,
-                    tmeta.kind,
-                    tmeta.parent,
-                    tmeta.pointee_addr
-                ),
-            );
-            return;
-        }
-        if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-            rz_violation(
-                "STALE_POINTER_EPOCH_MISMATCH",
-                format!(
-                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
-                    ameta.epoch,
-                    tmeta.alloc_epoch,
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.size,
                     tmeta.kind,
                     tmeta.parent,
                     tmeta.pointee_addr
@@ -264,30 +344,85 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         return;
     };
 
-    // Best-effort exact-base allocation lookup (will be extended to range lookup).
+    // Range-based allocation lookup.
     let amap = allocs().lock().unwrap();
-    if let Some(ameta) = amap.get(&addr) {
-        if !ameta.live {
+    let alloc_opt = find_alloc_containing(&amap, addr);
+
+    let Some((base, ameta)) = alloc_opt else {
+        rz_violation(
+            "WILD_POINTER",
+            format!(
+                "READ via tag={tag} addr=0x{addr:x} size={size}\n(no allocation contains this address) kind={:?} parent={} pointee=0x{:x}",
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    };
+
+    if !ameta.live {
+        rz_violation(
+            "USE_AFTER_DEAD",
+            format!(
+                "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                ameta.size,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    }
+
+    if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            format!(
+                "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
+                ameta.size,
+                ameta.epoch,
+                tmeta.alloc_epoch,
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+        );
+        return;
+    }
+
+    // OOB check if both the access size and allocation size are known.
+    if size != 0 && ameta.size != 0 {
+        let end = match addr.checked_add(size) {
+            Some(e) => e,
+            None => {
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    format!(
+                        "READ via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={} pointee=0x{:x}",
+                        ameta.size,
+                        tmeta.kind,
+                        tmeta.parent,
+                        tmeta.pointee_addr
+                    ),
+                );
+                return;
+            }
+        };
+
+        let alloc_end = match base.checked_add(ameta.size) {
+            Some(e) => e,
+            None => usize::MAX,
+        };
+
+        if end > alloc_end {
             rz_violation(
-                "USE_AFTER_DEAD",
+                "OUT_OF_BOUNDS",
                 format!(
-                    "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
-                    ameta.epoch,
-                    tmeta.alloc_epoch,
-                    tmeta.kind,
-                    tmeta.parent,
-                    tmeta.pointee_addr
-                ),
-            );
-            return;
-        }
-        if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-            rz_violation(
-                "STALE_POINTER_EPOCH_MISMATCH",
-                format!(
-                    "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
-                    ameta.epoch,
-                    tmeta.alloc_epoch,
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                    ameta.size,
                     tmeta.kind,
                     tmeta.parent,
                     tmeta.pointee_addr
@@ -362,13 +497,13 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
             .map(|p| p.alloc_epoch)
             .unwrap_or(0)
     } else {
-        // Root creation: best-effort snapshot from current allocation state.
-        allocs()
-            .lock()
-            .unwrap()
-            .get(&pointee_addr)
-            .map(|m| m.epoch)
-            .unwrap_or(0)
+        // Root creation: snapshot from the allocation that contains this address (range lookup).
+        {
+            let amap = allocs().lock().unwrap();
+            find_alloc_containing(&amap, pointee_addr)
+                .map(|(_base, m)| m.epoch)
+                .unwrap_or(0)
+        }
     };
 
     tags().lock().unwrap().insert(
@@ -413,12 +548,12 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
             .map(|p| p.alloc_epoch)
             .unwrap_or(0)
     } else {
-        allocs()
-            .lock()
-            .unwrap()
-            .get(&pointee_addr)
-            .map(|m| m.epoch)
-            .unwrap_or(0)
+        {
+            let amap = allocs().lock().unwrap();
+            find_alloc_containing(&amap, pointee_addr)
+                .map(|(_base, m)| m.epoch)
+                .unwrap_or(0)
+        }
     };
 
     tags().lock().unwrap().insert(
