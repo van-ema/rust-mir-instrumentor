@@ -95,6 +95,18 @@ name = "mutable_ref_test"
 version = "0.1.0"
 
 [[package]]
+name = "oob_read_u32"
+version = "0.1.0"
+
+[[package]]
+name = "oob_struct_interior"
+version = "0.1.0"
+
+[[package]]
+name = "oob_write_byte"
+version = "0.1.0"
+
+[[package]]
 name = "plain_read_wrappers"
 version = "0.1.0"
 
@@ -128,6 +140,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ret_ptr_local_uad"
+version = "0.1.0"
+
+[[package]]
+name = "ret_ptr_local_uad_interior"
 version = "0.1.0"
 
 [[package]]

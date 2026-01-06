@@ -568,13 +568,20 @@ impl MyOptimizationPass {
                 .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
             if is_deref_write {
                 let ptr_local = lhs_place.local;
+
+                // Best-effort size: use the type of the *place being written* (after projections).
+                // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
+                let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+                let size = self.layout_size_bytes(tcx, lhs_ty);
+
+                ptr_locals_needing_tag.insert(ptr_local);
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx,
                     insert_before: false,
                     source_info: stmt.source_info,
                     place: Place::from(ptr_local),
-                    kind: InstrKind::PtrWrite { ptr_local, size: 0 },
+                    kind: InstrKind::PtrWrite { ptr_local, size },
                 });
             }
         }
