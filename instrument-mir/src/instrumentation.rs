@@ -20,6 +20,15 @@ enum PassLogLevel {
     Trace,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum AllocShimKind {
+    No,
+    Alloc,
+    AllocZeroed,
+    Dealloc,
+    Realloc,
+}
+
 // Lightweight logging macros for the compiler pass.
 // These avoid repeating `if self.log_enabled(...) { eprintln!(...) }`.
 macro_rules! rz_pass_log {
@@ -48,12 +57,15 @@ macro_rules! rz_pass_trace {
     };
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 enum InstrKind<'tcx> {
     Ref { bk: BorrowKind, src: Place<'tcx> },
     Raw { is_mut: bool, src: Place<'tcx> },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc { local: Local, live: bool, size: usize },
+    /// Heap allocation lifetime event for an allocator-returned pointer.
+    /// `ptr_local` holds the pointer value; `size_op` is the allocation size operand (usize).
+    HeapAlloc { ptr_local: Local, live: bool, size_op: Operand<'tcx> },
     /// A write through a pointer local.
     /// `size` is best-effort (0 = unknown).
     PtrWrite { ptr_local: Local, size: usize },
@@ -783,6 +795,53 @@ impl MyOptimizationPass {
         (is_copy, is_memset)
     }
 
+    /// Recognize Rust allocator shims and common alloc::alloc wrappers (like exchange_malloc, alloc, etc.)
+    /// that back `Box`, `Vec`, etc. We instrument these to populate the runtime allocation map.
+    fn classify_rust_allocator_shim(&self, def_path: &str) -> AllocShimKind {
+        // NOTE: std/core/alloc are typically NOT instrumented by this pass, even in "instrument all deps" mode.
+        // Heap allocations for Vec/Box therefore frequently appear as calls to alloc wrappers like
+        // `alloc::alloc::exchange_malloc` rather than the raw `__rust_alloc` shims.
+
+        // Low-level shims (paths can be "__rust_alloc" or "...::__rust_alloc").
+        if def_path.contains("__rust_alloc_zeroed") {
+            return AllocShimKind::AllocZeroed;
+        }
+        if def_path.contains("__rust_alloc") {
+            return AllocShimKind::Alloc;
+        }
+        if def_path.contains("__rust_dealloc") {
+            return AllocShimKind::Dealloc;
+        }
+        if def_path.contains("__rust_realloc") {
+            return AllocShimKind::Realloc;
+        }
+
+        // alloc::alloc wrappers commonly seen in MIR (especially optimized builds).
+        // - exchange_malloc(size, align) -> *mut u8
+        // - alloc(size, align) -> *mut u8
+        // - alloc_zeroed(size, align) -> *mut u8
+        // - dealloc(ptr, size, align)
+        // - realloc(ptr, old_size, align, new_size) -> *mut u8
+        if def_path.contains("alloc::alloc::exchange_malloc") {
+            return AllocShimKind::Alloc;
+        }
+        if def_path.contains("alloc::alloc::alloc_zeroed") {
+            return AllocShimKind::AllocZeroed;
+        }
+        // Keep this after alloc_zeroed so it doesn't catch it first.
+        if def_path.contains("alloc::alloc::alloc") {
+            return AllocShimKind::Alloc;
+        }
+        if def_path.contains("alloc::alloc::dealloc") {
+            return AllocShimKind::Dealloc;
+        }
+        if def_path.contains("alloc::alloc::realloc") {
+            return AllocShimKind::Realloc;
+        }
+
+        AllocShimKind::No
+    }
+
     /// Best-effort: compute byte size for memory ops given a pointer operand local and a count operand.
     /// If count is not a constant or pointee size is unknown, returns 0.
     fn memop_size_bytes<'tcx>(
@@ -923,6 +982,14 @@ impl MyOptimizationPass {
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
+
+        // Allocator shim instrumentation (heap lifetime tracking).
+        // This is required for range-based allocation lookup to work for Vec/Box/etc.
+        let mut alloc_shim_kind = AllocShimKind::No;
+        if let Some((callee_def_id, _)) = callee_opt {
+            let path = tcx.def_path_str(callee_def_id);
+            alloc_shim_kind = self.classify_rust_allocator_shim(&path);
+        }
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
@@ -1235,6 +1302,112 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrRead { ptr_local: p0.local, size },
                     });
                 }
+            }
+        }
+
+        // --- Heap allocation/deallocation instrumentation via allocator shims ---
+        // __rust_alloc(size, align) -> *mut u8
+        // __rust_alloc_zeroed(size, align) -> *mut u8
+        // __rust_dealloc(ptr, size, align)
+        // __rust_realloc(ptr, old_size, align, new_size) -> *mut u8
+        if alloc_shim_kind != AllocShimKind::No {
+            // Where to insert events that need the call's return value.
+            let call_target_bb: Option<BasicBlock> = match &term.kind {
+                TerminatorKind::Call { target, .. } => *target,
+                _ => None,
+            };
+
+            match alloc_shim_kind {
+                AllocShimKind::Alloc | AllocShimKind::AllocZeroed => {
+                    // Record the newly allocated pointer as live.
+                    if let Some(dst_local) = destination.as_local() {
+                        if args.len() >= 1 {
+                            let size_op: Operand<'tcx> = args[0].node.clone();
+                            // Insert in the target block so `dst_local` is initialized.
+                            if let Some(tgt_bb) = call_target_bb {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                insert_points.push(InsertPoint {
+                                    bb: tgt_bb,
+                                    stmt_idx: 0,
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::HeapAlloc {
+                                        ptr_local: dst_local,
+                                        live: true,
+                                        size_op,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                AllocShimKind::Dealloc => {
+                    // Record the pointer as dead. Signature: (ptr, size, align)
+                    if args.len() >= 2 {
+                        if let Some(ptr_place) = self.place_from_operand(&args[0].node) {
+                            let ptr_local = ptr_place.local;
+                            let size_op: Operand<'tcx> = args[1].node.clone();
+                            ptr_locals_needing_tag.insert(ptr_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(ptr_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local,
+                                    live: false,
+                                    size_op,
+                                },
+                            });
+                        }
+                    }
+                }
+                AllocShimKind::Realloc => {
+                    // Record old ptr dead, new ptr live. Signature: (ptr, old_size, align, new_size) -> *mut u8
+                    if args.len() >= 4 {
+                        // Mark old dead in the call block.
+                        if let Some(old_ptr_place) = self.place_from_operand(&args[0].node) {
+                            let old_ptr_local = old_ptr_place.local;
+                            let old_size_op: Operand<'tcx> = args[1].node.clone();
+                            ptr_locals_needing_tag.insert(old_ptr_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(old_ptr_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: old_ptr_local,
+                                    live: false,
+                                    size_op: old_size_op,
+                                },
+                            });
+                        }
+
+                        // Mark new live in the target block (dst initialized after call returns).
+                        if let Some(dst_local) = destination.as_local() {
+                            let new_size_op: Operand<'tcx> = args[3].node.clone();
+                            if let Some(tgt_bb) = call_target_bb {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                insert_points.push(InsertPoint {
+                                    bb: tgt_bb,
+                                    stmt_idx: 0,
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::HeapAlloc {
+                                        ptr_local: dst_local,
+                                        live: true,
+                                        size_op: new_size_op,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                AllocShimKind::No => {}
             }
         }
 
@@ -1552,6 +1725,7 @@ impl MyOptimizationPass {
             InstrKind::Ref { .. } => hooks.def_id_ref,
             InstrKind::Raw { .. } => hooks.def_id_raw,
             InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
+            InstrKind::HeapAlloc { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
@@ -1940,6 +2114,12 @@ impl MyOptimizationPass {
 
             let func_operand = self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
 
+            let insert_before: bool = ip.insert_before
+                || matches!(
+                    &creation_kind,
+                    InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
+                );
+
             let tag_local: Option<Local> = match creation_kind {
                 InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
                     if let Some(lhs_local) = place.as_local() {
@@ -2047,6 +2227,23 @@ impl MyOptimizationPass {
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_size, span: source_info.span },
+                        Spanned { node: arg_live, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::HeapAlloc { live, size_op, .. } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let arg_live = self.const_u8(tcx, source_info.span, if live { 1 } else { 0 });
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: size_op, span: source_info.span },
                         Spanned { node: arg_live, span: source_info.span },
                     ]
                     .into_boxed_slice();
@@ -2198,11 +2395,6 @@ impl MyOptimizationPass {
                 },
             };
 
-            let insert_before = ip.insert_before
-                || matches!(
-                    creation_kind,
-                    InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
-                );
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
 

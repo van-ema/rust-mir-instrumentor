@@ -141,7 +141,7 @@ fn find_alloc_containing<'a>(
     }
 
     let end = base.checked_add(size)?;
-    if addr < end {
+    if addr <= end {
         Some((*base, meta))
     } else {
         None
