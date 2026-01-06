@@ -61,6 +61,16 @@ macro_rules! rz_pass_trace {
 enum InstrKind<'tcx> {
     Ref { bk: BorrowKind, src: Place<'tcx> },
     Raw { is_mut: bool, src: Place<'tcx> },
+    /// Root raw pointer creation for a pointer value already computed in a local.
+    ///
+    /// Option B: std/alloc often stores pointers inside ADTs like `NonNull<T>`/`Unique<T>` and then
+    /// produces a thin pointer via `Transmute`. Our TagProp only propagates between thin pointer
+    /// locals, so without this the destination pointer keeps tag=0 and triggers UNKNOWN_TAG.
+    ///
+    /// TODO(Option A): propagate/inherit the tag from the underlying pointer carried in the
+    /// NonNull/Unique ADT (track ADT-carried pointer tags / field projection) instead of creating
+    /// a new root tag.
+    RawRoot { ptr_local: Local, is_mut: bool },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc { local: Local, live: bool, size: usize },
     /// Heap allocation lifetime event for an allocator-returned pointer.
@@ -631,6 +641,51 @@ impl MyOptimizationPass {
                                 source_info: stmt.source_info,
                                 place: Place::from(dst_local),
                                 kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        //  std/alloc pattern where a thin pointer is produced by `Transmute` from
+        // `NonNull<T>`/`Unique<T>` (ADT). TagProp does not apply because the source is not a thin
+        // pointer local, so we synthesize a *root* raw-pointer tag for the destination.
+        //
+        // TODO: recover the parent tag from the pointer stored inside the ADT and propagate it.
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+            if let Some(dst_local) = dst_place.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    if let Rvalue::Cast(CastKind::Transmute, op, _to_ty) = rvalue {
+                        let src_ty = op.ty(body, tcx);
+                        let is_nonnull_like = match src_ty.kind() {
+                            TyKind::Adt(adt, _) => {
+                                let name = tcx.def_path_str(adt.did());
+                                name.contains("::ptr::NonNull")
+                                    || name.contains("::ptr::Unique")
+                                    || name.contains("core::ptr::NonNull")
+                                    || name.contains("alloc::ptr::Unique")
+                                    || name.contains("std::ptr::Unique")
+                            }
+                            _ => false,
+                        };
+
+                        if is_nonnull_like {
+                            let is_mut = match dst_ty.kind() {
+                                TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                _ => false,
+                            };
+
+                            ptr_locals_needing_tag.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
                             });
                         }
                     }
@@ -1724,6 +1779,7 @@ impl MyOptimizationPass {
         let def_id = match kind {
             InstrKind::Ref { .. } => hooks.def_id_ref,
             InstrKind::Raw { .. } => hooks.def_id_raw,
+            InstrKind::RawRoot { .. } => hooks.def_id_raw,
             InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
             InstrKind::HeapAlloc { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
@@ -1753,6 +1809,99 @@ impl MyOptimizationPass {
             let source_info = ip.source_info;
             let place = ip.place;
             let creation_kind = ip.kind;
+
+            // workaround for pointers produced from NonNull/Unique via Transmute
+            // RawRoot lowering: we implement this by mirroring the existing Raw lowering code path:
+            //   tag(ptr_local) = __record_raw_ptr_creation(expose(ptr_local), is_mut, 0)
+            if let InstrKind::RawRoot { ptr_local, is_mut } = creation_kind.clone() {
+                let dst_tag = *tag_local_for_ptr_local
+                    .get(&ptr_local)
+                    .expect("missing tag local for RawRoot");
+
+                // We insert using the same “split block with a call terminator” style used elsewhere.
+                // Create fresh block that will run the call and then continue.
+                let is_cleanup = body.basic_blocks[bb].is_cleanup;
+
+                // Split the current block at stmt_idx.
+                let mut tail_stmts: Vec<Statement<'tcx>> = Vec::new();
+                {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let split_at = stmt_idx.min(bd.statements.len());
+                    tail_stmts.extend(bd.statements.drain(split_at..));
+                }
+
+                let orig_term = body.basic_blocks[bb].terminator.clone();
+                let cont_bb = {
+                    let mut cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    cont_data.statements = tail_stmts;
+                    body.basic_blocks_mut().push(cont_data)
+                };
+
+                // Rewrite original terminator to jump to the new RawRoot call block.
+                // Create the RawRoot call block and set it as the new successor.
+                let call_bb = body.basic_blocks_mut().push(BasicBlockData::new(None, is_cleanup));
+                body.basic_blocks_mut()[bb].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Goto { target: call_bb },
+                });
+
+                // In the call block, compute exposed address.
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                body.basic_blocks_mut()[call_bb].statements.push(Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(addr_local),
+                        Rvalue::Cast(
+                            CastKind::PointerExposeProvenance,
+                            Operand::Copy(Place::from(ptr_local)),
+                            tcx.types.usize,
+                        ),
+                    ))),
+                ));
+
+                let raw_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_raw,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+
+                let is_mut_u8: u8 = if is_mut { 1 } else { 0 };
+                let args_raw: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, is_mut_u8),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, 0),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                body.basic_blocks_mut()[call_bb].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: raw_func,
+                        args: args_raw,
+                        destination: Place::from(dst_tag),
+                        target: Some(cont_bb),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Normal,
+                        fn_span: source_info.span,
+                    },
+                });
+
+                // Done handling this insert point.
+                continue;
+            }
 
             // Caller-side: take return tag after a call returned a thin pointer into `dst_local`.
             // This must run after the call, so we rewrite the call's target to a fresh block that
