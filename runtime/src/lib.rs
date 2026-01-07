@@ -186,6 +186,39 @@ fn rz_violation(kind: &str, msg: String) {
     }
 }
 
+/// Best-effort: resolve the allocation that a tag is derived from.
+///
+/// We walk up the tag-parent chain and try to map a tag's `pointee_addr` to an allocation
+/// using range-based lookup. We only accept the allocation if its epoch matches the tag's
+/// recorded `alloc_epoch` (when both are nonzero). This prevents misclassifying manually
+/// crafted pointers as OOB relative to an unrelated nearby allocation.
+#[inline]
+fn origin_alloc_for_tag<'a>(
+    tmap: &HashMap<u64, TagMeta>,
+    amap: &'a BTreeMap<usize, AllocMeta>,
+    mut tag: u64,
+) -> Option<(usize, &'a AllocMeta)> {
+    // Limit parent-walk to avoid pathological cycles.
+    for _ in 0..32 {
+        let t: &TagMeta = tmap.get(&tag)?;
+
+        if let Some((base, ameta)) = find_alloc_containing(amap, t.pointee_addr) {
+            // If both sides have epochs, require a match.
+            if t.alloc_epoch != 0 && ameta.epoch != 0 && t.alloc_epoch != ameta.epoch {
+                // Epoch mismatch: treat as unrelated (likely address reuse / stale).
+            } else {
+                return Some((base, ameta));
+            }
+        }
+
+        if t.parent == 0 {
+            break;
+        }
+        tag = t.parent;
+    }
+    None
+}
+
 /// Record (or update) allocation metadata. The key is the base address.
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
@@ -203,12 +236,12 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     // We must bump it not only on death, but also on reuse (dead -> live), otherwise
     // a later allocation at the same numeric address could "revive" stale pointers.
 
-    // Death transition: live -> dead
+    // Death transition: live to dead
     if !new_live && entry.live {
         entry.epoch = entry.epoch.wrapping_add(1);
     }
 
-    // Reuse/birth transition: dead -> live at an address we've seen before.
+    // Reuse/birth transition: dead to live at an address we've seen before.
     // If we already had a nonzero epoch, bump it so this is a fresh instance.
     if new_live && !entry.live {
         if entry.epoch != 0 {
@@ -273,6 +306,32 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!("[rusteze-runtime] WRITE lookup result: no containing allocation");
         }
+        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
+        // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
+            if ometa.size != 0 && size != 0 {
+                let access_end = addr.saturating_add(size);
+                let alloc_end = obase.saturating_add(ometa.size);
+
+                // If the access overlaps beyond the end of the origin allocation, it's OOB.
+                if addr >= obase && access_end > alloc_end {
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        format!(
+                            "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
+                            ometa.size,
+                            ometa.epoch,
+                            tmeta.alloc_epoch,
+                            tmeta.kind,
+                            tmeta.parent,
+                            tmeta.pointee_addr
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+
         rz_violation(
             "WILD_POINTER",
             format!(
@@ -398,6 +457,31 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let alloc_opt = find_alloc_containing(&amap, addr);
 
     let Some((base, ameta)) = alloc_opt else {
+        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
+        // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
+            if ometa.size != 0 && size != 0 {
+                let access_end = addr.saturating_add(size);
+                let alloc_end = obase.saturating_add(ometa.size);
+
+                if addr >= obase && access_end > alloc_end {
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        format!(
+                            "READ via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
+                            ometa.size,
+                            ometa.epoch,
+                            tmeta.alloc_epoch,
+                            tmeta.kind,
+                            tmeta.parent,
+                            tmeta.pointee_addr
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+
         rz_violation(
             "WILD_POINTER",
             format!(
