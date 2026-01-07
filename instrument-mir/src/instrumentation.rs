@@ -403,6 +403,14 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Compute the set of stack locals worth tracking as allocations.
+    ///
+    /// We track *pointee* locals whose address is taken (via `&` or `&raw`) so that range-based
+    /// allocation lookup and OOB checks work for stack data.
+    ///
+    /// We intentionally do NOT treat pointer-typed locals or miscellaneous temporaries as
+    /// allocations: aliasing models (e.g. Stacked Borrows) are enforced via pointer tags on
+    /// READ/WRITE, not by recording the address of pointer locals as allocations.
     fn compute_interesting_stack_locals<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -413,7 +421,7 @@ impl MyOptimizationPass {
             for stmt in block_data.statements.iter() {
                 if let StatementKind::Assign(box (_dst, rv)) = &stmt.kind {
                     match rv {
-                        // Direct address taking.
+                        // Address-taken locals: these correspond to real stack slots that pointers can reference.
                         Rvalue::Ref(_, _bk, src_place) => {
                             if src_place.local != RETURN_PLACE {
                                 interesting.insert(src_place.local);
@@ -424,30 +432,6 @@ impl MyOptimizationPass {
                                 interesting.insert(src_place.local);
                             }
                         }
-
-                        // Common deref-related temporary; treat the source local as interesting.
-                        Rvalue::CopyForDeref(p) => {
-                            if p.local != RETURN_PLACE {
-                                interesting.insert(p.local);
-                            }
-                        }
-
-                        // Pointer-related casts/coercions that often show up in optimized MIR.
-                        Rvalue::Cast(
-                            CastKind::PtrToPtr
-                            | CastKind::PointerCoercion(_, _)
-                            | CastKind::Transmute
-                            | CastKind::PointerExposeProvenance,
-                            op,
-                            _to_ty,
-                        ) => {
-                            if let Some(src_place) = self.place_from_operand(op) {
-                                if src_place.local != RETURN_PLACE {
-                                    interesting.insert(src_place.local);
-                                }
-                            }
-                        }
-
                         _ => {}
                     }
                 }
@@ -530,16 +514,22 @@ impl MyOptimizationPass {
                 {
                     let live = matches!(stmt.kind, StatementKind::StorageLive(_));
                     let ty = body.local_decls[local].ty;
-                    let size = self.layout_size_bytes(tcx, ty);
 
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx,
-                        insert_before: false,
-                        source_info: stmt.source_info,
-                        place: Place::from(local),
-                        kind: InstrKind::StackAlloc { local, live, size },
-                    });
+                    // Only record stack allocations for *pointee* locals (actual stack slots).
+                    // Pointer-typed locals (`&T`, `*mut T`, `*const T`) are just pointer values; recording
+                    // their addresses as allocations pollutes ALLOCS.
+                    if !self.is_thin_ptr_ty(tcx, ty) {
+                        let size = self.layout_size_bytes(tcx, ty);
+
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            insert_before: false,
+                            source_info: stmt.source_info,
+                            place: Place::from(local),
+                            kind: InstrKind::StackAlloc { local, live, size },
+                        });
+                    }
                 }
             }
             _ => {}
@@ -891,6 +881,22 @@ impl MyOptimizationPass {
             return AllocShimKind::Dealloc;
         }
         if def_path.contains("alloc::alloc::realloc") {
+            return AllocShimKind::Realloc;
+        }
+
+        // std::alloc wrappers (often take `Layout` instead of (size, align)).
+        // We still instrument them so heap liveness/epoch tracking works when std/core are not instrumented.
+        // TODO: extract Layout.size so we can do precise OOB for std::alloc::{alloc,dealloc,realloc}.
+        if def_path.contains("std::alloc::alloc_zeroed") {
+            return AllocShimKind::AllocZeroed;
+        }
+        if def_path.contains("std::alloc::alloc") {
+            return AllocShimKind::Alloc;
+        }
+        if def_path.contains("std::alloc::dealloc") {
+            return AllocShimKind::Dealloc;
+        }
+        if def_path.contains("std::alloc::realloc") {
             return AllocShimKind::Realloc;
         }
 
@@ -1377,7 +1383,24 @@ impl MyOptimizationPass {
                     // Record the newly allocated pointer as live.
                     if let Some(dst_local) = destination.as_local() {
                         if args.len() >= 1 {
-                            let size_op: Operand<'tcx> = args[0].node.clone();
+                            // Many std::alloc wrappers take a `Layout` as arg0 instead of (size, align).
+                            // For Layout-taking forms we currently record unknown size=0.
+                            // TODO: extract Layout.size so we can do precise OOB.
+                            let arg0_ty = args[0].node.ty(body, tcx);
+                            let size_op: Operand<'tcx> = match arg0_ty.kind() {
+                                TyKind::Adt(adt, _) => {
+                                    let name = tcx.def_path_str(adt.did());
+                                    if name.contains("core::alloc::Layout")
+                                        || name.contains("alloc::alloc::Layout")
+                                        || name.contains("std::alloc::Layout")
+                                    {
+                                        self.const_usize(tcx, term.source_info.span, 0)
+                                    } else {
+                                        args[0].node.clone()
+                                    }
+                                }
+                                _ => args[0].node.clone(),
+                            };
                             // Insert in the target block so `dst_local` is initialized.
                             if let Some(tgt_bb) = call_target_bb {
                                 ptr_locals_needing_tag.insert(dst_local);
@@ -1398,12 +1421,32 @@ impl MyOptimizationPass {
                     }
                 }
                 AllocShimKind::Dealloc => {
-                    // Record the pointer as dead. Signature: (ptr, size, align)
+                    // Deallocation: record pointer as dead.
+                    // For Layout-taking forms we currently record unknown size=0.
                     if args.len() >= 2 {
-                        if let Some(ptr_place) = self.place_from_operand(&args[0].node) {
-                            let ptr_local = ptr_place.local;
-                            let size_op: Operand<'tcx> = args[1].node.clone();
+                        let ptr_local_opt = args
+                            .get(0)
+                            .and_then(|a| self.place_from_operand(&a.node))
+                            .map(|p| p.local);
+                        if let Some(ptr_local) = ptr_local_opt {
                             ptr_locals_needing_tag.insert(ptr_local);
+
+                            let arg1_ty = args[1].node.ty(body, tcx);
+                            let size_op: Operand<'tcx> = match arg1_ty.kind() {
+                                TyKind::Adt(adt, _) => {
+                                    let name = tcx.def_path_str(adt.did());
+                                    if name.contains("core::alloc::Layout")
+                                        || name.contains("alloc::alloc::Layout")
+                                        || name.contains("std::alloc::Layout")
+                                    {
+                                        self.const_usize(tcx, term.source_info.span, 0)
+                                    } else {
+                                        args[1].node.clone()
+                                    }
+                                }
+                                _ => args[1].node.clone(),
+                            };
+
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
@@ -1589,7 +1632,12 @@ impl MyOptimizationPass {
 
         let interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
         let track_all_stack_allocs = self.track_all_stack_allocs_flag();
-
+        eprintln!(
+            "[rusteze][trace] track_all_stack_allocs={} RZ_STACK_ALLOCS={:?}",
+            track_all_stack_allocs,
+            std::env::var("RZ_STACK_ALLOCS").ok()
+          );
+          
         let entry_insert_at = self.entry_insert_after_prologue(body);
         self.push_arg_retags_at_entry(
             tcx,
@@ -1670,6 +1718,21 @@ impl MyOptimizationPass {
         let mut fallback_return_points: Vec<InsertPoint<'tcx>> = Vec::new();
 
         for (local, size) in fallback_locals.iter().copied() {
+            if local == RETURN_PLACE {
+                continue;
+            }
+        
+            // Only track stack slots that are actually address-taken (unless user forces all).
+            if !track_all_stack_allocs && !interesting_stack_locals.contains(&local) {
+                continue;
+            }
+        
+            // Never record pointer-typed locals as allocations.
+            let ty = body.local_decls[local].ty;
+            if self.is_thin_ptr_ty(tcx, ty) {
+                continue;
+            }
+            
             fallback_entry_points.push(InsertPoint {
                 bb: START_BLOCK,
                 stmt_idx: entry_insert_at,
@@ -2339,6 +2402,11 @@ impl MyOptimizationPass {
                 }
             };
 
+            let heap_alloc_info = match &creation_kind {
+                InstrKind::HeapAlloc { ptr_local, live, .. } => Some((*ptr_local, *live)),
+                _ => None,
+            };
+
             let arg_addr = Operand::Copy(Place::from(addr_local));
 
             let (args, dest_place) = match creation_kind {
@@ -2531,7 +2599,7 @@ impl MyOptimizationPass {
                 }
             };
 
-            let call_term = Terminator {
+            let mut call_term = Terminator {
                 source_info,
                 kind: TerminatorKind::Call {
                     func: func_operand,
@@ -2543,6 +2611,56 @@ impl MyOptimizationPass {
                     fn_span: source_info.span,
                 },
             };
+
+            if let Some((ptr_local, true)) = heap_alloc_info {
+                let raw_bb = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(None, is_cleanup));
+
+                if let TerminatorKind::Call { target, .. } = &mut call_term.kind {
+                    *target = Some(raw_bb);
+                }
+
+                let tag_local = *tag_local_for_ptr_local
+                    .get(&ptr_local)
+                    .expect("missing tag local for heap alloc ptr");
+
+                let raw_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_raw,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+
+                let raw_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, 1),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, 0),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                body.basic_blocks_mut()[raw_bb].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: raw_func,
+                        args: raw_args,
+                        destination: Place::from(tag_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                });
+            }
 
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];

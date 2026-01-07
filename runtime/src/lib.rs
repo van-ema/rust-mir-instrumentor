@@ -129,22 +129,45 @@ fn find_alloc_containing<'a>(
     amap: &'a BTreeMap<usize, AllocMeta>,
     addr: usize,
 ) -> Option<(usize, &'a AllocMeta)> {
-    let (base, meta) = amap.range(..=addr).next_back()?;
-    let size = meta.size;
+    // Allocations are half-open ranges: [base, base+size). 
+    // Choose the containing allocation with the largest end.
 
-    if size == 0 {
-        // Unknown-size allocations: only treat as containing if addr == base.
-        if *base == addr {
-            return Some((*base, meta));
+    let mut best: Option<(usize, &'a AllocMeta, usize)> = None; // (base, meta, end)
+    let mut best_unknown: Option<(usize, &'a AllocMeta)> = None;
+
+    for (base, meta) in amap.range(..=addr).rev() {
+        let size = meta.size;
+
+        if size == 0 {
+            // Unknown-size allocations: only treat as containing if addr == base.
+            // Keep as fallback only if we never find a known-size containing allocation.
+            if *base == addr && best.is_none() {
+                best_unknown = Some((*base, meta));
+            }
+            continue;
         }
-        return None;
+
+        let end = match base.checked_add(size) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        if addr < end {
+            match best {
+                None => best = Some((*base, meta, end)),
+                Some((_b, _m, best_end)) => {
+                    if end > best_end {
+                        best = Some((*base, meta, end));
+                    }
+                }
+            }
+        }
     }
 
-    let end = base.checked_add(size)?;
-    if addr <= end {
-        Some((*base, meta))
+    if let Some((b, m, _end)) = best {
+        Some((b, m))
     } else {
-        None
+        best_unknown
     }
 }
 
@@ -234,8 +257,22 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     // Range-based allocation lookup.
     let amap = allocs().lock().unwrap();
     let alloc_opt = find_alloc_containing(&amap, addr);
+    if rz_log_enabled(LogLevel::Trace) {
+        rz_trace!("[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}", addr, size, tag);
+        // Print up to 8 nearest bases <= addr for debugging.
+        let mut shown = 0usize;
+        for (b, m) in amap.range(..=addr).rev() {
+            if shown >= 8 { break; }
+            let end = b.saturating_add(m.size);
+            rz_trace!("  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}", b, m.size, m.live, m.epoch, end);
+            shown += 1;
+        }
+    }
 
     let Some((base, ameta)) = alloc_opt else {
+        if rz_log_enabled(LogLevel::Trace) {
+            rz_trace!("[rusteze-runtime] WRITE lookup result: no containing allocation");
+        }
         rz_violation(
             "WILD_POINTER",
             format!(
@@ -247,6 +284,18 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         );
         return;
     };
+
+    if rz_log_enabled(LogLevel::Trace) {
+        let alloc_end = base.saturating_add(ameta.size);
+        rz_trace!(
+            "[rusteze-runtime] WRITE lookup result: base=0x{:x} size={} live={} epoch={} alloc_end=0x{:x}",
+            base,
+            ameta.size,
+            ameta.live,
+            ameta.epoch,
+            alloc_end
+        );
+    }
 
     if !ameta.live {
         rz_violation(
