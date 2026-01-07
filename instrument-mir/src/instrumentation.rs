@@ -1098,7 +1098,6 @@ impl MyOptimizationPass {
         dst_local: Local,
         dst_ty: Ty<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
-        ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
         // Special-case: Box::into_raw returns a thin pointer derived from a Box ADT argument.
         // Since arg0 is not a thin pointer local, TagProp cannot apply; synthesize a root tag.
@@ -1116,8 +1115,6 @@ impl MyOptimizationPass {
             _ => 0,
         };
         let size_op: Operand<'tcx> = self.const_usize(tcx, term.source_info.span, pointee_size);
-
-        ptr_locals_needing_tag.insert(dst_local);
 
         // Insert after the call returns (in the call target block), so dst has the real value.
         let call_target_bb: Option<BasicBlock> = match &term.kind {
@@ -1176,13 +1173,44 @@ impl MyOptimizationPass {
         }
     }
 
+    fn push_box_from_raw_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        ptr_local: Local,
+        ptr_ty: Ty<'tcx>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+    ) {
+        let pointee_size: usize = match ptr_ty.kind() {
+            TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            _ => 0,
+        };
+        let size_op: Operand<'tcx> = self.const_usize(tcx, term.source_info.span, pointee_size);
+
+        insert_points.push(InsertPoint {
+            bb,
+            stmt_idx: block_data.statements.len(),
+            insert_before: true,
+            source_info: term.source_info,
+            place: Place::from(ptr_local),
+            kind: InstrKind::HeapAlloc {
+                ptr_local,
+                live: false,
+                size_op,
+            },
+        });
+    }
+
     fn warn_unknown_call_if_needed<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         args: &Box<[Spanned<Operand<'tcx>>]>,
         destination: &Place<'tcx>,
-        callee_opt: Option<(DefId, u64)>,
+        callee_path_opt: Option<&str>,
         callee_instrumented: bool,
         is_volatile_store: bool,
         is_volatile_load: bool,
@@ -1193,9 +1221,7 @@ impl MyOptimizationPass {
             return;
         }
 
-        if let Some((callee_def_id, _cid)) = callee_opt {
-            let def_path = tcx.def_path_str(callee_def_id);
-
+        if let Some(def_path) = callee_path_opt {
             // Does the call take any thin pointer argument?
             let mut has_ptr_arg = false;
             for a in args.iter() {
@@ -1215,10 +1241,10 @@ impl MyOptimizationPass {
 
             if (has_ptr_arg || returns_ptr) && !callee_instrumented {
                 // Known classifications we already handle:
-                let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&def_path);
-                let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&def_path);
-                let is_box_into_raw = self.is_box_into_raw_wrapper(&def_path);
-                let is_box_from_raw = self.is_box_from_raw_wrapper(&def_path);
+                let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(def_path);
+                let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(def_path);
+                let is_box_into_raw = self.is_box_into_raw_wrapper(def_path);
+                let is_box_from_raw = self.is_box_from_raw_wrapper(def_path);
                 let known = is_volatile_store
                     || is_volatile_load
                     || is_plain_store
@@ -1230,7 +1256,85 @@ impl MyOptimizationPass {
                     || is_box_from_raw;
 
                 if !known {
-                    self.warn_unknown_call_once(&def_path);
+                    self.warn_unknown_call_once(def_path);
+                }
+            }
+        }
+    }
+
+    fn push_memop_call_effects<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        is_copy: bool,
+        is_memset: bool,
+        classified_write_ptr_local: &mut Option<Local>,
+        classified_read_ptr_local: &mut Option<Local>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+    ) {
+        if !is_copy && !is_memset {
+            return;
+        }
+
+        if is_copy {
+            // Signature convention we assume (matches core::intrinsics and ptr wrappers):
+            //   copy::<T>(src: *const T, dst: *mut T, count: usize)
+            //   copy_nonoverlapping::<T>(src: *const T, dst: *mut T, count: usize)
+            if args.len() >= 3 {
+                let src_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                let dst_local = args.get(1).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                let count_op = &args[2].node;
+
+                if let Some(src) = src_local {
+                    *classified_read_ptr_local = Some(src);
+                    ptr_locals_needing_tag.insert(src);
+                    let size = self.memop_size_bytes(tcx, body, src, count_op);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(src),
+                        kind: InstrKind::PtrRead { ptr_local: src, size },
+                    });
+                }
+                if let Some(dst) = dst_local {
+                    *classified_write_ptr_local = Some(dst);
+                    ptr_locals_needing_tag.insert(dst);
+                    let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(dst),
+                        kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                    });
+                }
+            }
+        } else if is_memset {
+            // Signature convention:
+            //   write_bytes::<T>(dst: *mut T, val: u8, count: usize)
+            if args.len() >= 3 {
+                let dst_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
+                let count_op = &args[2].node;
+                if let Some(dst) = dst_local {
+                    *classified_write_ptr_local = Some(dst);
+                    ptr_locals_needing_tag.insert(dst);
+                    let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(dst),
+                        kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                    });
                 }
             }
         }
@@ -1250,24 +1354,24 @@ impl MyOptimizationPass {
         ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
         let (is_volatile_store, is_volatile_load) = self.is_volatile(tcx, body, func);
-        let mut is_plain_store = false;
-        let mut is_plain_load = false;
-        if let Some((callee_def_id, _)) = self.direct_callee(tcx, body, func) {
-            let path = tcx.def_path_str(callee_def_id);
-            (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(&path);
-        }
         let callee_opt = self.direct_callee(tcx, body, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
+        let callee_path_opt = callee_opt.map(|(did, _)| tcx.def_path_str(did));
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
 
+        let mut is_plain_store = false;
+        let mut is_plain_load = false;
+        if let Some(path) = callee_path_opt.as_deref() {
+            (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(path);
+        }
+
         // Allocator shim instrumentation (heap lifetime tracking).
         // This is required for range-based allocation lookup to work for Vec/Box/etc.
         let mut alloc_shim_kind = AllocShimKind::No;
-        if let Some((callee_def_id, _)) = callee_opt {
-            let path = tcx.def_path_str(callee_def_id);
-            alloc_shim_kind = self.classify_rust_allocator_shim(&path);
+        if let Some(path) = callee_path_opt.as_deref() {
+            alloc_shim_kind = self.classify_rust_allocator_shim(path);
         }
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
@@ -1278,7 +1382,7 @@ impl MyOptimizationPass {
             body,
             args,
             destination,
-            callee_opt,
+            callee_path_opt.as_deref(),
             callee_instrumented,
             is_volatile_store,
             is_volatile_load,
@@ -1299,11 +1403,10 @@ impl MyOptimizationPass {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if self.is_thin_ptr_ty(tcx, dst_ty) {
                     // Decide whether this call is a pointer-deriving wrapper that should get a fresh tag.
-                    let mut is_ptr_derive_call = false;
-                    if let Some((callee_def_id, _cid)) = callee_opt {
-                        let path = tcx.def_path_str(callee_def_id);
-                        is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&path);
-                    }
+                    let is_ptr_derive_call = callee_path_opt
+                        .as_deref()
+                        .map(|path| self.is_std_ptr_derive_wrapper(path))
+                        .unwrap_or(false);
 
                     if is_ptr_derive_call {
                         let mut src_local_opt: Option<Local> = None;
@@ -1327,28 +1430,28 @@ impl MyOptimizationPass {
                         if let Some(src_local) = src_local_opt {
                             ptr_locals_needing_tag.insert(dst_local);
                             ptr_locals_needing_tag.insert(src_local);
-    
-                                // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
-                                Self::push_ptr_derive_call(
-                                    bb,
-                                    block_data,
-                                    term,
-                                    dst_local,
-                                    dst_ty,
-                                    src_local,
-                                    insert_points,
-                                    &mut classified_derive_ptr_local,
-                                );
-                        }     
+
+                            // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
+                            Self::push_ptr_derive_call(
+                                bb,
+                                block_data,
+                                term,
+                                dst_local,
+                                dst_ty,
+                                src_local,
+                                insert_points,
+                                &mut classified_derive_ptr_local,
+                            );
+                        }
                     }
 
                     let mut is_box_into_raw = false;
-                    if let Some((callee_def_id, _cid)) = callee_opt {
-                        let path = tcx.def_path_str(callee_def_id);
-                        is_box_into_raw = self.is_box_into_raw_wrapper(&path);
+                    if let Some(path) = callee_path_opt.as_deref() {
+                        is_box_into_raw = self.is_box_into_raw_wrapper(path);
                     }
 
                     if is_box_into_raw {
+                        ptr_locals_needing_tag.insert(dst_local);
                         self.push_box_into_raw_call(
                             tcx,
                             bb,
@@ -1357,116 +1460,59 @@ impl MyOptimizationPass {
                             dst_local,
                             dst_ty,
                             insert_points,
-                            ptr_locals_needing_tag,
                         );
                     }
 
                 }
             }
-        }
-
-        // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
-        // In UAF examples where the Box is immediately dropped, this approximates the deallocation boundary.
-        // instrument actual drop glue / alloc::alloc::dealloc to mark dead precisely.
-        if let Some((callee_def_id, _cid)) = callee_opt {
-            let def_path = tcx.def_path_str(callee_def_id);
-            if self.is_box_from_raw_wrapper(&def_path) {
-                if let Some(first) = args.get(0) {
-                    if let Some(p) = self.place_from_operand(&first.node) {
-                        let ptr_local = p.local;
-                        let ptr_ty = body.local_decls[ptr_local].ty;
-                        if self.is_thin_ptr_ty(tcx, ptr_ty) {
-                            let pointee_size: usize = match ptr_ty.kind() {
-                                TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-                                TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-                                _ => 0,
-                            };
-                            let size_op: Operand<'tcx> =
-                                self.const_usize(tcx, term.source_info.span, pointee_size);
-
-                            ptr_locals_needing_tag.insert(ptr_local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: true,
-                                source_info: term.source_info,
-                                place: Place::from(ptr_local),
-                                kind: InstrKind::HeapAlloc {
+        
+            let is_box_from_raw_wrapper = callee_path_opt
+            .as_deref()
+            .is_some_and(|path| self.is_box_from_raw_wrapper(path));
+            // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
+            // In UAF examples where the Box is immediately dropped, this approximates the deallocation boundary.
+            // instrument actual drop glue / alloc::alloc::dealloc to mark dead precisely.
+                if is_box_from_raw_wrapper {
+                    if let Some(first) = args.get(0) {
+                        if let Some(p) = self.place_from_operand(&first.node) {
+                            let ptr_local = p.local;
+                            let ptr_ty = body.local_decls[ptr_local].ty;
+                            if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                                ptr_locals_needing_tag.insert(ptr_local);
+                                self.push_box_from_raw_call(
+                                    tcx,
+                                    bb,
+                                    block_data,
+                                    term,
                                     ptr_local,
-                                    live: false,
-                                    size_op,
-                                },
-                            });
+                                    ptr_ty,
+                                    insert_points,
+                                );
+                            }
                         }
                     }
                 }
-            }
         }
 
         // Memcpy/memset-style operations (intrinsics and std/core wrappers).
         // These are real READ/WRITE effects even when there is no explicit `(*p)` deref in MIR.
         // We handle them here so the runtime sees READ/WRITE, not only coarse USE.
-        if let Some((callee_def_id, _)) = callee_opt {
-            let path = tcx.def_path_str(callee_def_id);
-            let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&path);
-
-            if is_copy {
-                // Signature convention we assume (matches core::intrinsics and ptr wrappers):
-                //   copy::<T>(src: *const T, dst: *mut T, count: usize)
-                //   copy_nonoverlapping::<T>(src: *const T, dst: *mut T, count: usize)
-                if args.len() >= 3 {
-                    let src_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
-                    let dst_local = args.get(1).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
-                    let count_op = &args[2].node;
-
-                    if let Some(src) = src_local {
-                        classified_read_ptr_local = Some(src);
-                        ptr_locals_needing_tag.insert(src);
-                        let size = self.memop_size_bytes(tcx, body, src, count_op);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: Place::from(src),
-                            kind: InstrKind::PtrRead { ptr_local: src, size },
-                        });
-                    }
-                    if let Some(dst) = dst_local {
-                        classified_write_ptr_local = Some(dst);
-                        ptr_locals_needing_tag.insert(dst);
-                        let size = self.memop_size_bytes(tcx, body, dst, count_op);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: Place::from(dst),
-                            kind: InstrKind::PtrWrite { ptr_local: dst, size },
-                        });
-                    }
-                }
-            } else if is_memset {
-                // Signature convention:
-                //   write_bytes::<T>(dst: *mut T, val: u8, count: usize)
-                if args.len() >= 3 {
-                    let dst_local = args.get(0).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
-                    let count_op = &args[2].node;
-                    if let Some(dst) = dst_local {
-                        classified_write_ptr_local = Some(dst);
-                        ptr_locals_needing_tag.insert(dst);
-                        let size = self.memop_size_bytes(tcx, body, dst, count_op);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: Place::from(dst),
-                            kind: InstrKind::PtrWrite { ptr_local: dst, size },
-                        });
-                    }
-                }
-            }
+        if let Some(path) = callee_path_opt.as_deref() {
+            let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(path);
+            self.push_memop_call_effects(
+                tcx,
+                body,
+                bb,
+                block_data,
+                term,
+                args,
+                is_copy,
+                is_memset,
+                &mut classified_write_ptr_local,
+                &mut classified_read_ptr_local,
+                insert_points,
+                ptr_locals_needing_tag,
+            );
         }
 
         if is_volatile_store {
