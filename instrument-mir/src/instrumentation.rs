@@ -1340,6 +1340,204 @@ impl MyOptimizationPass {
         }
     }
 
+
+    fn push_alloc_shim_effects<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        destination: &Place<'tcx>,
+        alloc_shim_kind: AllocShimKind,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+    ) {
+        // Where to insert events that need the call's return value.
+        let call_target_bb: Option<BasicBlock> = match &term.kind {
+            TerminatorKind::Call { target, .. } => *target,
+            _ => None,
+        };
+
+        match alloc_shim_kind {
+            AllocShimKind::Alloc | AllocShimKind::AllocZeroed => {
+                // Record the newly allocated pointer as live.
+                if let Some(dst_local) = destination.as_local() {
+                    let dst_ty = body.local_decls[dst_local].ty;
+                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                        // Many std::alloc wrappers take a `Layout` as arg0 instead of (size, align).
+                        // For Layout-taking forms we currently record unknown size=0.
+                        // TODO: extract Layout.size so we can do precise OOB.
+                        let size_op: Operand<'tcx> = if let Some(arg0) = args.get(0) {
+                            let arg0_ty = arg0.node.ty(body, tcx);
+                            match arg0_ty.kind() {
+                                TyKind::Adt(adt, _) => {
+                                    let name = tcx.def_path_str(adt.did());
+                                    if name.contains("core::alloc::Layout")
+                                        || name.contains("alloc::alloc::Layout")
+                                        || name.contains("std::alloc::Layout")
+                                    {
+                                        self.const_usize(tcx, term.source_info.span, 0)
+                                    } else {
+                                        arg0.node.clone()
+                                    }
+                                }
+                                _ => arg0.node.clone(),
+                            }
+                        } else {
+                            self.const_usize(tcx, term.source_info.span, 0)
+                        };
+                        // Insert in the target block so `dst_local` is initialized.
+                        ptr_locals_needing_tag.insert(dst_local);
+                        if let Some(tgt_bb) = call_target_bb {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: dst_local,
+                                    live: true,
+                                    size_op,
+                                },
+                            });
+                        } else {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: dst_local,
+                                    live: true,
+                                    size_op,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            AllocShimKind::Dealloc => {
+                // Deallocation: record pointer as dead.
+                // For Layout-taking forms we currently record unknown size=0.
+                if let Some(first) = args.get(0) {
+                    if let Some(p) = self.place_from_operand(&first.node) {
+                        let ptr_local = p.local;
+                        let ptr_ty = body.local_decls[ptr_local].ty;
+                        if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                            let size_op: Operand<'tcx> = if args.len() >= 2 {
+                                let arg1_ty = args[1].node.ty(body, tcx);
+                                if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
+                                    args[1].node.clone()
+                                } else {
+                                    self.const_usize(tcx, term.source_info.span, 0)
+                                }
+                            } else {
+                                self.const_usize(tcx, term.source_info.span, 0)
+                            };
+
+                            ptr_locals_needing_tag.insert(ptr_local);
+
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: true,
+                                source_info: term.source_info,
+                                place: Place::from(ptr_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local,
+                                    live: false,
+                                    size_op,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            AllocShimKind::Realloc => {
+                // Record old ptr dead, new ptr live. Signature: (ptr, old_size, align, new_size) -> *mut u8
+                if let Some(first) = args.get(0) {
+                    if let Some(p) = self.place_from_operand(&first.node) {
+                        let old_ptr_local = p.local;
+                        let old_ptr_ty = body.local_decls[old_ptr_local].ty;
+                        if self.is_thin_ptr_ty(tcx, old_ptr_ty) {
+                            let old_size_op: Operand<'tcx> = if args.len() >= 2 {
+                                let arg1_ty = args[1].node.ty(body, tcx);
+                                if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
+                                    args[1].node.clone()
+                                } else {
+                                    self.const_usize(tcx, term.source_info.span, 0)
+                                }
+                            } else {
+                                self.const_usize(tcx, term.source_info.span, 0)
+                            };
+
+                            ptr_locals_needing_tag.insert(old_ptr_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: true,
+                                source_info: term.source_info,
+                                place: Place::from(old_ptr_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: old_ptr_local,
+                                    live: false,
+                                    size_op: old_size_op,
+                                },
+                            });
+                        }
+                    }
+                }
+
+                if let Some(dst_local) = destination.as_local() {
+                    let dst_ty = body.local_decls[dst_local].ty;
+                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                        let new_size_op: Operand<'tcx> = if args.len() >= 4 {
+                            args[3].node.clone()
+                        } else if args.len() >= 3 {
+                            args[2].node.clone()
+                        } else {
+                            self.const_usize(tcx, term.source_info.span, 0)
+                        };
+
+                        ptr_locals_needing_tag.insert(dst_local);
+                        if let Some(tgt_bb) = call_target_bb {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: dst_local,
+                                    live: true,
+                                    size_op: new_size_op,
+                                },
+                            });
+                        } else {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::HeapAlloc {
+                                    ptr_local: dst_local,
+                                    live: true,
+                                    size_op: new_size_op,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            AllocShimKind::No => {}
+        }
+    }
+
     fn scan_call_terminator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1365,13 +1563,6 @@ impl MyOptimizationPass {
         let mut is_plain_load = false;
         if let Some(path) = callee_path_opt.as_deref() {
             (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(path);
-        }
-
-        // Allocator shim instrumentation (heap lifetime tracking).
-        // This is required for range-based allocation lookup to work for Vec/Box/etc.
-        let mut alloc_shim_kind = AllocShimKind::No;
-        if let Some(path) = callee_path_opt.as_deref() {
-            alloc_shim_kind = self.classify_rust_allocator_shim(path);
         }
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
@@ -1611,195 +1802,32 @@ impl MyOptimizationPass {
             }
         }
 
+
+        // Allocator shim instrumentation (heap lifetime tracking).
         // --- Heap allocation/deallocation instrumentation via allocator shims ---
         // __rust_alloc(size, align) -> *mut u8
         // __rust_alloc_zeroed(size, align) -> *mut u8
         // __rust_dealloc(ptr, size, align)
         // __rust_realloc(ptr, old_size, align, new_size) -> *mut u8
-        if alloc_shim_kind != AllocShimKind::No {
-            // Where to insert events that need the call's return value.
-            let call_target_bb: Option<BasicBlock> = match &term.kind {
-                TerminatorKind::Call { target, .. } => *target,
-                _ => None,
-            };
-
-            match alloc_shim_kind {
-                AllocShimKind::Alloc | AllocShimKind::AllocZeroed => {
-                    // Record the newly allocated pointer as live.
-                    if let Some(dst_local) = destination.as_local() {
-                        let dst_ty = body.local_decls[dst_local].ty;
-                        if self.is_thin_ptr_ty(tcx, dst_ty) {
-                            // Many std::alloc wrappers take a `Layout` as arg0 instead of (size, align).
-                            // For Layout-taking forms we currently record unknown size=0.
-                            // TODO: extract Layout.size so we can do precise OOB.
-                            let size_op: Operand<'tcx> = if let Some(arg0) = args.get(0) {
-                                let arg0_ty = arg0.node.ty(body, tcx);
-                                match arg0_ty.kind() {
-                                    TyKind::Adt(adt, _) => {
-                                        let name = tcx.def_path_str(adt.did());
-                                        if name.contains("core::alloc::Layout")
-                                            || name.contains("alloc::alloc::Layout")
-                                            || name.contains("std::alloc::Layout")
-                                        {
-                                            self.const_usize(tcx, term.source_info.span, 0)
-                                        } else {
-                                            arg0.node.clone()
-                                        }
-                                    }
-                                    _ => arg0.node.clone(),
-                                }
-                            } else {
-                                self.const_usize(tcx, term.source_info.span, 0)
-                            };
-                            // Insert in the target block so `dst_local` is initialized.
-                            ptr_locals_needing_tag.insert(dst_local);
-                            if let Some(tgt_bb) = call_target_bb {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op,
-                                    },
-                                });
-                            } else {
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op,
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                AllocShimKind::Dealloc => {
-                    // Deallocation: record pointer as dead.
-                    // For Layout-taking forms we currently record unknown size=0.
-                    if let Some(first) = args.get(0) {
-                        if let Some(p) = self.place_from_operand(&first.node) {
-                            let ptr_local = p.local;
-                            let ptr_ty = body.local_decls[ptr_local].ty;
-                            if self.is_thin_ptr_ty(tcx, ptr_ty) {
-                                let size_op: Operand<'tcx> = if args.len() >= 2 {
-                                    let arg1_ty = args[1].node.ty(body, tcx);
-                                    if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
-                                        args[1].node.clone()
-                                    } else {
-                                        self.const_usize(tcx, term.source_info.span, 0)
-                                    }
-                                } else {
-                                    self.const_usize(tcx, term.source_info.span, 0)
-                                };
-
-                                ptr_locals_needing_tag.insert(ptr_local);
-
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: true,
-                                    source_info: term.source_info,
-                                    place: Place::from(ptr_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local,
-                                        live: false,
-                                        size_op,
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                AllocShimKind::Realloc => {
-                    // Record old ptr dead, new ptr live. Signature: (ptr, old_size, align, new_size) -> *mut u8
-                    if let Some(first) = args.get(0) {
-                        if let Some(p) = self.place_from_operand(&first.node) {
-                            let old_ptr_local = p.local;
-                            let old_ptr_ty = body.local_decls[old_ptr_local].ty;
-                            if self.is_thin_ptr_ty(tcx, old_ptr_ty) {
-                                let old_size_op: Operand<'tcx> = if args.len() >= 2 {
-                                    let arg1_ty = args[1].node.ty(body, tcx);
-                                    if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
-                                        args[1].node.clone()
-                                    } else {
-                                        self.const_usize(tcx, term.source_info.span, 0)
-                                    }
-                                } else {
-                                    self.const_usize(tcx, term.source_info.span, 0)
-                                };
-
-                                ptr_locals_needing_tag.insert(old_ptr_local);
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: true,
-                                    source_info: term.source_info,
-                                    place: Place::from(old_ptr_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: old_ptr_local,
-                                        live: false,
-                                        size_op: old_size_op,
-                                    },
-                                });
-                            }
-                        }
-                    }
-
-                    if let Some(dst_local) = destination.as_local() {
-                        let dst_ty = body.local_decls[dst_local].ty;
-                        if self.is_thin_ptr_ty(tcx, dst_ty) {
-                            let new_size_op: Operand<'tcx> = if args.len() >= 4 {
-                                args[3].node.clone()
-                            } else if args.len() >= 3 {
-                                args[2].node.clone()
-                            } else {
-                                self.const_usize(tcx, term.source_info.span, 0)
-                            };
-
-                            ptr_locals_needing_tag.insert(dst_local);
-                            if let Some(tgt_bb) = call_target_bb {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op: new_size_op,
-                                    },
-                                });
-                            } else {
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op: new_size_op,
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-                AllocShimKind::No => {}
-            }
+        let mut alloc_shim_kind = AllocShimKind::No;
+        if let Some(path) = callee_path_opt.as_deref() {
+            alloc_shim_kind = self.classify_rust_allocator_shim(path);
         }
+        if alloc_shim_kind != AllocShimKind::No {
+            self.push_alloc_shim_effects(
+                tcx,
+                body,
+                bb,
+                block_data,
+                term,
+                args,
+                destination,
+                alloc_shim_kind,
+                insert_points,
+                ptr_locals_needing_tag,
+            );    
+        }
+
 
         for (arg_index, a) in args.iter().enumerate() {
             if let Some(p) = self.place_from_operand(&a.node) {

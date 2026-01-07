@@ -1,5 +1,4 @@
 {
-    // Use nightly for everything rust-analyzer runs
     "rust-analyzer.check.overrideCommand": [
         "env",
         "RUSTC_BOOTSTRAP=1",
@@ -14,9 +13,7 @@
     "rust-analyzer.server.extraEnv": {
         "RUSTUP_TOOLCHAIN": "nightly-2025-08-01"
     },
-    // Enable procedural macros (recommended)
     "rust-analyzer.procMacro.enable": true,
-    // Use the correct compiler source for rustc_private crates
     "rust-analyzer.rustc.source": "discover",
     "rust-analyzer.cargo.buildScripts.enable": true,
 }
