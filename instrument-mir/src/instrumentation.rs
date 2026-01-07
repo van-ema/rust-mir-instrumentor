@@ -62,14 +62,9 @@ enum InstrKind<'tcx> {
     Ref { bk: BorrowKind, src: Place<'tcx> },
     Raw { is_mut: bool, src: Place<'tcx> },
     /// Root raw pointer creation for a pointer value already computed in a local.
-    ///
-    /// Option B: std/alloc often stores pointers inside ADTs like `NonNull<T>`/`Unique<T>` and then
+    /// std/alloc often stores pointers inside ADTs like `NonNull<T>`/`Unique<T>` and then
     /// produces a thin pointer via `Transmute`. Our TagProp only propagates between thin pointer
     /// locals, so without this the destination pointer keeps tag=0 and triggers UNKNOWN_TAG.
-    ///
-    /// TODO(Option A): propagate/inherit the tag from the underlying pointer carried in the
-    /// NonNull/Unique ADT (track ADT-carried pointer tags / field projection) instead of creating
-    /// a new root tag.
     RawRoot { ptr_local: Local, is_mut: bool },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc { local: Local, live: bool, size: usize },
@@ -1033,6 +1028,154 @@ impl MyOptimizationPass {
         None
     }
 
+    fn push_ptr_derive_call<'tcx>(
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+        src_local: Local,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        classified_derive_ptr_local: &mut Option<Local>,
+    ) {
+        // This call derives a new pointer from `src_local` (e.g. add/sub/offset/as_ptr).
+        // We will emit a PtrDerive hook for the result, so suppress the redundant coarse PtrUse
+        // for the base pointer argument.
+        *classified_derive_ptr_local = Some(src_local);
+
+        // Fresh tag derived from the base pointer tag.
+        let is_mut = match dst_ty.kind() {
+            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            _ => false,
+        };
+
+        // IMPORTANT: for ptr-derivation wrappers (add/sub/offset/...), the destination local
+        // is only initialized *after* the call returns. We must therefore insert the PtrDerive
+        // hook in the call's `target` block, not in the call block itself, otherwise we
+        // expose provenance of an uninitialized local and record a garbage pointee address.
+        let call_target_bb: Option<BasicBlock> = match &term.kind {
+            TerminatorKind::Call { target, .. } => *target,
+            _ => None,
+        };
+
+        if let Some(tgt_bb) = call_target_bb {
+            insert_points.push(InsertPoint {
+                bb: tgt_bb,
+                stmt_idx: 0,
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::PtrDerive {
+                    dst: dst_local,
+                    src: src_local,
+                    is_mut,
+                },
+            });
+        } else {
+            // Fallback (should not happen for normal calls): keep the old placement.
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::PtrDerive {
+                    dst: dst_local,
+                    src: src_local,
+                    is_mut,
+                },
+            });
+        }
+    }
+
+    fn push_box_into_raw_call<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+    ) {
+        // Special-case: Box::into_raw returns a thin pointer derived from a Box ADT argument.
+        // Since arg0 is not a thin pointer local, TagProp cannot apply; synthesize a root tag.
+        let is_mut = match dst_ty.kind() {
+            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            _ => false,
+        };
+
+        // Best-effort heap range recording for Box<T>: the raw pointer points to the T allocation.
+        // TODO(Option A): hook real allocator shims/drop glue to get exact layout/size in general.
+        let pointee_size: usize = match dst_ty.kind() {
+            TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
+            _ => 0,
+        };
+        let size_op: Operand<'tcx> = self.const_usize(tcx, term.source_info.span, pointee_size);
+
+        ptr_locals_needing_tag.insert(dst_local);
+
+        // Insert after the call returns (in the call target block), so dst has the real value.
+        let call_target_bb: Option<BasicBlock> = match &term.kind {
+            TerminatorKind::Call { target, .. } => *target,
+            _ => None,
+        };
+
+        if let Some(tgt_bb) = call_target_bb {
+            insert_points.push(InsertPoint {
+                bb: tgt_bb,
+                stmt_idx: 0,
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::RawRoot {
+                    ptr_local: dst_local,
+                    is_mut,
+                },
+            });
+            insert_points.push(InsertPoint {
+                bb: tgt_bb,
+                stmt_idx: 0,
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::HeapAlloc {
+                    ptr_local: dst_local,
+                    live: true,
+                    size_op: size_op.clone(),
+                },
+            });
+        } else {
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::RawRoot {
+                    ptr_local: dst_local,
+                    is_mut,
+                },
+            });
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::HeapAlloc {
+                    ptr_local: dst_local,
+                    live: true,
+                    size_op: size_op.clone(),
+                },
+            });
+        }
+    }
+
     fn scan_call_terminator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1126,21 +1269,29 @@ impl MyOptimizationPass {
             if let Some(dst_local) = destination.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    // Decide whether this call is a pointer-deriving wrapper that should get a fresh tag.
+                    let mut is_ptr_derive_call = false;
+                    if let Some((callee_def_id, _cid)) = callee_opt {
+                        let path = tcx.def_path_str(callee_def_id);
+                        is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&path);
+                    }
+
                     let mut src_local_opt: Option<Local> = None;
+                    if is_ptr_derive_call {
+                        if let Some(first) = args.get(0) {
+                            if let Some(arg_place) = self.place_from_operand(&first.node) {
+                                let arg_local = arg_place.local;
+                                let arg_ty = body.local_decls[arg_local].ty;
 
-                    if let Some(first) = args.get(0) {
-                        if let Some(arg_place) = self.place_from_operand(&first.node) {
-                            let arg_local = arg_place.local;
-                            let arg_ty = body.local_decls[arg_local].ty;
-
-                            if self.is_thin_ptr_ty(tcx, arg_ty) {
-                                src_local_opt = Some(arg_local);
-                            } else if let Some(base_local) =
-                                self.backtrack_unsize_base_local(arg_local, &block_data.statements)
-                            {
-                                let base_ty = body.local_decls[base_local].ty;
-                                if self.is_thin_ptr_ty(tcx, base_ty) {
-                                    src_local_opt = Some(base_local);
+                                if self.is_thin_ptr_ty(tcx, arg_ty) {
+                                    src_local_opt = Some(arg_local);
+                                } else if let Some(base_local) =
+                                    self.backtrack_unsize_base_local(arg_local, &block_data.statements)
+                                {
+                                    let base_ty = body.local_decls[base_local].ty;
+                                    if self.is_thin_ptr_ty(tcx, base_ty) {
+                                        src_local_opt = Some(base_local);
+                                    }
                                 }
                             }
                         }
@@ -1150,63 +1301,18 @@ impl MyOptimizationPass {
                         ptr_locals_needing_tag.insert(dst_local);
                         ptr_locals_needing_tag.insert(src_local);
 
-                        // Decide whether this call is a pointer-deriving wrapper that should get a fresh tag.
-                        let mut is_ptr_derive_call = false;
-                        if let Some((callee_def_id, _cid)) = callee_opt {
-                            let path = tcx.def_path_str(callee_def_id);
-                            is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&path);
-                        }
-
                         if is_ptr_derive_call {
-                            // This call derives a new pointer from `src_local` (e.g. add/sub/offset/as_ptr).
-                            // We will emit a PtrDerive hook for the result, so suppress the redundant coarse PtrUse
-                            // for the base pointer argument.
-                            classified_derive_ptr_local = Some(src_local);
-
-                            // Fresh tag derived from the base pointer tag.
-                            let is_mut = match dst_ty.kind() {
-                                TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                _ => false,
-                            };
-
-                            // IMPORTANT: for ptr-derivation wrappers (add/sub/offset/...), the destination local
-                            // is only initialized *after* the call returns. We must therefore insert the PtrDerive
-                            // hook in the call's `target` block, not in the call block itself, otherwise we
-                            // expose provenance of an uninitialized local and record a garbage pointee address.
-                            let call_target_bb: Option<BasicBlock> = match &term.kind {
-                                TerminatorKind::Call { target, .. } => *target,
-                                _ => None,
-                            };
-
-                            if let Some(tgt_bb) = call_target_bb {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::PtrDerive {
-                                        dst: dst_local,
-                                        src: src_local,
-                                        is_mut,
-                                    },
-                                });
-                            } else {
-                                // Fallback (should not happen for normal calls): keep the old placement.
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::PtrDerive {
-                                        dst: dst_local,
-                                        src: src_local,
-                                        is_mut,
-                                    },
-                                });
-                            }
+                            // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
+                            Self::push_ptr_derive_call(
+                                bb,
+                                block_data,
+                                term,
+                                dst_local,
+                                dst_ty,
+                                src_local,
+                                insert_points,
+                                &mut classified_derive_ptr_local,
+                            );
                         } else {
                             // Plain propagation: dst gets the same tag as src.
                             insert_points.push(InsertPoint {
@@ -1219,8 +1325,6 @@ impl MyOptimizationPass {
                             });
                         }
                     } else {
-                        // Special-case: Box::into_raw returns a thin pointer derived from a Box ADT argument.
-                        // Since arg0 is not a thin pointer local, TagProp cannot apply; synthesize a root tag.
                         let mut is_box_into_raw = false;
                         if let Some((callee_def_id, _cid)) = callee_opt {
                             let path = tcx.def_path_str(callee_def_id);
@@ -1228,79 +1332,16 @@ impl MyOptimizationPass {
                         }
 
                         if is_box_into_raw {
-                            let is_mut = match dst_ty.kind() {
-                                TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                _ => false,
-                            };
-
-                            // Best-effort heap range recording for Box<T>: the raw pointer points to the T allocation.
-                            // TODO(Option A): hook real allocator shims/drop glue to get exact layout/size in general.
-                            let pointee_size: usize = match dst_ty.kind() {
-                                TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-                                TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-                                _ => 0,
-                            };
-                            let size_op: Operand<'tcx> =
-                                self.const_usize(tcx, term.source_info.span, pointee_size);
-
-                            ptr_locals_needing_tag.insert(dst_local);
-
-                            // Insert after the call returns (in the call target block), so dst has the real value.
-                            let call_target_bb: Option<BasicBlock> = match &term.kind {
-                                TerminatorKind::Call { target, .. } => *target,
-                                _ => None,
-                            };
-
-                            if let Some(tgt_bb) = call_target_bb {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::RawRoot {
-                                        ptr_local: dst_local,
-                                        is_mut,
-                                    },
-                                });
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op: size_op.clone(),
-                                    },
-                                });
-                            } else {
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::RawRoot {
-                                        ptr_local: dst_local,
-                                        is_mut,
-                                    },
-                                });
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::HeapAlloc {
-                                        ptr_local: dst_local,
-                                        live: true,
-                                        size_op: size_op.clone(),
-                                    },
-                                });
-                            }
+                            self.push_box_into_raw_call(
+                                tcx,
+                                bb,
+                                block_data,
+                                term,
+                                dst_local,
+                                dst_ty,
+                                insert_points,
+                                ptr_locals_needing_tag,
+                            );
                         }
                     }
                 }
