@@ -1176,6 +1176,66 @@ impl MyOptimizationPass {
         }
     }
 
+    fn warn_unknown_call_if_needed<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        destination: &Place<'tcx>,
+        callee_opt: Option<(DefId, u64)>,
+        callee_instrumented: bool,
+        is_volatile_store: bool,
+        is_volatile_load: bool,
+        is_plain_store: bool,
+        is_plain_load: bool,
+    ) {
+        if !self.warn_unknown_calls_enabled() {
+            return;
+        }
+
+        if let Some((callee_def_id, _cid)) = callee_opt {
+            let def_path = tcx.def_path_str(callee_def_id);
+
+            // Does the call take any thin pointer argument?
+            let mut has_ptr_arg = false;
+            for a in args.iter() {
+                if let Some(p) = self.place_from_operand(&a.node) {
+                    let ty = body.local_decls[p.local].ty;
+                    if self.is_thin_ptr_ty(tcx, ty) {
+                        has_ptr_arg = true;
+                        break;
+                    }
+                }
+            }
+
+            // Does the call return a thin pointer into a local?
+            let returns_ptr = destination
+                .as_local()
+                .is_some_and(|dl| self.is_thin_ptr_ty(tcx, body.local_decls[dl].ty));
+
+            if (has_ptr_arg || returns_ptr) && !callee_instrumented {
+                // Known classifications we already handle:
+                let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&def_path);
+                let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&def_path);
+                let is_box_into_raw = self.is_box_into_raw_wrapper(&def_path);
+                let is_box_from_raw = self.is_box_from_raw_wrapper(&def_path);
+                let known = is_volatile_store
+                    || is_volatile_load
+                    || is_plain_store
+                    || is_plain_load
+                    || is_copy
+                    || is_memset
+                    || is_ptr_derive_call
+                    || is_box_into_raw
+                    || is_box_from_raw;
+
+                if !known {
+                    self.warn_unknown_call_once(&def_path);
+                }
+            }
+        }
+    }
+
     fn scan_call_terminator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1213,49 +1273,18 @@ impl MyOptimizationPass {
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
         // This helps avoid silently missing std/core/dep wrappers.
-        if self.warn_unknown_calls_enabled() {
-            if let Some((callee_def_id, _cid)) = callee_opt {
-                let def_path = tcx.def_path_str(callee_def_id);
-
-                // Does the call take any thin pointer argument?
-                let mut has_ptr_arg = false;
-                for a in args.iter() {
-                    if let Some(p) = self.place_from_operand(&a.node) {
-                        let ty = body.local_decls[p.local].ty;
-                        if self.is_thin_ptr_ty(tcx, ty) {
-                            has_ptr_arg = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Does the call return a thin pointer into a local?
-                let returns_ptr = destination
-                    .as_local()
-                    .is_some_and(|dl| self.is_thin_ptr_ty(tcx, body.local_decls[dl].ty));
-
-                if (has_ptr_arg || returns_ptr) && !callee_instrumented {
-                    // Known classifications we already handle:
-                    let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(&def_path);
-                    let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&def_path);
-                    let is_box_into_raw = self.is_box_into_raw_wrapper(&def_path);
-                    let is_box_from_raw = self.is_box_from_raw_wrapper(&def_path);
-                    let known = is_volatile_store
-                        || is_volatile_load
-                        || is_plain_store
-                        || is_plain_load
-                        || is_copy
-                        || is_memset
-                        || is_ptr_derive_call
-                        || is_box_into_raw
-                        || is_box_from_raw;
-
-                    if !known {
-                        self.warn_unknown_call_once(&def_path);
-                    }
-                }
-            }
-        }
+        self.warn_unknown_call_if_needed(
+            tcx,
+            body,
+            args,
+            destination,
+            callee_opt,
+            callee_instrumented,
+            is_volatile_store,
+            is_volatile_load,
+            is_plain_store,
+            is_plain_load,
+        );
 
         let mut classified_write_ptr_local: Option<Local> = None;
         let mut classified_read_ptr_local: Option<Local> = None;
@@ -1276,8 +1305,8 @@ impl MyOptimizationPass {
                         is_ptr_derive_call = self.is_std_ptr_derive_wrapper(&path);
                     }
 
-                    let mut src_local_opt: Option<Local> = None;
                     if is_ptr_derive_call {
+                        let mut src_local_opt: Option<Local> = None;
                         if let Some(first) = args.get(0) {
                             if let Some(arg_place) = self.place_from_operand(&first.node) {
                                 let arg_local = arg_place.local;
@@ -1295,62 +1324,50 @@ impl MyOptimizationPass {
                                 }
                             }
                         }
+                        if let Some(src_local) = src_local_opt {
+                            ptr_locals_needing_tag.insert(dst_local);
+                            ptr_locals_needing_tag.insert(src_local);
+    
+                                // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
+                                Self::push_ptr_derive_call(
+                                    bb,
+                                    block_data,
+                                    term,
+                                    dst_local,
+                                    dst_ty,
+                                    src_local,
+                                    insert_points,
+                                    &mut classified_derive_ptr_local,
+                                );
+                        }     
                     }
 
-                    if let Some(src_local) = src_local_opt {
-                        ptr_locals_needing_tag.insert(dst_local);
-                        ptr_locals_needing_tag.insert(src_local);
-
-                        if is_ptr_derive_call {
-                            // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
-                            Self::push_ptr_derive_call(
-                                bb,
-                                block_data,
-                                term,
-                                dst_local,
-                                dst_ty,
-                                src_local,
-                                insert_points,
-                                &mut classified_derive_ptr_local,
-                            );
-                        } else {
-                            // Plain propagation: dst gets the same tag as src.
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::TagProp { dst: dst_local, src: src_local },
-                            });
-                        }
-                    } else {
-                        let mut is_box_into_raw = false;
-                        if let Some((callee_def_id, _cid)) = callee_opt {
-                            let path = tcx.def_path_str(callee_def_id);
-                            is_box_into_raw = self.is_box_into_raw_wrapper(&path);
-                        }
-
-                        if is_box_into_raw {
-                            self.push_box_into_raw_call(
-                                tcx,
-                                bb,
-                                block_data,
-                                term,
-                                dst_local,
-                                dst_ty,
-                                insert_points,
-                                ptr_locals_needing_tag,
-                            );
-                        }
+                    let mut is_box_into_raw = false;
+                    if let Some((callee_def_id, _cid)) = callee_opt {
+                        let path = tcx.def_path_str(callee_def_id);
+                        is_box_into_raw = self.is_box_into_raw_wrapper(&path);
                     }
+
+                    if is_box_into_raw {
+                        self.push_box_into_raw_call(
+                            tcx,
+                            bb,
+                            block_data,
+                            term,
+                            dst_local,
+                            dst_ty,
+                            insert_points,
+                            ptr_locals_needing_tag,
+                        );
+                    }
+
                 }
             }
         }
 
         // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
         // In UAF examples where the Box is immediately dropped, this approximates the deallocation boundary.
-        // TODO(Option A): instrument actual drop glue / alloc::alloc::dealloc to mark dead precisely.
+        // instrument actual drop glue / alloc::alloc::dealloc to mark dead precisely.
         if let Some((callee_def_id, _cid)) = callee_opt {
             let def_path = tcx.def_path_str(callee_def_id);
             if self.is_box_from_raw_wrapper(&def_path) {
