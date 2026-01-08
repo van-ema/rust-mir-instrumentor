@@ -71,12 +71,37 @@ struct EffectRule {
 // Order matters: first match wins.
 // These rules cover "simple" std/core wrapper classification that is purely path-string based.
 static CALL_EFFECT_RULES: &[EffectRule] = &[
+    // ---- Allocator shims & wrappers (order matters) ----
+
+    // Low-level shims.
+    EffectRule { kind: MatchKind::Contains, needle: "__rust_alloc_zeroed", effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
+    EffectRule { kind: MatchKind::Contains, needle: "__rust_alloc",        effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "__rust_dealloc",      effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "__rust_realloc",      effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
+
+    // alloc::alloc wrappers.
+    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::exchange_malloc", effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::alloc_zeroed",    effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
+    // Keep this after alloc_zeroed so it doesn't catch it first.
+    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::alloc",           effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::dealloc",         effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::realloc",         effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
+
+    // std::alloc wrappers (often take `Layout`).
+    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::alloc_zeroed", effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
+    // Keep this after alloc_zeroed so it doesn't catch it first.
+    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::alloc",        effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::dealloc",      effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
+    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::realloc",      effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
     // No-op helpers.
     EffectRule { kind: MatchKind::EndsWith, needle: "::is_null", effect: CallEffect::Ignore },
 
     // Volatile wrappers (free functions).
     EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_volatile", effect: CallEffect::VolatileLoad },
     EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_volatile", effect: CallEffect::VolatileStore },
+    // Volatile intrinsics.
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_load", effect: CallEffect::VolatileLoad },
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_store", effect: CallEffect::VolatileStore },
 
     // Plain wrappers.
     EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_unaligned", effect: CallEffect::PlainLoad },
@@ -89,6 +114,10 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy", effect: CallEffect::MemCopy },
     EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy_nonoverlapping", effect: CallEffect::MemCopy },
     EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy", effect: CallEffect::MemCopy },
+    // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy_nonoverlapping)
+    EffectRule { kind: MatchKind::EndsWith, needle: "::copy_nonoverlapping", effect: CallEffect::MemCopy },
+    // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy)
+    EffectRule { kind: MatchKind::EndsWith, needle: "::copy", effect: CallEffect::MemCopy },
 
     // Memset-like.
     EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::write_bytes", effect: CallEffect::MemSet },
@@ -836,116 +865,13 @@ impl MyOptimizationPass {
     }
 
 
-    /// Recognize `core/std::ptr::{read_volatile,write_volatile}` wrappers.
-    ///
-    /// We want to treat these as READ/WRITE even before they inline down to
-    /// `core::intrinsics::{volatile_load,volatile_store}`.
-    fn classify_std_ptr_volatile_wrapper(&self, def_path: &str) -> (bool, bool) {
-        let eff = self.match_call_effect_rule(def_path);
-        let is_store = matches!(eff, Some(CallEffect::VolatileStore));
-        let is_load = matches!(eff, Some(CallEffect::VolatileLoad));
-        (is_store, is_load)
-    }
 
-    /// Recognize non-volatile std/core ptr load/store wrappers.
-    ///
-    /// These are *memory effects* even though the MIR often does not contain an explicit `(*p)`.
-    /// We classify them so we can emit PtrRead/PtrWrite hooks.
-    ///
-    /// Covered (monomorphized paths included):
-    ///   - core::ptr::read / std::ptr::read
-    ///   - core::ptr::read_unaligned / std::ptr::read_unaligned
-    ///   - core::ptr::write / std::ptr::write
-    ///   - core::ptr::write_unaligned / std::ptr::write_unaligned
-    fn classify_std_ptr_plain_wrapper(&self, def_path: &str) -> (bool, bool) {
-        let eff = self.match_call_effect_rule(def_path);
-        let is_store = matches!(eff, Some(CallEffect::PlainStore));
-        let is_load = matches!(eff, Some(CallEffect::PlainLoad));
-        (is_store, is_load)
-    }
-
-    /// Recognize memcpy/memmove/memset-like intrinsics and thin std/core wrappers.
-    /// Returns (is_memcpy, is_memset).
-    fn classify_mem_intrinsic_or_wrapper(&self, def_path: &str) -> (bool, bool) {
-        let eff = self.match_call_effect_rule(def_path);
-        let is_copy = matches!(eff, Some(CallEffect::MemCopy));
-        let is_memset = matches!(eff, Some(CallEffect::MemSet));
-        (is_copy, is_memset)
-    }
-
-    /// Recognize Rust allocator shims and common alloc::alloc wrappers (like exchange_malloc, alloc, etc.)
-    /// that back `Box`, `Vec`, etc. We instrument these to populate the runtime allocation map.
-    fn classify_rust_allocator_shim(&self, def_path: &str) -> AllocShimKind {
-        // NOTE: std/core/alloc are typically NOT instrumented by this pass, even in "instrument all deps" mode.
-        // Heap allocations for Vec/Box therefore frequently appear as calls to alloc wrappers like
-        // `alloc::alloc::exchange_malloc` rather than the raw `__rust_alloc` shims.
-
-        // Low-level shims (paths can be "__rust_alloc" or "...::__rust_alloc").
-        if def_path.contains("__rust_alloc_zeroed") {
-            return AllocShimKind::AllocZeroed;
-        }
-        if def_path.contains("__rust_alloc") {
-            return AllocShimKind::Alloc;
-        }
-        if def_path.contains("__rust_dealloc") {
-            return AllocShimKind::Dealloc;
-        }
-        if def_path.contains("__rust_realloc") {
-            return AllocShimKind::Realloc;
-        }
-
-        // alloc::alloc wrappers commonly seen in MIR (especially optimized builds).
-        // - exchange_malloc(size, align) -> *mut u8
-        // - alloc(size, align) -> *mut u8
-        // - alloc_zeroed(size, align) -> *mut u8
-        // - dealloc(ptr, size, align)
-        // - realloc(ptr, old_size, align, new_size) -> *mut u8
-        if def_path.contains("alloc::alloc::exchange_malloc") {
-            return AllocShimKind::Alloc;
-        }
-        if def_path.contains("alloc::alloc::alloc_zeroed") {
-            return AllocShimKind::AllocZeroed;
-        }
-        // Keep this after alloc_zeroed so it doesn't catch it first.
-        if def_path.contains("alloc::alloc::alloc") {
-            return AllocShimKind::Alloc;
-        }
-        if def_path.contains("alloc::alloc::dealloc") {
-            return AllocShimKind::Dealloc;
-        }
-        if def_path.contains("alloc::alloc::realloc") {
-            return AllocShimKind::Realloc;
-        }
-
-        // std::alloc wrappers (often take `Layout` instead of (size, align)).
-        // We still instrument them so heap liveness/epoch tracking works when std/core are not instrumented.
-        // TODO: extract Layout.size so we can do precise OOB for std::alloc::{alloc,dealloc,realloc}.
-        if def_path.contains("std::alloc::alloc_zeroed") {
-            return AllocShimKind::AllocZeroed;
-        }
-        if def_path.contains("std::alloc::alloc") {
-            return AllocShimKind::Alloc;
-        }
-        if def_path.contains("std::alloc::dealloc") {
-            return AllocShimKind::Dealloc;
-        }
-        if def_path.contains("std::alloc::realloc") {
-            return AllocShimKind::Realloc;
-        }
-
-        AllocShimKind::No
-    }
 
     /// Centralized call-effect classifier ("table").
     ///
     /// This MUST be kept consistent with instrumentation emission so that
     /// `warn_unknown_call_if_needed` does not drift from actual handling.
     fn classify_call_effect(&self, def_path: &str) -> CallEffect {
-        let ak = self.classify_rust_allocator_shim(def_path);
-        if ak != AllocShimKind::No {
-            return CallEffect::AllocShim(ak);
-        }
-
         if self.is_box_into_raw_wrapper(def_path) {
             return CallEffect::BoxIntoRaw;
         }
@@ -1054,32 +980,6 @@ impl MyOptimizationPass {
             && def_path.contains("::from_raw")
     }
 
-    fn is_volatile<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        func: &Operand<'tcx>,
-    ) -> (bool, bool) {
-        let mut is_volatile_store = false;
-        let mut is_volatile_load = false;
-
-        if let TyKind::FnDef(callee_def_id, _) = func.ty(body, tcx).kind() {
-            // Fast path for intrinsics (these are the "real" volatile ops once inlined).
-            let path = tcx.def_path_str(*callee_def_id);
-            if path.starts_with("core::intrinsics::") || path.starts_with("std::intrinsics::") {
-                let name_sym: rustc_span::symbol::Symbol = tcx.item_name(*callee_def_id);
-                match name_sym.as_str() {
-                    "volatile_store" => is_volatile_store = true,
-                    "volatile_load" => is_volatile_load = true,
-                    _ => {}
-                }
-                return (is_volatile_store, is_volatile_load);
-            }
-            (is_volatile_store, is_volatile_load) = self.classify_std_ptr_volatile_wrapper(&path);
-        }
-
-        (is_volatile_store, is_volatile_load)
-    }
 
     fn direct_callee<'tcx>(
         &self,
@@ -1278,8 +1178,6 @@ impl MyOptimizationPass {
         destination: &Place<'tcx>,
         callee_path_opt: Option<&str>,
         callee_instrumented: bool,
-        is_volatile_store: bool,
-        is_volatile_load: bool,
     ) {
         if !self.warn_unknown_calls_enabled() {
             return;
@@ -1307,12 +1205,7 @@ impl MyOptimizationPass {
                 // Use the centralized classifier so warning suppression matches actual handling.
                 let effect = self.classify_call_effect(def_path);
 
-                // Also treat volatile wrapper flags (computed earlier) as known.
-                // `is_volatile()` can classify intrinsics via item_name even when def_path is generic.
-                let known = is_volatile_store
-                    || is_volatile_load
-                    || !matches!(effect, CallEffect::Unknown);
-
+                let known = !matches!(effect, CallEffect::Unknown);
                 if !known {
                     self.warn_unknown_call_once(def_path);
                 }
@@ -1609,7 +1502,6 @@ impl MyOptimizationPass {
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
-        let (is_volatile_store, is_volatile_load) = self.is_volatile(tcx, body, func);
         let callee_opt = self.direct_callee(tcx, body, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
         let callee_path_opt = callee_opt.map(|(did, _)| tcx.def_path_str(did));
@@ -1621,12 +1513,6 @@ impl MyOptimizationPass {
 
         // Centralized effect classification for direct calls.
         let mut call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
-        // `is_volatile()` can classify intrinsics via item_name even when the def_path is generic.
-        if is_volatile_store {
-            call_effect_opt = Some(CallEffect::VolatileStore);
-        } else if is_volatile_load {
-            call_effect_opt = Some(CallEffect::VolatileLoad);
-        }
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
@@ -1638,8 +1524,6 @@ impl MyOptimizationPass {
             destination,
             callee_path_opt.as_deref(),
             callee_instrumented,
-            is_volatile_store,
-            is_volatile_load,
         );
 
         let mut classified_write_ptr_local: Option<Local> = None;
