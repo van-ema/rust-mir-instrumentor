@@ -38,12 +38,9 @@ enum CallEffect {
     MemCopy,
     /// memset-style (write dst).
     MemSet,
-    /// Non-volatile ptr::read*/write* wrappers.
-    PlainLoad,
-    PlainStore,
-    /// Volatile wrappers / intrinsics.
-    VolatileLoad,
-    VolatileStore,
+    /// Ptr load/store wrappers/intrinsics (plain or volatile).
+    Load,
+    Store,
     /// Pointer derivation wrappers that return a pointer derived from arg0 (fresh tag, parent linkage).
     PtrDerive,
     /// Box boundary modeling (Option B).
@@ -97,17 +94,17 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule { kind: MatchKind::EndsWith, needle: "::is_null", effect: CallEffect::Ignore },
 
     // Volatile wrappers (free functions).
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_volatile", effect: CallEffect::VolatileLoad },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_volatile", effect: CallEffect::VolatileStore },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_volatile", effect: CallEffect::Load },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_volatile", effect: CallEffect::Store },
     // Volatile intrinsics.
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_load", effect: CallEffect::VolatileLoad },
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_store", effect: CallEffect::VolatileStore },
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_load", effect: CallEffect::Load },
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_store", effect: CallEffect::Store },
 
     // Plain wrappers.
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_unaligned", effect: CallEffect::PlainLoad },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read", effect: CallEffect::PlainLoad },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_unaligned", effect: CallEffect::PlainStore },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write", effect: CallEffect::PlainStore },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_unaligned", effect: CallEffect::Load },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read", effect: CallEffect::Load },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_unaligned", effect: CallEffect::Store },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write", effect: CallEffect::Store },
 
     // Memcpy/memmove-like.
     EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy_nonoverlapping", effect: CallEffect::MemCopy },
@@ -1574,101 +1571,69 @@ impl MyOptimizationPass {
                     );
                 }
 
-                CallEffect::VolatileStore => {
-                    // Volatile store: WRITE through arg0.
+                CallEffect::Store => {
+                    // store wrapper/intrinsic: WRITE through arg0.
                     if let Some(first) = args.get(0) {
                         if let Some(p0) = self.place_from_operand(&first.node) {
                             classified_write_ptr_local = Some(p0.local);
                             ptr_locals_needing_tag.insert(p0.local);
-                
+
                             let mut size = 0usize;
                             let ty0 = body.local_decls[p0.local].ty;
-                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            match ty0.kind() {
+                                TyKind::RawPtr(pointee_ty, _mutbl) => {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                TyKind::Ref(_, pointee_ty, _mutbl) => {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                _ => {}
                             }
-                
+
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
                                 insert_before: false,
                                 source_info: term.source_info,
                                 place: Place::from(p0.local),
-                                kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
+                                kind: InstrKind::PtrWrite {
+                                    ptr_local: p0.local,
+                                    size,
+                                },
                             });
                         }
                     }
                 }
-                
-                CallEffect::VolatileLoad => {
-                    // Volatile load: READ through arg0.
+
+                CallEffect::Load => {
+                    // load wrapper/intrinsic: READ through arg0.
                     if let Some(first) = args.get(0) {
                         if let Some(p0) = self.place_from_operand(&first.node) {
                             classified_read_ptr_local = Some(p0.local);
                             ptr_locals_needing_tag.insert(p0.local);
-                
+
                             let mut size = 0usize;
                             let ty0 = body.local_decls[p0.local].ty;
-                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            match ty0.kind() {
+                                TyKind::RawPtr(pointee_ty, _mutbl) => {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                TyKind::Ref(_, pointee_ty, _mutbl) => {
+                                    size = self.layout_size_bytes(tcx, *pointee_ty);
+                                }
+                                _ => {}
                             }
-                
+
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
                                 insert_before: false,
                                 source_info: term.source_info,
                                 place: Place::from(p0.local),
-                                kind: InstrKind::PtrRead { ptr_local: p0.local, size },
-                            });
-                        }
-                    }
-                }
-                
-                CallEffect::PlainStore => {
-                    // Non-volatile ptr::write* wrappers: WRITE through arg0.
-                    if let Some(first) = args.get(0) {
-                        if let Some(p0) = self.place_from_operand(&first.node) {
-                            classified_write_ptr_local = Some(p0.local);
-                            ptr_locals_needing_tag.insert(p0.local);
-                
-                            let mut size = 0usize;
-                            let ty0 = body.local_decls[p0.local].ty;
-                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                size = self.layout_size_bytes(tcx, *pointee_ty);
-                            }
-                
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(p0.local),
-                                kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
-                            });
-                        }
-                    }
-                }
-                
-                CallEffect::PlainLoad => {
-                    // Non-volatile ptr::read* wrappers: READ through arg0.
-                    if let Some(first) = args.get(0) {
-                        if let Some(p0) = self.place_from_operand(&first.node) {
-                            classified_read_ptr_local = Some(p0.local);
-                            ptr_locals_needing_tag.insert(p0.local);
-                
-                            let mut size = 0usize;
-                            let ty0 = body.local_decls[p0.local].ty;
-                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                                size = self.layout_size_bytes(tcx, *pointee_ty);
-                            }
-                
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(p0.local),
-                                kind: InstrKind::PtrRead { ptr_local: p0.local, size },
+                                kind: InstrKind::PtrRead {
+                                    ptr_local: p0.local,
+                                    size,
+                                },
                             });
                         }
                     }
@@ -1783,10 +1748,8 @@ impl MyOptimizationPass {
             Some(
                 CallEffect::MemCopy
                     | CallEffect::MemSet
-                    | CallEffect::PlainLoad
-                    | CallEffect::PlainStore
-                    | CallEffect::VolatileLoad
-                    | CallEffect::VolatileStore
+                    | CallEffect::Load
+                    | CallEffect::Store
                     | CallEffect::PtrDerive
             )
         );
