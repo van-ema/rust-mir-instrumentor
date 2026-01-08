@@ -20,6 +20,7 @@ enum PassLogLevel {
     Trace,
 }
 
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum AllocShimKind {
     No,
@@ -27,6 +28,31 @@ enum AllocShimKind {
     AllocZeroed,
     Dealloc,
     Realloc,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CallEffect {
+    /// No memory / pointer-tracking relevant effect (e.g., ptr::is_null).
+    Ignore,
+    /// memcpy/memmove-style (read src, write dst).
+    MemCopy,
+    /// memset-style (write dst).
+    MemSet,
+    /// Non-volatile ptr::read*/write* wrappers.
+    PlainLoad,
+    PlainStore,
+    /// Volatile wrappers / intrinsics.
+    VolatileLoad,
+    VolatileStore,
+    /// Pointer derivation wrappers that return a pointer derived from arg0 (fresh tag, parent linkage).
+    PtrDerive,
+    /// Box boundary modeling (Option B).
+    BoxIntoRaw,
+    BoxFromRaw,
+    /// Allocator shims/wrappers.
+    AllocShim(AllocShimKind),
+    /// Not recognized.
+    Unknown,
 }
 
 // Lightweight logging macros for the compiler pass.
@@ -916,6 +942,66 @@ impl MyOptimizationPass {
         AllocShimKind::No
     }
 
+    /// Centralized call-effect classifier ("table").
+    ///
+    /// This MUST be kept consistent with instrumentation emission so that
+    /// `warn_unknown_call_if_needed` does not drift from actual handling.
+    fn classify_call_effect(&self, def_path: &str) -> CallEffect {
+        // 1) Allocator shims/wrappers.
+        let ak = self.classify_rust_allocator_shim(def_path);
+        if ak != AllocShimKind::No {
+            return CallEffect::AllocShim(ak);
+        }
+
+        // 2) Box wrappers.
+        if self.is_box_into_raw_wrapper(def_path) {
+            return CallEffect::BoxIntoRaw;
+        }
+        if self.is_box_from_raw_wrapper(def_path) {
+            return CallEffect::BoxFromRaw;
+        }
+
+        // 3) Pointer derivation wrappers.
+        if self.is_std_ptr_derive_wrapper(def_path) {
+            return CallEffect::PtrDerive;
+        }
+
+        // 4) Volatile wrappers (string-based; note that `is_volatile()` also detects intrinsics by item_name).
+        let (vs, vl) = self.classify_std_ptr_volatile_wrapper(def_path);
+        if vs {
+            return CallEffect::VolatileStore;
+        }
+        if vl {
+            return CallEffect::VolatileLoad;
+        }
+
+        // 5) Plain ptr load/store wrappers.
+        let (ps, pl) = self.classify_std_ptr_plain_wrapper(def_path);
+        if ps {
+            return CallEffect::PlainStore;
+        }
+        if pl {
+            return CallEffect::PlainLoad;
+        }
+
+        // 6) Memcpy/memset-like operations.
+        let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(def_path);
+        if is_copy {
+            return CallEffect::MemCopy;
+        }
+        if is_memset {
+            return CallEffect::MemSet;
+        }
+
+        // 7) No-op / value-level helpers.
+        // `ptr::is_null` does not read/write memory.
+        if def_path.contains("::ptr::") && def_path.ends_with("::is_null") {
+            return CallEffect::Ignore;
+        }
+
+        CallEffect::Unknown
+    }
+
     /// Best-effort: compute byte size for memory ops given a pointer operand local and a count operand.
     /// If count is not a constant or pointee size is unknown, returns 0.
     fn memop_size_bytes<'tcx>(
@@ -1258,29 +1344,16 @@ impl MyOptimizationPass {
                 .is_some_and(|dl| self.is_thin_ptr_ty(tcx, body.local_decls[dl].ty));
 
             if (has_ptr_arg || returns_ptr) && !callee_instrumented {
-                // Known classifications we already handle:
-                let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(def_path);
-                let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(def_path);
-                let is_box_into_raw = self.is_box_into_raw_wrapper(def_path);
-                let is_box_from_raw = self.is_box_from_raw_wrapper(def_path);
+                // Use the centralized classifier so warning suppression matches actual handling.
+                let effect = self.classify_call_effect(def_path);
 
-                // Allocator shims/wrappers are handled via HeapAlloc instrumentation.
-                let is_alloc_shim = self.classify_rust_allocator_shim(def_path) != AllocShimKind::No;
-
-                // `ptr::is_null` is value-level only (no memory effect).
-                let is_ptr_is_null = def_path.contains("::ptr::") && def_path.ends_with("::is_null");
-
+                // Also treat volatile/plain wrapper flags (computed earlier) as known.
+                // `is_volatile()` can classify intrinsics via item_name even when def_path is generic.
                 let known = is_volatile_store
                     || is_volatile_load
                     || is_plain_store
                     || is_plain_load
-                    || is_copy
-                    || is_memset
-                    || is_ptr_derive_call
-                    || is_box_into_raw
-                    || is_box_from_raw
-                    || is_alloc_shim
-                    || is_ptr_is_null;
+                    || !matches!(effect, CallEffect::Unknown);
 
                 if !known {
                     self.warn_unknown_call_once(def_path);
@@ -1592,6 +1665,9 @@ impl MyOptimizationPass {
             (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(path);
         }
 
+        // Centralized effect classification for direct calls.
+        let call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
         // This helps avoid silently missing std/core/dep wrappers.
@@ -1612,219 +1688,243 @@ impl MyOptimizationPass {
         let mut classified_read_ptr_local: Option<Local> = None;
         let mut classified_derive_ptr_local: Option<Local> = None;
 
-        // Pointer-result handling for calls:
-        // - If the callee is instrumented, we rely on RetTake/RetPush, so we do not also TagProp/PtrDerive.
-        // - If the callee is *not* instrumented (e.g. std/core wrappers), we best-effort propagate tags locally.
-        //   In particular, pointer-derivation wrappers (add/sub/offset/...) should produce a *fresh* tag.
-        if !callee_instrumented {
-            if let Some(dst_local) = destination.as_local() {
-                let dst_ty = body.local_decls[dst_local].ty;
-                if self.is_thin_ptr_ty(tcx, dst_ty) {
-                    // Decide whether this call is a pointer-deriving wrapper that should get a fresh tag.
-                    let is_ptr_derive_call = callee_path_opt
-                        .as_deref()
-                        .map(|path| self.is_std_ptr_derive_wrapper(path))
-                        .unwrap_or(false);
+        // Centralized emission for direct-call effects.
+        if let Some(effect) = call_effect_opt {
+            match effect {
+                CallEffect::Ignore => {
+                    // No memory/pointer effect.
+                }
 
-                    if is_ptr_derive_call {
-                        let mut src_local_opt: Option<Local> = None;
-                        if let Some(first) = args.get(0) {
-                            if let Some(arg_place) = self.place_from_operand(&first.node) {
-                                let arg_local = arg_place.local;
-                                let arg_ty = body.local_decls[arg_local].ty;
+                CallEffect::AllocShim(kind) => {
+                    // Allocator shims/wrappers: emit HeapAlloc live/dead events.
+                    self.push_alloc_shim_effects(
+                        tcx,
+                        body,
+                        bb,
+                        block_data,
+                        term,
+                        args,
+                        destination,
+                        kind,
+                        insert_points,
+                        ptr_locals_needing_tag,
+                    );
+                }
 
-                                if self.is_thin_ptr_ty(tcx, arg_ty) {
-                                    src_local_opt = Some(arg_local);
-                                } else if let Some(base_local) =
-                                    self.backtrack_unsize_base_local(arg_local, &block_data.statements)
-                                {
-                                    let base_ty = body.local_decls[base_local].ty;
-                                    if self.is_thin_ptr_ty(tcx, base_ty) {
-                                        src_local_opt = Some(base_local);
+                CallEffect::MemCopy | CallEffect::MemSet => {
+                    // Memcpy/memset-style operations (intrinsics and std/core wrappers).
+                    // These are real READ/WRITE effects even when there is no explicit `(*p)` deref in MIR.
+                    let is_copy = matches!(effect, CallEffect::MemCopy);
+                    let is_memset = matches!(effect, CallEffect::MemSet);
+                    self.push_memop_call_effects(
+                        tcx,
+                        body,
+                        bb,
+                        block_data,
+                        term,
+                        args,
+                        is_copy,
+                        is_memset,
+                        &mut classified_write_ptr_local,
+                        &mut classified_read_ptr_local,
+                        insert_points,
+                        ptr_locals_needing_tag,
+                    );
+                }
+
+                CallEffect::VolatileStore => {
+                    // Volatile store: WRITE through arg0.
+                    if let Some(first) = args.get(0) {
+                        if let Some(p0) = self.place_from_operand(&first.node) {
+                            classified_write_ptr_local = Some(p0.local);
+                            ptr_locals_needing_tag.insert(p0.local);
+                
+                            let mut size = 0usize;
+                            let ty0 = body.local_decls[p0.local].ty;
+                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            }
+                
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(p0.local),
+                                kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
+                            });
+                        }
+                    }
+                }
+                
+                CallEffect::VolatileLoad => {
+                    // Volatile load: READ through arg0.
+                    if let Some(first) = args.get(0) {
+                        if let Some(p0) = self.place_from_operand(&first.node) {
+                            classified_read_ptr_local = Some(p0.local);
+                            ptr_locals_needing_tag.insert(p0.local);
+                
+                            let mut size = 0usize;
+                            let ty0 = body.local_decls[p0.local].ty;
+                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            }
+                
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(p0.local),
+                                kind: InstrKind::PtrRead { ptr_local: p0.local, size },
+                            });
+                        }
+                    }
+                }
+                
+                CallEffect::PlainStore => {
+                    // Non-volatile ptr::write* wrappers: WRITE through arg0.
+                    if let Some(first) = args.get(0) {
+                        if let Some(p0) = self.place_from_operand(&first.node) {
+                            classified_write_ptr_local = Some(p0.local);
+                            ptr_locals_needing_tag.insert(p0.local);
+                
+                            let mut size = 0usize;
+                            let ty0 = body.local_decls[p0.local].ty;
+                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            }
+                
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(p0.local),
+                                kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
+                            });
+                        }
+                    }
+                }
+                
+                CallEffect::PlainLoad => {
+                    // Non-volatile ptr::read* wrappers: READ through arg0.
+                    if let Some(first) = args.get(0) {
+                        if let Some(p0) = self.place_from_operand(&first.node) {
+                            classified_read_ptr_local = Some(p0.local);
+                            ptr_locals_needing_tag.insert(p0.local);
+                
+                            let mut size = 0usize;
+                            let ty0 = body.local_decls[p0.local].ty;
+                            if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
+                                size = self.layout_size_bytes(tcx, *pointee_ty);
+                            }
+                
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(p0.local),
+                                kind: InstrKind::PtrRead { ptr_local: p0.local, size },
+                            });
+                        }
+                    }
+                }
+
+                CallEffect::PtrDerive => {
+                    // Pointer-result handling for ptr-derivation wrappers (add/sub/offset/as_ptr...).
+                    // Only needed when the callee is not instrumented.
+                    if !callee_instrumented {
+                        if let Some(dst_local) = destination.as_local() {
+                            let dst_ty = body.local_decls[dst_local].ty;
+                            if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                // Find base pointer local in arg0 (thin ptr) or backtrack an unsize cast.
+                                let mut src_local_opt: Option<Local> = None;
+                                if let Some(first) = args.get(0) {
+                                    if let Some(arg_place) = self.place_from_operand(&first.node) {
+                                        let arg_local = arg_place.local;
+                                        let arg_ty = body.local_decls[arg_local].ty;
+                                        if self.is_thin_ptr_ty(tcx, arg_ty) {
+                                            src_local_opt = Some(arg_local);
+                                        } else if let Some(base_local) =
+                                            self.backtrack_unsize_base_local(arg_local, &block_data.statements)
+                                        {
+                                            let base_ty = body.local_decls[base_local].ty;
+                                            if self.is_thin_ptr_ty(tcx, base_ty) {
+                                                src_local_opt = Some(base_local);
+                                            }
+                                        }
                                     }
+                                }
+
+                                if let Some(src_local) = src_local_opt {
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    ptr_locals_needing_tag.insert(src_local);
+                                    Self::push_ptr_derive_call(
+                                        bb,
+                                        block_data,
+                                        term,
+                                        dst_local,
+                                        dst_ty,
+                                        src_local,
+                                        insert_points,
+                                        &mut classified_derive_ptr_local,
+                                    );
                                 }
                             }
                         }
-                        if let Some(src_local) = src_local_opt {
-                            ptr_locals_needing_tag.insert(dst_local);
-                            ptr_locals_needing_tag.insert(src_local);
-
-                            // create a new tag that is linked to the old tag as its parent, instead of copying the same tag.
-                            Self::push_ptr_derive_call(
-                                bb,
-                                block_data,
-                                term,
-                                dst_local,
-                                dst_ty,
-                                src_local,
-                                insert_points,
-                                &mut classified_derive_ptr_local,
-                            );
-                        }
                     }
-
-                    let mut is_box_into_raw = false;
-                    if let Some(path) = callee_path_opt.as_deref() {
-                        is_box_into_raw = self.is_box_into_raw_wrapper(path);
-                    }
-
-                    if is_box_into_raw {
-                        ptr_locals_needing_tag.insert(dst_local);
-                        self.push_box_into_raw_call(
-                            tcx,
-                            bb,
-                            block_data,
-                            term,
-                            dst_local,
-                            dst_ty,
-                            insert_points,
-                        );
-                    }
-
                 }
-            }
-        
-            let is_box_from_raw_wrapper = callee_path_opt
-            .as_deref()
-            .is_some_and(|path| self.is_box_from_raw_wrapper(path));
-            // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
-            // In UAF examples where the Box is immediately dropped, this approximates the deallocation boundary.
-            // instrument actual drop glue / alloc::alloc::dealloc to mark dead precisely.
-                if is_box_from_raw_wrapper {
-                    if let Some(first) = args.get(0) {
-                        if let Some(p) = self.place_from_operand(&first.node) {
-                            let ptr_local = p.local;
-                            let ptr_ty = body.local_decls[ptr_local].ty;
-                            if self.is_thin_ptr_ty(tcx, ptr_ty) {
-                                ptr_locals_needing_tag.insert(ptr_local);
-                                self.push_box_from_raw_call(
+
+                CallEffect::BoxIntoRaw => {
+                    // Box::into_raw boundary modeling (Option B): root-tag + HeapAlloc live.
+                    if !callee_instrumented {
+                        if let Some(dst_local) = destination.as_local() {
+                            let dst_ty = body.local_decls[dst_local].ty;
+                            if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                self.push_box_into_raw_call(
                                     tcx,
                                     bb,
                                     block_data,
                                     term,
-                                    ptr_local,
-                                    ptr_ty,
+                                    dst_local,
+                                    dst_ty,
                                     insert_points,
                                 );
                             }
                         }
                     }
                 }
-        }
 
-        // Memcpy/memset-style operations (intrinsics and std/core wrappers).
-        // These are real READ/WRITE effects even when there is no explicit `(*p)` deref in MIR.
-        // We handle them here so the runtime sees READ/WRITE, not only coarse USE.
-        if let Some(path) = callee_path_opt.as_deref() {
-            let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(path);
-            self.push_memop_call_effects(
-                tcx,
-                body,
-                bb,
-                block_data,
-                term,
-                args,
-                is_copy,
-                is_memset,
-                &mut classified_write_ptr_local,
-                &mut classified_read_ptr_local,
-                insert_points,
-                ptr_locals_needing_tag,
-            );
-        }
-
-        if is_volatile_store {
-            if let Some(first) = args.get(0) {
-                if let Some(p0) = self.place_from_operand(&first.node) {
-                    classified_write_ptr_local = Some(p0.local);
-                    let mut size = 0usize;
-                    let ty0 = body.local_decls[p0.local].ty;
-                    if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                        size = self.layout_size_bytes(tcx, *pointee_ty);
+                CallEffect::BoxFromRaw => {
+                    // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
+                    // Only when the callee is not instrumented.
+                    if !callee_instrumented {
+                        if let Some(first) = args.get(0) {
+                            if let Some(p) = self.place_from_operand(&first.node) {
+                                let ptr_local = p.local;
+                                let ptr_ty = body.local_decls[ptr_local].ty;
+                                if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                                    ptr_locals_needing_tag.insert(ptr_local);
+                                    self.push_box_from_raw_call(
+                                        tcx,
+                                        bb,
+                                        block_data,
+                                        term,
+                                        ptr_local,
+                                        ptr_ty,
+                                        insert_points,
+                                    );
+                                }
+                            }
+                        }
                     }
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(p0.local),
-                        kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
-                    });
                 }
-            }
-        }
 
-        if is_volatile_load {
-            if let Some(first) = args.get(0) {
-                if let Some(p0) = self.place_from_operand(&first.node) {
-                    classified_read_ptr_local = Some(p0.local);
-                    let mut size = 0usize;
-                    let ty0 = body.local_decls[p0.local].ty;
-                    if let TyKind::RawPtr(pointee_ty, _mutbl) = ty0.kind() {
-                        size = self.layout_size_bytes(tcx, *pointee_ty);
-                    }
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(p0.local),
-                        kind: InstrKind::PtrRead { ptr_local: p0.local, size },
-                    });
-                }
-            }
-        }
-
-        // Non-volatile core/std ptr wrappers: treat as real READ/WRITE effects.
-        // `ptr::read*` reads from arg0; `ptr::write*` writes to arg0.
-        if is_plain_store {
-            if let Some(first) = args.get(0) {
-                if let Some(p0) = self.place_from_operand(&first.node) {
-                    classified_write_ptr_local = Some(p0.local);
-                    ptr_locals_needing_tag.insert(p0.local);
-
-                    let mut size = 0usize;
-                    let ty0 = body.local_decls[p0.local].ty;
-                    match ty0.kind() {
-                        TyKind::RawPtr(pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
-                        TyKind::Ref(_, pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
-                        _ => {}
-                    }
-
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(p0.local),
-                        kind: InstrKind::PtrWrite { ptr_local: p0.local, size },
-                    });
-                }
-            }
-        }
-
-        if is_plain_load {
-            if let Some(first) = args.get(0) {
-                if let Some(p0) = self.place_from_operand(&first.node) {
-                    classified_read_ptr_local = Some(p0.local);
-                    ptr_locals_needing_tag.insert(p0.local);
-
-                    let mut size = 0usize;
-                    let ty0 = body.local_decls[p0.local].ty;
-                    match ty0.kind() {
-                        TyKind::RawPtr(pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
-                        TyKind::Ref(_, pointee_ty, _) => size = self.layout_size_bytes(tcx, *pointee_ty),
-                        _ => {}
-                    }
-
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(p0.local),
-                        kind: InstrKind::PtrRead { ptr_local: p0.local, size },
-                    });
+                CallEffect::Unknown => {
+                    // No special emission here.
                 }
             }
         }
