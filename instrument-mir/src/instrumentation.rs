@@ -55,6 +55,47 @@ enum CallEffect {
     Unknown,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum MatchKind {
+    Contains,
+    EndsWith,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct EffectRule {
+    kind: MatchKind,
+    needle: &'static str,
+    effect: CallEffect,
+}
+
+// Order matters: first match wins.
+// These rules cover "simple" std/core wrapper classification that is purely path-string based.
+static CALL_EFFECT_RULES: &[EffectRule] = &[
+    // No-op helpers.
+    EffectRule { kind: MatchKind::EndsWith, needle: "::is_null", effect: CallEffect::Ignore },
+
+    // Volatile wrappers (free functions).
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_volatile", effect: CallEffect::VolatileLoad },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_volatile", effect: CallEffect::VolatileStore },
+
+    // Plain wrappers.
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_unaligned", effect: CallEffect::PlainLoad },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read", effect: CallEffect::PlainLoad },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_unaligned", effect: CallEffect::PlainStore },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write", effect: CallEffect::PlainStore },
+
+    // Memcpy/memmove-like.
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy_nonoverlapping", effect: CallEffect::MemCopy },
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy", effect: CallEffect::MemCopy },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy_nonoverlapping", effect: CallEffect::MemCopy },
+    EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy", effect: CallEffect::MemCopy },
+
+    // Memset-like.
+    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::write_bytes", effect: CallEffect::MemSet },
+    // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::write_bytes)
+    EffectRule { kind: MatchKind::EndsWith, needle: "::write_bytes", effect: CallEffect::MemSet },
+];
+
 // Lightweight logging macros for the compiler pass.
 // These avoid repeating `if self.log_enabled(...) { eprintln!(...) }`.
 macro_rules! rz_pass_log {
@@ -355,6 +396,19 @@ impl MyOptimizationPass {
             Operand::Copy(p) | Operand::Move(p) => Some(*p),
             _ => None,
         }
+    }
+
+    fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
+        for r in CALL_EFFECT_RULES {
+            let matched = match r.kind {
+                MatchKind::Contains => def_path.contains(r.needle),
+                MatchKind::EndsWith => def_path.ends_with(r.needle),
+            };
+            if matched {
+                return Some(r.effect);
+            }
+        }
+        None
     }
 
     fn const_u64<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span, v: u64) -> Operand<'tcx> {
@@ -787,22 +841,9 @@ impl MyOptimizationPass {
     /// We want to treat these as READ/WRITE even before they inline down to
     /// `core::intrinsics::{volatile_load,volatile_store}`.
     fn classify_std_ptr_volatile_wrapper(&self, def_path: &str) -> (bool, bool) {
-        let mut is_store = false;
-        let mut is_load = false;
-
-        // Examples of def_path_str():
-        //   "core::ptr::read_volatile"
-        //   "std::ptr::write_volatile"
-        //   "core::ptr::read_volatile::<i32>"
-        //   "std::ptr::write_volatile::<u64>"
-        //
-        // We keep this purely string-based so it works uniformly across inlining/monomorphization.
-        if def_path.contains("::ptr::read_volatile") {
-            is_load = true;
-        } else if def_path.contains("::ptr::write_volatile") {
-            is_store = true;
-        }
-
+        let eff = self.match_call_effect_rule(def_path);
+        let is_store = matches!(eff, Some(CallEffect::VolatileStore));
+        let is_load = matches!(eff, Some(CallEffect::VolatileLoad));
         (is_store, is_load)
     }
 
@@ -817,65 +858,18 @@ impl MyOptimizationPass {
     ///   - core::ptr::write / std::ptr::write
     ///   - core::ptr::write_unaligned / std::ptr::write_unaligned
     fn classify_std_ptr_plain_wrapper(&self, def_path: &str) -> (bool, bool) {
-        let mut is_store = false;
-        let mut is_load = false;
-
-        // Examples of def_path_str():
-        //   "core::ptr::read"
-        //   "std::ptr::write"
-        //   "core::ptr::read_unaligned::<u64>"
-        //   "std::ptr::write_unaligned::<i32>"
-        if def_path.contains("::ptr::read_unaligned") {
-            is_load = true;
-        } else if def_path.contains("::ptr::read") {
-            is_load = true;
-        } else if def_path.contains("::ptr::write_unaligned") {
-            is_store = true;
-        } else if def_path.contains("::ptr::write") {
-            is_store = true;
-        }
-
+        let eff = self.match_call_effect_rule(def_path);
+        let is_store = matches!(eff, Some(CallEffect::PlainStore));
+        let is_load = matches!(eff, Some(CallEffect::PlainLoad));
         (is_store, is_load)
     }
 
     /// Recognize memcpy/memmove/memset-like intrinsics and thin std/core wrappers.
     /// Returns (is_memcpy, is_memset).
     fn classify_mem_intrinsic_or_wrapper(&self, def_path: &str) -> (bool, bool) {
-        // Intrinsics:
-        //   core::intrinsics::copy
-        //   core::intrinsics::copy_nonoverlapping
-        //   core::intrinsics::write_bytes
-        //
-        // Wrappers (common free functions):
-        //   core::ptr::copy
-        //   core::ptr::copy_nonoverlapping
-        //   core::ptr::write_bytes
-        //   std::ptr::copy
-        //   std::ptr::copy_nonoverlapping
-        //   std::ptr::write_bytes
-        //
-        // Wrappers (method-style, seen in MIR as monomorphized impl methods):
-        //   std::ptr::mut_ptr::<impl *mut T>::write_bytes
-        //   core::ptr::mut_ptr::<impl *mut T>::write_bytes
-        //   ...::<impl *mut T>::copy / copy_nonoverlapping (rare but possible)
-
-        let is_intr_copy = def_path.contains("::intrinsics::copy")
-            || def_path.contains("::intrinsics::copy_nonoverlapping");
-
-        // Free-function wrappers.
-        let is_ptr_copy_fn = def_path.contains("::ptr::copy")
-            || def_path.contains("::ptr::copy_nonoverlapping");
-        let is_ptr_memset_fn = def_path.contains("::ptr::write_bytes");
-
-        // Method-style wrappers: any def_path under a ptr module ending in these names.
-        let is_ptr_copy_method = def_path.contains("::ptr::")
-            && (def_path.ends_with("::copy") || def_path.ends_with("::copy_nonoverlapping"));
-        let is_ptr_memset_method =
-            def_path.contains("::ptr::") && def_path.ends_with("::write_bytes");
-
-        let is_copy = is_intr_copy || is_ptr_copy_fn || is_ptr_copy_method;
-        let is_memset =
-            def_path.contains("::intrinsics::write_bytes") || is_ptr_memset_fn || is_ptr_memset_method;
+        let eff = self.match_call_effect_rule(def_path);
+        let is_copy = matches!(eff, Some(CallEffect::MemCopy));
+        let is_memset = matches!(eff, Some(CallEffect::MemSet));
         (is_copy, is_memset)
     }
 
@@ -947,13 +941,11 @@ impl MyOptimizationPass {
     /// This MUST be kept consistent with instrumentation emission so that
     /// `warn_unknown_call_if_needed` does not drift from actual handling.
     fn classify_call_effect(&self, def_path: &str) -> CallEffect {
-        // 1) Allocator shims/wrappers.
         let ak = self.classify_rust_allocator_shim(def_path);
         if ak != AllocShimKind::No {
             return CallEffect::AllocShim(ak);
         }
 
-        // 2) Box wrappers.
         if self.is_box_into_raw_wrapper(def_path) {
             return CallEffect::BoxIntoRaw;
         }
@@ -961,42 +953,12 @@ impl MyOptimizationPass {
             return CallEffect::BoxFromRaw;
         }
 
-        // 3) Pointer derivation wrappers.
         if self.is_std_ptr_derive_wrapper(def_path) {
             return CallEffect::PtrDerive;
         }
 
-        // 4) Volatile wrappers (string-based; note that `is_volatile()` also detects intrinsics by item_name).
-        let (vs, vl) = self.classify_std_ptr_volatile_wrapper(def_path);
-        if vs {
-            return CallEffect::VolatileStore;
-        }
-        if vl {
-            return CallEffect::VolatileLoad;
-        }
-
-        // 5) Plain ptr load/store wrappers.
-        let (ps, pl) = self.classify_std_ptr_plain_wrapper(def_path);
-        if ps {
-            return CallEffect::PlainStore;
-        }
-        if pl {
-            return CallEffect::PlainLoad;
-        }
-
-        // 6) Memcpy/memset-like operations.
-        let (is_copy, is_memset) = self.classify_mem_intrinsic_or_wrapper(def_path);
-        if is_copy {
-            return CallEffect::MemCopy;
-        }
-        if is_memset {
-            return CallEffect::MemSet;
-        }
-
-        // 7) No-op / value-level helpers.
-        // `ptr::is_null` does not read/write memory.
-        if def_path.contains("::ptr::") && def_path.ends_with("::is_null") {
-            return CallEffect::Ignore;
+        if let Some(eff) = self.match_call_effect_rule(def_path) {
+            return eff;
         }
 
         CallEffect::Unknown
@@ -1154,7 +1116,7 @@ impl MyOptimizationPass {
             _ => false,
         };
 
-        // IMPORTANT: for ptr-derivation wrappers (add/sub/offset/...), the destination local
+        // NOTE: for ptr-derivation wrappers (add/sub/offset/...), the destination local
         // is only initialized *after* the call returns. We must therefore insert the PtrDerive
         // hook in the call's `target` block, not in the call block itself, otherwise we
         // expose provenance of an uninitialized local and record a garbage pointee address.
@@ -1212,7 +1174,7 @@ impl MyOptimizationPass {
         };
 
         // Best-effort heap range recording for Box<T>: the raw pointer points to the T allocation.
-        // TODO(Option A): hook real allocator shims/drop glue to get exact layout/size in general.
+        // TODO: hook real allocator shims/drop glue to get exact layout/size in general.
         let pointee_size: usize = match dst_ty.kind() {
             TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
             TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
@@ -1318,8 +1280,6 @@ impl MyOptimizationPass {
         callee_instrumented: bool,
         is_volatile_store: bool,
         is_volatile_load: bool,
-        is_plain_store: bool,
-        is_plain_load: bool,
     ) {
         if !self.warn_unknown_calls_enabled() {
             return;
@@ -1347,12 +1307,10 @@ impl MyOptimizationPass {
                 // Use the centralized classifier so warning suppression matches actual handling.
                 let effect = self.classify_call_effect(def_path);
 
-                // Also treat volatile/plain wrapper flags (computed earlier) as known.
+                // Also treat volatile wrapper flags (computed earlier) as known.
                 // `is_volatile()` can classify intrinsics via item_name even when def_path is generic.
                 let known = is_volatile_store
                     || is_volatile_load
-                    || is_plain_store
-                    || is_plain_load
                     || !matches!(effect, CallEffect::Unknown);
 
                 if !known {
@@ -1659,14 +1617,16 @@ impl MyOptimizationPass {
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
 
-        let mut is_plain_store = false;
-        let mut is_plain_load = false;
-        if let Some(path) = callee_path_opt.as_deref() {
-            (is_plain_store, is_plain_load) = self.classify_std_ptr_plain_wrapper(path);
-        }
+        // 6a: Remove is_plain_store/is_plain_load computation.
 
         // Centralized effect classification for direct calls.
-        let call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+        let mut call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+        // `is_volatile()` can classify intrinsics via item_name even when the def_path is generic.
+        if is_volatile_store {
+            call_effect_opt = Some(CallEffect::VolatileStore);
+        } else if is_volatile_load {
+            call_effect_opt = Some(CallEffect::VolatileLoad);
+        }
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
@@ -1680,8 +1640,6 @@ impl MyOptimizationPass {
             callee_instrumented,
             is_volatile_store,
             is_volatile_load,
-            is_plain_store,
-            is_plain_load,
         );
 
         let mut classified_write_ptr_local: Option<Local> = None;
