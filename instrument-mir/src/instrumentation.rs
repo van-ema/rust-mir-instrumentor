@@ -819,19 +819,37 @@ impl MyOptimizationPass {
         //   core::intrinsics::copy
         //   core::intrinsics::copy_nonoverlapping
         //   core::intrinsics::write_bytes
-        // Wrappers (common):
+        //
+        // Wrappers (common free functions):
         //   core::ptr::copy
         //   core::ptr::copy_nonoverlapping
         //   core::ptr::write_bytes
         //   std::ptr::copy
         //   std::ptr::copy_nonoverlapping
         //   std::ptr::write_bytes
-        let is_copy = def_path.contains("::intrinsics::copy")
-            || def_path.contains("::ptr::copy")
-            || def_path.contains("::ptr::copy_nonoverlapping")
+        //
+        // Wrappers (method-style, seen in MIR as monomorphized impl methods):
+        //   std::ptr::mut_ptr::<impl *mut T>::write_bytes
+        //   core::ptr::mut_ptr::<impl *mut T>::write_bytes
+        //   ...::<impl *mut T>::copy / copy_nonoverlapping (rare but possible)
+
+        let is_intr_copy = def_path.contains("::intrinsics::copy")
             || def_path.contains("::intrinsics::copy_nonoverlapping");
-        let is_memset = def_path.contains("::intrinsics::write_bytes")
-            || def_path.contains("::ptr::write_bytes");
+
+        // Free-function wrappers.
+        let is_ptr_copy_fn = def_path.contains("::ptr::copy")
+            || def_path.contains("::ptr::copy_nonoverlapping");
+        let is_ptr_memset_fn = def_path.contains("::ptr::write_bytes");
+
+        // Method-style wrappers: any def_path under a ptr module ending in these names.
+        let is_ptr_copy_method = def_path.contains("::ptr::")
+            && (def_path.ends_with("::copy") || def_path.ends_with("::copy_nonoverlapping"));
+        let is_ptr_memset_method =
+            def_path.contains("::ptr::") && def_path.ends_with("::write_bytes");
+
+        let is_copy = is_intr_copy || is_ptr_copy_fn || is_ptr_copy_method;
+        let is_memset =
+            def_path.contains("::intrinsics::write_bytes") || is_ptr_memset_fn || is_ptr_memset_method;
         (is_copy, is_memset)
     }
 
@@ -1245,6 +1263,13 @@ impl MyOptimizationPass {
                 let is_ptr_derive_call = self.is_std_ptr_derive_wrapper(def_path);
                 let is_box_into_raw = self.is_box_into_raw_wrapper(def_path);
                 let is_box_from_raw = self.is_box_from_raw_wrapper(def_path);
+
+                // Allocator shims/wrappers are handled via HeapAlloc instrumentation.
+                let is_alloc_shim = self.classify_rust_allocator_shim(def_path) != AllocShimKind::No;
+
+                // `ptr::is_null` is value-level only (no memory effect).
+                let is_ptr_is_null = def_path.contains("::ptr::") && def_path.ends_with("::is_null");
+
                 let known = is_volatile_store
                     || is_volatile_load
                     || is_plain_store
@@ -1253,7 +1278,9 @@ impl MyOptimizationPass {
                     || is_memset
                     || is_ptr_derive_call
                     || is_box_into_raw
-                    || is_box_from_raw;
+                    || is_box_from_raw
+                    || is_alloc_shim
+                    || is_ptr_is_null;
 
                 if !known {
                     self.warn_unknown_call_once(def_path);
