@@ -1930,77 +1930,70 @@ impl MyOptimizationPass {
         }
 
 
-        // Allocator shim instrumentation (heap lifetime tracking).
-        // --- Heap allocation/deallocation instrumentation via allocator shims ---
-        // __rust_alloc(size, align) -> *mut u8
-        // __rust_alloc_zeroed(size, align) -> *mut u8
-        // __rust_dealloc(ptr, size, align)
-        // __rust_realloc(ptr, old_size, align, new_size) -> *mut u8
-        let mut alloc_shim_kind = AllocShimKind::No;
-        if let Some(path) = callee_path_opt.as_deref() {
-            alloc_shim_kind = self.classify_rust_allocator_shim(path);
-        }
-        if alloc_shim_kind != AllocShimKind::No {
-            self.push_alloc_shim_effects(
-                tcx,
-                body,
-                bb,
-                block_data,
-                term,
-                args,
-                destination,
-                alloc_shim_kind,
-                insert_points,
-                ptr_locals_needing_tag,
-            );    
-        }
-
-
+        let arg_is_already_accounted_for = |l: Local| {
+            classified_write_ptr_local == Some(l)
+                || classified_read_ptr_local == Some(l)
+                || classified_derive_ptr_local == Some(l)
+        };
+        
+        let suppress_ptr_use_for_call = matches!(
+            call_effect_opt,
+            Some(
+                CallEffect::MemCopy
+                    | CallEffect::MemSet
+                    | CallEffect::PlainLoad
+                    | CallEffect::PlainStore
+                    | CallEffect::VolatileLoad
+                    | CallEffect::VolatileStore
+                    | CallEffect::PtrDerive
+            )
+        );
+        
         for (arg_index, a) in args.iter().enumerate() {
-            if let Some(p) = self.place_from_operand(&a.node) {
-                let ty = body.local_decls[p.local].ty;
-                if self.is_thin_ptr_ty(tcx, ty) {
-                    if callee_instrumented {
-                        if let Some(callee_id) = callee_id_opt {
-                            ptr_locals_needing_tag.insert(p.local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(p.local),
-                                kind: InstrKind::CallArgPush {
-                                    callee_id,
-                                    arg_index: arg_index as u64,
-                                    ptr_local: p.local,
-                                },
-                            });
-                        }
-                    }
-                    if classified_write_ptr_local == Some(p.local)
-                        || classified_read_ptr_local == Some(p.local)
-                        || classified_derive_ptr_local == Some(p.local)
-                    {
-                        continue;
-                    }
-                    // suppress noisy PtrUse hooks coming from std/core/alloc spans
-                    // (e.g., println! machinery). This keeps user-code propagation bugs visible
-                    // while avoiding "untagged USE" spam from std wrappers until we instrument std.
-                    if !(self.filter_stdlib_uses_enabled()
-                        && self.span_is_stdlib(tcx, term.source_info.span))
-                    {
-                        ptr_locals_needing_tag.insert(p.local);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: Place::from(p.local),
-                            kind: InstrKind::PtrUse { ptr_local: p.local },
-                        });
-                    }
+            let Some(p) = self.place_from_operand(&a.node) else { continue; };
+            let ty = body.local_decls[p.local].ty;
+            if !self.is_thin_ptr_ty(tcx, ty) { continue; }
+        
+            // Inter-procedural: push argument tag to callee if instrumented.
+            if callee_instrumented {
+                if let Some(callee_id) = callee_id_opt {
+                    ptr_locals_needing_tag.insert(p.local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(p.local),
+                        kind: InstrKind::CallArgPush {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            ptr_local: p.local,
+                        },
+                    });
                 }
             }
+        
+            if arg_is_already_accounted_for(p.local) {
+                continue;
+            }
+        
+            if suppress_ptr_use_for_call {
+                continue;
+            }
+        
+            if self.filter_stdlib_uses_enabled() && self.span_is_stdlib(tcx, term.source_info.span) {
+                continue;
+            }
+        
+            ptr_locals_needing_tag.insert(p.local);
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(p.local),
+                kind: InstrKind::PtrUse { ptr_local: p.local },
+            });
         }
 
         // Caller-side return-tag recovery: if the call returns a thin pointer into a local, take the tag.
