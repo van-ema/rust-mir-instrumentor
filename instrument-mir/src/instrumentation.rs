@@ -60,9 +60,34 @@ enum MatchKind {
 
 #[derive(Copy, Clone, Debug)]
 struct EffectRule {
-    kind: MatchKind,
-    needle: &'static str,
+    kind1: MatchKind,
+    needle1: &'static str,
+    // Optional second condition: both must match.
+    kind2: Option<MatchKind>,
+    needle2: Option<&'static str>,
     effect: CallEffect,
+}
+
+impl EffectRule {
+    const fn one(kind: MatchKind, needle: &'static str, effect: CallEffect) -> Self {
+        Self { kind1: kind, needle1: needle, kind2: None, needle2: None, effect }
+    }
+
+    const fn two(
+        kind1: MatchKind,
+        needle1: &'static str,
+        kind2: MatchKind,
+        needle2: &'static str,
+        effect: CallEffect,
+    ) -> Self {
+        Self {
+            kind1,
+            needle1,
+            kind2: Some(kind2),
+            needle2: Some(needle2),
+            effect,
+        }
+    }
 }
 
 // Order matters: first match wins.
@@ -71,55 +96,78 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // ---- Allocator shims & wrappers (order matters) ----
 
     // Low-level shims.
-    EffectRule { kind: MatchKind::Contains, needle: "__rust_alloc_zeroed", effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
-    EffectRule { kind: MatchKind::Contains, needle: "__rust_alloc",        effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "__rust_dealloc",      effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "__rust_realloc",      effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
+    EffectRule::one(MatchKind::Contains, "__rust_alloc_zeroed", CallEffect::AllocShim(AllocShimKind::AllocZeroed)),
+    EffectRule::one(MatchKind::Contains, "__rust_alloc",        CallEffect::AllocShim(AllocShimKind::Alloc)),
+    EffectRule::one(MatchKind::Contains, "__rust_dealloc",      CallEffect::AllocShim(AllocShimKind::Dealloc)),
+    EffectRule::one(MatchKind::Contains, "__rust_realloc",      CallEffect::AllocShim(AllocShimKind::Realloc)),
 
     // alloc::alloc wrappers.
-    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::exchange_malloc", effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::alloc_zeroed",    effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
+    EffectRule::one(MatchKind::Contains, "alloc::alloc::exchange_malloc", CallEffect::AllocShim(AllocShimKind::Alloc)),
+    EffectRule::one(MatchKind::Contains, "alloc::alloc::alloc_zeroed",    CallEffect::AllocShim(AllocShimKind::AllocZeroed)),
     // Keep this after alloc_zeroed so it doesn't catch it first.
-    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::alloc",           effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::dealloc",         effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "alloc::alloc::realloc",         effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
+    EffectRule::one(MatchKind::Contains, "alloc::alloc::alloc",           CallEffect::AllocShim(AllocShimKind::Alloc)),
+    EffectRule::one(MatchKind::Contains, "alloc::alloc::dealloc",         CallEffect::AllocShim(AllocShimKind::Dealloc)),
+    EffectRule::one(MatchKind::Contains, "alloc::alloc::realloc",         CallEffect::AllocShim(AllocShimKind::Realloc)),
 
     // std::alloc wrappers (often take `Layout`).
-    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::alloc_zeroed", effect: CallEffect::AllocShim(AllocShimKind::AllocZeroed) },
+    EffectRule::one(MatchKind::Contains, "std::alloc::alloc_zeroed", CallEffect::AllocShim(AllocShimKind::AllocZeroed)),
     // Keep this after alloc_zeroed so it doesn't catch it first.
-    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::alloc",        effect: CallEffect::AllocShim(AllocShimKind::Alloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::dealloc",      effect: CallEffect::AllocShim(AllocShimKind::Dealloc) },
-    EffectRule { kind: MatchKind::Contains, needle: "std::alloc::realloc",      effect: CallEffect::AllocShim(AllocShimKind::Realloc) },
+    EffectRule::one(MatchKind::Contains, "std::alloc::alloc",        CallEffect::AllocShim(AllocShimKind::Alloc)),
+    EffectRule::one(MatchKind::Contains, "std::alloc::dealloc",      CallEffect::AllocShim(AllocShimKind::Dealloc)),
+    EffectRule::one(MatchKind::Contains, "std::alloc::realloc",      CallEffect::AllocShim(AllocShimKind::Realloc)),
+
     // No-op helpers.
-    EffectRule { kind: MatchKind::EndsWith, needle: "::is_null", effect: CallEffect::Ignore },
+    EffectRule::one(MatchKind::EndsWith, "::is_null", CallEffect::Ignore),
+
+    // ---- PtrDerive wrappers (pointer arithmetic + slice/vec pointer extraction) ----
+
+    // Pointer arithmetic wrappers: constrain to `::ptr::` and method name.
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::add", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::sub", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::offset", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_add", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_sub", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_offset", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::byte_add", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::byte_sub", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_byte_add", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_byte_sub", CallEffect::PtrDerive),
+
+    // Slice pointer extraction wrappers.
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
+
+    // Vec pointer extraction wrappers. Covers `alloc::vec::Vec` and `std::vec::Vec`, including monomorphized forms.
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
 
     // Volatile wrappers (free functions).
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_volatile", effect: CallEffect::Load },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_volatile", effect: CallEffect::Store },
+    EffectRule::one(MatchKind::Contains, "::ptr::read_volatile", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::ptr::write_volatile", CallEffect::Store),
     // Volatile intrinsics.
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_load", effect: CallEffect::Load },
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::volatile_store", effect: CallEffect::Store },
+    EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_load", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_store", CallEffect::Store),
 
     // Plain wrappers.
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read_unaligned", effect: CallEffect::Load },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::read", effect: CallEffect::Load },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write_unaligned", effect: CallEffect::Store },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::write", effect: CallEffect::Store },
+    EffectRule::one(MatchKind::Contains, "::ptr::read_unaligned", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::ptr::read", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::ptr::write_unaligned", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::ptr::write", CallEffect::Store),
 
     // Memcpy/memmove-like.
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy_nonoverlapping", effect: CallEffect::MemCopy },
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::copy", effect: CallEffect::MemCopy },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy_nonoverlapping", effect: CallEffect::MemCopy },
-    EffectRule { kind: MatchKind::Contains, needle: "::ptr::copy", effect: CallEffect::MemCopy },
+    EffectRule::one(MatchKind::Contains, "::intrinsics::copy_nonoverlapping", CallEffect::MemCopy),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::copy", CallEffect::MemCopy),
+    EffectRule::one(MatchKind::Contains, "::ptr::copy_nonoverlapping", CallEffect::MemCopy),
+    EffectRule::one(MatchKind::Contains, "::ptr::copy", CallEffect::MemCopy),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy_nonoverlapping)
-    EffectRule { kind: MatchKind::EndsWith, needle: "::copy_nonoverlapping", effect: CallEffect::MemCopy },
+    EffectRule::one(MatchKind::EndsWith, "::copy_nonoverlapping", CallEffect::MemCopy),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy)
-    EffectRule { kind: MatchKind::EndsWith, needle: "::copy", effect: CallEffect::MemCopy },
+    EffectRule::one(MatchKind::EndsWith, "::copy", CallEffect::MemCopy),
 
     // Memset-like.
-    EffectRule { kind: MatchKind::Contains, needle: "::intrinsics::write_bytes", effect: CallEffect::MemSet },
+    EffectRule::one(MatchKind::Contains, "::intrinsics::write_bytes", CallEffect::MemSet),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::write_bytes)
-    EffectRule { kind: MatchKind::EndsWith, needle: "::write_bytes", effect: CallEffect::MemSet },
+    EffectRule::one(MatchKind::EndsWith, "::write_bytes", CallEffect::MemSet),
 ];
 
 // Lightweight logging macros for the compiler pass.
@@ -426,13 +474,25 @@ impl MyOptimizationPass {
 
     fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
         for r in CALL_EFFECT_RULES {
-            let matched = match r.kind {
-                MatchKind::Contains => def_path.contains(r.needle),
-                MatchKind::EndsWith => def_path.ends_with(r.needle),
+            let m1 = match r.kind1 {
+                MatchKind::Contains => def_path.contains(r.needle1),
+                MatchKind::EndsWith => def_path.ends_with(r.needle1),
             };
-            if matched {
-                return Some(r.effect);
+            if !m1 {
+                continue;
             }
+
+            if let (Some(k2), Some(n2)) = (r.kind2, r.needle2) {
+                let m2 = match k2 {
+                    MatchKind::Contains => def_path.contains(n2),
+                    MatchKind::EndsWith => def_path.ends_with(n2),
+                };
+                if !m2 {
+                    continue;
+                }
+            }
+
+            return Some(r.effect);
         }
         None
     }
@@ -876,10 +936,6 @@ impl MyOptimizationPass {
             return CallEffect::BoxFromRaw;
         }
 
-        if self.is_std_ptr_derive_wrapper(def_path) {
-            return CallEffect::PtrDerive;
-        }
-
         if let Some(eff) = self.match_call_effect_rule(def_path) {
             return eff;
         }
@@ -921,46 +977,7 @@ impl MyOptimizationPass {
             .unwrap_or(0)
     }
 
-    /// Recognize std/core pointer-derivation wrappers that return a pointer derived from
-    /// a base pointer argument (typically arg0). We treat these like pointer arithmetic,
-    /// i.e. the result gets a fresh tag derived from the base tag.
-    ///
-    /// Expanded to include slice/Vec pointer-extraction wrappers, which also derive a pointer from a fat pointer.
-    fn is_std_ptr_derive_wrapper(&self, def_path: &str) -> bool {
-        // Pointer-derivation wrappers: these produce a pointer derived from a base pointer/slice.
-        // We treat them like pointer arithmetic (fresh tag with parent linkage).
-        //
-        // Common pointer arithmetic wrappers (monomorphized):
-        //   "core::ptr::const_ptr::<impl *const T>::add"
-        //   "core::ptr::mut_ptr::<impl *mut T>::offset"
-        //   "std::ptr::const_ptr::<impl *const T>::wrapping_add"
-        //   "core::ptr::wrapping_offset" (older paths)
-        let is_ptr_arith = def_path.contains("::ptr::")
-            && (def_path.contains("::add")
-                || def_path.contains("::sub")
-                || def_path.contains("::offset")
-                || def_path.contains("::wrapping_add")
-                || def_path.contains("::wrapping_sub")
-                || def_path.contains("::wrapping_offset")
-                || def_path.contains("::byte_add")
-                || def_path.contains("::byte_sub")
-                || def_path.contains("::wrapping_byte_add")
-                || def_path.contains("::wrapping_byte_sub"));
 
-        // Slice/Vec pointer extraction wrappers (these also *derive* a pointer from a fat pointer):
-        //   "core::slice::<impl [T]>::as_ptr"
-        //   "core::slice::<impl [T]>::as_mut_ptr"
-        //   "alloc::vec::Vec::<T>::as_ptr"
-        //   "alloc::vec::Vec::<T>::as_mut_ptr"
-        // Note: we keep this string-based to work across monomorphization/inlining.
-        let is_slice_ptr = def_path.contains("::slice::<impl [")
-            && (def_path.contains("::as_ptr") || def_path.contains("::as_mut_ptr"));
-
-        let is_vec_ptr = def_path.contains("alloc::vec::Vec")
-            && (def_path.contains("::as_ptr") || def_path.contains("::as_mut_ptr"));
-
-        is_ptr_arith || is_slice_ptr || is_vec_ptr
-    }
 
     /// Recognize std/alloc Box wrappers that return a raw pointer but take an ADT (Box<T>) as input.
     ///
