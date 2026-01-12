@@ -905,33 +905,57 @@ impl MyOptimizationPass {
 
         // Ref creation
         if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
+            // Only instrument *thin* pointers. Fat pointers (e.g., &[T], &str, trait objects)
+            // lower to ScalarPair and attempting `PointerExposeProvenance` on them can ICE in codegen,
+            // especially in optimized (release) builds.
             if let Some(lhs_local) = place.as_local() {
-                ptr_locals_needing_tag.insert(lhs_local);
+                let lhs_ty = body.local_decls[lhs_local].ty;
+                if self.is_thin_ptr_ty(tcx, lhs_ty) {
+                    ptr_locals_needing_tag.insert(lhs_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
+                    });
+                } else {
+                    rz_pass_trace!(
+                        self,
+                        "[rusteze][trace] skipping Ref creation for fat pointer local {:?} ty={:?}",
+                        lhs_local,
+                        lhs_ty
+                    );
+                }
             }
-            insert_points.push(InsertPoint {
-                bb,
-                stmt_idx,
-                insert_before: false,
-                source_info: stmt.source_info,
-                place: place.clone(),
-                kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
-            });
         }
 
         // Raw pointer creation
         if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind {
+            // Only instrument *thin* pointers. Fat raw pointers like `*const [T]` are ScalarPair.
             if let Some(lhs_local) = place.as_local() {
-                ptr_locals_needing_tag.insert(lhs_local);
+                let lhs_ty = body.local_decls[lhs_local].ty;
+                if self.is_thin_ptr_ty(tcx, lhs_ty) {
+                    ptr_locals_needing_tag.insert(lhs_local);
+                    let is_mut = matches!(*mutbl, RawPtrKind::Mut);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::Raw { is_mut, src: src_place.clone() },
+                    });
+                } else {
+                    rz_pass_trace!(
+                        self,
+                        "[rusteze][trace] skipping RawPtr creation for fat pointer local {:?} ty={:?}",
+                        lhs_local,
+                        lhs_ty
+                    );
+                }
             }
-            let is_mut = matches!(*mutbl, RawPtrKind::Mut);
-            insert_points.push(InsertPoint {
-                bb,
-                stmt_idx,
-                insert_before: false,
-                source_info: stmt.source_info,
-                place: place.clone(),
-                kind: InstrKind::Raw { is_mut, src: src_place.clone() },
-            });
         }
     }
 
