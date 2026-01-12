@@ -7,11 +7,19 @@ name = "alloc_uaf"
 version = "0.1.0"
 
 [[package]]
+name = "alloc_uaf_write_bytes"
+version = "0.1.0"
+
+[[package]]
 name = "app"
 version = "0.1.0"
 dependencies = [
  "dep",
 ]
+
+[[package]]
+name = "box_uaf"
+version = "0.1.0"
 
 [[package]]
 name = "call_arg_offset"
@@ -48,11 +56,19 @@ name = "deref_write_and_read"
 version = "0.1.0"
 
 [[package]]
+name = "double_free"
+version = "0.1.0"
+
+[[package]]
 name = "dynamic_loader"
 version = "0.1.0"
 dependencies = [
  "libloading",
 ]
+
+[[package]]
+name = "forged_pointer"
+version = "0.1.0"
 
 [[package]]
 name = "hello"
@@ -103,11 +119,23 @@ name = "oob_array_write"
 version = "0.1.0"
 
 [[package]]
+name = "oob_last_byte_ok"
+version = "0.1.0"
+
+[[package]]
 name = "oob_read_u32"
 version = "0.1.0"
 
 [[package]]
 name = "oob_struct_interior"
+version = "0.1.0"
+
+[[package]]
+name = "oob_vec_capacity"
+version = "0.1.0"
+
+[[package]]
+name = "oob_vec_read_capacity"
 version = "0.1.0"
 
 [[package]]
@@ -188,6 +216,10 @@ version = "0.1.0"
 
 [[package]]
 name = "tag0_return_ref_created_in_callee"
+version = "0.1.0"
+
+[[package]]
+name = "vec_shrink_stale"
 version = "0.1.0"
 
 [[package]]
