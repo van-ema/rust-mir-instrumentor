@@ -55,6 +55,14 @@ fn rz_in_runtime_hook() -> bool {
 }
 
 #[inline]
+fn rz_abort_on_double_free() -> bool {
+    // Default: abort on double free to avoid cascading UB/noise.
+    std::env::var("RZ_ABORT_ON_DOUBLE_FREE")
+        .ok()
+        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     if ptr.is_null() {
         return;
@@ -62,57 +70,6 @@ fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     unsafe {
         // live=true => alloc, live=false => free
         __rz_record_alloc(ptr as usize, size, if live { 1 } else { 0 });
-    }
-}
-
-/// Pre-free validation to avoid process abort on double-free/invalid-free.
-/// Returns `true` if it is safe to call the underlying system deallocator.
-///
-/// IMPORTANT: this intentionally diverges from program behavior to keep the
-/// process alive long enough to report the violation.
-#[inline]
-fn rz_pre_free_check(ptr: *mut u8) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-
-    // Avoid recursion/allocations while inside allocator hooks.
-    let _g = RzRuntimeGuard::enter();
-
-    let base = ptr as usize;
-    let mut amap = allocs().lock().unwrap();
-
-    match amap.get_mut(&base) {
-        None => {
-            // Free of an unknown pointer. Report and skip calling the system allocator,
-            // otherwise the process may abort.
-            rz_violation(
-                "INVALID_FREE",
-                format!(
-                    "FREE of unknown base=0x{base:x} (skipping system dealloc to avoid abort)"
-                ),
-            );
-            false
-        }
-        Some(meta) => {
-            if !meta.live {
-                rz_violation(
-                    "DOUBLE_FREE",
-                    format!(
-                        "DOUBLE_FREE base=0x{base:x} alloc_epoch={} size={}",
-                        meta.epoch, meta.size
-                    ),
-                );
-
-                ::std::process::abort();
-            }
-
-            // Mark as dead in our bookkeeping now (and bump epoch on death transition).
-            // Use the same logic as the normal record path to keep epochs consistent.
-            drop(amap);
-            __rz_record_alloc(base, 0, 0);
-            true
-        }
     }
 }
 
@@ -217,11 +174,77 @@ fn rz_log_enabled(level: LogLevel) -> bool {
     rz_log_level() >= level
 }
 
+#[cfg(unix)]
+extern "C" {
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+struct RzStackBuf {
+    buf: [u8; 1024],
+    len: usize,
+}
+
+impl RzStackBuf {
+    #[inline]
+    fn new() -> Self {
+        Self { buf: [0u8; 1024], len: 0 }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl core::fmt::Write for RzStackBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let cap = self.buf.len().saturating_sub(self.len);
+        let n = core::cmp::min(cap, bytes.len());
+        if n == 0 {
+            return Ok(());
+        }
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+#[inline]
+fn rz_emit_args(args: core::fmt::Arguments<'_>) {
+    #[cfg(unix)]
+    unsafe {
+        let mut sb = RzStackBuf::new();
+        let _ = core::fmt::write(&mut sb, args);
+        let b = sb.as_bytes();
+        let _ = write(2, b.as_ptr(), b.len());
+        let _ = write(2, b"\n".as_ptr(), 1);
+    }
+
+    #[cfg(not(unix))]
+    {
+        eprintln!("{}", args);
+    }
+}
+
+#[inline]
+fn rz_emit_str(s: &str) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = write(2, s.as_bytes().as_ptr(), s.as_bytes().len());
+    }
+
+    #[cfg(not(unix))]
+    {
+        eprint!("{}", s);
+    }
+}
+
 
 macro_rules! rz_log {
     ($lvl:expr, $($arg:tt)*) => {{
         if rz_log_enabled($lvl) {
-            println!($($arg)*);
+            rz_emit_args(format_args!($($arg)*));
         }
     }};
 }
@@ -242,6 +265,78 @@ macro_rules! rz_trace {
     ($($arg:tt)*) => {
         rz_log!(LogLevel::Trace, $($arg)*)
     };
+}
+
+
+/// Pre-free validation to avoid process abort on double-free/invalid-free.
+/// Returns `true` if it is safe to call the underlying system deallocator.
+///
+/// IMPORTANT: this intentionally diverges from program behavior to keep the
+/// process alive long enough to report the violation.
+#[inline]
+fn rz_pre_free_check(ptr: *mut u8) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+
+    // Avoid recursion/allocations while inside allocator hooks.
+    let _g = RzRuntimeGuard::enter();
+
+    let base = ptr as usize;
+    let mut amap = allocs().lock().unwrap();
+
+    match amap.get_mut(&base) {
+        None => {
+            // This pointer base was not tracked in our allocation map.
+            // This can legitimately happen for allocations performed while inside runtime hooks
+            // (we intentionally suppress allocator recording to avoid recursion).
+            //
+            // Default: allow the system deallocator to run to avoid false positives and leaks.
+            // Opt-in strict mode: report and skip the system deallocator.
+            let strict = std::env::var("RZ_STRICT_FREE_CHECK")
+                .ok()
+                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+
+            if strict {
+                rz_violation(
+                    "INVALID_FREE",
+                    format!(
+                        "FREE of unknown base=0x{base:x} (skipping system dealloc to avoid abort)"
+                    ),
+                );
+                false
+            } else {
+                rz_trace!(
+                    "[rusteze-runtime] note: FREE of untracked base=0x{:x} (allowing system dealloc; set RZ_STRICT_FREE_CHECK=1 for violation)",
+                    base
+                );
+                true
+            }
+        }
+        Some(meta) => {
+            if !meta.live {
+                rz_violation(
+                    "DOUBLE_FREE",
+                    format!(
+                        "DOUBLE_FREE base=0x{base:x} alloc_epoch={} size={}",
+                        meta.epoch, meta.size
+                    ),
+                );
+
+                if rz_abort_on_double_free() {
+                    ::std::process::abort();
+                }
+
+                return false;
+            }
+
+            // Mark as dead in our bookkeeping now (and bump epoch on death transition).
+            // Use the same logic as the normal record path to keep epochs consistent.
+            drop(amap);
+            __rz_record_alloc(base, 0, 0);
+            true
+        }
+    }
 }
 
 
@@ -359,10 +454,15 @@ fn find_alloc_containing<'a>(
 
 #[inline(never)]
 fn rz_violation(kind: &str, msg: String) {
-    // Always print the report
-    eprintln!(
-        "\n================ RUSTEZE VIOLATION ================\n{kind}\n{msg}\n===================================================\n"
-    );
+    // Always print the report. Avoid stdio re-entrancy by writing directly to fd=2.
+    rz_emit_str("\n================ RUSTEZE VIOLATION ================\n");
+    rz_emit_str(kind);
+    rz_emit_str("\n");
+    rz_emit_str(&msg);
+    if !msg.ends_with('\n') {
+        rz_emit_str("\n");
+    }
+    rz_emit_str("===================================================\n\n");
 
     // Fail-fast only if requested
     let failfast = std::env::var("RUSTEZE_FAILFAST").ok().map_or(false, |v| v != "0");
