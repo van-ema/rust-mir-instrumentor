@@ -3,26 +3,6 @@
 #![allow(unused)]
 #![allow(internal_features)]
 use core::ptr;
-// === Rusteze: Global allocator wrapper ============================
-//
-// Purpose:
-//   Track heap allocations originating inside std/alloc (Vec/Box/String/etc)
-//   without instrumenting stdlib internals. This intercepts allocations at the
-//   allocator boundary and forwards them to the runtime allocation tracker.
-//
-// Requirements:
-//   - Uses std::alloc::System as underlying allocator.
-//   - Uses TLS re-entrancy guard to avoid recursion (the runtime may allocate
-//     while recording metadata).
-//
-// Assumption:
-//   The runtime already exports:
-//     #[no_mangle] pub unsafe extern "C" fn __rz_record_alloc(ptr: usize, size: u64, live: u8)
-//   where live=1 => alloc, live=0 => free.
-//
-// If your runtime does NOT expose __rz_record_alloc yet, add it as an adapter
-// that forwards to your existing heap bookkeeping (record_alloc/record_free or
-// similar). Codex should wire it to your real internal functions.
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
