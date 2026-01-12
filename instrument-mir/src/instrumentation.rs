@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
+// (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
@@ -214,11 +215,11 @@ enum InstrKind<'tcx> {
     /// `ptr_local` holds the pointer value; `size_op` is the allocation size operand (usize).
     HeapAlloc { ptr_local: Local, live: bool, size_op: Operand<'tcx> },
     /// A write through a pointer local.
-    /// `size` is best-effort (0 = unknown).
-    PtrWrite { ptr_local: Local, size: usize },
+    /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
+    PtrWrite { ptr_local: Local, size_op: Operand<'tcx> },
     /// A read through a pointer local.
-    /// `size` is best-effort (0 = unknown).
-    PtrRead { ptr_local: Local, size: usize },
+    /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
+    PtrRead { ptr_local: Local, size_op: Operand<'tcx> },
     /// Coarse pointer-use work tracking: a pointer-typed local appears in a call argument.
     PtrUse { ptr_local: Local },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
@@ -731,6 +732,7 @@ impl MyOptimizationPass {
                         // Best-effort size: use the destination local's type size (0 if unknown).
                         let lhs_ty = body.local_decls[lhs_place.local].ty;
                         let size = self.layout_size_bytes(tcx, lhs_ty);
+                        let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
                         ptr_locals_needing_tag.insert(ptr_local);
                         insert_points.push(InsertPoint {
@@ -739,7 +741,7 @@ impl MyOptimizationPass {
                             insert_before: false,
                             source_info: stmt.source_info,
                             place: Place::from(ptr_local),
-                            kind: InstrKind::PtrRead { ptr_local, size },
+                            kind: InstrKind::PtrRead { ptr_local, size_op },
                         });
                     }
                 }
@@ -760,6 +762,7 @@ impl MyOptimizationPass {
                 // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                 let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
                 let size = self.layout_size_bytes(tcx, lhs_ty);
+                let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
                 ptr_locals_needing_tag.insert(ptr_local);
                 insert_points.push(InsertPoint {
@@ -768,7 +771,7 @@ impl MyOptimizationPass {
                     insert_before: false,
                     source_info: stmt.source_info,
                     place: Place::from(ptr_local),
-                    kind: InstrKind::PtrWrite { ptr_local, size },
+                    kind: InstrKind::PtrWrite { ptr_local, size_op },
                 });
             }
         }
@@ -981,38 +984,50 @@ impl MyOptimizationPass {
         CallEffect::Unknown
     }
 
-    /// Best-effort: compute byte size for memory ops given a pointer operand local and a count operand.
-    /// If count is not a constant or pointee size is unknown, returns 0.
+    /// Best-effort: compute byte size operand for memory ops given a pointer local and a count operand.
+    ///
+    /// Semantics: byte_len = count * size_of::<T>(), where `count` is in *elements*.
+    ///
+    /// Policy:
+    /// - If `size_of::<T>() == 1` (e.g., `T = u8`), return `count_op.clone()` so dynamic sizes propagate.
+    /// - Else, if `count_op` is a constant, constant-fold `count * size_of::<T>()`.
+    /// - Otherwise, return a constant 0 (unknown).
     fn memop_size_bytes<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         ptr_local: Local,
         count_op: &Operand<'tcx>,
-    ) -> usize {
+        span: Span,
+    ) -> Operand<'tcx> {
         let pointee_size = match body.local_decls[ptr_local].ty.kind() {
             TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
             TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
             _ => 0,
         };
+
         if pointee_size == 0 {
-            return 0;
+            return self.const_usize(tcx, span, 0);
+        }
+
+        // If we know we're operating on bytes already, propagate the dynamic count.
+        if pointee_size == 1 {
+            return count_op.clone();
         }
 
         // Try to extract constant count.
         let count: Option<u64> = match count_op {
-            Operand::Constant(c) => {
-                match c.const_.try_to_scalar() {
-                    Some(s) => s.to_u64().discard_err(),
-                    None => None,
-                }
-            }
+            Operand::Constant(c) => match c.const_.try_to_scalar() {
+                Some(s) => s.to_u64().discard_err(),
+                None => None,
+            },
             _ => None,
         };
 
-        count
+        let bytes = count
             .and_then(|c| (c as usize).checked_mul(pointee_size))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        self.const_usize(tcx, span, bytes)
     }
 
 
@@ -1293,30 +1308,34 @@ impl MyOptimizationPass {
                 let dst_local = args.get(1).and_then(|a| self.place_from_operand(&a.node)).map(|p| p.local);
                 let count_op = &args[2].node;
 
+                let size_op_for = |ptr_local: Local| -> Operand<'tcx> {
+                    self.memop_size_bytes(tcx, body, ptr_local, count_op, term.source_info.span)
+                };
+
                 if let Some(src) = src_local {
                     *classified_read_ptr_local = Some(src);
                     ptr_locals_needing_tag.insert(src);
-                    let size = self.memop_size_bytes(tcx, body, src, count_op);
+                    let size_op = size_op_for(src);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
                         insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(src),
-                        kind: InstrKind::PtrRead { ptr_local: src, size },
+                        kind: InstrKind::PtrRead { ptr_local: src, size_op },
                     });
                 }
                 if let Some(dst) = dst_local {
                     *classified_write_ptr_local = Some(dst);
                     ptr_locals_needing_tag.insert(dst);
-                    let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                    let size_op = size_op_for(dst);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
                         insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(dst),
-                        kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                        kind: InstrKind::PtrWrite { ptr_local: dst, size_op },
                     });
                 }
             }
@@ -1329,14 +1348,14 @@ impl MyOptimizationPass {
                 if let Some(dst) = dst_local {
                     *classified_write_ptr_local = Some(dst);
                     ptr_locals_needing_tag.insert(dst);
-                    let size = self.memop_size_bytes(tcx, body, dst, count_op);
+                    let size_op = self.memop_size_bytes(tcx, body, dst, count_op, term.source_info.span);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
                         insert_before: false,
                         source_info: term.source_info,
                         place: Place::from(dst),
-                        kind: InstrKind::PtrWrite { ptr_local: dst, size },
+                        kind: InstrKind::PtrWrite { ptr_local: dst, size_op },
                     });
                 }
             }
@@ -1698,6 +1717,7 @@ impl MyOptimizationPass {
                                 _ => {}
                             }
 
+                            let size_op = self.const_usize(tcx, term.source_info.span, size);
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
@@ -1706,7 +1726,7 @@ impl MyOptimizationPass {
                                 place: Place::from(p0.local),
                                 kind: InstrKind::PtrWrite {
                                     ptr_local: p0.local,
-                                    size,
+                                    size_op,
                                 },
                             });
                         }
@@ -1732,6 +1752,7 @@ impl MyOptimizationPass {
                                 _ => {}
                             }
 
+                            let size_op = self.const_usize(tcx, term.source_info.span, size);
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
@@ -1740,7 +1761,7 @@ impl MyOptimizationPass {
                                 place: Place::from(p0.local),
                                 kind: InstrKind::PtrRead {
                                     ptr_local: p0.local,
-                                    size,
+                                    size_op,
                                 },
                             });
                         }
@@ -2777,7 +2798,7 @@ impl MyOptimizationPass {
             let arg_addr = Operand::Copy(Place::from(addr_local));
 
             let (args, dest_place) = match creation_kind {
-                InstrKind::PtrRead { ptr_local, size } => {
+                InstrKind::PtrRead { ptr_local, ref size_op } => {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -2788,12 +2809,10 @@ impl MyOptimizationPass {
                         self.const_u64(tcx, source_info.span, 0)
                     };
 
-                    let arg_size0 = self.const_usize(tcx, source_info.span, size);
-
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: tag_op, span: source_info.span },
                         Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_size0, span: source_info.span },
+                        Spanned { node: size_op.clone(), span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -2835,7 +2854,7 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::PtrWrite { ptr_local, size } => {
+                InstrKind::PtrWrite { ptr_local, ref size_op } => {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -2846,12 +2865,10 @@ impl MyOptimizationPass {
                         self.const_u64(tcx, source_info.span, 0)
                     };
 
-                    let arg_size0 = self.const_usize(tcx, source_info.span, size);
-
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: tag_op, span: source_info.span },
                         Spanned { node: arg_addr, span: source_info.span },
-                        Spanned { node: arg_size0, span: source_info.span },
+                        Spanned { node: size_op.clone(), span: source_info.span },
                     ]
                     .into_boxed_slice();
 
