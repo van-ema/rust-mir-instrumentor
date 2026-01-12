@@ -150,11 +150,17 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_load", CallEffect::Load),
     EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_store", CallEffect::Store),
 
+    // Memset-like.
+    EffectRule::one(MatchKind::Contains, "::intrinsics::write_bytes", CallEffect::MemSet),
+    // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::write_bytes)
+    EffectRule::one(MatchKind::EndsWith, "::write_bytes", CallEffect::MemSet),
+
     // Plain wrappers.
+    // Use suffix matching for `read`/`write` so we don't accidentally match `write_bytes`/`read_bytes`.
     EffectRule::one(MatchKind::Contains, "::ptr::read_unaligned", CallEffect::Load),
-    EffectRule::one(MatchKind::Contains, "::ptr::read", CallEffect::Load),
+    EffectRule::one(MatchKind::EndsWith, "::read", CallEffect::Load),
     EffectRule::one(MatchKind::Contains, "::ptr::write_unaligned", CallEffect::Store),
-    EffectRule::one(MatchKind::Contains, "::ptr::write", CallEffect::Store),
+    EffectRule::one(MatchKind::EndsWith, "::write", CallEffect::Store),
 
     // Memcpy/memmove-like.
     EffectRule::one(MatchKind::Contains, "::intrinsics::copy_nonoverlapping", CallEffect::MemCopy),
@@ -165,11 +171,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::EndsWith, "::copy_nonoverlapping", CallEffect::MemCopy),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy)
     EffectRule::one(MatchKind::EndsWith, "::copy", CallEffect::MemCopy),
-
-    // Memset-like.
-    EffectRule::one(MatchKind::Contains, "::intrinsics::write_bytes", CallEffect::MemSet),
-    // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::write_bytes)
-    EffectRule::one(MatchKind::EndsWith, "::write_bytes", CallEffect::MemSet),
 ];
 
 // Lightweight logging macros for the compiler pass.
@@ -488,10 +489,30 @@ impl MyOptimizationPass {
     }
 
     fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
+        // Strip only a *trailing* monomorphization like `::<T>`.
+        // Do NOT strip generic args that appear in the middle of a path like
+        // `std::vec::Vec::<T, A>::as_mut_ptr`, otherwise we lose the method suffix.
+        let def_path_no_trailing_mono = {
+            let s = def_path;
+            if !s.ends_with('>') {
+                s
+            } else if let Some(pos) = s.rfind("::<") {
+                // Only treat it as a trailing monomorphization if there is no further module separator
+                // after the `::<`.
+                if s[pos..].contains("::") {
+                    s
+                } else {
+                    &s[..pos]
+                }
+            } else {
+                s
+            }
+        };
+
         for r in CALL_EFFECT_RULES {
             let m1 = match r.kind1 {
                 MatchKind::Contains => def_path.contains(r.needle1),
-                MatchKind::EndsWith => def_path.ends_with(r.needle1),
+                MatchKind::EndsWith => def_path.ends_with(r.needle1) || def_path_no_trailing_mono.ends_with(r.needle1),
             };
             if !m1 {
                 continue;
@@ -500,7 +521,7 @@ impl MyOptimizationPass {
             if let (Some(k2), Some(n2)) = (r.kind2, r.needle2) {
                 let m2 = match k2 {
                     MatchKind::Contains => def_path.contains(n2),
-                    MatchKind::EndsWith => def_path.ends_with(n2),
+                    MatchKind::EndsWith => def_path.ends_with(n2) || def_path_no_trailing_mono.ends_with(n2),
                 };
                 if !m2 {
                     continue;
@@ -809,6 +830,39 @@ impl MyOptimizationPass {
                                 source_info: stmt.source_info,
                                 place: Place::from(dst_local),
                                 kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                            });
+                        }
+                    } else {
+                        // If the RHS is a projected place (e.g., `copy (_13.0: &u8)`), there may be
+                        // no thin-pointer *local* we can TagProp from, but the destination is still a
+                        // thin pointer local. Synthesize a fresh root tag so the runtime does not see
+                        // tag=0 (UNKNOWN_TAG) for subsequent deref reads/writes.
+                        let rhs_is_projected_thin_ptr = match rvalue {
+                            Rvalue::Use(op) => match op {
+                                Operand::Copy(p) | Operand::Move(p) => {
+                                    !p.projection.is_empty()
+                                        && self.is_thin_ptr_ty(tcx, p.ty(&body.local_decls, tcx).ty)
+                                }
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+
+                        if rhs_is_projected_thin_ptr {
+                            let is_mut = match dst_ty.kind() {
+                                TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                _ => false,
+                            };
+
+                            ptr_locals_needing_tag.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
                             });
                         }
                     }
