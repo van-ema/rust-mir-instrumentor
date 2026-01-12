@@ -23,6 +23,7 @@ members = [
     "examples/hello_lib",
     "examples/memcpy_copy_nonoverlapping",
     "examples/memset_write_bytes",
+    "examples/memset_u8_dynamic",
     "examples/mutable_ref_test",
     "examples/oob_write_byte",
     "examples/oob_struct_interior",

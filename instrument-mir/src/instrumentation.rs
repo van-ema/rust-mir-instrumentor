@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
-use rustc_middle::mir::interpret::Scalar;
+use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
@@ -204,7 +204,12 @@ macro_rules! rz_pass_trace {
 #[derive(Clone, Debug)]
 enum InstrKind<'tcx> {
     Ref { bk: BorrowKind, src: Place<'tcx> },
+    // Raw: created by MIR Rvalue::RawPtr; can propagate a parent tag from the source place.
+    // Example MIR: `_p = &raw const (*_r);` where `_r: &u8`.
     Raw { is_mut: bool, src: Place<'tcx> },
+    // RawRoot: synthesized for pointer values without a thin-pointer source local
+    // (e.g., transmute from NonNull/Unique, projected place, const/global pointer).
+    // Example MIR: `_p = transmute::<NonNull<u8>, *const u8>(_nn);`.
     /// Root raw pointer creation for a pointer value already computed in a local.
     /// std/alloc often stores pointers inside ADTs like `NonNull<T>`/`Unique<T>` and then
     /// produces a thin pointer via `Transmute`. Our TagProp only propagates between thin pointer
@@ -215,6 +220,10 @@ enum InstrKind<'tcx> {
     /// Heap allocation lifetime event for an allocator-returned pointer.
     /// `ptr_local` holds the pointer value; `size_op` is the allocation size operand (usize).
     HeapAlloc { ptr_local: Local, live: bool, size_op: Operand<'tcx> },
+    /// Global/promoted const allocation materialized as a pointer.
+    /// `ptr_local` holds the pointer value; `size` is the allocation size (0 = unknown).
+    /// `base_offset` is the relative offset of the pointer within the global allocation.
+    ConstAlloc { ptr_local: Local, size: usize, base_offset: usize },
     /// A write through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrWrite { ptr_local: Local, size_op: Operand<'tcx> },
@@ -253,6 +262,12 @@ struct InsertPoint<'tcx> {
 struct ScanResult<'tcx> {
     insert_points: Vec<InsertPoint<'tcx>>,
     ptr_locals_needing_tag: HashSet<Local>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ConstAllocInfo {
+    size: usize,
+    base_offset: usize,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -571,6 +586,35 @@ impl MyOptimizationPass {
             .unwrap_or(0)
     }
 
+    // Resolve const/promoted pointers to their global allocation metadata (size + offset).
+    fn const_alloc_info<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        c: &ConstOperand<'tcx>,
+    ) -> Option<ConstAllocInfo> {
+        let scalar = c
+            .const_
+            .try_eval_scalar(tcx, TypingEnv::fully_monomorphized())?;
+        let ptr = scalar.to_pointer(&tcx).discard_err()?;
+        let (prov_opt, offset) = ptr.into_raw_parts();
+        let prov = prov_opt?;
+        let alloc_id = prov.alloc_id();
+
+        let size = match tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Memory(mem) => mem.inner().size().bytes() as usize,
+            GlobalAlloc::Static(def_id) => {
+                let ty = tcx.type_of(def_id).skip_binder();
+                self.layout_size_bytes(tcx, ty)
+            }
+            _ => return None,
+        };
+
+        Some(ConstAllocInfo {
+            size,
+            base_offset: offset.bytes() as usize,
+        })
+    }
+
     /// If `fat_local` is a fat pointer local (e.g. `&[T]`), try to find a thin "base" pointer local
     /// it was coerced from via `PointerCoercion(Unsize, ...)` in the *same basic block*.
     ///
@@ -864,6 +908,49 @@ impl MyOptimizationPass {
                                 place: Place::from(dst_local),
                                 kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
                             });
+                        } else {
+                            // If the RHS is a global/promoted pointer constant, record its allocation
+                            // and synthesize a root tag for the destination.
+                            let const_op: Option<&ConstOperand<'tcx>> = match rvalue {
+                                Rvalue::Use(Operand::Constant(c)) => Some(c),
+                                Rvalue::Cast(_, op, _) => match op {
+                                    Operand::Constant(c) => Some(c),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+
+                            if let Some(c) = const_op {
+                                if let Some(info) = self.const_alloc_info(tcx, c) {
+                                    let is_mut = match dst_ty.kind() {
+                                        TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                        TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                        _ => false,
+                                    };
+
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::ConstAlloc {
+                                            ptr_local: dst_local,
+                                            size: info.size,
+                                            base_offset: info.base_offset,
+                                        },
+                                    });
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx: stmt_idx + 1,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -2273,6 +2360,8 @@ impl MyOptimizationPass {
             InstrKind::RawRoot { .. } => hooks.def_id_raw,
             InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
             InstrKind::HeapAlloc { .. } => hooks.def_id_alloc,
+            // ConstAlloc is recorded via the same allocation hook.
+            InstrKind::ConstAlloc { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
@@ -2814,7 +2903,8 @@ impl MyOptimizationPass {
 
                     (Some(s1), s2)
                 }
-                InstrKind::HeapAlloc { ptr_local, .. } => {
+                // Heap/const allocations already have a pointer local; just expose its address.
+                InstrKind::HeapAlloc { ptr_local, .. } | InstrKind::ConstAlloc { ptr_local, .. } => {
                     let s2 = Statement::new(
                         source_info,
                         StatementKind::Assign(Box::new((
@@ -2849,7 +2939,31 @@ impl MyOptimizationPass {
                 _ => None,
             };
 
-            let arg_addr = Operand::Copy(Place::from(addr_local));
+            // For const/global allocations, rewrite the exposed pointer address to the base.
+            let mut arg_addr_local = addr_local;
+            let mut addr_adjust_stmt_opt: Option<Statement<'tcx>> = None;
+
+            if let InstrKind::ConstAlloc { base_offset, .. } = &creation_kind {
+                if *base_offset != 0 {
+                    let base_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let offset_op = self.const_usize(tcx, source_info.span, *base_offset);
+                    addr_adjust_stmt_opt = Some(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(base_local),
+                            Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                Box::new((Operand::Copy(Place::from(addr_local)), offset_op)),
+                            ),
+                        ))),
+                    ));
+                    arg_addr_local = base_local;
+                }
+            }
+
+            let arg_addr = Operand::Copy(Place::from(arg_addr_local));
 
             let (args, dest_place) = match creation_kind {
                 InstrKind::PtrRead { ptr_local, ref size_op } => {
@@ -2901,6 +3015,25 @@ impl MyOptimizationPass {
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: size_op.clone(), span: source_info.span },
+                        Spanned { node: arg_live, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                // Record a live global/promoted allocation at the computed base address.
+                InstrKind::ConstAlloc { size, .. } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let arg_size = self.const_usize(tcx, source_info.span, size);
+                    let arg_live = self.const_u8(tcx, source_info.span, 1);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size, span: source_info.span },
                         Spanned { node: arg_live, span: source_info.span },
                     ]
                     .into_boxed_slice();
@@ -3118,6 +3251,9 @@ impl MyOptimizationPass {
                     bd.statements.push(s1);
                 }
                 bd.statements.push(addr_stmt2);
+                if let Some(s3) = addr_adjust_stmt_opt {
+                    bd.statements.push(s3);
+                }
 
                 bd.terminator = Some(call_term);
                 rem

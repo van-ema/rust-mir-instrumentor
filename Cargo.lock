@@ -107,6 +107,10 @@ name = "memcpy_copy_nonoverlapping"
 version = "0.1.0"
 
 [[package]]
+name = "memset_u8_dynamic"
+version = "0.1.0"
+
+[[package]]
 name = "memset_write_bytes"
 version = "0.1.0"
 

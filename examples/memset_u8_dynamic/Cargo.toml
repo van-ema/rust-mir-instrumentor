@@ -1,0 +1,6 @@
+[package]
+name = "memset_u8_dynamic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
