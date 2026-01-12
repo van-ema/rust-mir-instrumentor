@@ -40,13 +40,50 @@ make run EXAMPLE=hello PROFILE=release
 ### Runtime
 - `RUSTEZE_FAILFAST`: If non-zero, panic on violation; default is log-and-continue.
 
+- **Global allocator wrapper (enabled by default)**: the runtime installs a
+  `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap
+  allocations originating inside `std` / `core` / `alloc` (e.g., `Vec`, `Box`,
+  `String`). This enables heap range tracking and out-of-bounds / use-after-free
+  detection without instrumenting the standard library itself.
+
+  The allocator wrapper uses thread-local reentrancy guards to avoid recursion
+  and deadlocks when runtime hooks perform logging or internal allocations.
+
 ### Instrumentation
+-  `RZ_LOG`: Control log level
 - `RZ_STACK_ALLOCS`: Track stack allocation for all locals if set (`all`, `1`, `true`); default is only "interesting" locals.
 - `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
-- `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all non-std/non-runtime dependency crates as instrumented.
+- `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all *non-std-like*
+  (non `std` / `core` / `alloc`) dependency crates as instrumented.
+  Standard library crates are never treated as instrumented callees; instead,
+  their effects are modeled via wrapper classification and allocator-boundary
+  interception.
 - `RZ_PRINT_CRATES`: If non-zero/true, print the crate graph and show which crates are instrumented.
 - `RZ_FILTER_STDLIB_USES`: If set to `0` or `false`, do not filter out coarse pointer-use hooks from std/core/alloc; default is enabled.
 - `RZ_WARN_UNKNOWN_CALLS`: If set to `0` or `false`, suppress warnings about unknown direct calls with pointer effects; default is enabled.
+
+
+## Standard Library Handling
+
+The standard library (`std`, `core`, `alloc`) is **not instrumented directly**.
+Instead, Rusteze relies on two complementary mechanisms:
+
+1. **Wrapper classification at the MIR level** for common pointer-producing and
+   memory-effect functions (e.g., `Vec::as_mut_ptr`, `ptr::add`, `ptr::copy`,
+   `write_bytes`). These are modeled explicitly as pointer-derivation, read, or
+   write effects.
+
+2. **Allocator-boundary interception** via a global allocator wrapper, which
+   records heap allocation and deallocation events even when they originate
+   inside stdlib code.
+
+This design avoids the need for `-Z build-std`, keeps the toolchain simple, and
+ensures that pointer provenance and allocation metadata remain consistent at the
+stdlib boundary.
+
+Bugs *inside* the standard library are not instrumented instruction-by-
+instruction, but misuses of stdlib APIs (e.g., out-of-bounds pointer arithmetic,
+use-after-free via raw pointers) are detected at the application boundary.
 
 ### Call-argument tag buffering
 
@@ -86,3 +123,7 @@ We can force loading extern crate with
 ```
 --extern=force:runtime={runtime_path}/libruntime.rlib
 ```
+
+- Performance:For best performance, disable tracing (`RZ_LOG=warn` or unset) and avoid
+  `RZ_STACK_ALLOCS=all`. Future work includes lock sharding, TLS fast paths,
+  and optional native runtime backends for hot paths.

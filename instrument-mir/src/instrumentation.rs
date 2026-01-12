@@ -43,7 +43,7 @@ enum CallEffect {
     Store,
     /// Pointer derivation wrappers that return a pointer derived from arg0 (fresh tag, parent linkage).
     PtrDerive,
-    /// Box boundary modeling (Option B).
+    /// Box boundary modeling.
     BoxIntoRaw,
     BoxFromRaw,
     /// Allocator shims/wrappers.
@@ -366,6 +366,7 @@ impl MyOptimizationPass {
         Some(set)
     }
 
+
     fn is_std_like_crate_name(&self, name: &str) -> bool {
         matches!(
             name,
@@ -391,26 +392,29 @@ impl MyOptimizationPass {
                 return env_set;
             }
 
-            // Priority 2: optional "instrument all deps" mode.
+            // Priority 2: instrument all non-runtime dependencies
             let instrument_all_deps = std::env::var("RZ_INSTRUMENT_ALL_DEPS")
                 .ok()
                 .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
 
             if !instrument_all_deps {
-                // Default: only current crate is assumed instrumented,
                 return HashSet::new();
             }
 
-            // Priority 3: instrument all non-std-like dependencies.
             let mut set = HashSet::new();
             for &cnum in tcx.crates(()).iter() {
                 let name = tcx.crate_name(cnum).as_str().to_string();
                 if name == "runtime" {
                     continue;
                 }
+
+                // Even in "instrument all deps" mode, do NOT treat std/core/alloc and other
+                // std-like crates as instrumented callees. We rely on boundary interception
+                // (global allocator wrapper) and wrapper classification instead.
                 if self.is_std_like_crate_name(&name) {
                     continue;
                 }
+
                 set.insert(name);
             }
             set
@@ -441,7 +445,7 @@ impl MyOptimizationPass {
             let flag = if allow.contains(&name) { "instrumented" } else { "dep" };
             eprintln!("  - {} ({})", name, flag);
         }
-        eprintln!("[rusteze] note: current crate is always treated as instrumented; set RZ_INSTRUMENTED_CRATES or RZ_INSTRUMENT_ALL_DEPS=1 to include deps.");
+        eprintln!("[rusteze] note: current crate is always treated as instrumented; set RZ_INSTRUMENTED_CRATES or RZ_INSTRUMENT_ALL_DEPS=1 to include dependencies.");
     }
 
     fn is_instrumented_callee<'tcx>(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
@@ -983,7 +987,7 @@ impl MyOptimizationPass {
     ///
     /// In optimized MIR, `Box::into_raw` appears as a direct call where the argument is an ADT,
     /// so we cannot use TagProp (arg0 is not a thin pointer local). We therefore synthesize a root
-    /// raw-pointer tag for the returned pointer local (Option B).
+    /// raw-pointer tag for the returned pointer local.
     fn is_box_into_raw_wrapper(&self, def_path: &str) -> bool {
         (def_path.contains("::boxed::Box") || def_path.contains("boxed::Box"))
             && def_path.contains("::into_raw")
@@ -1702,7 +1706,7 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::BoxIntoRaw => {
-                    // Box::into_raw boundary modeling (Option B): root-tag + HeapAlloc live.
+                    // Box::into_raw boundary modeling: root-tag + HeapAlloc live.
                     if !callee_instrumented {
                         if let Some(dst_local) = destination.as_local() {
                             let dst_ty = body.local_decls[dst_local].ty;

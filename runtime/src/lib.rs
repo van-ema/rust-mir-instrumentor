@@ -2,7 +2,129 @@
 // runtime/src/lib.rs
 #![allow(unused)]
 #![allow(internal_features)]
+// === Rusteze: Global allocator wrapper ============================
+//
+// Purpose:
+//   Track heap allocations originating inside std/alloc (Vec/Box/String/etc)
+//   without instrumenting stdlib internals. This intercepts allocations at the
+//   allocator boundary and forwards them to the runtime allocation tracker.
+//
+// Requirements:
+//   - Uses std::alloc::System as underlying allocator.
+//   - Uses TLS re-entrancy guard to avoid recursion (the runtime may allocate
+//     while recording metadata).
+//
+// Assumption:
+//   The runtime already exports:
+//     #[no_mangle] pub unsafe extern "C" fn __rz_record_alloc(ptr: usize, size: u64, live: u8)
+//   where live=1 => alloc, live=0 => free.
+//
+// If your runtime does NOT expose __rz_record_alloc yet, add it as an adapter
+// that forwards to your existing heap bookkeeping (record_alloc/record_free or
+// similar). Codex should wire it to your real internal functions.
 
+::std::thread_local! {
+    // Re-entrancy guard to prevent infinite recursion when the runtime allocates
+    // while recording allocation metadata.
+    static RZ_IN_ALLOC_HOOK: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
+
+    // Guard to disable allocator recording while inside any runtime hook.
+    // Logging (println!/format!) can allocate while locks are held.
+    static RZ_IN_RUNTIME_HOOK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
+}
+
+struct RzRuntimeGuard;
+impl RzRuntimeGuard {
+    #[inline]
+    fn enter() -> Self {
+        RZ_IN_RUNTIME_HOOK.with(|c| c.set(c.get().saturating_add(1)));
+        Self
+    }
+}
+impl Drop for RzRuntimeGuard {
+    #[inline]
+    fn drop(&mut self) {
+        RZ_IN_RUNTIME_HOOK.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+#[inline]
+fn rz_in_runtime_hook() -> bool {
+    RZ_IN_RUNTIME_HOOK.with(|c| c.get() != 0)
+}
+
+#[inline]
+fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        // live=true => alloc, live=false => free
+        __rz_record_alloc(ptr as usize, size, if live { 1 } else { 0 });
+    }
+}
+
+struct RzGlobalAlloc;
+
+unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
+    unsafe fn alloc(&self, layout: ::std::alloc::Layout) -> *mut u8 {
+        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
+            return ::std::alloc::System.alloc(layout);
+        }
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+        let p = ::std::alloc::System.alloc(layout);
+        rz_record_heap_event(p, layout.size(), true);
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: ::std::alloc::Layout) -> *mut u8 {
+        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
+            return ::std::alloc::System.alloc_zeroed(layout);
+        }
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+        let p = ::std::alloc::System.alloc_zeroed(layout);
+        rz_record_heap_event(p, layout.size(), true);
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: ::std::alloc::Layout) {
+        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
+            return ::std::alloc::System.dealloc(ptr, layout);
+        }
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+        rz_record_heap_event(ptr, layout.size(), false);
+        ::std::alloc::System.dealloc(ptr, layout);
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+    }
+
+    unsafe fn realloc(
+        &self,
+        ptr: *mut u8,
+        layout: ::std::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
+            return ::std::alloc::System.realloc(ptr, layout, new_size);
+        }
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+
+        // Model realloc as free(old) + alloc(new) for range tracking.
+        rz_record_heap_event(ptr, layout.size(), false);
+        let p = ::std::alloc::System.realloc(ptr, layout, new_size);
+        rz_record_heap_event(p, new_size, true);
+
+        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        p
+    }
+}
+
+// Install allocator wrapper globally for any binary linking `runtime`.
+#[global_allocator]
+static RZ_ALLOC: RzGlobalAlloc = RzGlobalAlloc;
+
+// === end global allocator wrapper ===========================================
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
@@ -223,6 +345,7 @@ fn origin_alloc_for_tag<'a>(
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
+    let _g = RzRuntimeGuard::enter();
     let mut m = allocs().lock().unwrap();
     let entry = m.entry(base_addr).or_insert(AllocMeta {
         live: false,
@@ -266,6 +389,7 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
 /// Read-only helper for debugging/testing.
 #[no_mangle]
 pub extern "C" fn __rz_dump_state() {
+    let _g = RzRuntimeGuard::enter();
     let a = allocs().lock().unwrap();
     let t = tags().lock().unwrap();
     rz_info!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
@@ -278,6 +402,7 @@ pub extern "C" fn __rz_dump_state() {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    let _g = RzRuntimeGuard::enter();
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
         rz_violation(
@@ -443,6 +568,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+    let _g = RzRuntimeGuard::enter();
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
         rz_violation(
@@ -577,6 +703,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
+    let _g = RzRuntimeGuard::enter();
     call_arg_tags()
         .lock()
         .unwrap()
@@ -586,6 +713,7 @@ pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
     call_arg_tags()
         .lock()
         .unwrap()
@@ -596,12 +724,14 @@ pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
+    let _g = RzRuntimeGuard::enter();
     ret_tags().lock().unwrap().insert((callee_id, addr), tag);
 }
 
 /// Take (consume) a pushed return-tag for a callee/return-address pair.
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
     ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0)
 }
 
@@ -616,6 +746,7 @@ macro_rules! force_runtime {
 #[no_mangle]
 #[rustc_diagnostic_item = "mir_runtime_record_ref_creation"]
 pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_tag: u64) -> u64 {
+    let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
 
@@ -667,6 +798,7 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
 #[no_mangle]
 #[rustc_diagnostic_item = "mir_runtime_record_raw_ptr_creation"]
 pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, derived_from: u64) -> u64 {
+    let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
 
@@ -721,6 +853,7 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
 /// `addr` is the pointer value (exposed provenance), not an interior offset.
 #[no_mangle]
 pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
+    let _g = RzRuntimeGuard::enter();
     if tag == 0 {
         rz_trace!(
             "[rusteze-runtime] USE: untagged ptr addr=0x{:x} (likely untracked/propagation missing)",
