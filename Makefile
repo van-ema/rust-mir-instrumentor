@@ -24,10 +24,12 @@ ifeq ($(PROFILE),release)
 RUNTIME_PATH := $(abspath target/release)
 PROFILE_FLAG := --release
 BIN_PATH := target/release/$(EXAMPLE)
+RUNTIME_FEATURES :=
 else
 RUNTIME_PATH := $(abspath target/debug)
 PROFILE_FLAG :=
 BIN_PATH := target/debug/$(EXAMPLE)
+RUNTIME_FEATURES := --features rz_log
 endif
 
 .PHONY: clean clean-mir runtime tools instrument run rebuild
@@ -39,7 +41,7 @@ clean-mir:
 	rm -f *.mir
 
 runtime:
-	$(CARGO_CMD) build -p runtime $(PROFILE_FLAG) $(BUILD_STD_ARGS)
+	$(CARGO_CMD) build -p runtime $(PROFILE_FLAG) $(BUILD_STD_ARGS) $(RUNTIME_FEATURES)
 
 tools:
 	$(CARGO_CMD) install --path instrument-mir --bin instrument-mir

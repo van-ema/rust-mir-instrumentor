@@ -130,6 +130,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "rz_log")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum LogLevel {
     Warn,
@@ -137,6 +138,15 @@ enum LogLevel {
     Trace,
 }
 
+#[cfg(not(feature = "rz_log"))]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum LogLevel {
+    Warn,
+    Info,
+    Trace,
+}
+
+#[cfg(feature = "rz_log")]
 fn rz_log_level() -> LogLevel {
     match std::env::var("RZ_LOG")
         .unwrap_or_else(|_| "warn".to_string())
@@ -149,9 +159,16 @@ fn rz_log_level() -> LogLevel {
     }
 }
 
+#[cfg(feature = "rz_log")]
 #[inline]
 fn rz_log_enabled(level: LogLevel) -> bool {
     rz_log_level() >= level
+}
+
+#[cfg(not(feature = "rz_log"))]
+#[inline(always)]
+fn rz_log_enabled(_level: LogLevel) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -159,11 +176,13 @@ extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 }
 
+#[cfg(feature = "rz_log")]
 struct RzStackBuf {
     buf: [u8; 1024],
     len: usize,
 }
 
+#[cfg(feature = "rz_log")]
 impl RzStackBuf {
     #[inline]
     fn new() -> Self {
@@ -176,6 +195,7 @@ impl RzStackBuf {
     }
 }
 
+#[cfg(feature = "rz_log")]
 impl core::fmt::Write for RzStackBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
@@ -190,6 +210,7 @@ impl core::fmt::Write for RzStackBuf {
     }
 }
 
+#[cfg(feature = "rz_log")]
 #[inline]
 fn rz_emit_args(args: core::fmt::Arguments<'_>) {
     #[cfg(unix)]
@@ -221,6 +242,7 @@ fn rz_emit_str(s: &str) {
 }
 
 
+#[cfg(feature = "rz_log")]
 macro_rules! rz_log {
     ($lvl:expr, $($arg:tt)*) => {{
         if rz_log_enabled($lvl) {
@@ -229,18 +251,49 @@ macro_rules! rz_log {
     }};
 }
 
+#[cfg(not(feature = "rz_log"))]
+macro_rules! rz_log {
+    ($lvl:expr, $($arg:tt)*) => {{
+        let _ = $lvl;
+    }};
+}
+
+#[cfg(feature = "rz_log")]
 macro_rules! rz_warn {
     ($($arg:tt)*) => {
         rz_log!(LogLevel::Warn, $($arg)*)
     };
 }
 
+#[cfg(not(feature = "rz_log"))]
+macro_rules! rz_warn {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Warn, $($arg)*)
+    };
+}
+
+#[cfg(feature = "rz_log")]
 macro_rules! rz_info {
     ($($arg:tt)*) => {
         rz_log!(LogLevel::Info, $($arg)*)
     };
 }
 
+#[cfg(not(feature = "rz_log"))]
+macro_rules! rz_info {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Info, $($arg)*)
+    };
+}
+
+#[cfg(feature = "rz_log")]
+macro_rules! rz_trace {
+    ($($arg:tt)*) => {
+        rz_log!(LogLevel::Trace, $($arg)*)
+    };
+}
+
+#[cfg(not(feature = "rz_log"))]
 macro_rules! rz_trace {
     ($($arg:tt)*) => {
         rz_log!(LogLevel::Trace, $($arg)*)
