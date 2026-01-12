@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
+// NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
@@ -332,6 +333,15 @@ impl MyOptimizationPass {
         std::env::var("RZ_WARN_UNKNOWN_CALLS")
             .ok()
             .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    /// If true, emit MIR-based heap alloc/free hooks (`HeapAlloc` / `__rz_record_alloc`).
+    /// Default: false (we rely on the runtime's global allocator wrapper in `runtime/src/lib.rs`).
+    /// Set `RZ_HEAP_ALLOCS_FROM_MIR=1` to force the old behavior.
+    fn heap_allocs_from_mir_enabled(&self) -> bool {
+        std::env::var("RZ_HEAP_ALLOCS_FROM_MIR")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
     /// Print an "unknown call" warning once per callee def-path to avoid spam.
@@ -1556,19 +1566,72 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::AllocShim(kind) => {
-                    // Allocator shims/wrappers: emit HeapAlloc live/dead events.
-                    self.push_alloc_shim_effects(
-                        tcx,
-                        body,
-                        bb,
-                        block_data,
-                        term,
-                        args,
-                        destination,
-                        kind,
-                        insert_points,
-                        ptr_locals_needing_tag,
-                    );
+                    if self.heap_allocs_from_mir_enabled() {
+                        // Old behavior: emit HeapAlloc hooks from MIR (may require Layout.size extraction).
+                        self.push_alloc_shim_effects(
+                            tcx,
+                            body,
+                            bb,
+                            block_data,
+                            term,
+                            args,
+                            destination,
+                            kind,
+                            insert_points,
+                            ptr_locals_needing_tag,
+                        );
+                    } else {
+                        // New default: rely on runtime global allocator wrapper for heap tracking.
+                        // Still tag allocator-returned pointers so later READ/WRITE are not UNKNOWN_TAG.
+                        let returns_ptr = matches!(
+                            kind,
+                            AllocShimKind::Alloc | AllocShimKind::AllocZeroed | AllocShimKind::Realloc
+                        );
+
+                        if returns_ptr {
+                            if let Some(dst_local) = destination.as_local() {
+                                let dst_ty = body.local_decls[dst_local].ty;
+
+                                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                    ptr_locals_needing_tag.insert(dst_local);
+
+                                    // IMPORTANT: destination local is initialized only after call returns.
+                                    // Insert in call target block at stmt 0.
+                                    let call_target_bb: Option<BasicBlock> = match &term.kind {
+                                        TerminatorKind::Call { target, .. } => *target,
+                                        _ => None,
+                                    };
+
+                                    if let Some(tgt_bb) = call_target_bb {
+                                        insert_points.push(InsertPoint {
+                                            bb: tgt_bb,
+                                            stmt_idx: 0,
+                                            insert_before: false,
+                                            source_info: term.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::RawRoot {
+                                                ptr_local: dst_local,
+                                                is_mut: true,
+                                            },
+                                        });
+                                    } else {
+                                        // Fallback: if no target, place at end of current block.
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: block_data.statements.len(),
+                                            insert_before: false,
+                                            source_info: term.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::RawRoot {
+                                                ptr_local: dst_local,
+                                                is_mut: true,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 CallEffect::MemCopy | CallEffect::MemSet => {

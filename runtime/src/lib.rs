@@ -2,6 +2,7 @@
 // runtime/src/lib.rs
 #![allow(unused)]
 #![allow(internal_features)]
+use core::ptr;
 // === Rusteze: Global allocator wrapper ============================
 //
 // Purpose:
@@ -64,6 +65,57 @@ fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     }
 }
 
+/// Pre-free validation to avoid process abort on double-free/invalid-free.
+/// Returns `true` if it is safe to call the underlying system deallocator.
+///
+/// IMPORTANT: this intentionally diverges from program behavior to keep the
+/// process alive long enough to report the violation.
+#[inline]
+fn rz_pre_free_check(ptr: *mut u8) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+
+    // Avoid recursion/allocations while inside allocator hooks.
+    let _g = RzRuntimeGuard::enter();
+
+    let base = ptr as usize;
+    let mut amap = allocs().lock().unwrap();
+
+    match amap.get_mut(&base) {
+        None => {
+            // Free of an unknown pointer. Report and skip calling the system allocator,
+            // otherwise the process may abort.
+            rz_violation(
+                "INVALID_FREE",
+                format!(
+                    "FREE of unknown base=0x{base:x} (skipping system dealloc to avoid abort)"
+                ),
+            );
+            false
+        }
+        Some(meta) => {
+            if !meta.live {
+                rz_violation(
+                    "DOUBLE_FREE",
+                    format!(
+                        "DOUBLE_FREE base=0x{base:x} alloc_epoch={} size={}",
+                        meta.epoch, meta.size
+                    ),
+                );
+
+                ::std::process::abort();
+            }
+
+            // Mark as dead in our bookkeeping now (and bump epoch on death transition).
+            // Use the same logic as the normal record path to keep epochs consistent.
+            drop(amap);
+            __rz_record_alloc(base, 0, 0);
+            true
+        }
+    }
+}
+
 struct RzGlobalAlloc;
 
 unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
@@ -94,8 +146,12 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
             return ::std::alloc::System.dealloc(ptr, layout);
         }
         RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
-        rz_record_heap_event(ptr, layout.size(), false);
-        ::std::alloc::System.dealloc(ptr, layout);
+
+        // Validate before calling the system allocator to avoid abort on double-free.
+        let ok = rz_pre_free_check(ptr);
+        if ok {
+            ::std::alloc::System.dealloc(ptr, layout);
+        }
         RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
     }
 
@@ -110,8 +166,16 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
         }
         RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
 
-        // Model realloc as free(old) + alloc(new) for range tracking.
-        rz_record_heap_event(ptr, layout.size(), false);
+        // Validate and record the implicit free(old) before calling the system.
+        // If the old pointer is invalid/double-freed, skip the system realloc to avoid abort.
+        if !ptr.is_null() {
+            let ok = rz_pre_free_check(ptr);
+            if !ok {
+                RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+                return core::ptr::null_mut();
+            }
+        }
+
         let p = ::std::alloc::System.realloc(ptr, layout, new_size);
         rz_record_heap_event(p, new_size, true);
 
