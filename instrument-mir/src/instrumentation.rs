@@ -332,7 +332,9 @@ impl MyOptimizationPass {
             || s.contains("/library/core/")
             || s.contains("/library/alloc/")
     }
-    /// Return true for any pointer/reference type (thin or fat).
+    /// Return true for any pointer/reference type, including wide pointers like slices and str.
+    /// This keeps tags attached to wide pointers so later conversions to thin data pointers can
+    /// reuse the same tag without falling back to tag zero.
     fn is_pointer_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
     }
@@ -350,6 +352,86 @@ impl MyOptimizationPass {
             }
             _ => false,
         }
+    }
+
+    /// Produce a thin raw pointer type suitable for extracting the data pointer from a wide pointer.
+    /// We only care about the address, so we cast to a pointer to unit with the same mutability.
+    fn data_ptr_ty_for_ptr<'tcx>(&self, tcx: TyCtxt<'tcx>, ptr_ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+        match ptr_ty.kind() {
+            TyKind::Ref(_, _ty, mutbl) | TyKind::RawPtr(_ty, mutbl) => {
+                let is_mut = matches!(mutbl, Mutability::Mut);
+                Some(if is_mut {
+                    Ty::new_mut_ptr(tcx, tcx.types.unit)
+                } else {
+                    Ty::new_imm_ptr(tcx, tcx.types.unit)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Build statements that compute `addr_local` from a pointer-typed place.
+    /// For wide pointers, cast to a thin data pointer first, then expose provenance so we
+    /// avoid codegen ICE and keep the address in sync with later raw pointer uses.
+    fn addr_stmts_for_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        place: Place<'tcx>,
+        addr_local: Local,
+    ) -> Option<(Option<Statement<'tcx>>, Statement<'tcx>)> {
+        let place_ty = place.ty(&body.local_decls, tcx).ty;
+        if self.is_thin_ptr_ty(tcx, place_ty) {
+            let addr_stmt = Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(addr_local),
+                    Rvalue::Cast(
+                        CastKind::PointerExposeProvenance,
+                        Operand::Copy(place),
+                        tcx.types.usize,
+                    ),
+                ))),
+            );
+            return Some((None, addr_stmt));
+        }
+
+        if self.is_pointer_ty(place_ty) {
+            let data_ptr_ty = self.data_ptr_ty_for_ptr(tcx, place_ty)?;
+            let data_ptr_local = body
+                .local_decls
+                .push(LocalDecl::new(data_ptr_ty, source_info.span));
+
+            // `PtrToPtr` extracts the data pointer for wide pointers like slices and str.
+            let data_ptr_stmt = Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(data_ptr_local),
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr,
+                        Operand::Copy(place),
+                        data_ptr_ty,
+                    ),
+                ))),
+            );
+
+            let addr_stmt = Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(addr_local),
+                    Rvalue::Cast(
+                        CastKind::PointerExposeProvenance,
+                        Operand::Copy(Place::from(data_ptr_local)),
+                        tcx.types.usize,
+                    ),
+                ))),
+            );
+
+            return Some((Some(data_ptr_stmt), addr_stmt));
+        }
+
+        None
     }
 
     /// Whether to warn about unknown (unclassified) direct calls that may read/write memory via pointers.
@@ -728,9 +810,11 @@ impl MyOptimizationPass {
         };
         let callee_id = self.callee_id_u64(body.source.def_id());
 
+        // Retag all pointer arguments, including wide pointers, because later conversions
+        // often drop metadata and only carry the data pointer address.
         for (arg_index, arg_local) in body.args_iter().enumerate() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_thin_ptr_ty(tcx, arg_ty) {
+            if self.is_pointer_ty(arg_ty) {
                 ptr_locals_needing_tag.insert(arg_local);
                 insert_points.push(InsertPoint {
                     bb: entry_bb,
@@ -863,11 +947,12 @@ impl MyOptimizationPass {
             }
         }
 
-        // Tag propagation across pointer-to-pointer casts and plain copies/moves of pointer locals.
+        // Tag propagation across pointer-to-pointer casts and plain copies or moves of pointer locals.
+        // This includes wide pointers so tags survive through unsize and reborrow patterns.
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
-                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                if self.is_pointer_ty(dst_ty) {
                     let src_local_opt: Option<Local> = match rvalue {
                         Rvalue::Use(op) => self
                             .place_from_operand(op)
@@ -885,7 +970,7 @@ impl MyOptimizationPass {
 
                     if let Some(src_local) = src_local_opt {
                         let src_ty = body.local_decls[src_local].ty;
-                        if self.is_thin_ptr_ty(tcx, src_ty) {
+                        if self.is_pointer_ty(src_ty) {
                             ptr_locals_needing_tag.insert(dst_local);
                             ptr_locals_needing_tag.insert(src_local);
 
@@ -914,7 +999,7 @@ impl MyOptimizationPass {
                             _ => false,
                         };
 
-                        if rhs_is_projected_thin_ptr {
+                        if rhs_is_projected_thin_ptr && self.is_thin_ptr_ty(tcx, dst_ty) {
                             let is_mut = match dst_ty.kind() {
                                 TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                                 TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -963,14 +1048,19 @@ impl MyOptimizationPass {
                                             base_offset: info.base_offset,
                                         },
                                     });
-                                    insert_points.push(InsertPoint {
-                                        bb,
-                                        stmt_idx: stmt_idx + 1,
-                                        insert_before: false,
-                                        source_info: stmt.source_info,
-                                        place: Place::from(dst_local),
-                                        kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
-                                    });
+                                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: stmt_idx + 1,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::RawRoot {
+                                                ptr_local: dst_local,
+                                                is_mut,
+                                            },
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1071,12 +1161,9 @@ impl MyOptimizationPass {
 
         // Ref creation
         if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
-            // Only instrument *thin* pointers. Fat pointers (e.g., &[T], &str, trait objects)
-            // lower to ScalarPair and attempting `PointerExposeProvenance` on them can ICE in codegen,
-            // especially in optimized (release) builds.
             if let Some(lhs_local) = place.as_local() {
                 let lhs_ty = body.local_decls[lhs_local].ty;
-                if self.is_thin_ptr_ty(tcx, lhs_ty) {
+                if self.is_pointer_ty(lhs_ty) {
                     ptr_locals_needing_tag.insert(lhs_local);
                     insert_points.push(InsertPoint {
                         bb,
@@ -1086,23 +1173,15 @@ impl MyOptimizationPass {
                         place: place.clone(),
                         kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
                     });
-                } else {
-                    rz_pass_trace!(
-                        self,
-                        "[rusteze][trace] skipping Ref creation for fat pointer local {:?} ty={:?}",
-                        lhs_local,
-                        lhs_ty
-                    );
                 }
             }
         }
 
         // Raw pointer creation
         if let StatementKind::Assign(box (place, Rvalue::RawPtr(mutbl, src_place))) = &stmt.kind {
-            // Only instrument *thin* pointers. Fat raw pointers like `*const [T]` are ScalarPair.
             if let Some(lhs_local) = place.as_local() {
                 let lhs_ty = body.local_decls[lhs_local].ty;
-                if self.is_thin_ptr_ty(tcx, lhs_ty) {
+                if self.is_pointer_ty(lhs_ty) {
                     ptr_locals_needing_tag.insert(lhs_local);
                     let is_mut = matches!(*mutbl, RawPtrKind::Mut);
                     insert_points.push(InsertPoint {
@@ -1113,13 +1192,6 @@ impl MyOptimizationPass {
                         place: place.clone(),
                         kind: InstrKind::Raw { is_mut, src: src_place.clone() },
                     });
-                } else {
-                    rz_pass_trace!(
-                        self,
-                        "[rusteze][trace] skipping RawPtr creation for fat pointer local {:?} ty={:?}",
-                        lhs_local,
-                        lhs_ty
-                    );
                 }
             }
         }
@@ -1414,22 +1486,22 @@ impl MyOptimizationPass {
         }
 
         if let Some(def_path) = callee_path_opt {
-            // Does the call take any thin pointer argument?
+            // Does the call take any pointer argument?
             let mut has_ptr_arg = false;
             for a in args.iter() {
                 if let Some(p) = self.place_from_operand(&a.node) {
                     let ty = body.local_decls[p.local].ty;
-                    if self.is_thin_ptr_ty(tcx, ty) {
+                    if self.is_pointer_ty(ty) {
                         has_ptr_arg = true;
                         break;
                     }
                 }
             }
 
-            // Does the call return a thin pointer into a local?
+            // Does the call return a pointer into a local?
             let returns_ptr = destination
                 .as_local()
-                .is_some_and(|dl| self.is_thin_ptr_ty(tcx, body.local_decls[dl].ty));
+                .is_some_and(|dl| self.is_pointer_ty(body.local_decls[dl].ty));
 
             if (has_ptr_arg || returns_ptr) && !callee_instrumented {
                 // Use the centralized classifier so warning suppression matches actual handling.
@@ -1944,13 +2016,13 @@ impl MyOptimizationPass {
                                     if let Some(arg_place) = self.place_from_operand(&first.node) {
                                         let arg_local = arg_place.local;
                                         let arg_ty = body.local_decls[arg_local].ty;
-                                        if self.is_thin_ptr_ty(tcx, arg_ty) {
+                                        if self.is_pointer_ty(arg_ty) {
                                             src_local_opt = Some(arg_local);
                                         } else if let Some(base_local) =
                                             self.backtrack_unsize_base_local(arg_local, &block_data.statements)
                                         {
                                             let base_ty = body.local_decls[base_local].ty;
-                                            if self.is_thin_ptr_ty(tcx, base_ty) {
+                                            if self.is_pointer_ty(base_ty) {
                                                 src_local_opt = Some(base_local);
                                             }
                                         }
@@ -2046,10 +2118,11 @@ impl MyOptimizationPass {
             )
         );
         
+        // Treat any pointer argument as tag-relevant, including wide pointers.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else { continue; };
             let ty = body.local_decls[p.local].ty;
-            if !self.is_thin_ptr_ty(tcx, ty) { continue; }
+            if !self.is_pointer_ty(ty) { continue; }
         
             // Inter-procedural: push argument tag to callee if instrumented.
             if callee_instrumented {
@@ -2093,10 +2166,11 @@ impl MyOptimizationPass {
             });
         }
 
-        // Caller-side return-tag recovery: if the call returns a thin pointer into a local, take the tag.
+        // Caller-side return-tag recovery for pointer returns, including wide pointers whose
+        // address is tracked through the data pointer.
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
-            if self.is_thin_ptr_ty(tcx, dst_ty) {
+            if self.is_pointer_ty(dst_ty) {
                 if callee_instrumented {
                     if let Some(callee_id) = callee_id_opt {
                         ptr_locals_needing_tag.insert(dst_local);
@@ -2281,7 +2355,7 @@ impl MyOptimizationPass {
                 }
 
                 if let TerminatorKind::Return = &term.kind {
-                    if self.is_thin_ptr_ty(tcx, body.return_ty()) {
+                    if self.is_pointer_ty(body.return_ty()) {
                         let callee_id = self.callee_id_u64(body.source.def_id());
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
@@ -2608,22 +2682,21 @@ impl MyOptimizationPass {
                     }
                 }
 
-                // addr_local = expose_provenance(dst_local)
+                // Compute the address from the return place. For wide pointers we extract the
+                // data pointer first so the tag maps to the same address used by raw reads.
                 let addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
 
-                let addr_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(addr_local),
-                        Rvalue::Cast(
-                            CastKind::PointerExposeProvenance,
-                            Operand::Copy(Place::from(dst_local)),
-                            tcx.types.usize,
-                        ),
-                    ))),
-                );
+                let (addr_stmt1_opt, addr_stmt2) = self
+                    .addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(dst_local),
+                        addr_local,
+                    )
+                    .expect("RetTake on non-pointer local");
 
                 let take_func = Operand::function_handle(
                     tcx,
@@ -2658,7 +2731,10 @@ impl MyOptimizationPass {
                 };
 
                 let take_bd = &mut body.basic_blocks_mut()[take_bb];
-                take_bd.statements.push(addr_stmt);
+                if let Some(addr_stmt1) = addr_stmt1_opt {
+                    take_bd.statements.push(addr_stmt1);
+                }
+                take_bd.statements.push(addr_stmt2);
                 take_bd.terminator = Some(take_term);
 
                 continue;
@@ -2670,21 +2746,21 @@ impl MyOptimizationPass {
                     .get(&ptr_local)
                     .expect("missing tag local for RetPush");
 
+                // Use the data pointer for wide return values so tag passing stays consistent.
                 let addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
 
-                let addr_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(addr_local),
-                        Rvalue::Cast(
-                            CastKind::PointerExposeProvenance,
-                            Operand::Copy(Place::from(ptr_local)),
-                            tcx.types.usize,
-                        ),
-                    ))),
-                );
+                // Use the same address extraction helper for wide pointers.
+                let (addr_stmt1_opt, addr_stmt2) = self
+                    .addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(ptr_local),
+                        addr_local,
+                    )
+                    .expect("RetPush on non-pointer local");
 
                 let push_func = Operand::function_handle(
                     tcx,
@@ -2737,7 +2813,10 @@ impl MyOptimizationPass {
 
                 let bd = &mut body.basic_blocks_mut()[bb];
                 // Put the address computation in the current block, then call push, then jump to old Return.
-                bd.statements.push(addr_stmt);
+                if let Some(addr_stmt1) = addr_stmt1_opt {
+                    bd.statements.push(addr_stmt1);
+                }
+                bd.statements.push(addr_stmt2);
                 bd.terminator = Some(call_term);
                 continue;
             }
@@ -2799,6 +2878,7 @@ impl MyOptimizationPass {
                     _ => panic!("ArgRetag on non-pointer local"),
                 };
 
+                // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
                 let addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
@@ -2806,17 +2886,15 @@ impl MyOptimizationPass {
                     .local_decls
                     .push(LocalDecl::new(tcx.types.u64, source_info.span));
 
-                let addr_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(addr_local),
-                        Rvalue::Cast(
-                            CastKind::PointerExposeProvenance,
-                            Operand::Copy(Place::from(ptr_local)),
-                            tcx.types.usize,
-                        ),
-                    ))),
-                );
+                let (addr_stmt1_opt, addr_stmt2) = self
+                    .addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(ptr_local),
+                        addr_local,
+                    )
+                    .expect("ArgRetag on non-pointer local");
 
                 let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                 let arg_index = self.const_u64(tcx, source_info.span, arg_index);
@@ -2905,7 +2983,10 @@ impl MyOptimizationPass {
                         stmt_idx
                     };
                     let rem = bd.statements.split_off(split_at);
-                    bd.statements.push(addr_stmt);
+                    if let Some(addr_stmt1) = addr_stmt1_opt {
+                        bd.statements.push(addr_stmt1);
+                    }
+                    bd.statements.push(addr_stmt2);
                     bd.terminator = Some(take_term);
                     rem
                 };
@@ -2965,24 +3046,8 @@ impl MyOptimizationPass {
                 .local_decls
                 .push(LocalDecl::new(tcx.types.usize, source_info.span));
 
-            let needs_thin_place = matches!(
-                creation_kind,
-                InstrKind::Ref { .. }
-                    | InstrKind::Raw { .. }
-                    | InstrKind::PtrRead { .. }
-                    | InstrKind::PtrWrite { .. }
-                    | InstrKind::PtrUse { .. }
-                    | InstrKind::PtrDerive { .. }
-                    | InstrKind::CallArgPush { .. }
-                    | InstrKind::RetRoot { .. }
-            );
-            if needs_thin_place {
-                let place_ty = place.ty(&body.local_decls, tcx).ty;
-                if !self.is_thin_ptr_ty(tcx, place_ty) {
-                    continue;
-                }
-            }
-
+            // Compute the address for runtime hooks. We route all pointer cases through
+            // addr_stmts_for_place so wide pointers are handled via their data pointer.
             let (addr_stmt1_opt, addr_stmt2) = match creation_kind {
                 InstrKind::StackAlloc { local, .. } => {
                     let local_ty = body.local_decls[local].ty;
@@ -3015,32 +3080,22 @@ impl MyOptimizationPass {
                 }
                 // Heap/const allocations already have a pointer local; just expose its address.
                 InstrKind::HeapAlloc { ptr_local, .. } | InstrKind::ConstAlloc { ptr_local, .. } => {
-                    let s2 = Statement::new(
+                    match self.addr_stmts_for_place(
+                        tcx,
+                        body,
                         source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(addr_local),
-                            Rvalue::Cast(
-                                CastKind::PointerExposeProvenance,
-                                Operand::Copy(Place::from(ptr_local)),
-                                tcx.types.usize,
-                            ),
-                        ))),
-                    );
-                    (None, s2)
+                        Place::from(ptr_local),
+                        addr_local,
+                    ) {
+                        Some(stmts) => stmts,
+                        None => continue,
+                    }
                 }
                 _ => {
-                    let s2 = Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(addr_local),
-                            Rvalue::Cast(
-                                CastKind::PointerExposeProvenance,
-                                Operand::Copy(place),
-                                tcx.types.usize,
-                            ),
-                        ))),
-                    );
-                    (None, s2)
+                    match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
+                        Some(stmts) => stmts,
+                        None => continue,
+                    }
                 }
             };
 
@@ -3539,7 +3594,7 @@ impl MyOptimizationPass {
         let mut arg_ptr_locals: HashSet<Local> = HashSet::new();
         for arg_local in body.args_iter() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_thin_ptr_ty(tcx, arg_ty) {
+            if self.is_pointer_ty(arg_ty) {
                 arg_ptr_locals.insert(arg_local);
             }
         }
