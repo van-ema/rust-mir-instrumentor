@@ -332,17 +332,16 @@ impl MyOptimizationPass {
             || s.contains("/library/core/")
             || s.contains("/library/alloc/")
     }
-    /// Return true for any pointer/reference type, including wide pointers like slices and str.
-    /// This keeps tags attached to wide pointers so later conversions to thin data pointers can
-    /// reuse the same tag without falling back to tag zero.
+    /// Return true for any pointer or reference type, including wide pointers like slices and str.
+    /// We treat these as tag-carrying so that when MIR later extracts a thin data pointer, the
+    /// original tag can be propagated instead of silently dropping to tag zero.
     fn is_pointer_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
     }
 
-    /// Return true only for *thin* pointers (single-word), i.e. `&T` / `*const T` / `*mut T`
-    /// where the pointer value is a single scalar. Fat pointers like `&[T]`, `&str`, and trait
-    /// objects carry metadata and lower to a ScalarPair; casting them with
-    /// `PointerExposeProvenance` currently triggers an ICE in codegen.
+    /// Return true only for *thin* pointers, meaning one machine word.
+    /// Fat pointers like `&[T]`, `&str`, and trait objects include metadata and lower to a
+    /// ScalarPair, and `PointerExposeProvenance` on those values triggers a codegen ICE today.
     fn is_thin_ptr_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
             TyKind::Ref(..) | TyKind::RawPtr(..) => {
@@ -355,7 +354,8 @@ impl MyOptimizationPass {
     }
 
     /// Produce a thin raw pointer type suitable for extracting the data pointer from a wide pointer.
-    /// We only care about the address, so we cast to a pointer to unit with the same mutability.
+    /// We only care about the address, so a pointer to unit keeps the correct size and mutability
+    /// while discarding the metadata.
     fn data_ptr_ty_for_ptr<'tcx>(&self, tcx: TyCtxt<'tcx>, ptr_ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
         match ptr_ty.kind() {
             TyKind::Ref(_, _ty, mutbl) | TyKind::RawPtr(_ty, mutbl) => {
@@ -371,8 +371,9 @@ impl MyOptimizationPass {
     }
 
     /// Build statements that compute `addr_local` from a pointer-typed place.
-    /// For wide pointers, cast to a thin data pointer first, then expose provenance so we
-    /// avoid codegen ICE and keep the address in sync with later raw pointer uses.
+    /// For thin pointers we can expose provenance directly.
+    /// For wide pointers we first extract the data pointer, then expose provenance on that
+    /// thin pointer so codegen does not ICE and the runtime observes the data address.
     fn addr_stmts_for_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -403,7 +404,8 @@ impl MyOptimizationPass {
                 .local_decls
                 .push(LocalDecl::new(data_ptr_ty, source_info.span));
 
-            // `PtrToPtr` extracts the data pointer for wide pointers like slices and str.
+            // `PtrToPtr` extracts the data pointer for wide pointers like slices and str,
+            // keeping only the address portion of the scalar pair.
             let data_ptr_stmt = Statement::new(
                 source_info,
                 StatementKind::Assign(Box::new((
@@ -948,7 +950,8 @@ impl MyOptimizationPass {
         }
 
         // Tag propagation across pointer-to-pointer casts and plain copies or moves of pointer locals.
-        // This includes wide pointers so tags survive through unsize and reborrow patterns.
+        // Include wide pointers so tags survive unsize and reborrow patterns before a thin data
+        // pointer is extracted later in MIR.
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
@@ -957,6 +960,8 @@ impl MyOptimizationPass {
                         Rvalue::Use(op) => self
                             .place_from_operand(op)
                             .and_then(|p| p.as_local()),
+                        // CopyForDeref shows up when MIR materializes a place for deref;
+                        // it still represents a pointer value that needs tag propagation.
                         Rvalue::CopyForDeref(p) => p.as_local(),
                         Rvalue::Cast(
                             CastKind::PtrToPtr
@@ -984,10 +989,9 @@ impl MyOptimizationPass {
                             });
                         }
                     } else {
-                        // If the RHS is a projected place (e.g., `copy (_13.0: &u8)`), there may be
-                        // no thin-pointer *local* we can TagProp from, but the destination is still a
-                        // thin pointer local. Synthesize a fresh root tag so the runtime does not see
-                        // tag=0 (UNKNOWN_TAG) for subsequent deref reads/writes.
+                        // If the RHS is a projected place, there may be no pointer local we can
+                        // propagate from, but the destination still needs a tag for later derefs.
+                        // Synthesize a fresh root tag so the runtime does not see UNKNOWN_TAG.
                         let rhs_is_projected_thin_ptr = match rvalue {
                             Rvalue::Use(op) => match op {
                                 Operand::Copy(p) | Operand::Move(p) => {
@@ -2118,7 +2122,8 @@ impl MyOptimizationPass {
             )
         );
         
-        // Treat any pointer argument as tag-relevant, including wide pointers.
+        // Treat any pointer argument as tag relevant, including wide pointers, so argument tags
+        // survive through metadata carrying types that later yield thin data pointers.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else { continue; };
             let ty = body.local_decls[p.local].ty;
