@@ -792,16 +792,19 @@ impl MyOptimizationPass {
                         .next()
                         .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
                     if is_deref_read {
+                        // `p` is a deref place `(*ptr_local) ...` so the base pointer local is `p.local`.
                         let ptr_local = p.local;
 
-                        // Best-effort size: use the destination local's type size (0 if unknown).
-                        let lhs_ty = body.local_decls[lhs_place.local].ty;
-                        let size = self.layout_size_bytes(tcx, lhs_ty);
+                        // Best-effort size: use the type of the *loaded place* (after projections).
+                        // This is important for patterns where the destination is a projection
+                        // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
+                        let loaded_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+                        let size = self.layout_size_bytes(tcx, loaded_ty);
                         let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
                         ptr_locals_needing_tag.insert(ptr_local);
                         insert_points.push(InsertPoint {
-                            bb,
+                            bb, 
                             stmt_idx,
                             insert_before: false,
                             source_info: stmt.source_info,

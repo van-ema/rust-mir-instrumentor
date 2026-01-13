@@ -999,23 +999,42 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
 
-    // IMPORTANT: On retagging/derived pointers (derived_from != 0), do NOT refresh alloc_epoch
-    // from the current allocation map. Inherit it from the parent tag to keep the original
-    // allocation-instance snapshot and make stack-slot reuse detectable as stale pointers.
+    // IMPORTANT: On retagging/derived pointers (derived_from != 0), prefer inheriting the
+    // parent's alloc_epoch to keep the original allocation-instance snapshot and make
+    // stack-slot reuse detectable as stale pointers. Exception: if the derived pointer
+    // clearly points into a different allocation than the parent, refresh to the pointee's
+    // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
     let alloc_epoch = if derived_from != 0 {
-        tags()
+        let (parent_epoch, parent_pointee) = tags()
             .lock()
             .unwrap()
             .get(&derived_from)
-            .map(|p| p.alloc_epoch)
-            .unwrap_or(0)
-    } else {
-        {
+            .map(|p| (p.alloc_epoch, Some(p.pointee_addr)))
+            .unwrap_or((0, None));
+
+        if let Some(parent_pointee) = parent_pointee {
             let amap = allocs().lock().unwrap();
-            find_alloc_containing(&amap, pointee_addr)
-                .map(|(_base, m)| m.epoch)
-                .unwrap_or(0)
+            let parent_alloc = find_alloc_containing(&amap, parent_pointee);
+            let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+            if let (Some((parent_base, _)), Some((pointee_base, pointee_meta))) =
+                (parent_alloc, pointee_alloc)
+            {
+                if parent_base != pointee_base {
+                    pointee_meta.epoch
+                } else {
+                    parent_epoch
+                }
+            } else {
+                parent_epoch
+            }
+        } else {
+            parent_epoch
         }
+    } else {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, pointee_addr)
+            .map(|(_base, m)| m.epoch)
+            .unwrap_or(0)
     };
 
     tags().lock().unwrap().insert(
