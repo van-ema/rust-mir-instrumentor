@@ -230,7 +230,8 @@ enum InstrKind<'tcx> {
     /// A read through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrRead { ptr_local: Local, size_op: Operand<'tcx> },
-    /// Coarse pointer-use work tracking: a pointer-typed local appears in a call argument.
+    /// Coarse pointer-use tracking: a pointer-typed local appears in a call argument.
+    /// This is treated as an escape event at call boundaries.
     PtrUse { ptr_local: Local },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
@@ -246,6 +247,8 @@ enum InstrKind<'tcx> {
     RetPush { callee_id: u64, ptr_local: Local },
     /// Caller-side: take the pushed return tag after a call that returns a pointer.
     RetTake { callee_id: u64, dst_local: Local },
+    /// Caller-side: synthesize a fresh tag for an uninstrumented call return.
+    RetRoot { dst_local: Local, is_mut: bool, is_ref: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +332,11 @@ impl MyOptimizationPass {
             || s.contains("/library/core/")
             || s.contains("/library/alloc/")
     }
+    /// Return true for any pointer/reference type (thin or fat).
+    fn is_pointer_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
+    }
+
     /// Return true only for *thin* pointers (single-word), i.e. `&T` / `*const T` / `*mut T`
     /// where the pointer value is a single scalar. Fat pointers like `&[T]`, `&str`, and trait
     /// objects carry metadata and lower to a ScalarPair; casting them with
@@ -665,12 +673,18 @@ impl MyOptimizationPass {
                         // Address-taken locals: these correspond to real stack slots that pointers can reference.
                         Rvalue::Ref(_, _bk, src_place) => {
                             if src_place.local != RETURN_PLACE {
-                                interesting.insert(src_place.local);
+                                let local_ty = body.local_decls[src_place.local].ty;
+                                if !self.is_pointer_ty(local_ty) {
+                                    interesting.insert(src_place.local);
+                                }
                             }
                         }
                         Rvalue::RawPtr(_mutbl, src_place) => {
                             if src_place.local != RETURN_PLACE {
-                                interesting.insert(src_place.local);
+                                let local_ty = body.local_decls[src_place.local].ty;
+                                if !self.is_pointer_ty(local_ty) {
+                                    interesting.insert(src_place.local);
+                                }
                             }
                         }
                         _ => {}
@@ -759,17 +773,18 @@ impl MyOptimizationPass {
                     // Only record stack allocations for *pointee* locals (actual stack slots).
                     // Pointer-typed locals (`&T`, `*mut T`, `*const T`) are just pointer values; recording
                     // their addresses as allocations pollutes ALLOCS.
-                    if !self.is_thin_ptr_ty(tcx, ty) {
+                    if !self.is_pointer_ty(ty) {
                         let size = self.layout_size_bytes(tcx, ty);
-
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx,
-                            insert_before: false,
-                            source_info: stmt.source_info,
-                            place: Place::from(local),
-                            kind: InstrKind::StackAlloc { local, live, size },
-                        });
+                        if size != 0 {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(local),
+                                kind: InstrKind::StackAlloc { local, live, size },
+                            });
+                        }
                     }
                 }
             }
@@ -794,23 +809,25 @@ impl MyOptimizationPass {
                     if is_deref_read {
                         // `p` is a deref place `(*ptr_local) ...` so the base pointer local is `p.local`.
                         let ptr_local = p.local;
+                        let ptr_ty = body.local_decls[ptr_local].ty;
+                        if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                            // Best-effort size: use the type of the *loaded place* (after projections).
+                            // This is important for patterns where the destination is a projection
+                            // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
+                            let loaded_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+                            let size = self.layout_size_bytes(tcx, loaded_ty);
+                            let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
-                        // Best-effort size: use the type of the *loaded place* (after projections).
-                        // This is important for patterns where the destination is a projection
-                        // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
-                        let loaded_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                        let size = self.layout_size_bytes(tcx, loaded_ty);
-                        let size_op = self.const_usize(tcx, stmt.source_info.span, size);
-
-                        ptr_locals_needing_tag.insert(ptr_local);
-                        insert_points.push(InsertPoint {
-                            bb, 
-                            stmt_idx,
-                            insert_before: false,
-                            source_info: stmt.source_info,
-                            place: Place::from(ptr_local),
-                            kind: InstrKind::PtrRead { ptr_local, size_op },
-                        });
+                            ptr_locals_needing_tag.insert(ptr_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(ptr_local),
+                                kind: InstrKind::PtrRead { ptr_local, size_op },
+                            });
+                        }
                     }
                 }
             }
@@ -825,22 +842,24 @@ impl MyOptimizationPass {
                 .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
             if is_deref_write {
                 let ptr_local = lhs_place.local;
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                    // Best-effort size: use the type of the *place being written* (after projections).
+                    // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
+                    let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+                    let size = self.layout_size_bytes(tcx, lhs_ty);
+                    let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
-                // Best-effort size: use the type of the *place being written* (after projections).
-                // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
-                let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                let size = self.layout_size_bytes(tcx, lhs_ty);
-                let size_op = self.const_usize(tcx, stmt.source_info.span, size);
-
-                ptr_locals_needing_tag.insert(ptr_local);
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx,
-                    insert_before: false,
-                    source_info: stmt.source_info,
-                    place: Place::from(ptr_local),
-                    kind: InstrKind::PtrWrite { ptr_local, size_op },
-                });
+                    ptr_locals_needing_tag.insert(ptr_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: Place::from(ptr_local),
+                        kind: InstrKind::PtrWrite { ptr_local, size_op },
+                    });
+                }
             }
         }
 
@@ -2090,6 +2109,61 @@ impl MyOptimizationPass {
                             kind: InstrKind::RetTake { callee_id, dst_local },
                         });
                     }
+                } else {
+                    // Uninstrumented callee: synthesize a fresh return tag unless another effect already
+                    // models the return pointer (alloc shims/ptr-derive/Box::into_raw).
+                    let alloc_returns_ptr = matches!(
+                        call_effect_opt,
+                        Some(CallEffect::AllocShim(
+                            AllocShimKind::Alloc | AllocShimKind::AllocZeroed | AllocShimKind::Realloc
+                        ))
+                    );
+                    let return_tagged_by_effect = matches!(
+                        call_effect_opt,
+                        Some(CallEffect::PtrDerive | CallEffect::BoxIntoRaw)
+                    ) || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
+
+                    if !return_tagged_by_effect {
+                        let is_mut = match dst_ty.kind() {
+                            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                            _ => false,
+                        };
+                        let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+                        let call_target_bb: Option<BasicBlock> = match &term.kind {
+                            TerminatorKind::Call { target, .. } => *target,
+                            _ => None,
+                        };
+
+                        ptr_locals_needing_tag.insert(dst_local);
+                        if let Some(tgt_bb) = call_target_bb {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RetRoot {
+                                    dst_local,
+                                    is_mut,
+                                    is_ref,
+                                },
+                            });
+                        } else {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RetRoot {
+                                    dst_local,
+                                    is_mut,
+                                    is_ref,
+                                },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -2141,6 +2215,9 @@ impl MyOptimizationPass {
                 continue;
             }
             let ty = body.local_decls[local].ty;
+            if self.is_pointer_ty(ty) {
+                continue;
+            }
             let size = self.layout_size_bytes(tcx, ty);
             if size == 0 {
                 continue;
@@ -2247,7 +2324,7 @@ impl MyOptimizationPass {
         
             // Never record pointer-typed locals as allocations.
             let ty = body.local_decls[local].ty;
-            if self.is_thin_ptr_ty(tcx, ty) {
+            if self.is_pointer_ty(ty) {
                 continue;
             }
             
@@ -2361,6 +2438,13 @@ impl MyOptimizationPass {
             InstrKind::Ref { .. } => hooks.def_id_ref,
             InstrKind::Raw { .. } => hooks.def_id_raw,
             InstrKind::RawRoot { .. } => hooks.def_id_raw,
+            InstrKind::RetRoot { is_ref, .. } => {
+                if *is_ref {
+                    hooks.def_id_ref
+                } else {
+                    hooks.def_id_raw
+                }
+            }
             InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
             InstrKind::HeapAlloc { .. } => hooks.def_id_alloc,
             // ConstAlloc is recorded via the same allocation hook.
@@ -2864,6 +2948,11 @@ impl MyOptimizationPass {
                         None
                     }
                 }
+                InstrKind::RetRoot { dst_local, .. } => Some(
+                    *tag_local_for_ptr_local
+                        .get(&dst_local)
+                        .expect("missing preallocated tag local for RetRoot destination"),
+                ),
                 InstrKind::PtrDerive { dst, .. } => Some(
                     *tag_local_for_ptr_local
                         .get(&dst)
@@ -2875,6 +2964,24 @@ impl MyOptimizationPass {
             let addr_local = body
                 .local_decls
                 .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+            let needs_thin_place = matches!(
+                creation_kind,
+                InstrKind::Ref { .. }
+                    | InstrKind::Raw { .. }
+                    | InstrKind::PtrRead { .. }
+                    | InstrKind::PtrWrite { .. }
+                    | InstrKind::PtrUse { .. }
+                    | InstrKind::PtrDerive { .. }
+                    | InstrKind::CallArgPush { .. }
+                    | InstrKind::RetRoot { .. }
+            );
+            if needs_thin_place {
+                let place_ty = place.ty(&body.local_decls, tcx).ty;
+                if !self.is_thin_ptr_ty(tcx, place_ty) {
+                    continue;
+                }
+            }
 
             let (addr_stmt1_opt, addr_stmt2) = match creation_kind {
                 InstrKind::StackAlloc { local, .. } => {
@@ -3144,6 +3251,7 @@ impl MyOptimizationPass {
                             _ => 0,
                         },
                         InstrKind::Raw { is_mut, .. } => if is_mut { 1 } else { 0 },
+                        InstrKind::RetRoot { is_mut, .. } => if is_mut { 1 } else { 0 },
                         _ => 0,
                     };
 

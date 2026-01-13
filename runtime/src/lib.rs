@@ -404,6 +404,8 @@ pub struct TagMeta {
     pub kind: PtrKind,
     /// Parent/derived tag (0 means none/root).
     pub parent: u64,
+    /// Whether the pointer has escaped its original scope (e.g., passed across a call boundary).
+    pub escaped: bool,
     /// Allocation epoch observed at creation time (0 if unknown).
     /// TODO: This is a best-effort snapshot used to disambiguate
     /// address reuse (e.g., stack slots or freed heap memory). Currently,
@@ -973,6 +975,7 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
             pointee_addr,
             kind,
             parent: parent_tag,
+            escaped: false,
             alloc_epoch,
         },
     );
@@ -1043,6 +1046,7 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
             pointee_addr,
             kind,
             parent: derived_from,
+            escaped: false,
             alloc_epoch,
         },
     );
@@ -1078,15 +1082,17 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
         return;
     }
 
-    let tmap = tags().lock().unwrap();
-    if let Some(tmeta) = tmap.get(&tag) {
+    let mut tmap = tags().lock().unwrap();
+    if let Some(tmeta) = tmap.get_mut(&tag) {
+        tmeta.escaped = true;
         rz_trace!(
-            "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={}",
+            "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,
             addr,
             tmeta.kind,
             tmeta.alloc_epoch,
-            tmeta.parent
+            tmeta.parent,
+            tmeta.escaped
         );
     } else {
         rz_trace!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);

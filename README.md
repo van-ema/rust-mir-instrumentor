@@ -17,6 +17,19 @@ cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p hello 
 
 You can specify output MIR files with `--mir-out` and provide a runtime path with `--runtime-path`.
 Note: `cargo instrument-mir` only builds the binary; run the produced binary directly (do not use `cargo run`).
+MIR output is only emitted during compilation. If Cargo says the target is up to date, no `before.*` or `after.*` file is written. Run `cargo clean -p <crate>` or touch a source file to force a rebuild. Also, `--mir-out` expects a file path, not a directory. The tool writes `before.<name>` and `after.<name>` alongside that file.
+
+```bash
+cargo clean -p medium_bytes_driver
+RZ_INSTRUMENT_ALL_DEPS=1 \
+cargo instrument-mir \
+  --runtime-path=target/debug \
+  --mir-out=./out.medium_bytes_driver.mir \
+  -p medium_bytes_driver --bin medium_bytes_driver
+
+# Alternative: force a rebuild without cleaning
+touch medium/bytes_driver/src/main.rs
+```
 
 ## Makefile shortcuts
 
