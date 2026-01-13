@@ -48,6 +48,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "copy_alias_violation"
+version = "0.1.0"
+
+[[package]]
 name = "dep"
 version = "0.1.0"
 
@@ -104,6 +108,14 @@ dependencies = [
 
 [[package]]
 name = "memcpy_copy_nonoverlapping"
+version = "0.1.0"
+
+[[package]]
+name = "memcpy_copy_u32_dynamic"
+version = "0.1.0"
+
+[[package]]
+name = "memset_u32_const"
 version = "0.1.0"
 
 [[package]]
