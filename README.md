@@ -64,6 +64,7 @@ make run EXAMPLE=hello PROFILE=release
 
 ### Instrumentation
 -  `RZ_LOG`: Control log level
+- `RZ_LOG_LOC`: If set to `1` or `true`, include caller location information in runtime violation logs. This is useful for tracing where a read/write was issued.
 - `RZ_STACK_ALLOCS`: Track stack allocation for all locals if set (`all`, `1`, `true`); default is only "interesting" locals.
 - `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
 - `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all *non-std-like*
