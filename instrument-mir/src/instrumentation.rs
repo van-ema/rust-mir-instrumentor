@@ -442,6 +442,50 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Extract mutability from a raw pointer or reference type.
+    fn ptr_is_mut<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            _ => false,
+        }
+    }
+
+    /// Ensure `ptr_local` has a tag by synthesizing a `RawRoot` before the current statement
+    /// if it hasn't been tagged yet. Only applies to THIN pointers.
+    fn ensure_raw_root_before<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        ptr_local: Local,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        tagged_ptr_locals: &mut HashSet<Local>,
+    ) {
+        if tagged_ptr_locals.contains(&ptr_local) {
+            return;
+        }
+
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        if !self.is_thin_ptr_ty(tcx, ptr_ty) {
+            // Do not attempt to RawRoot-tag wide pointers.
+            return;
+        }
+
+        let is_mut = self.ptr_is_mut(ptr_ty);
+        tagged_ptr_locals.insert(ptr_local);
+        insert_points.push(InsertPoint {
+            bb,
+            stmt_idx,
+            insert_before: true,
+            source_info,
+            place: Place::from(ptr_local),
+            kind: InstrKind::RawRoot { ptr_local, is_mut },
+        });
+    }
+
     /// Build statements that compute `addr_local` from a pointer-typed place.
     /// For thin pointers we can expose provenance directly.
     /// For wide pointers we first extract the data pointer, then expose provenance on that
@@ -1060,24 +1104,16 @@ impl MyOptimizationPass {
                             let size = self.layout_size_bytes(tcx, loaded_ty);
                             let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
-                            let needs_raw_root = !tagged_ptr_locals.contains(&ptr_local);
-                            if needs_raw_root {
-                                let is_mut = match ptr_ty.kind() {
-                                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                    _ => false,
-                                };
-                                tagged_ptr_locals.insert(ptr_local);
-                                // Insert RawRoot before the read by applying it after PtrRead insertion.
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx,
-                                    insert_before: true,
-                                    source_info: stmt.source_info,
-                                    place: Place::from(ptr_local),
-                                    kind: InstrKind::RawRoot { ptr_local, is_mut },
-                                });
-                            }
+                            self.ensure_raw_root_before(
+                                tcx,
+                                body,
+                                bb,
+                                stmt_idx,
+                                stmt.source_info,
+                                ptr_local,
+                                insert_points,
+                                tagged_ptr_locals,
+                            );
                             ptr_locals_needing_tag.insert(ptr_local);
                             insert_points.push(InsertPoint {
                                 bb,
@@ -1110,23 +1146,16 @@ impl MyOptimizationPass {
                     let size = self.layout_size_bytes(tcx, lhs_ty);
                     let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
-                    let needs_raw_root = !tagged_ptr_locals.contains(&ptr_local);
-                    if needs_raw_root {
-                        let is_mut = match ptr_ty.kind() {
-                            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                            _ => false,
-                        };
-                        tagged_ptr_locals.insert(ptr_local);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx,
-                            insert_before: true,
-                            source_info: stmt.source_info,
-                            place: Place::from(ptr_local),
-                            kind: InstrKind::RawRoot { ptr_local, is_mut },
-                        });
-                    }
+                    self.ensure_raw_root_before(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        stmt.source_info,
+                        ptr_local,
+                        insert_points,
+                        tagged_ptr_locals,
+                    );
                     ptr_locals_needing_tag.insert(ptr_local);
                     insert_points.push(InsertPoint {
                         bb,
@@ -1248,11 +1277,7 @@ impl MyOptimizationPass {
 
                             if let Some(c) = const_op {
                                 if let Some(info) = self.const_alloc_info(tcx, c) {
-                                    let is_mut = match dst_ty.kind() {
-                                        TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                        TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                        _ => false,
-                                    };
+                                    let is_mut = self.ptr_is_mut(dst_ty);
 
                                     ptr_locals_needing_tag.insert(dst_local);
                                     insert_points.push(InsertPoint {
@@ -1608,11 +1633,7 @@ impl MyOptimizationPass {
     ) {
         // Special-case: Box::into_raw returns a thin pointer derived from a Box ADT argument.
         // Since arg0 is not a thin pointer local, TagProp cannot apply; synthesize a root tag.
-        let is_mut = match dst_ty.kind() {
-            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-            _ => false,
-        };
+        let is_mut = self.ptr_is_mut(dst_ty);
 
         // Best-effort heap range recording for Box<T>: the raw pointer points to the T allocation.
         // TODO: hook real allocator shims/drop glue to get exact layout/size in general.
