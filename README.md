@@ -17,7 +17,7 @@ cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p hello 
 
 You can specify output MIR files with `--mir-out` and provide a runtime path with `--runtime-path`.
 Note: `cargo instrument-mir` only builds the binary; run the produced binary directly (do not use `cargo run`).
-MIR output is only emitted during compilation. If Cargo says the target is up to date, no `before.*` or `after.*` file is written. Run `cargo clean -p <crate>` or touch a source file to force a rebuild. `--mir-out` accepts either a file path or a directory. If you pass a directory or a path ending with a separator, the tool writes `before.out.mir` and `after.out.mir` inside that directory. If you pass a file path, the tool writes `before.<name>` and `after.<name>` alongside that file. `~` is expanded and parent directories are created as needed.
+MIR output is only emitted during compilation. If Cargo says the target is up to date, no `before.*` or `after.*` file is written. Run `cargo clean -p <crate>` or touch a source file to force a rebuild. `--mir-out` accepts either a file path or a directory. If you pass a directory or a path ending with a separator, the tool writes `before.out.mir` and `after.out.mir` inside that directory. If you pass a file path, the tool writes `before.<name>` and `after.<name>` alongside that file. `~` is expanded and parent directories are created as needed. The resolved paths follow these rules and are not printed by default.
 
 ```bash
 cargo clean -p medium_bytes_driver
