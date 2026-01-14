@@ -821,6 +821,8 @@ impl MyOptimizationPass {
         def_id: DefId,
         args: GenericArgsRef<'tcx>,
     ) -> DefId {
+        // Call-boundary tag ids must use the concrete impl instance, not the trait method item.
+        // If we keep the trait item DefId here, push and take end up keyed differently.
         let typing_env = body.typing_env(tcx);
         let normalized_args = tcx.try_normalize_erasing_regions(typing_env, args).unwrap_or(args);
         Instance::try_resolve(tcx, typing_env, def_id, normalized_args)
@@ -1058,6 +1060,24 @@ impl MyOptimizationPass {
                             let size = self.layout_size_bytes(tcx, loaded_ty);
                             let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
+                            let needs_raw_root = !tagged_ptr_locals.contains(&ptr_local);
+                            if needs_raw_root {
+                                let is_mut = match ptr_ty.kind() {
+                                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                                    _ => false,
+                                };
+                                tagged_ptr_locals.insert(ptr_local);
+                                // Insert RawRoot before the read by applying it after PtrRead insertion.
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: true,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(ptr_local),
+                                    kind: InstrKind::RawRoot { ptr_local, is_mut },
+                                });
+                            }
                             ptr_locals_needing_tag.insert(ptr_local);
                             insert_points.push(InsertPoint {
                                 bb,
@@ -1067,22 +1087,6 @@ impl MyOptimizationPass {
                                 place: Place::from(ptr_local),
                                 kind: InstrKind::PtrRead { ptr_local, size_op },
                             });
-                            if !tagged_ptr_locals.contains(&ptr_local) {
-                                let is_mut = match ptr_ty.kind() {
-                                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                                    _ => false,
-                                };
-                                tagged_ptr_locals.insert(ptr_local);
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx,
-                                    insert_before: false,
-                                    source_info: stmt.source_info,
-                                    place: Place::from(ptr_local),
-                                    kind: InstrKind::RawRoot { ptr_local, is_mut },
-                                });
-                            }
                         }
                     }
                 }
@@ -1106,16 +1110,8 @@ impl MyOptimizationPass {
                     let size = self.layout_size_bytes(tcx, lhs_ty);
                     let size_op = self.const_usize(tcx, stmt.source_info.span, size);
 
-                    ptr_locals_needing_tag.insert(ptr_local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx,
-                        insert_before: false,
-                        source_info: stmt.source_info,
-                        place: Place::from(ptr_local),
-                        kind: InstrKind::PtrWrite { ptr_local, size_op },
-                    });
-                    if !tagged_ptr_locals.contains(&ptr_local) {
+                    let needs_raw_root = !tagged_ptr_locals.contains(&ptr_local);
+                    if needs_raw_root {
                         let is_mut = match ptr_ty.kind() {
                             TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                             TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -1125,12 +1121,21 @@ impl MyOptimizationPass {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx,
-                            insert_before: false,
+                            insert_before: true,
                             source_info: stmt.source_info,
                             place: Place::from(ptr_local),
                             kind: InstrKind::RawRoot { ptr_local, is_mut },
                         });
                     }
+                    ptr_locals_needing_tag.insert(ptr_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: Place::from(ptr_local),
+                        kind: InstrKind::PtrWrite { ptr_local, size_op },
+                    });
                 }
             }
         }
@@ -1673,37 +1678,6 @@ impl MyOptimizationPass {
                 },
             });
         }
-    }
-
-    fn push_box_from_raw_call<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        bb: BasicBlock,
-        block_data: &BasicBlockData<'tcx>,
-        term: &Terminator<'tcx>,
-        ptr_local: Local,
-        ptr_ty: Ty<'tcx>,
-        insert_points: &mut Vec<InsertPoint<'tcx>>,
-    ) {
-        let pointee_size: usize = match ptr_ty.kind() {
-            TyKind::RawPtr(pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-            TyKind::Ref(_, pointee_ty, _) => self.layout_size_bytes(tcx, *pointee_ty),
-            _ => 0,
-        };
-        let size_op: Operand<'tcx> = self.const_usize(tcx, term.source_info.span, pointee_size);
-
-        insert_points.push(InsertPoint {
-            bb,
-            stmt_idx: block_data.statements.len(),
-            insert_before: true,
-            source_info: term.source_info,
-            place: Place::from(ptr_local),
-            kind: InstrKind::HeapAlloc {
-                ptr_local,
-                live: false,
-                size_op,
-            },
-        });
     }
 
     fn warn_unknown_call_if_needed<'tcx>(
@@ -2309,28 +2283,9 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::BoxFromRaw => {
-                    // Conservative modeling: mark Box<T> allocation dead at Box::from_raw(ptr).
-                    // Only when the callee is not instrumented.
-                    if !callee_instrumented {
-                        if let Some(first) = args.get(0) {
-                            if let Some(p) = self.place_from_operand(&first.node) {
-                                let ptr_local = p.local;
-                                let ptr_ty = body.local_decls[ptr_local].ty;
-                                if self.is_thin_ptr_ty(tcx, ptr_ty) {
-                                    ptr_locals_needing_tag.insert(ptr_local);
-                                    self.push_box_from_raw_call(
-                                        tcx,
-                                        bb,
-                                        block_data,
-                                        term,
-                                        ptr_local,
-                                        ptr_ty,
-                                        insert_points,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    // Box::from_raw only rewraps an existing allocation, so do not emit
+                    // any heap lifetime event here. Pointer argument tagging happens
+                    // through the regular call argument handling below.
                 }
 
                 CallEffect::Unknown => {
@@ -2492,10 +2447,21 @@ impl MyOptimizationPass {
                                     is_mut,
                                     is_ref,
                                 },
-                            });
-                        }
-                    }
-                }
+                });
+            }
+        }
+
+        let is_box_from_raw = callee_path_opt
+            .as_deref()
+            .is_some_and(|p| self.is_box_from_raw_wrapper(p));
+        if is_box_from_raw {
+            // Box::from_raw rewraps an existing allocation. Any dead HeapAlloc hook here
+            // makes the destructor read look like use-after-dead (bytes::release_shared).
+            insert_points.retain(|ip| {
+                !(ip.bb == bb && matches!(ip.kind, InstrKind::HeapAlloc { live: false, .. }))
+            });
+        }
+    }
             }
         }
     }
@@ -3853,10 +3819,38 @@ impl MyOptimizationPass {
         let tag_local_for_ptr_local =
             self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag);
 
+        let mut insert_points = scan.insert_points;
+        // Box::from_raw rewraps an existing allocation. Suppress any dead HeapAlloc
+        // hook placed at its call site so drop can read the pointee safely.
+        insert_points.retain(|ip| {
+            if let InstrKind::HeapAlloc { ptr_local, live: false, .. } = ip.kind {
+                if let Some(term) = body.basic_blocks[ip.bb].terminator.as_ref() {
+                    if let TerminatorKind::Call { args, destination, .. } = &term.kind {
+                        let arg0_local = args
+                            .get(0)
+                            .and_then(|arg| self.place_from_operand(&arg.node))
+                            .map(|p| p.local);
+                        if arg0_local == Some(ptr_local) {
+                            if let Some(dst_local) = destination.as_local() {
+                                let dst_ty = body.local_decls[dst_local].ty;
+                                if let TyKind::Adt(adt, _) = dst_ty.kind() {
+                                    let name = tcx.def_path_str(adt.did());
+                                    if name.contains("boxed::Box") || name.contains("::boxed::Box") {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        });
+
         self.insert_instrumentation(
             tcx,
             body,
-            scan.insert_points,
+            insert_points,
             &tag_local_for_ptr_local,
             hooks,
         );
