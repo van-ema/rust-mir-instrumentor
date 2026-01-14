@@ -507,6 +507,41 @@ fn rz_violation(kind: &str, msg: String) {
     }
 }
 
+fn backtrace_enabled(var: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+fn append_backtrace_if_enabled(mut msg: String, var: &str) -> String {
+    if backtrace_enabled(var) {
+        let bt = std::backtrace::Backtrace::force_capture();
+        msg.push_str("\nbacktrace:\n");
+        msg.push_str(&format!("{bt:?}"));
+    }
+    msg
+}
+
+fn location_enabled(var: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[track_caller]
+fn append_location_if_enabled(mut msg: String, var: &str) -> String {
+    if location_enabled(var) {
+        let loc = std::panic::Location::caller();
+        msg.push_str(&format!(
+            "\nloc={}:{}:{}",
+            loc.file(),
+            loc.line(),
+            loc.column()
+        ));
+    }
+    msg
+}
+
 /// Best-effort: resolve the allocation that a tag is derived from.
 ///
 /// We walk up the tag-parent chain and try to map a tag's `pointee_addr` to an allocation
@@ -600,13 +635,19 @@ pub extern "C" fn __rz_dump_state() {
 ///  - if an allocation record exists at exactly `addr`, it must be live
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+#[track_caller]
+pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
+        let msg = append_location_if_enabled(
+            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+            "RZ_LOG_LOC",
+        );
+        let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
         rz_violation(
             "UNKNOWN_TAG",
-            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+            msg,
         );
         return;
     };
@@ -639,8 +680,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 
                 // If the access overlaps beyond the end of the origin allocation, it's OOB.
                 if addr >= obase && access_end > alloc_end {
-                    rz_violation(
-                        "OUT_OF_BOUNDS",
+                    let msg = append_location_if_enabled(
                         format!(
                             "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
                             ometa.size,
@@ -650,20 +690,29 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                             tmeta.parent,
                             tmeta.pointee_addr
                         ),
+                        "RZ_LOG_LOC",
+                    );
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        msg,
                     );
                     return;
                 }
             }
         }
 
-        rz_violation(
-            "WILD_POINTER",
+        let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no allocation contains this address) kind={:?} parent={} pointee=0x{:x}",
                 tmeta.kind,
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "WILD_POINTER",
+            msg,
         );
         return;
     };
@@ -681,8 +730,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     if !ameta.live {
-        rz_violation(
-            "USE_AFTER_DEAD",
+        let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
                 ameta.size,
@@ -692,13 +740,17 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "USE_AFTER_DEAD",
+            msg,
         );
         return;
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-        rz_violation(
-            "STALE_POINTER_EPOCH_MISMATCH",
+        let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
                 ameta.size,
@@ -708,6 +760,11 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            msg,
         );
         return;
     }
@@ -717,8 +774,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         let end = match addr.checked_add(size) {
             Some(e) => e,
             None => {
-                rz_violation(
-                    "OUT_OF_BOUNDS",
+                let msg = append_location_if_enabled(
                     format!(
                         "WRITE via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={} pointee=0x{:x}",
                         ameta.size,
@@ -726,6 +782,11 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                         tmeta.parent,
                         tmeta.pointee_addr
                     ),
+                    "RZ_LOG_LOC",
+                );
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
                 );
                 return;
             }
@@ -737,8 +798,7 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            rz_violation(
-                "OUT_OF_BOUNDS",
+            let msg = append_location_if_enabled(
                 format!(
                     "WRITE via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
                     ameta.size,
@@ -746,6 +806,11 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     tmeta.parent,
                     tmeta.pointee_addr
                 ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
             );
             return;
         }
@@ -766,13 +831,19 @@ pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 ///  - if an allocation record exists at exactly `addr`, it must be live
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+#[track_caller]
+pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
     let tmap = tags().lock().unwrap();
     let Some(tmeta) = tmap.get(&tag) else {
+        let msg = append_location_if_enabled(
+            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+            "RZ_LOG_LOC",
+        );
+        let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
         rz_violation(
             "UNKNOWN_TAG",
-            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+            msg,
         );
         return;
     };
@@ -790,8 +861,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 if addr >= obase && access_end > alloc_end {
-                    rz_violation(
-                        "OUT_OF_BOUNDS",
+                    let msg = append_location_if_enabled(
                         format!(
                             "READ via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
                             ometa.size,
@@ -801,27 +871,35 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                             tmeta.parent,
                             tmeta.pointee_addr
                         ),
+                        "RZ_LOG_LOC",
+                    );
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        msg,
                     );
                     return;
                 }
             }
         }
 
-        rz_violation(
-            "WILD_POINTER",
+        let msg = append_location_if_enabled(
             format!(
                 "READ via tag={tag} addr=0x{addr:x} size={size}\n(no allocation contains this address) kind={:?} parent={} pointee=0x{:x}",
                 tmeta.kind,
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "WILD_POINTER",
+            msg,
         );
         return;
     };
 
     if !ameta.live {
-        rz_violation(
-            "USE_AFTER_DEAD",
+        let msg = append_location_if_enabled(
             format!(
                 "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
                 ameta.size,
@@ -831,13 +909,17 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "USE_AFTER_DEAD",
+            msg,
         );
         return;
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
-        rz_violation(
-            "STALE_POINTER_EPOCH_MISMATCH",
+        let msg = append_location_if_enabled(
             format!(
                 "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
                 ameta.size,
@@ -847,6 +929,11 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 tmeta.parent,
                 tmeta.pointee_addr
             ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            msg,
         );
         return;
     }
@@ -856,8 +943,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         let end = match addr.checked_add(size) {
             Some(e) => e,
             None => {
-                rz_violation(
-                    "OUT_OF_BOUNDS",
+                let msg = append_location_if_enabled(
                     format!(
                         "READ via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={} pointee=0x{:x}",
                         ameta.size,
@@ -865,6 +951,11 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                         tmeta.parent,
                         tmeta.pointee_addr
                     ),
+                    "RZ_LOG_LOC",
+                );
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
                 );
                 return;
             }
@@ -876,8 +967,7 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            rz_violation(
-                "OUT_OF_BOUNDS",
+            let msg = append_location_if_enabled(
                 format!(
                     "READ via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
                     ameta.size,
@@ -885,6 +975,11 @@ pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     tmeta.parent,
                     tmeta.pointee_addr
                 ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
             );
             return;
         }

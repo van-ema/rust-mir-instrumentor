@@ -60,6 +60,22 @@ fn main() {
         if let Some(p) = mir_out {
             let before = prefixed_path(&p, "before.");
             let after = prefixed_path(&p, "after.");
+            if std::env::var("RZ_MIR_OUT_DEBUG")
+                .ok()
+                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+            {
+                eprintln!(
+                    "[rusteze][debug] mir_out_base={} before={} after={}",
+                    p, before, after
+                );
+            }
+            for path in [&before, &after] {
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                }
+            }
             set_mir_output_paths(before, after);
         }
 

@@ -12,6 +12,7 @@ use crate::instrumentation::MyOptimizationPass;
 
 static MIR_OUT_BEFORE: OnceLock<String> = OnceLock::new();
 static MIR_OUT_AFTER: OnceLock<String> = OnceLock::new();
+static MIR_OUT_DEBUG_PRINTED: OnceLock<()> = OnceLock::new();
 
 pub(crate) fn set_mir_output_paths(before: String, after: String) {
     MIR_OUT_BEFORE.set(before).unwrap();
@@ -21,6 +22,19 @@ pub(crate) fn set_mir_output_paths(before: String, after: String) {
 const CUSTOM_OPT_MIR: for<'tcx> fn(tcx: TyCtxt<'tcx>, def: LocalDefId) -> &'tcx Body<'tcx> =
     |tcx, def| {
         let mut body = (rustc_interface::DEFAULT_QUERY_PROVIDERS.optimized_mir)(tcx, def).clone();
+
+        if std::env::var("RZ_MIR_OUT_DEBUG")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        {
+            if MIR_OUT_DEBUG_PRINTED.set(()).is_ok() {
+                eprintln!(
+                    "[rusteze][debug] mir_out_before={:?} mir_out_after={:?}",
+                    MIR_OUT_BEFORE.get(),
+                    MIR_OUT_AFTER.get()
+                );
+            }
+        }
 
         // Write MIR before running our optimization/instrumentation.
         if let Some(path) = MIR_OUT_BEFORE.get() {
