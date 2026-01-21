@@ -57,7 +57,12 @@ make run EXAMPLE=hello PROFILE=release
 ## Env
 
 ### Runtime
+- `RZ_LOG`: Log level for runtime output (`trace`, `info`, `warn`); default is `warn`.
+- `RZ_LOG_LOC`: If set to `1` or `true`, include caller location information in runtime violation logs.
+- `RZ_BACKTRACE_UNKNOWN_TAG`: If set to `1` or `true`, include a backtrace on `UNKNOWN_TAG` violations.
 - `RUSTEZE_FAILFAST`: If non-zero, panic on violation; default is log-and-continue.
+- `RZ_ABORT_ON_DOUBLE_FREE`: If non-zero, abort the process on `DOUBLE_FREE` after reporting.
+- `RZ_STRICT_FREE_CHECK`: If non-zero, treat frees of unknown bases as violations (and skip system dealloc).
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a
   `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap
@@ -69,8 +74,7 @@ make run EXAMPLE=hello PROFILE=release
   and deadlocks when runtime hooks perform logging or internal allocations.
 
 ### Instrumentation
--  `RZ_LOG`: Control log level
-- `RZ_LOG_LOC`: If set to `1` or `true`, include caller location information in runtime violation logs. This is useful for tracing where a read/write was issued.
+- `RZ_LOG`: Log level for the instrumentor pass (`trace`, `info`, `warn`); default is `warn`.
 - `RZ_STACK_ALLOCS`: Track stack allocation for all locals if set (`all`, `1`, `true`); default is only "interesting" locals.
 - `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
 - `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all *non-std-like*
@@ -81,6 +85,8 @@ make run EXAMPLE=hello PROFILE=release
 - `RZ_PRINT_CRATES`: If non-zero/true, print the crate graph and show which crates are instrumented.
 - `RZ_FILTER_STDLIB_USES`: If set to `0` or `false`, do not filter out coarse pointer-use hooks from std/core/alloc; default is enabled.
 - `RZ_WARN_UNKNOWN_CALLS`: If set to `0` or `false`, suppress warnings about unknown direct calls with pointer effects; default is enabled.
+- `RZ_HEAP_ALLOCS_FROM_MIR`: If set to `1` or `true`, emit MIR-level heap alloc/free hooks (overrides allocator-wrapper default).
+- `RZ_DEBUG_SYMBOL_LOOKUP`: If set to `1` or `true`, print verbose symbol lookup logs when resolving runtime hooks.
 
 
 ## Standard Library Handling
@@ -134,6 +140,22 @@ RZ_STACK_ALLOCS=true cargo instrument-mir ...
 Notes:
 - The toggle affects only stack allocation lifetime tracking; pointer creation/use tracking is unchanged.
 - The "all" mode can produce many more `__rz_record_alloc` events, especially in code that uses formatting/panic paths.
+
+## Debugging recipes
+
+```bash
+# Show caller locations for violations
+RZ_LOG=trace RZ_LOG_LOC=1 ./target/release/hello
+
+# Include a backtrace on UNKNOWN_TAG violations
+RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE_UNKNOWN_TAG=1 ./target/release/hello
+
+# See instrumented vs dep crates during compilation
+RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bin hello
+
+# Force stack alloc tracking for all locals (more noise)
+RZ_STACK_ALLOCS=all cargo instrument-mir --runtime-path=target/debug -p hello --bin hello
+```
 
 
 
