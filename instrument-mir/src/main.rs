@@ -70,11 +70,11 @@ fn main() {
             set_mir_output_paths(before, after);
         }
 
-        // Cargo probes the compiler with `-vV` (verbose version) before building.
-        // That invocation won't carry our custom flags, so we must not require them.
-        let is_version_probe = args
-            .iter()
-            .any(|a| a == "-vV" || a == "-V" || a == "--version");
+        // Cargo probes the compiler before building. Those invocations won't carry our
+        // custom flags, so we must not require them.
+        let is_query_probe = args.iter().any(|a| {
+            a == "-vV" || a == "-V" || a == "--version" || a.starts_with("--print")
+        });
 
         if let Some(runtime_path) = runtime_path {
             args.push("-Zunstable-options".to_string());
@@ -83,7 +83,7 @@ fn main() {
                 "--extern=force:runtime={}/libruntime.rlib",
                 runtime_path
             ));
-        } else if !is_version_probe {
+        } else if !is_query_probe {
             panic!("missing --runtime-path argument (pass it via `cargo instrument-mir --runtime-path=...`)");
         }
         // args.push("-Zdump-mir=main".to_string());

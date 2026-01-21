@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 
 // (rest unchanged)
@@ -9,7 +10,8 @@ use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
-use rustc_middle::ty::{GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
+use rustc_middle::ty::{ConstKind as TyConstKind, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
+use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
 use rustc_middle::ty::TyKind;
 use rustc_span::{source_map::Spanned, Span};
 
@@ -411,16 +413,25 @@ impl MyOptimizationPass {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
     }
 
-    /// Return true only for *thin* pointers, meaning one machine word.
-    /// Fat pointers like `&[T]`, `&str`, and trait objects include metadata and lower to a
-    /// ScalarPair, and `PointerExposeProvenance` on those values triggers a codegen ICE today.
-    fn is_thin_ptr_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    /// Return true only for *thin* pointers (one machine word).
+    ///
+    /// IMPORTANT: do **not** call `tcx.layout_of` / `layout_size_bytes` here.
+    /// During MIR instrumentation we may see generic/projection types that cannot be
+    /// normalized yet (e.g. `&[<I as Iterator>::Item; 0]` inside `SmallVec`), and forcing a
+    /// layout query can surface an `E0080` "unable to determine layout ... cannot be normalized"
+    /// error during compilation.
+    ///
+    /// Instead, classify fat pointers syntactically by looking at the pointee type:
+    /// references/raw-pointers to DSTs (`[T]`, `str`, `dyn Trait`) are fat; everything else is
+    /// treated as thin.
+    fn is_thin_ptr_ty<'tcx>(&self, _tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
-            TyKind::Ref(..) | TyKind::RawPtr(..) => {
-                let ptr_bytes = tcx.data_layout.pointer_size().bytes() as usize;
-                // Use layout size of the pointer type itself: thin ptr == pointer size; fat ptr == 2*ptr size (on 64-bit).
-                self.layout_size_bytes(tcx, ty) == ptr_bytes
-            }
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => match pointee.kind() {
+                TyKind::Slice(..) | TyKind::Str | TyKind::Dynamic(..) => false,
+                // `extern type` is unsized but uses `()` metadata, so pointers are thin.
+                TyKind::Foreign(..) => true,
+                _ => true,
+            },
             _ => false,
         }
     }
@@ -787,6 +798,21 @@ impl MyOptimizationPass {
     }
 
     fn layout_size_bytes<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> usize {
+        // `tcx.layout_of(...)` can trigger normalization and will hard-error (E0080)
+        // for types that are not fully normalizable in the current context, e.g.
+        // `&[<I as Iterator>::Item; 0]` inside generic code like `Splice<'_, I, N>::drop`.
+        //
+        // For our instrumentation, "unknown size" is fine: we already treat size=0 as
+        // best-effort and avoid precise OOB checks in that case.
+        if ty.has_param()
+            || ty.has_infer()
+            || ty.has_aliases()
+            || ty.has_opaque_types()
+            || ty.has_placeholders()
+        {
+            return 0;
+        }
+
         let input = PseudoCanonicalInput {
             typing_env: TypingEnv::fully_monomorphized(),
             value: ty,
@@ -797,12 +823,62 @@ impl MyOptimizationPass {
             .unwrap_or(0)
     }
 
+    fn type_needs_normalization<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        struct NeedsNormalizationVisitor;
+
+        impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for NeedsNormalizationVisitor {
+            type Result = ControlFlow<()>;
+
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+                match ty.kind() {
+                    TyKind::Alias(..)
+                    | TyKind::Param(..)
+                    | TyKind::Bound(..)
+                    | TyKind::Placeholder(..)
+                    | TyKind::Infer(..)
+                    | TyKind::Error(..) => ControlFlow::Break(()),
+                    _ => ty.super_visit_with(self),
+                }
+            }
+
+            fn visit_const(&mut self, c: rustc_middle::ty::Const<'tcx>) -> Self::Result {
+                match c.kind() {
+                    TyConstKind::Param(..)
+                    | TyConstKind::Infer(..)
+                    | TyConstKind::Bound(..)
+                    | TyConstKind::Placeholder(..)
+                    | TyConstKind::Unevaluated(..)
+                    | TyConstKind::Expr(..)
+                    | TyConstKind::Error(..) => ControlFlow::Break(()),
+                    _ => c.super_visit_with(self),
+                }
+            }
+        }
+
+        let mut v = NeedsNormalizationVisitor;
+        ty.visit_with(&mut v).is_break()
+    }
+
     // Resolve const/promoted pointers to their global allocation metadata (size + offset).
     fn const_alloc_info<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         c: &ConstOperand<'tcx>,
     ) -> Option<ConstAllocInfo> {
+        let const_ty = c.const_.ty();
+        if const_ty.has_param()
+            || const_ty.has_infer()
+            || const_ty.has_aliases()
+            || const_ty.has_opaque_types()
+            || const_ty.has_placeholders()
+            || const_ty.has_bound_vars()
+            || const_ty.has_free_regions()
+            || self.type_needs_normalization(const_ty)
+            || !const_ty.is_global()
+        {
+            return None;
+        }
+
         let scalar = c
             .const_
             .try_eval_scalar(tcx, TypingEnv::fully_monomorphized())?;
@@ -815,7 +891,19 @@ impl MyOptimizationPass {
             GlobalAlloc::Memory(mem) => mem.inner().size().bytes() as usize,
             GlobalAlloc::Static(def_id) => {
                 let ty = tcx.type_of(def_id).skip_binder();
-                self.layout_size_bytes(tcx, ty)
+                // Same issue as above: statics can have types that still require
+                // normalization/projection evaluation in ways that can ICE/error.
+                // Unknown is fine.
+                if ty.has_param()
+                    || ty.has_infer()
+                    || ty.has_aliases()
+                    || ty.has_opaque_types()
+                    || ty.has_placeholders()
+                {
+                    0
+                } else {
+                    self.layout_size_bytes(tcx, ty)
+                }
             }
             _ => return None,
         };
@@ -833,6 +921,20 @@ impl MyOptimizationPass {
         c: &ConstOperand<'tcx>,
     ) -> Option<DefId> {
         let mut def_id_opt: Option<DefId> = None;
+
+        let const_ty = c.const_.ty();
+        if const_ty.has_param()
+            || const_ty.has_infer()
+            || const_ty.has_aliases()
+            || const_ty.has_opaque_types()
+            || const_ty.has_placeholders()
+            || const_ty.has_bound_vars()
+            || const_ty.has_free_regions()
+            || self.type_needs_normalization(const_ty)
+            || !const_ty.is_global()
+        {
+            return None;
+        }
 
         if let TyKind::FnDef(def_id, args) = c.const_.ty().kind() {
             def_id_opt = Some(self.resolve_instance_def_id(tcx, body, *def_id, args));
