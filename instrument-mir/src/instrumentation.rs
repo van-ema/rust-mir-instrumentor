@@ -139,6 +139,24 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // No-op helpers.
     EffectRule::one(MatchKind::EndsWith, "::is_null", CallEffect::Ignore),
 
+    // ---- Common std/core helpers (suppress unknown-call noise) ----
+
+    // Deref/DerefMut return a reference derived from self.
+    EffectRule::two(MatchKind::Contains, "::ops::Deref", MatchKind::EndsWith, "::deref", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ops::DerefMut", MatchKind::EndsWith, "::deref_mut", CallEffect::PtrDerive),
+
+    // Iterator adaptors: conservative Ignore to avoid treating &mut self as read/write.
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::by_ref", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::for_each", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::size_hint", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::collect", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::next", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::nth", CallEffect::Ignore),
+
+    // Slice helpers.
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::iter", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::iter_mut", CallEffect::Ignore),
+
     // ---- PtrDerive wrappers (pointer arithmetic + slice/vec pointer extraction) ----
 
     // Pointer arithmetic wrappers: constrain to `::ptr::` and method name.
