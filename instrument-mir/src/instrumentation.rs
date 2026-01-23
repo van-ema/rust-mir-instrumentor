@@ -814,6 +814,7 @@ impl MyOptimizationPass {
         if !ty.is_sized(tcx, body.typing_env(tcx)) {
             return SizeOperand::Const(self.const_usize(tcx, span, 0));
         }
+        // Emit MIR size_of to avoid layout normalization during instrumentation.
         SizeOperand::SizeOf(ty)
     }
 
@@ -1092,6 +1093,22 @@ impl MyOptimizationPass {
                         }
                         _ => {}
                     }
+                }
+            }
+            if let Some(term) = &block_data.terminator {
+                match &term.kind {
+                    TerminatorKind::Drop { place, .. } => {
+                        // Drop glue implicitly takes `&place` even if MIR has no explicit ref/raw.
+                        // Treat Drop as an implicit address-of so stack slots are tracked.
+                        let local = place.local;
+                        if local != RETURN_PLACE {
+                            let local_ty = body.local_decls[local].ty;
+                            if !self.is_pointer_ty(local_ty) {
+                                interesting.insert(local);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1567,6 +1584,7 @@ impl MyOptimizationPass {
                 }
             }
         }
+
     }
 
 

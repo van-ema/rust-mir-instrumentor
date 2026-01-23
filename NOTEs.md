@@ -1,6 +1,14 @@
-
+∆
 
 # Notes
+
+## Access-size computation via MIR size_of
+
+To avoid `layout_of` normalization failures in generic MIR, access sizes are now
+emitted using MIR `size_of::<T>()` for sized types. This means size computation
+is deferred to codegen/runtime and we no longer query layouts during
+instrumentation. Unsized types or non-thin pointers still fall back to size=0
+as a conservative unknown.
 
 ## PtrWrite address precision caveat
 
@@ -44,3 +52,11 @@ Compute the **actual accessed address** for a deref write by accounting for proj
 - then pass `addr = base + computed_offset` to `__rz_ptr_write`
 
 This will be necessary to correctly track writes like `(*p).field = ...` and other interior accesses.
+
+## Drop glue and implicit address-of
+
+MIR drop terminators (`TerminatorKind::Drop`) call drop glue with a pointer to
+the local being dropped. This effectively takes `&place` even when there is no
+explicit `Rvalue::Ref`/`Rvalue::RawPtr` in the statements. To avoid missing
+stack allocations that are only touched by drop glue, we treat `Drop` as an
+implicit address-of when computing the set of stack locals worth tracking.
