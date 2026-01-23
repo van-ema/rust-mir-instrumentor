@@ -2521,23 +2521,6 @@ impl MyOptimizationPass {
         }
 
 
-        let arg_is_already_accounted_for = |l: Local| {
-            classified_write_ptr_local == Some(l)
-                || classified_read_ptr_local == Some(l)
-                || classified_derive_ptr_local == Some(l)
-        };
-        
-        let suppress_ptr_use_for_call = matches!(
-            call_effect_opt,
-            Some(
-                CallEffect::MemCopy
-                    | CallEffect::MemSet
-                    | CallEffect::Load
-                    | CallEffect::Store
-                    | CallEffect::PtrDerive
-            )
-        );
-        
         // Treat any pointer argument as tag relevant, including wide pointers, so argument tags
         // survive through metadata carrying types that later yield thin data pointers.
         for (arg_index, a) in args.iter().enumerate() {
@@ -2564,18 +2547,11 @@ impl MyOptimizationPass {
                 }
             }
         
-            if arg_is_already_accounted_for(p.local) {
-                continue;
-            }
-        
-            if suppress_ptr_use_for_call {
-                continue;
-            }
-        
+            // Always record a coarse escape event for pointer arguments at call boundaries,
+            // even when specific effects (read/write/derive) are also modeled.
             if self.filter_stdlib_uses_enabled() && self.span_is_stdlib(tcx, term.source_info.span) {
                 continue;
             }
-        
             ptr_locals_needing_tag.insert(p.local);
             insert_points.push(InsertPoint {
                 bb,
@@ -2585,6 +2561,7 @@ impl MyOptimizationPass {
                 place: Place::from(p.local),
                 kind: InstrKind::PtrUse { ptr_local: p.local },
             });
+
             if !tagged_ptr_locals.contains(&p.local) {
                 let is_mut = match ty.kind() {
                     TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),

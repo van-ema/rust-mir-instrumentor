@@ -1,4 +1,4 @@
-Phase 0 — Lock in a Repeatable Test Harness (DO THIS NEXT)
+Phase 0 — Lock in a Repeatable Test Harness (COMPLETED)
 
 Goal
 
@@ -26,6 +26,9 @@ Exit Criteria
 	•	Running the harness twice yields:
 	•	the same outcome (pass or same first violation)
 	•	no nondeterministic crashes or random epoch mismatches
+
+Status
+	•	Completed: `scripts/run_harness.sh` exists with FAST/DEBUG profiles and capture logic.
 
 ⸻
 
@@ -232,9 +235,8 @@ You are done when:
 ⸻
 
 Immediate Next Actions (Concrete)
-	1.	Write scripts/run_harness.sh
-	2.	Implement Phase 1 call-boundary semantics
-	3.	Start running bytes + smallvec now
-	4.	Only then move to SB-lite
+	1.	Implement Phase 1 call-boundary semantics
+	2.	Start running bytes + smallvec now
+	3.	Only then move to SB-lite
 
 ⸻
