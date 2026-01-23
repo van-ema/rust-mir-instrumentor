@@ -46,6 +46,11 @@ Implementation
 	•	Create a fresh tag
 	•	Parent = UNKNOWN (tag=0), snapshot alloc_epoch from pointee allocation
 
+Status
+	•	Argument passing escape events are emitted at call boundaries.
+	•	Unknown call policy implemented (read/write/escape for pointer args).
+	•	Common helpers classified (Deref, Iterator adaptors, slice iter).
+
 2. Unknown Call Policy
 Adopt a single consistent policy:
 
