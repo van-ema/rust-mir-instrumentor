@@ -2249,6 +2249,8 @@ impl MyOptimizationPass {
 
         // Centralized effect classification for direct calls.
         let mut call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+        let unknown_call = !callee_instrumented
+            && matches!(call_effect_opt, None | Some(CallEffect::Unknown));
 
         // Warn when we see a *direct* call that likely has pointer-based memory effects,
         // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
@@ -2545,6 +2547,33 @@ impl MyOptimizationPass {
                         },
                     });
                 }
+            }
+
+            // Unknown call policy: conservatively model potential read/write through any pointer arg.
+            if unknown_call {
+                let size_op = match ty.kind() {
+                    TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
+                        self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
+                    }
+                    _ => SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0)),
+                };
+                ptr_locals_needing_tag.insert(p.local);
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(p.local),
+                    kind: InstrKind::PtrRead { ptr_local: p.local, size_op: size_op.clone() },
+                });
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(p.local),
+                    kind: InstrKind::PtrWrite { ptr_local: p.local, size_op },
+                });
             }
         
             // Always record a coarse escape event for pointer arguments at call boundaries,
