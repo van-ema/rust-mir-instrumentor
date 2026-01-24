@@ -32,6 +32,11 @@ timestamp="$(date +%Y%m%d_%H%M%S)"
 run_dir="${REPORT_DIR}/${timestamp}"
 mkdir -p "${run_dir}"
 
+if [[ -z "${CARGO_INCREMENTAL:-}" ]]; then
+  # Force full rebuilds so the harness picks up updated instrumentor binaries.
+  export CARGO_INCREMENTAL=0
+fi
+
 summary_file="${run_dir}/summary.tsv"
 printf "example\trun\tstatus\tsignature\n" > "${summary_file}"
 
@@ -60,6 +65,9 @@ if [[ -z "${RZ_LOG:-}" ]]; then
     export RZ_LOG=warn
   fi
 fi
+
+# Default to instrumenting all deps for stable pointer metadata unless overridden.
+export RZ_INSTRUMENT_ALL_DEPS="${RZ_INSTRUMENT_ALL_DEPS:-1}"
 
 profile_flag=()
 runtime_features=()
