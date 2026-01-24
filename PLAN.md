@@ -199,6 +199,37 @@ Run in:
 
 ⸻
 
+Phase 6 — Evaluation & Fuzzing Integration (Publication-Grade)
+
+Goal
+
+Make results defensible for a first-tier paper and practical for fuzzing workflows.
+
+Implementation
+	•	Add a fuzzing harness (cargo-fuzz/libFuzzer) that:
+		•	runs instrumented binaries
+		•	deduplicates violations by canonical signature
+		•	saves minimal repro inputs
+	•	Add a triage script:
+		•	group by violation kind + access type + pointer kind + size
+		•	tag as true/false positive based on a small review set
+	•	Collect performance metrics:
+		•	run-time slowdown vs baseline
+		•	peak memory overhead
+
+Evaluation Benchmarks
+	•	UB suites: core UB examples + public Rust UB test corpus
+	•	Medium crates: bytes, smallvec, serde (instrumented tests)
+	•	Larger crates: ripgrep, reqwest/hyper, rust-analyzer components
+	•	Comparisons: Miri, ASan, and at least one dynamic Rust tool (if feasible)
+
+Exit Criteria
+	•	Reproducible violation signatures across runs
+	•	Actionable bug reports from fuzzing on real crates
+	•	Clear precision/coverage tradeoff documented in main.tex
+
+⸻
+
 Phase 6 — Evaluation (Make Results Defensible)
 
 Metrics
