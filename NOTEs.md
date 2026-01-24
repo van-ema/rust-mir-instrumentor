@@ -10,6 +10,19 @@ is deferred to codegen/runtime and we no longer query layouts during
 instrumentation. Unsized types or non-thin pointers still fall back to size=0
 as a conservative unknown.
 
+## Unknown-call allow-untagged reads/writes
+
+When we see a direct call that is unclassified and not instrumented, we insert
+conservative pointer effects for each pointer argument:
+
+- `PtrReadAllowUntagged` and `PtrWriteAllowUntagged` are emitted at the call site.
+- They lower to `__rz_ptr_read_allow_untagged` / `__rz_ptr_write_allow_untagged`.
+- The runtime returns early when `tag == 0`, so missing metadata does not
+  raise `UNKNOWN_TAG` while still checking nonzero tags.
+
+These hooks are only used for the unknown-call policy, not for ordinary deref
+reads/writes or classified wrappers.
+
 ## PtrWrite address precision caveat
 
 Right now, the `PtrWrite` instrumentation computes the write address as:

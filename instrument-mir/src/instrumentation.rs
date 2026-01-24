@@ -142,10 +142,18 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // ---- Common std/core helpers (suppress unknown-call noise) ----
 
     // Deref/DerefMut return a reference derived from self.
+    EffectRule::two(MatchKind::Contains, "::ops::deref::Deref", MatchKind::EndsWith, "::deref", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ops::deref::DerefMut", MatchKind::EndsWith, "::deref_mut", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ops::Deref", MatchKind::EndsWith, "::deref", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ops::DerefMut", MatchKind::EndsWith, "::deref_mut", CallEffect::PtrDerive),
 
     // Iterator adaptors: conservative Ignore to avoid treating &mut self as read/write.
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::by_ref", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::for_each", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::size_hint", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::collect", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::next", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::traits::iterator::Iterator", MatchKind::EndsWith, "::nth", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::by_ref", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::for_each", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::iter::Iterator", MatchKind::EndsWith, "::size_hint", CallEffect::Ignore),
@@ -270,9 +278,13 @@ enum InstrKind<'tcx> {
     /// A write through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrWrite { ptr_local: Local, size_op: SizeOperand<'tcx> },
+    /// A write through a pointer local, but skip if the tag is uninitialized (tag=0).
+    PtrWriteAllowUntagged { ptr_local: Local, size_op: SizeOperand<'tcx> },
     /// A read through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrRead { ptr_local: Local, size_op: SizeOperand<'tcx> },
+    /// A read through a pointer local, but skip if the tag is uninitialized (tag=0).
+    PtrReadAllowUntagged { ptr_local: Local, size_op: SizeOperand<'tcx> },
     /// Coarse pointer-use tracking: a pointer-typed local appears in a call argument.
     /// This is treated as an escape event at call boundaries.
     PtrUse { ptr_local: Local },
@@ -322,7 +334,9 @@ struct Hooks {
     def_id_raw: DefId,
     def_id_alloc: DefId,
     def_id_write: DefId,
+    def_id_write_allow_untagged: DefId,
     def_id_read: DefId,
+    def_id_read_allow_untagged: DefId,
     def_id_use: DefId,
     def_id_push_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
@@ -911,9 +925,7 @@ impl MyOptimizationPass {
             || const_ty.has_opaque_types()
             || const_ty.has_placeholders()
             || const_ty.has_bound_vars()
-            || const_ty.has_free_regions()
             || self.type_needs_normalization(const_ty)
-            || !const_ty.is_global()
         {
             return None;
         }
@@ -964,13 +976,12 @@ impl MyOptimizationPass {
         let const_ty = c.const_.ty();
         if const_ty.has_param()
             || const_ty.has_infer()
+      
             || const_ty.has_aliases()
             || const_ty.has_opaque_types()
             || const_ty.has_placeholders()
             || const_ty.has_bound_vars()
-            || const_ty.has_free_regions()
             || self.type_needs_normalization(const_ty)
-            || !const_ty.is_global()
         {
             return None;
         }
@@ -1276,7 +1287,7 @@ impl MyOptimizationPass {
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx,
-                                insert_before: false,
+                                insert_before: true,
                                 source_info: stmt.source_info,
                                 place: Place::from(ptr_local),
                                 kind: InstrKind::PtrRead { ptr_local, size_op },
@@ -1318,7 +1329,7 @@ impl MyOptimizationPass {
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx,
-                        insert_before: false,
+                        insert_before: true,
                         source_info: stmt.source_info,
                         place: Place::from(ptr_local),
                         kind: InstrKind::PtrWrite { ptr_local, size_op },
@@ -2547,6 +2558,26 @@ impl MyOptimizationPass {
             let Some(p) = self.place_from_operand(&a.node) else { continue; };
             let ty = body.local_decls[p.local].ty;
             if !self.is_pointer_ty(ty) { continue; }
+
+            let was_tagged = tagged_ptr_locals.contains(&p.local);
+
+            // Ensure a tag exists before any call-boundary effects that consume it.
+            if !was_tagged {
+                let is_mut = match ty.kind() {
+                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                    _ => false,
+                };
+                tagged_ptr_locals.insert(p.local);
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(p.local),
+                    kind: InstrKind::RawRoot { ptr_local: p.local, is_mut },
+                });
+            }
         
             // Inter-procedural: push argument tag to callee if instrumented.
             if callee_instrumented {
@@ -2568,7 +2599,7 @@ impl MyOptimizationPass {
             }
 
             // Unknown call policy: conservatively model potential read/write through any pointer arg.
-            if unknown_call {
+            if unknown_call && was_tagged {
                 let size_op = match ty.kind() {
                     TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
                         self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
@@ -2582,7 +2613,10 @@ impl MyOptimizationPass {
                     insert_before: false,
                     source_info: term.source_info,
                     place: Place::from(p.local),
-                    kind: InstrKind::PtrRead { ptr_local: p.local, size_op: size_op.clone() },
+                    kind: InstrKind::PtrReadAllowUntagged {
+                        ptr_local: p.local,
+                        size_op: size_op.clone(),
+                    },
                 });
                 insert_points.push(InsertPoint {
                     bb,
@@ -2590,7 +2624,7 @@ impl MyOptimizationPass {
                     insert_before: false,
                     source_info: term.source_info,
                     place: Place::from(p.local),
-                    kind: InstrKind::PtrWrite { ptr_local: p.local, size_op },
+                    kind: InstrKind::PtrWriteAllowUntagged { ptr_local: p.local, size_op },
                 });
             }
         
@@ -2608,23 +2642,6 @@ impl MyOptimizationPass {
                 place: Place::from(p.local),
                 kind: InstrKind::PtrUse { ptr_local: p.local },
             });
-
-            if !tagged_ptr_locals.contains(&p.local) {
-                let is_mut = match ty.kind() {
-                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                    _ => false,
-                };
-                tagged_ptr_locals.insert(p.local);
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx: block_data.statements.len(),
-                    insert_before: false,
-                    source_info: term.source_info,
-                    place: Place::from(p.local),
-                    kind: InstrKind::RawRoot { ptr_local: p.local, is_mut },
-                });
-            }
         }
 
         // Caller-side return-tag recovery for pointer returns, including wide pointers whose
@@ -3000,7 +3017,9 @@ impl MyOptimizationPass {
             // ConstAlloc is recorded via the same allocation hook.
             InstrKind::ConstAlloc { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
+            InstrKind::PtrWriteAllowUntagged { .. } => hooks.def_id_write_allow_untagged,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
+            InstrKind::PtrReadAllowUntagged { .. } => hooks.def_id_read_allow_untagged,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
             InstrKind::TagProp { .. } => hooks.def_id_use, // should never become a call (handled as a plain Assign)
             InstrKind::PtrDerive { .. } => hooks.def_id_raw,
@@ -3020,7 +3039,34 @@ impl MyOptimizationPass {
         tag_local_for_ptr_local: &HashMap<Local, Local>,
         hooks: Hooks,
     ) {
-        for ip in insert_points.into_iter().rev() {
+        fn instr_priority(kind: &InstrKind<'_>) -> u8 {
+            match kind {
+                InstrKind::Ref { .. }
+                | InstrKind::Raw { .. }
+                | InstrKind::RawRoot { .. }
+                | InstrKind::RetRoot { .. }
+                | InstrKind::PtrDerive { .. } => 0,
+                InstrKind::PtrRead { .. }
+                | InstrKind::PtrWrite { .. }
+                | InstrKind::PtrReadAllowUntagged { .. }
+                | InstrKind::PtrWriteAllowUntagged { .. } => 1,
+                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 2,
+                _ => 3,
+            }
+        }
+
+        let mut indexed: Vec<(usize, InsertPoint<'tcx>)> =
+            insert_points.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(idx, ip)| {
+            (
+                ip.bb.index(),
+                ip.stmt_idx,
+                instr_priority(&ip.kind),
+                *idx,
+            )
+        });
+
+        for (_idx, ip) in indexed.into_iter().rev() {
             let bb = ip.bb;
             let stmt_idx = ip.stmt_idx;
             let source_info = ip.source_info;
@@ -3508,11 +3554,7 @@ impl MyOptimizationPass {
 
             let func_operand = self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
 
-            let insert_before: bool = ip.insert_before
-                || matches!(
-                    &creation_kind,
-                    InstrKind::PtrRead { .. } | InstrKind::PtrWrite { .. }
-                );
+            let insert_before: bool = ip.insert_before;
 
             let tag_local: Option<Local> = match creation_kind {
                 InstrKind::Ref { .. } | InstrKind::Raw { .. } => {
@@ -3630,7 +3672,8 @@ impl MyOptimizationPass {
             let mut extra_stmts: Vec<Statement<'tcx>> = Vec::new();
 
             let (args, dest_place) = match creation_kind {
-                InstrKind::PtrRead { ptr_local, ref size_op } => {
+                InstrKind::PtrRead { ptr_local, ref size_op }
+                | InstrKind::PtrReadAllowUntagged { ptr_local, ref size_op } => {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -3726,7 +3769,8 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::PtrWrite { ptr_local, ref size_op } => {
+                InstrKind::PtrWrite { ptr_local, ref size_op }
+                | InstrKind::PtrWriteAllowUntagged { ptr_local, ref size_op } => {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -4075,9 +4119,15 @@ impl MyOptimizationPass {
         let def_id_write = self
             .find_def_id_by_name(tcx, "__rz_ptr_write")
             .expect("missing '__rz_ptr_write' definition");
+        let def_id_write_allow_untagged = self
+            .find_def_id_by_name(tcx, "__rz_ptr_write_allow_untagged")
+            .expect("missing '__rz_ptr_write_allow_untagged' definition");
         let def_id_read = self
             .find_def_id_by_name(tcx, "__rz_ptr_read")
             .expect("missing '__rz_ptr_read' definition");
+        let def_id_read_allow_untagged = self
+            .find_def_id_by_name(tcx, "__rz_ptr_read_allow_untagged")
+            .expect("missing '__rz_ptr_read_allow_untagged' definition");
         let def_id_use = self
             .find_def_id_by_name(tcx, "__rz_ptr_use")
             .expect("missing '__rz_ptr_use' definition");
@@ -4099,7 +4149,9 @@ impl MyOptimizationPass {
             def_id_raw,
             def_id_alloc,
             def_id_write,
+            def_id_write_allow_untagged,
             def_id_read,
+            def_id_read_allow_untagged,
             def_id_use,
             def_id_push_call_arg_tag,
             def_id_take_call_arg_tag,

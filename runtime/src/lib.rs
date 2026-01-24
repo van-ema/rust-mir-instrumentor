@@ -825,6 +825,16 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     );
 }
 
+/// Like `__rz_ptr_write`, but silently skips untagged pointers (tag=0).
+#[no_mangle]
+#[track_caller]
+pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
+    if tag == 0 {
+        return;
+    }
+    __rz_ptr_write(tag, addr, size);
+}
+
 /// Record/validate a read through a tracked pointer tag.
 /// For now this performs only best-effort checks:
 ///  - tag must exist
@@ -992,6 +1002,16 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         size,
         tmeta.kind
     );
+}
+
+/// Like `__rz_ptr_read`, but silently skips untagged pointers (tag=0).
+#[no_mangle]
+#[track_caller]
+pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
+    if tag == 0 {
+        return;
+    }
+    __rz_ptr_read(tag, addr, size);
 }
 
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
