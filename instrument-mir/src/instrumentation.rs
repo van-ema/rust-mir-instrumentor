@@ -3044,6 +3044,7 @@ impl MyOptimizationPass {
                 InstrKind::Ref { .. }
                 | InstrKind::Raw { .. }
                 | InstrKind::RawRoot { .. }
+                | InstrKind::ArgRetag { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. } => 0,
                 InstrKind::PtrRead { .. }
@@ -3055,18 +3056,34 @@ impl MyOptimizationPass {
             }
         }
 
-        let mut indexed: Vec<(usize, InsertPoint<'tcx>)> =
-            insert_points.into_iter().enumerate().collect();
-        indexed.sort_by_key(|(idx, ip)| {
-            (
-                ip.bb.index(),
-                ip.stmt_idx,
-                instr_priority(&ip.kind),
-                *idx,
-            )
-        });
+        // ArgRetag must run at function entry before any ptr reads/writes in the callee.
+        // We split it out so we can enforce ordering independent of stmt_idx sorting.
+        let mut arg_retag_points: Vec<(usize, InsertPoint<'tcx>)> = Vec::new();
+        let mut other_points: Vec<(usize, InsertPoint<'tcx>)> = Vec::new();
 
-        for (_idx, ip) in indexed.into_iter().rev() {
+        for (idx, ip) in insert_points.into_iter().enumerate() {
+            if matches!(ip.kind, InstrKind::ArgRetag { .. }) {
+                arg_retag_points.push((idx, ip));
+            } else {
+                other_points.push((idx, ip));
+            }
+        }
+
+        let sort_points = |points: &mut Vec<(usize, InsertPoint<'tcx>)>| {
+            points.sort_by_key(|(idx, ip)| {
+                (
+                    ip.bb.index(),
+                    ip.stmt_idx,
+                    instr_priority(&ip.kind),
+                    *idx,
+                )
+            });
+        };
+
+        sort_points(&mut other_points);
+        sort_points(&mut arg_retag_points);
+
+        for (_idx, ip) in other_points.into_iter().rev() {
             let bb = ip.bb;
             let stmt_idx = ip.stmt_idx;
             let source_info = ip.source_info;
@@ -4003,6 +4020,158 @@ impl MyOptimizationPass {
             body.basic_blocks_mut()[cont_block]
                 .statements
                 .extend(remaining_stmts);
+        }
+
+        // Insert ArgRetag points after all other instrumentation.
+        // Because each insertion rewrites the entry terminator, the last-applied
+        // retag runs first at runtime, ensuring tags are initialized before reads.
+        for (_idx, ip) in arg_retag_points.into_iter().rev() {
+            let bb = ip.bb;
+            let stmt_idx = ip.stmt_idx;
+            let source_info = ip.source_info;
+            let place = ip.place;
+            let creation_kind = ip.kind;
+
+            if let InstrKind::ArgRetag {
+                callee_id,
+                arg_index,
+                ptr_local,
+            } = creation_kind
+            {
+                let tag_local = *tag_local_for_ptr_local
+                    .get(&ptr_local)
+                    .expect("missing tag local for ArgRetag");
+
+                // Take the caller-pushed tag first, then create a fresh tag for this argument.
+                let (record_def_id, is_mut_u8) = match body.local_decls[ptr_local].ty.kind() {
+                    TyKind::Ref(_, _ty, mutbl) => {
+                        let is_mut = matches!(mutbl, Mutability::Mut);
+                        (hooks.def_id_ref, if is_mut { 1 } else { 0 })
+                    }
+                    TyKind::RawPtr(_ty, mutbl) => {
+                        let is_mut = matches!(mutbl, Mutability::Mut);
+                        (hooks.def_id_raw, if is_mut { 1 } else { 0 })
+                    }
+                    _ => panic!("ArgRetag on non-pointer local"),
+                };
+
+                // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let parent_tag_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+                let (addr_stmt1_opt, addr_stmt2) = self
+                    .addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(ptr_local),
+                        addr_local,
+                    )
+                    .expect("ArgRetag on non-pointer local");
+
+                let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
+                let arg_index = self.const_u64(tcx, source_info.span, arg_index);
+                let arg_addr = Operand::Copy(Place::from(addr_local));
+
+                let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned { node: arg_callee, span: source_info.span },
+                    Spanned { node: arg_index, span: source_info.span },
+                    Spanned { node: arg_addr, span: source_info.span },
+                ]
+                .into_boxed_slice();
+
+                let args_record: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned { node: Operand::Copy(Place::from(addr_local)), span: source_info.span },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, is_mut_u8),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(parent_tag_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = {
+                    let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    body.basic_blocks_mut().push(cont_data)
+                };
+
+                let record_func = Operand::function_handle(
+                    tcx,
+                    record_def_id,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let record_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: record_func,
+                        args: args_record,
+                        destination: Place::from(tag_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                let retag_block = {
+                    let retag_data = BasicBlockData::new(Some(record_term), is_cleanup);
+                    body.basic_blocks_mut().push(retag_data)
+                };
+
+                let take_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_take_call_arg_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: take_func,
+                        args: args_take,
+                        destination: Place::from(parent_tag_local),
+                        target: Some(retag_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    if let Some(addr_stmt1) = addr_stmt1_opt {
+                        bd.statements.push(addr_stmt1);
+                    }
+                    bd.statements.push(addr_stmt2);
+                    bd.terminator = Some(take_term);
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+            }
         }
     }
 

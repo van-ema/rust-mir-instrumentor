@@ -23,6 +23,55 @@ conservative pointer effects for each pointer argument:
 These hooks are only used for the unknown-call policy, not for ordinary deref
 reads/writes or classified wrappers.
 
+## ArgRetag ordering at function entry
+
+The callee-side ArgRetag sequence (`__rz_take_call_arg_tag` then
+`__record_ref_creation` / `__record_raw_ptr_creation`) must run before any
+instrumented read/write that uses the argument's tag local.
+
+We enforce this with two layers of ordering:
+
+- `InstrKind::ArgRetag` has highest priority (same bucket as ref/raw/root) so
+  it sorts ahead of reads/writes at the same `stmt_idx`.
+- ArgRetag insert points are applied **after** all other instrumentation in
+  `insert_instrumentation`. Because insertion walks points in reverse and each
+  insertion rewrites the entry terminator, the *last-applied* ArgRetag executes
+  *first* at runtime.
+
+Example (SmallVec::len):
+
+- Before: `__rz_ptr_read(tag_local, addr, size)` ran before
+  `__rz_take_call_arg_tag(...)`, so `tag_local` was 0 and raised UNKNOWN_TAG.
+- After: entry order is `__rz_take_call_arg_tag(...)` →
+  `__record_ref_creation(...)` → `__rz_ptr_read(...)`, so the tag is initialized
+  before the read.
+
+This is the necessary plumbing to avoid UNKNOWN_TAG on plain reads of `&self`
+in instrumented dependencies like `smallvec`.
+
+### Instrumentation priority order
+
+When multiple hooks target the same basic block and statement index, we order
+by `instr_priority` before insertion. The buckets are:
+
+1) Priority 0: `Ref`, `Raw`, `RawRoot`, `ArgRetag`, `RetRoot`, `PtrDerive`
+2) Priority 1: `PtrRead`, `PtrWrite` (and allow-untagged variants)
+3) Priority 2: `CallArgPush`, `PtrUse`
+4) Priority 3: everything else (alloc/lifetime hooks, ret push/take, etc.)
+
+Why this order:
+
+- Creation/derivation first (priority 0) ensures tags exist before any access.
+- Reads/writes next (priority 1) should observe the tag produced by creation.
+- Escape/side-effect bookkeeping after that (priority 2) should see the tag
+  state after any direct access.
+- Allocation/lifetime bookkeeping last (priority 3) avoids reordering caller
+  control flow around accesses and keeps entry/exit hooks as outer wrappers.
+
+We still rely on the "reverse insertion" rule when splitting terminators:
+later-applied hooks execute earlier at runtime. The explicit priorities keep
+the ordering stable when multiple hooks share the same insertion point.
+
 ## PtrWrite address precision caveat
 
 Right now, the `PtrWrite` instrumentation computes the write address as:
