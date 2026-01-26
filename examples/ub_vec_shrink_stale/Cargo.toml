@@ -1,5 +1,5 @@
 [package]
-name = "vec_shrink_stale"
+name = "ub_vec_shrink_stale"
 version = "0.1.0"
 edition = "2024"
 
