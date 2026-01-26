@@ -51,6 +51,7 @@ members = [
     "examples/volatile_ro_rw",
     "examples/volatile_wrappers",
     "examples/ret_ptr_local",
+    "examples/realloc_same_base",
     "medium/bytes_driver",
     "medium/smallvec_driver",
     "instrument-mir",

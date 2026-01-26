@@ -103,18 +103,34 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
         }
         RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
 
-        // Validate and record the implicit free(old) before calling the system.
-        // If the old pointer is invalid/double-freed, skip the system realloc to avoid abort.
-        if !ptr.is_null() {
-            let ok = rz_pre_free_check(ptr);
-            if !ok {
-                RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
-                return core::ptr::null_mut();
-            }
+        // Validate old pointer without marking it dead yet.
+        // If invalid/double-freed, skip the system realloc to avoid abort.
+        if !ptr.is_null() && !rz_pre_realloc_check(ptr) {
+            RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+            return core::ptr::null_mut();
         }
 
         let p = ::std::alloc::System.realloc(ptr, layout, new_size);
-        rz_record_heap_event(p, new_size, true);
+        if p.is_null() {
+            // realloc failed (or new_size == 0). If size==0, treat as free.
+            if new_size == 0 && !ptr.is_null() {
+                __rz_record_alloc(ptr as usize, 0, 0);
+            }
+            RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+            return p;
+        }
+
+        if ptr.is_null() {
+            // Null old pointer: realloc behaves like alloc.
+            rz_record_heap_event(p, new_size, true);
+        } else if p == ptr {
+            // Same-base realloc: keep epoch, update size.
+            __rz_record_alloc(p as usize, new_size, 1);
+        } else {
+            // Moved realloc: old base dies, new base is live.
+            __rz_record_alloc(ptr as usize, 0, 0);
+            __rz_record_alloc(p as usize, new_size, 1);
+        }
 
         RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
         p
@@ -367,6 +383,64 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
             // Use the same logic as the normal record path to keep epochs consistent.
             drop(amap);
             __rz_record_alloc(base, 0, 0);
+            true
+        }
+    }
+}
+
+/// Pre-realloc validation to avoid process abort on double-free/invalid-free.
+/// Returns `true` if it is safe to call the underlying system realloc.
+///
+/// This check does not update allocation liveness; the caller handles live/dead
+/// transitions based on whether the realloc moved the base pointer.
+#[inline]
+fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
+    if ptr.is_null() {
+        return true;
+    }
+
+    let _g = RzRuntimeGuard::enter();
+    let base = ptr as usize;
+    let amap = allocs().lock().unwrap();
+
+    match amap.get(&base) {
+        None => {
+            let strict = std::env::var("RZ_STRICT_FREE_CHECK")
+                .ok()
+                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+
+            if strict {
+                rz_violation(
+                    "INVALID_FREE",
+                    format!(
+                        "REALLOC of unknown base=0x{base:x} (skipping system realloc to avoid abort)"
+                    ),
+                );
+                false
+            } else {
+                rz_trace!(
+                    "[rusteze-runtime] note: REALLOC of untracked base=0x{:x} (allowing system realloc; set RZ_STRICT_FREE_CHECK=1 for violation)",
+                    base
+                );
+                true
+            }
+        }
+        Some(meta) => {
+            if !meta.live {
+                rz_violation(
+                    "DOUBLE_FREE",
+                    format!(
+                        "DOUBLE_FREE base=0x{base:x} alloc_epoch={} size={}",
+                        meta.epoch, meta.size
+                    ),
+                );
+
+                if rz_abort_on_double_free() {
+                    ::std::process::abort();
+                }
+
+                return false;
+            }
             true
         }
     }
