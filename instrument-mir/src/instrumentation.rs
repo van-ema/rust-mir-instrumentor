@@ -1085,14 +1085,83 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Backtrack a deref'ed pointer local to the base local it was borrowed from, if any.
+    ///
+    /// Goal: recover the *stack* local that actually owns storage when MIR takes an address
+    /// through a deref projection, e.g. `&raw const (*_r)` or `&_r` where `_r: &T`.
+    ///
+    /// Constraints and policy:
+    /// - Same-block only, walking backwards from `ptr_local`'s last definition.
+    /// - Follow only ref/rawptr creations whose source place is **not** a deref projection.
+    ///   This keeps us from treating heap/foreign pointees as stack locals.
+    /// - Allow simple pointer-local forwarding (`Use`, `CopyForDeref`, and pointer casts)
+    ///   to find the original ref/rawptr creation.
+    /// - Return `None` on ambiguity or if we would cross a deref boundary.
+    ///
+    /// This is intentionally conservative: missing metadata is acceptable; incorrect metadata is not.
+    fn backtrack_deref_base_local<'tcx>(
+        &self,
+        ptr_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        for (idx, stmt) in statements.iter().enumerate().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+            if place.as_local() != Some(ptr_local) {
+                continue;
+            }
+
+            match rvalue {
+                Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
+                    let is_deref_src = src_place
+                        .projection
+                        .iter()
+                        .next()
+                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                    if is_deref_src {
+                        return None;
+                    }
+                    return Some(src_place.local);
+                }
+                Rvalue::Use(op) => {
+                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                Rvalue::CopyForDeref(p) => {
+                    if let Some(p_local) = p.as_local() {
+                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                Rvalue::Cast(
+                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                    op,
+                    _to_ty,
+                ) => {
+                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
-    /// We track *pointee* locals whose address is taken (via `&` or `&raw`) so that range-based
-    /// allocation lookup and OOB checks work for stack data.
+    /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
+    /// lookup and OOB checks work for stack data. This includes "address-of through deref"
+    /// patterns that appear in optimized MIR, such as:
+    ///   _r = &_x;
+    ///   _p = &raw const (*_r);
+    /// In that case, we must treat `_x` as address-taken (not just `_r`), otherwise no
+    /// StackAlloc is emitted for the actual stack slot and the runtime will see WILD_POINTER.
     ///
-    /// We intentionally do NOT treat pointer-typed locals or miscellaneous temporaries as
-    /// allocations: aliasing models (e.g. Stacked Borrows) are enforced via pointer tags on
-    /// READ/WRITE, not by recording the address of pointer locals as allocations.
+    /// Pointer-typed locals are included only when *their own* address is taken (e.g., `&&T`),
+    /// which avoids false OOB reports when simply reading a pointer value through `*const *const T`.
     fn compute_interesting_stack_locals<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1100,23 +1169,43 @@ impl MyOptimizationPass {
     ) -> HashSet<Local> {
         let mut interesting: HashSet<Local> = HashSet::new();
         for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
-            for stmt in block_data.statements.iter() {
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 if let StatementKind::Assign(box (_dst, rv)) = &stmt.kind {
                     match rv {
                         // Address-taken locals: these correspond to real stack slots that pointers can reference.
                         Rvalue::Ref(_, _bk, src_place) => {
-                            if src_place.local != RETURN_PLACE {
-                                let local_ty = body.local_decls[src_place.local].ty;
-                                if !self.is_pointer_ty(local_ty) {
-                                    interesting.insert(src_place.local);
+                            interesting.insert(src_place.local);
+                            let is_deref_src = src_place
+                                .projection
+                                .iter()
+                                .next()
+                                .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                            if is_deref_src {
+                                if let Some(base_local) = self.backtrack_deref_base_local(
+                                    src_place.local,
+                                    &block_data.statements[..stmt_idx],
+                                ) {
+                                    if base_local != RETURN_PLACE {
+                                        interesting.insert(base_local);
+                                    }
                                 }
                             }
                         }
                         Rvalue::RawPtr(_mutbl, src_place) => {
-                            if src_place.local != RETURN_PLACE {
-                                let local_ty = body.local_decls[src_place.local].ty;
-                                if !self.is_pointer_ty(local_ty) {
-                                    interesting.insert(src_place.local);
+                            interesting.insert(src_place.local);
+                            let is_deref_src = src_place
+                                .projection
+                                .iter()
+                                .next()
+                                .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                            if is_deref_src {
+                                if let Some(base_local) = self.backtrack_deref_base_local(
+                                    src_place.local,
+                                    &block_data.statements[..stmt_idx],
+                                ) {
+                                    if base_local != RETURN_PLACE {
+                                        interesting.insert(base_local);
+                                    }
                                 }
                             }
                         }
@@ -1130,12 +1219,7 @@ impl MyOptimizationPass {
                         // Drop glue implicitly takes `&place` even if MIR has no explicit ref/raw.
                         // Treat Drop as an implicit address-of so stack slots are tracked.
                         let local = place.local;
-                        if local != RETURN_PLACE {
-                            let local_ty = body.local_decls[local].ty;
-                            if !self.is_pointer_ty(local_ty) {
-                                interesting.insert(local);
-                            }
-                        }
+                        interesting.insert(local);
                     }
                     _ => {}
                 }
@@ -1218,16 +1302,14 @@ impl MyOptimizationPass {
         // Stack allocation lifetime: StorageLive/StorageDead.
         match stmt.kind {
             StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                if local != RETURN_PLACE
-                    && (track_all_stack_allocs || interesting_stack_locals.contains(&local))
+                if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
+                    && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
                     let live = matches!(stmt.kind, StatementKind::StorageLive(_));
                     let ty = body.local_decls[local].ty;
 
-                    // Only record stack allocations for *pointee* locals (actual stack slots).
-                    // Pointer-typed locals (`&T`, `*mut T`, `*const T`) are just pointer values; recording
-                    // their addresses as allocations pollutes ALLOCS.
-                    if !self.is_pointer_ty(ty) {
+                    // Record pointer-typed locals only if their address is taken (interesting locals).
+                    if !(self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local)) {
                         let size_op =
                             self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span);
                         if !matches!(size_op, SizeOperand::Const(_)) {
@@ -2750,6 +2832,8 @@ impl MyOptimizationPass {
             }
         }
 
+        let interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
+
         // Fallback stack locals:
         // Some locals never get explicit `StorageLive/StorageDead` in optimized MIR,
         // including address-taken arguments. Example pattern:
@@ -2765,14 +2849,14 @@ impl MyOptimizationPass {
         // StorageLive/StorageDead takes precedence when available.
         let mut fallback_locals: Vec<(Local, SizeOperand<'tcx>)> = Vec::new();
         for local in body.local_decls.indices() {
-            if local == RETURN_PLACE {
+            if local == RETURN_PLACE && !interesting_stack_locals.contains(&local) {
                 continue;
             }
             if explicitly_tracked.contains(&local) {
                 continue;
             }
             let ty = body.local_decls[local].ty;
-            if self.is_pointer_ty(ty) {
+            if self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local) {
                 continue;
             }
             let size_op = self.size_operand_for_ty(tcx, body, ty, rustc_span::DUMMY_SP);
@@ -2782,7 +2866,6 @@ impl MyOptimizationPass {
             fallback_locals.push((local, size_op));
         }
 
-        let interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
         let track_all_stack_allocs = self.track_all_stack_allocs_flag();
         eprintln!(
             "[rusteze][trace] track_all_stack_allocs={} RZ_STACK_ALLOCS={:?}",
@@ -2869,7 +2952,7 @@ impl MyOptimizationPass {
         let mut fallback_return_points: Vec<InsertPoint<'tcx>> = Vec::new();
 
         for (local, size_op) in fallback_locals.iter().cloned() {
-            if local == RETURN_PLACE {
+            if local == RETURN_PLACE && !interesting_stack_locals.contains(&local) {
                 continue;
             }
 
@@ -2878,9 +2961,9 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            // Never record pointer-typed locals as allocations.
+            // Record pointer-typed locals only if their address is taken.
             let ty = body.local_decls[local].ty;
-            if self.is_pointer_ty(ty) {
+            if self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local) {
                 continue;
             }
 

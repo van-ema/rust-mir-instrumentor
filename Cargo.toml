@@ -14,7 +14,7 @@ members = [
     "examples/double_free",
     "examples/oob_vec_capacity",
     "examples/oob_vec_read_capacity",
-    "examples/vec_shrink_stale",
+    "examples/ub_vec_shrink_stale",
     "examples/oob_last_byte_ok",
     "examples/forged_pointer",
     "examples/oob_array_write",

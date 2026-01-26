@@ -578,6 +578,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ub_vec_shrink_stale"
+version = "0.1.0"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,10 +592,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vec_shrink_stale"
-version = "0.1.0"
 
 [[package]]
 name = "volatile_ro_rw"
