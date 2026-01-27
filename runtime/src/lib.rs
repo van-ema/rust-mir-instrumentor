@@ -12,6 +12,9 @@ use core::ptr;
     // Guard to disable allocator recording while inside any runtime hook.
     // Logging (println!/format!) can allocate while locks are held.
     static RZ_IN_RUNTIME_HOOK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
+
+    // Temporarily suppress SB-lite enforcement for coarse "unknown call" hooks.
+    static RZ_SB_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
 }
 
 struct RzRuntimeGuard;
@@ -29,9 +32,35 @@ impl Drop for RzRuntimeGuard {
     }
 }
 
+struct SbSuppressGuard {
+    prev: bool,
+}
+impl SbSuppressGuard {
+    #[inline]
+    fn enter() -> Self {
+        let prev = RZ_SB_SUPPRESS.with(|c| {
+            let p = c.get();
+            c.set(true);
+            p
+        });
+        Self { prev }
+    }
+}
+impl Drop for SbSuppressGuard {
+    #[inline]
+    fn drop(&mut self) {
+        RZ_SB_SUPPRESS.with(|c| c.set(self.prev));
+    }
+}
+
 #[inline]
 fn rz_in_runtime_hook() -> bool {
     RZ_IN_RUNTIME_HOOK.with(|c| c.get() != 0)
+}
+
+#[inline]
+fn rz_sb_suppressed() -> bool {
+    RZ_SB_SUPPRESS.with(|c| c.get())
 }
 
 #[inline]
@@ -489,10 +518,13 @@ pub struct TagMeta {
     ///   - use allocation ranges instead of exact address equality
     ///   - reject accesses when tag.alloc_epoch != alloc.epoch
     pub alloc_epoch: u64,
+    /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
+    pub alias_exempt: bool,
 }
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
+static BORROWS: OnceLock<Mutex<HashMap<usize, Vec<BorrowEntry>>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
 
@@ -502,6 +534,29 @@ fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
 
 fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
     TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn borrows() -> &'static Mutex<HashMap<usize, Vec<BorrowEntry>>> {
+    BORROWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BorrowKind {
+    Shared,
+    Unique,
+}
+
+#[derive(Clone, Debug)]
+struct BorrowEntry {
+    tag: u64,
+    kind: BorrowKind,
+}
+
+#[inline]
+fn rz_sb_lite_enabled() -> bool {
+    std::env::var("RZ_SB_LITE")
+        .ok()
+        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
@@ -558,6 +613,91 @@ fn find_alloc_containing<'a>(
         Some((b, m))
     } else {
         best_unknown
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum AccessKind {
+    Read,
+    Write,
+}
+
+fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
+    if !rz_sb_lite_enabled() || tmeta.alias_exempt {
+        return;
+    }
+
+    let kind = match tmeta.kind {
+        PtrKind::RefShared => BorrowKind::Shared,
+        PtrKind::RefMut => BorrowKind::Unique,
+        _ => return,
+    };
+
+    let base = {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, tmeta.pointee_addr)
+            .map(|(b, _)| b)
+            .unwrap_or(tmeta.pointee_addr)
+    };
+
+    let mut bmap = borrows().lock().unwrap();
+    bmap.entry(base).or_default().push(BorrowEntry { tag, kind });
+}
+
+fn sb_lite_check(
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+    access: AccessKind,
+) -> Option<String> {
+    if !rz_sb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
+        return None;
+    }
+
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return None;
+    }
+
+    let base = {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, addr)
+            .map(|(b, _)| b)
+            .unwrap_or(addr)
+    };
+
+    let bmap = borrows().lock().unwrap();
+    let stack = match bmap.get(&base) {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let top = match stack.last() {
+        Some(t) => t,
+        None => return None,
+    };
+
+    match access {
+        AccessKind::Read => {
+            if top.kind == BorrowKind::Unique && top.tag != tag {
+                Some(format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                    tmeta.kind, top.kind, top.tag
+                ))
+            } else {
+                None
+            }
+        }
+        AccessKind::Write => {
+            if top.kind == BorrowKind::Unique && top.tag == tag {
+                None
+            } else {
+                Some(format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                    tmeta.kind, top.kind, top.tag
+                ))
+            }
+        }
     }
 }
 
@@ -692,6 +832,12 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     if size != 0 {
         entry.size = entry.size.max(size);
     }
+
+    // Clear any SB-lite borrow stack when the allocation dies.
+    if !new_live && rz_sb_lite_enabled() {
+        drop(m);
+        borrows().lock().unwrap().remove(&base_addr);
+    }
 }
 
 /// Read-only helper for debugging/testing.
@@ -712,19 +858,30 @@ pub extern "C" fn __rz_dump_state() {
 #[track_caller]
 pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    let tmap = tags().lock().unwrap();
-    let Some(tmeta) = tmap.get(&tag) else {
-        let msg = append_location_if_enabled(
-            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
-            "RZ_LOG_LOC",
-        );
-        let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
+    let tmeta = {
+        let tmap = tags().lock().unwrap();
+        let Some(tmeta) = tmap.get(&tag) else {
+            let msg = append_location_if_enabled(
+                format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+                "RZ_LOG_LOC",
+            );
+            let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
+            rz_violation(
+                "UNKNOWN_TAG",
+                msg,
+            );
+            return;
+        };
+        tmeta.clone()
+    };
+
+    if let Some(msg) = sb_lite_check(tag, &tmeta, addr, size, AccessKind::Write) {
         rz_violation(
-            "UNKNOWN_TAG",
-            msg,
+            "STACKED_BORROWS_VIOLATION",
+            append_location_if_enabled(msg, "RZ_LOG_LOC"),
         );
         return;
-    };
+    }
 
     // Range-based allocation lookup.
     let amap = allocs().lock().unwrap();
@@ -747,6 +904,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
         // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        let tmap = tags().lock().unwrap();
         if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
@@ -906,6 +1064,7 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
     if tag == 0 {
         return;
     }
+    let _sb = SbSuppressGuard::enter();
     __rz_ptr_write(tag, addr, size);
 }
 
@@ -918,19 +1077,30 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 #[track_caller]
 pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    let tmap = tags().lock().unwrap();
-    let Some(tmeta) = tmap.get(&tag) else {
-        let msg = append_location_if_enabled(
-            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
-            "RZ_LOG_LOC",
-        );
-        let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
+    let tmeta = {
+        let tmap = tags().lock().unwrap();
+        let Some(tmeta) = tmap.get(&tag) else {
+            let msg = append_location_if_enabled(
+                format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+                "RZ_LOG_LOC",
+            );
+            let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
+            rz_violation(
+                "UNKNOWN_TAG",
+                msg,
+            );
+            return;
+        };
+        tmeta.clone()
+    };
+
+    if let Some(msg) = sb_lite_check(tag, &tmeta, addr, size, AccessKind::Read) {
         rz_violation(
-            "UNKNOWN_TAG",
-            msg,
+            "STACKED_BORROWS_VIOLATION",
+            append_location_if_enabled(msg, "RZ_LOG_LOC"),
         );
         return;
-    };
+    }
 
     // Range-based allocation lookup.
     let amap = allocs().lock().unwrap();
@@ -939,6 +1109,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let Some((base, ameta)) = alloc_opt else {
         // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        let tmap = tags().lock().unwrap();
         if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
@@ -1085,6 +1256,7 @@ pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
     if tag == 0 {
         return;
     }
+    let _sb = SbSuppressGuard::enter();
     __rz_ptr_read(tag, addr, size);
 }
 
@@ -1127,13 +1299,18 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
 macro_rules! force_runtime {
     ($sym:path) => {
         #[used]
-        static _FORCE_RUNTIME: fn(usize, u8, u64) -> u64 = $sym;
+        static _FORCE_RUNTIME: fn(usize, u8, u64, u8) -> u64 = $sym;
     };
 }
 
 #[no_mangle]
 #[rustc_diagnostic_item = "mir_runtime_record_ref_creation"]
-pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_tag: u64) -> u64 {
+pub extern "C" fn __record_ref_creation(
+    pointee_addr: usize,
+    is_mut: u8,
+    parent_tag: u64,
+    alias_exempt: u8,
+) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
@@ -1158,16 +1335,16 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
         }
     };
 
-    tags().lock().unwrap().insert(
-        tag,
-        TagMeta {
-            pointee_addr,
-            kind,
-            parent: parent_tag,
-            escaped: false,
-            alloc_epoch,
-        },
-    );
+    let tmeta = TagMeta {
+        pointee_addr,
+        kind,
+        parent: parent_tag,
+        escaped: false,
+        alloc_epoch,
+        alias_exempt: alias_exempt != 0,
+    };
+    tags().lock().unwrap().insert(tag, tmeta.clone());
+    sb_lite_push(tag, &tmeta);
 
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
@@ -1186,7 +1363,12 @@ pub extern "C" fn __record_ref_creation(pointee_addr: usize, is_mut: u8, parent_
 
 #[no_mangle]
 #[rustc_diagnostic_item = "mir_runtime_record_raw_ptr_creation"]
-pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, derived_from: u64) -> u64 {
+pub extern "C" fn __record_raw_ptr_creation(
+    pointee_addr: usize,
+    is_mut: u8,
+    derived_from: u64,
+    alias_exempt: u8,
+) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
@@ -1229,16 +1411,15 @@ pub extern "C" fn __record_raw_ptr_creation(pointee_addr: usize, is_mut: u8, der
             .unwrap_or(0)
     };
 
-    tags().lock().unwrap().insert(
-        tag,
-        TagMeta {
-            pointee_addr,
-            kind,
-            parent: derived_from,
-            escaped: false,
-            alloc_epoch,
-        },
-    );
+    let tmeta = TagMeta {
+        pointee_addr,
+        kind,
+        parent: derived_from,
+        escaped: false,
+        alloc_epoch,
+        alias_exempt: alias_exempt != 0,
+    };
+    tags().lock().unwrap().insert(tag, tmeta);
 
     let kind_str = match kind {
         PtrKind::RawConst => "const",

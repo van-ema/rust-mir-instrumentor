@@ -850,6 +850,41 @@ impl MyOptimizationPass {
         SizeOperand::SizeOf(ty)
     }
 
+    /// Returns true when alias checks should be skipped for this pointee type.
+    /// We conservatively opt out if the type may contain UnsafeCell or if it is
+    /// not fully known/normalizable in the current typing context.
+    fn alias_exempt_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        if ty.has_param()
+            || ty.has_infer()
+            || ty.has_aliases()
+            || ty.has_opaque_types()
+            || ty.has_placeholders()
+        {
+            return true;
+        }
+        let typing_env = body.typing_env(tcx);
+        !ty.is_freeze(tcx, typing_env)
+    }
+
+    fn alias_exempt_for_ptr_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_ty: Ty<'tcx>,
+    ) -> bool {
+        match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                self.alias_exempt_for_ty(tcx, body, *pointee)
+            }
+            _ => false,
+        }
+    }
+
     fn layout_size_bytes<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> usize {
         // `tcx.layout_of(...)` can trigger normalization and will hard-error (E0080)
         // for types that are not fully normalizable in the current context, e.g.
@@ -3254,6 +3289,11 @@ impl MyOptimizationPass {
                 );
 
                 let is_mut_u8: u8 = if is_mut { 1 } else { 0 };
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
                 let args_raw: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
@@ -3265,6 +3305,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u64(tcx, source_info.span, 0),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
                         span: source_info.span,
                     },
                 ]
@@ -3520,6 +3564,16 @@ impl MyOptimizationPass {
                     }
                     _ => panic!("ArgRetag on non-pointer local"),
                 };
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
                 let addr_local = body
@@ -3558,6 +3612,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: Operand::Copy(Place::from(parent_tag_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
                         span: source_info.span,
                     },
                 ]
@@ -3961,11 +4019,15 @@ impl MyOptimizationPass {
                         };
 
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
+                    let dst_ty = body.local_decls[dst].ty;
+                    let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
+                    let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_mut, span: source_info.span },
                         Spanned { node: parent_tag_op, span: source_info.span },
+                        Spanned { node: arg_alias, span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -3996,10 +4058,28 @@ impl MyOptimizationPass {
                         _ => self.const_u64(tcx, source_info.span, 0),
                     };
 
+                    let alias_exempt = match &creation_kind {
+                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                            let ty = src.ty(&body.local_decls, tcx).ty;
+                            self.alias_exempt_for_ty(tcx, body, ty)
+                        }
+                        InstrKind::RawRoot { ptr_local, .. } => {
+                            let ty = body.local_decls[*ptr_local].ty;
+                            self.alias_exempt_for_ptr_ty(tcx, body, ty)
+                        }
+                        InstrKind::RetRoot { dst_local, .. } => {
+                            let ty = body.local_decls[*dst_local].ty;
+                            self.alias_exempt_for_ptr_ty(tcx, body, ty)
+                        }
+                        _ => false,
+                    };
+                    let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
+
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_mut, span: source_info.span },
                         Spanned { node: arg_parent, span: source_info.span },
+                        Spanned { node: arg_alias, span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -4040,6 +4120,11 @@ impl MyOptimizationPass {
                     std::iter::empty(),
                     source_info.span,
                 );
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
 
                 let raw_args: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
@@ -4052,6 +4137,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u64(tcx, source_info.span, 0),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
                         span: source_info.span,
                     },
                 ]
@@ -4137,6 +4226,11 @@ impl MyOptimizationPass {
                     }
                     _ => panic!("ArgRetag on non-pointer local"),
                 };
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
                 let addr_local = body
@@ -4175,6 +4269,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: Operand::Copy(Place::from(parent_tag_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
                         span: source_info.span,
                     },
                 ]

@@ -103,6 +103,10 @@ Implementation
 	•	if realloc returns same base: keep epoch, update size
 	•	if realloc moves: bump epoch on old base, mark old dead, new base gets fresh epoch
 
+Status
+	•	Same-base realloc now preserves epoch; moved realloc marks old dead and records new base.
+	•	Added micro example: `examples/realloc_same_base` (expected ok).
+
 Store per allocation:
 	•	base
 	•	size
@@ -271,8 +275,9 @@ You are done when:
 ⸻
 
 Immediate Next Actions (Concrete)
-	1.	Implement Phase 1 call-boundary semantics
-	2.	Start running bytes + smallvec now
-	3.	Only then move to SB-lite
+	1.	Implement SB-lite retagging + per-allocation borrow stack (behind a flag).
+	2.	Add UnsafeCell carve-out / opt-out marker before running medium crates.
+	3.	Run bytes + smallvec in SB-lite mode; keep coverage-only as fallback.
+	4.	Iterate on false positives, then move toward TB.
 
 ⸻
