@@ -122,3 +122,19 @@ the local being dropped. This effectively takes `&place` even when there is no
 explicit `Rvalue::Ref`/`Rvalue::RawPtr` in the statements. To avoid missing
 stack allocations that are only touched by drop glue, we treat `Drop` as an
 implicit address-of when computing the set of stack locals worth tracking.
+
+## Raw pointer reads into static metadata (vtables)
+
+Optimized MIR often loads function pointers from vtables or other static
+metadata via raw-pointer reads. Because the runtime does not track static/global
+allocations, these reads would show up as WILD_POINTER even though they are
+valid.
+
+Current behavior: suppress WILD_POINTER for raw-pointer **reads** where the tag
+has no known allocation origin (`alloc_epoch == 0`) and the access is a
+pointer-sized load. This avoids false positives in crates like `bytes`, but it
+means forged raw-pointer reads (e.g., integer-cast pointers) that happen to be
+pointer-sized can be missed. Raw-pointer writes are still reported.
+
+TODO: track static/global allocations or their embedded pointer provenance so
+these reads can be checked without suppression.

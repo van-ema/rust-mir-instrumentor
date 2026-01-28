@@ -1,0 +1,8 @@
+[package]
+name = "vtable_read_raw"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vtable_read_raw"
+path = "src/main.rs"

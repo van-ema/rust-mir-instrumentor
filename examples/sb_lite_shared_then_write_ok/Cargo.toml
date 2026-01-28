@@ -1,5 +1,5 @@
 [package]
-name = "sb_lite_shared_then_write"
+name = "sb_lite_shared_then_write_ok"
 version = "0.1.0"
 edition = "2021"
 

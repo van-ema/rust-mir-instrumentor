@@ -398,6 +398,9 @@ version = "0.1.0"
 [[package]]
 name = "runtime"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rustversion"
@@ -434,7 +437,11 @@ name = "sb_lite_shared_after_unique_read"
 version = "0.1.0"
 
 [[package]]
-name = "sb_lite_shared_then_write"
+name = "sb_lite_shared_live_then_write"
+version = "0.1.0"
+
+[[package]]
+name = "sb_lite_shared_then_write_ok"
 version = "0.1.0"
 
 [[package]]
@@ -639,6 +646,10 @@ version = "0.1.0"
 
 [[package]]
 name = "volatile_wrappers"
+version = "0.1.0"
+
+[[package]]
+name = "vtable_read_raw"
 version = "0.1.0"
 
 [[package]]

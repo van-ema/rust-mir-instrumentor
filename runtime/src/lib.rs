@@ -81,6 +81,21 @@ fn rz_stack_addr_hint(addr: usize) -> bool {
     addr >= lo && addr <= hi
 }
 
+#[cfg(unix)]
+#[inline]
+fn rz_addr_in_image(addr: usize) -> bool {
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        libc::dladdr(addr as *const libc::c_void, &mut info) != 0
+    }
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn rz_addr_in_image(_addr: usize) -> bool {
+    false
+}
+
 #[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     if ptr.is_null() {
@@ -1036,6 +1051,18 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             }
         }
 
+        if rz_addr_in_image(addr) {
+            return;
+        }
+        // Raw pointers with no allocation origin (alloc_epoch=0) can be static metadata (vtables).
+        // Suppress only pointer-sized READs to avoid masking forged writes like *p = 1.
+        if tmeta.alloc_epoch == 0
+            && matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+            && size == std::mem::size_of::<usize>()
+        {
+            return;
+        }
+
         let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no allocation contains this address) kind={:?} parent={} pointee=0x{:x}",
@@ -1254,6 +1281,11 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 }
             }
         }
+
+        if rz_addr_in_image(addr) {
+            return;
+        }
+        // Keep writes conservative: do not suppress WILD_POINTER for alloc_epoch==0.
 
         let msg = append_location_if_enabled(
             format!(

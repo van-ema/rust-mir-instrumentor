@@ -8,3 +8,6 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 rz_log = []
+
+[dependencies]
+libc = "0.2"

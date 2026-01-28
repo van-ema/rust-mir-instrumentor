@@ -289,6 +289,9 @@ enum InstrKind<'tcx> {
     /// `ptr_local` holds the pointer value; `size` is the allocation size (0 = unknown).
     /// `base_offset` is the relative offset of the pointer within the global allocation.
     ConstAlloc { ptr_local: Local, size: usize, base_offset: usize },
+    /// Global/promoted const allocation from a constant pointer operand.
+    /// Used when the pointer is not stored in a local (e.g., aggregate literals).
+    ConstAllocConst { const_op: ConstOperand<'tcx>, size: usize, base_offset: usize },
     /// A write through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrWrite { ptr_local: Local, size_op: SizeOperand<'tcx> },
@@ -466,6 +469,37 @@ impl MyOptimizationPass {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
     }
 
+    /// Best-effort detection of "vtable-like" structs: all fields are function pointers.
+    fn is_fn_table_adt_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        let TyKind::Adt(adt, args) = ty.kind() else { return false };
+        if !adt.is_struct() {
+            return false;
+        }
+        let variant = adt.non_enum_variant();
+        if variant.fields.is_empty() {
+            return false;
+        }
+
+        for field in variant.fields.iter() {
+            let fty = field.ty(tcx, args);
+            match fty.kind() {
+                TyKind::FnPtr(..) | TyKind::FnDef(..) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Best-effort detection of "vtable-like" pointers: pointers to structs whose
+    /// fields are all function pointers. These typically live in static memory.
+    fn is_vtable_like_ptr_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        let pointee = match ty.kind() {
+            TyKind::Ref(_, p, _) | TyKind::RawPtr(p, _) => *p,
+            _ => return false,
+        };
+        self.is_fn_table_adt_ty(tcx, pointee)
+    }
+
     /// Return true only for *thin* pointers (one machine word).
     ///
     /// IMPORTANT: do **not** call `tcx.layout_of` / `layout_size_bytes` here.
@@ -543,6 +577,7 @@ impl MyOptimizationPass {
         source_info: SourceInfo,
         ptr_local: Local,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
     ) {
@@ -558,6 +593,7 @@ impl MyOptimizationPass {
 
         let is_mut = self.ptr_is_mut(ptr_ty);
         tagged_ptr_locals.insert(ptr_local);
+        ptr_locals_needing_tag.insert(ptr_local);
         insert_points.push(InsertPoint {
             bb,
             stmt_idx,
@@ -1464,34 +1500,61 @@ impl MyOptimizationPass {
                         // `p` is a deref place `(*ptr_local) ...` so the base pointer local is `p.local`.
                         let ptr_local = p.local;
                         let ptr_ty = body.local_decls[ptr_local].ty;
-                        if self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
+                        // Skip reads through &'static references. These point to global memory
+                        // that we don't track, and treating them as wild would be a false positive.
+                        let skip_static_ref_read =
+                            matches!(ptr_ty.kind(), TyKind::Ref(region, ..) if region.is_static());
+                        let skip_vtable_read = self.is_vtable_like_ptr_ty(tcx, ptr_ty);
+                        if !skip_static_ref_read
+                            && !skip_vtable_read
+                            && self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty)
+                        {
                             // Best-effort size: use the type of the *loaded place* (after projections).
                             // This is important for patterns where the destination is a projection
                             // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
                             let loaded_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                            let size_op =
-                                self.size_operand_for_ty(tcx, body, loaded_ty, stmt.source_info.span);
+                            let read_ty = p.ty(&body.local_decls, tcx).ty;
+                            // Loading function pointers or vtable-like structs should not trigger
+                            // memory access checks; treat these as benign metadata reads.
+                            let skip_fn_ptr_read = matches!(
+                                loaded_ty.kind(),
+                                TyKind::FnPtr(..) | TyKind::FnDef(..)
+                            ) || self.is_fn_table_adt_ty(tcx, loaded_ty);
+                            let skip_vtable_field_read = match read_ty.kind() {
+                                TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+                                TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                                    self.is_fn_table_adt_ty(tcx, *pointee)
+                                }
+                                _ => self.is_fn_table_adt_ty(tcx, read_ty),
+                            };
+                            if skip_fn_ptr_read || skip_vtable_field_read {
+                                // Skip only the READ instrumentation; continue scanning this stmt.
+                            } else {
+                                let size_op =
+                                    self.size_operand_for_ty(tcx, body, loaded_ty, stmt.source_info.span);
 
-                            self.ensure_raw_root_before(
-                                tcx,
-                                body,
-                                bb,
-                                stmt_idx,
-                                stmt.source_info,
-                                ptr_local,
-                                insert_points,
-                                tagged_ptr_locals,
-                                ptr_locals_with_tag_sources,
-                            );
-                            ptr_locals_needing_tag.insert(ptr_local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx,
-                                insert_before: true,
-                                source_info: stmt.source_info,
-                                place: Place::from(ptr_local),
-                                kind: InstrKind::PtrRead { ptr_local, size_op },
-                            });
+                                self.ensure_raw_root_before(
+                                    tcx,
+                                    body,
+                                    bb,
+                                    stmt_idx,
+                                    stmt.source_info,
+                                    ptr_local,
+                                    insert_points,
+                                    ptr_locals_needing_tag,
+                                    tagged_ptr_locals,
+                                    ptr_locals_with_tag_sources,
+                                );
+                                ptr_locals_needing_tag.insert(ptr_local);
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: true,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(ptr_local),
+                                    kind: InstrKind::PtrRead { ptr_local, size_op },
+                                });
+                            }
                         }
                     }
                 }
@@ -1508,7 +1571,15 @@ impl MyOptimizationPass {
             if is_deref_write {
                 let ptr_local = lhs_place.local;
                 let ptr_ty = body.local_decls[ptr_local].ty;
-                if self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
+                // Skip writes through &'static references. They are immutable by type,
+                // and we don't track global memory for validity.
+                let skip_static_ref_write =
+                    matches!(ptr_ty.kind(), TyKind::Ref(region, ..) if region.is_static());
+                let skip_vtable_write = self.is_vtable_like_ptr_ty(tcx, ptr_ty);
+                if !skip_static_ref_write
+                    && !skip_vtable_write
+                    && self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty)
+                {
                     // Best-effort size: use the type of the *place being written* (after projections).
                     // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                     let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
@@ -1523,6 +1594,7 @@ impl MyOptimizationPass {
                         stmt.source_info,
                         ptr_local,
                         insert_points,
+                        ptr_locals_needing_tag,
                         tagged_ptr_locals,
                         ptr_locals_with_tag_sources,
                     );
@@ -1728,6 +1800,50 @@ impl MyOptimizationPass {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Handle pointer constants embedded in aggregate/field assignments where the destination
+        // is not a pointer local we can tag. We still want to record the backing global allocation
+        // so later derefs (e.g., vtable loads) do not report WILD_POINTER.
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+            let dst_is_local = dst_place.as_local().is_some();
+            let mut const_ops: Vec<&ConstOperand<'tcx>> = Vec::new();
+
+            match rvalue {
+                Rvalue::Aggregate(_, ops) => {
+                    for op in ops.iter() {
+                        if let Operand::Constant(c) = op {
+                            const_ops.push(c);
+                        }
+                    }
+                }
+                Rvalue::Use(Operand::Constant(c)) | Rvalue::Cast(_, Operand::Constant(c), _) => {
+                    if !dst_is_local {
+                        const_ops.push(c);
+                    }
+                }
+                _ => {}
+            }
+
+            if !const_ops.is_empty() {
+                let place_local = dst_place.as_local().unwrap_or(RETURN_PLACE);
+                for c in const_ops {
+                    if let Some(info) = self.const_alloc_info(tcx, c) {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            insert_before: true,
+                            source_info: stmt.source_info,
+                            place: Place::from(place_local),
+                            kind: InstrKind::ConstAllocConst {
+                                const_op: c.clone(),
+                                size: info.size,
+                                base_offset: info.base_offset,
+                            },
+                        });
                     }
                 }
             }
@@ -2822,6 +2938,7 @@ impl MyOptimizationPass {
                     _ => false,
                 };
                 tagged_ptr_locals.insert(p.local);
+                ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx: block_data.statements.len(),
@@ -3273,7 +3390,7 @@ impl MyOptimizationPass {
             InstrKind::StackAlloc { .. } => hooks.def_id_alloc,
             InstrKind::HeapAlloc { .. } => hooks.def_id_alloc,
             // ConstAlloc is recorded via the same allocation hook.
-            InstrKind::ConstAlloc { .. } => hooks.def_id_alloc,
+            InstrKind::ConstAlloc { .. } | InstrKind::ConstAllocConst { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrWriteAllowUntagged { .. } => hooks.def_id_write_allow_untagged,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
@@ -3924,6 +4041,33 @@ impl MyOptimizationPass {
                         None => continue,
                     }
                 }
+                InstrKind::ConstAllocConst { const_op, .. } => {
+                    let const_ty = const_op.const_.ty();
+                    let tmp_ptr = body
+                        .local_decls
+                        .push(LocalDecl::new(const_ty, source_info.span));
+                    let assign_const = Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(tmp_ptr),
+                            Rvalue::Use(Operand::Constant(Box::new(const_op.clone()))),
+                        ))),
+                    );
+                    let Some((opt_stmt, addr_stmt)) = self.addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(tmp_ptr),
+                        addr_local,
+                    ) else {
+                        continue;
+                    };
+                    // If we need multiple address statements (wide pointer), skip.
+                    if opt_stmt.is_some() {
+                        continue;
+                    }
+                    (Some(assign_const), addr_stmt)
+                }
                 _ => {
                     match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
                         Some(stmts) => stmts,
@@ -3953,7 +4097,9 @@ impl MyOptimizationPass {
             let mut arg_addr_local = addr_local;
             let mut addr_adjust_stmt_opt: Option<Statement<'tcx>> = None;
 
-            if let InstrKind::ConstAlloc { base_offset, .. } = &creation_kind {
+            if let InstrKind::ConstAlloc { base_offset, .. }
+            | InstrKind::ConstAllocConst { base_offset, .. } = &creation_kind
+            {
                 if *base_offset != 0 {
                     let base_local = body
                         .local_decls
@@ -4059,7 +4205,7 @@ impl MyOptimizationPass {
                 }
 
                 // Record a live global/promoted allocation at the computed base address.
-                InstrKind::ConstAlloc { size, .. } => {
+                InstrKind::ConstAlloc { size, .. } | InstrKind::ConstAllocConst { size, .. } => {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
