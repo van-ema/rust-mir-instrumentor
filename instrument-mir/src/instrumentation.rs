@@ -513,8 +513,9 @@ impl MyOptimizationPass {
         ptr_local: Local,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         tagged_ptr_locals: &mut HashSet<Local>,
+        ptr_locals_with_tag_sources: &HashSet<Local>,
     ) {
-        if tagged_ptr_locals.contains(&ptr_local) {
+        if tagged_ptr_locals.contains(&ptr_local) || ptr_locals_with_tag_sources.contains(&ptr_local) {
             return;
         }
 
@@ -534,6 +535,69 @@ impl MyOptimizationPass {
             place: Place::from(ptr_local),
             kind: InstrKind::RawRoot { ptr_local, is_mut },
         });
+    }
+
+    /// Pre-scan the body to find pointer locals that are assigned from a known pointer source.
+    /// This prevents later RawRoot insertion from overwriting tags when control-flow order
+    /// differs from basic-block index order.
+    fn collect_ptr_locals_with_tag_sources<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+    ) -> HashSet<Local> {
+        let mut locals = HashSet::new();
+
+        for block_data in body.basic_blocks.iter() {
+            for stmt in block_data.statements.iter() {
+                let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind else { continue };
+                let Some(dst_local) = dst_place.as_local() else { continue };
+                let dst_ty = body.local_decls[dst_local].ty;
+                if !self.is_pointer_ty(dst_ty) {
+                    continue;
+                }
+
+                match rvalue {
+                    Rvalue::Ref(..) | Rvalue::RawPtr(..) => {
+                        locals.insert(dst_local);
+                    }
+                    Rvalue::Use(op) => {
+                        if let Some(src_local) = self
+                            .place_from_operand(op)
+                            .and_then(|p| p.as_local())
+                        {
+                            let src_ty = body.local_decls[src_local].ty;
+                            if self.is_pointer_ty(src_ty) {
+                                locals.insert(dst_local);
+                            }
+                        }
+                    }
+                    Rvalue::CopyForDeref(p) => {
+                        let src_ty = p.ty(&body.local_decls, tcx).ty;
+                        if self.is_pointer_ty(src_ty) {
+                            locals.insert(dst_local);
+                        }
+                    }
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                        op,
+                        _,
+                    ) => {
+                        if let Some(src_local) = self
+                            .place_from_operand(op)
+                            .and_then(|p| p.as_local())
+                        {
+                            let src_ty = body.local_decls[src_local].ty;
+                            if self.is_pointer_ty(src_ty) {
+                                locals.insert(dst_local);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        locals
     }
 
     /// Build statements that compute `addr_local` from a pointer-typed place.
@@ -1331,6 +1395,7 @@ impl MyOptimizationPass {
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
+        ptr_locals_with_tag_sources: &HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
         track_all_stack_allocs: bool,
     ) {
@@ -1399,6 +1464,7 @@ impl MyOptimizationPass {
                                 ptr_local,
                                 insert_points,
                                 tagged_ptr_locals,
+                                ptr_locals_with_tag_sources,
                             );
                             ptr_locals_needing_tag.insert(ptr_local);
                             insert_points.push(InsertPoint {
@@ -1441,6 +1507,7 @@ impl MyOptimizationPass {
                         ptr_local,
                         insert_points,
                         tagged_ptr_locals,
+                        ptr_locals_with_tag_sources,
                     );
                     ptr_locals_needing_tag.insert(ptr_local);
                     insert_points.push(InsertPoint {
@@ -2854,6 +2921,7 @@ impl MyOptimizationPass {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
         let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
+        let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
 
         let mut explicitly_tracked: HashSet<Local> = HashSet::new();
         for block_data in body.basic_blocks.iter() {
@@ -2932,6 +3000,7 @@ impl MyOptimizationPass {
                     &mut insert_points,
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
+                    &ptr_locals_with_tag_sources,
                     &interesting_stack_locals,
                     track_all_stack_allocs,
                 );

@@ -641,7 +641,21 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
     };
 
     let mut bmap = borrows().lock().unwrap();
-    bmap.entry(base).or_default().push(BorrowEntry { tag, kind });
+    let stack = bmap.entry(base).or_default();
+
+    // Retagging: if we know the parent, truncate to it (invalidate younger tags).
+    // For fresh unique borrows, clear the stack to invalidate all prior aliases.
+    if tmeta.parent != 0 {
+        if let Some(pos) = stack.iter().rposition(|entry| entry.tag == tmeta.parent) {
+            stack.truncate(pos + 1);
+        } else if kind == BorrowKind::Unique {
+            stack.clear();
+        }
+    } else if kind == BorrowKind::Unique {
+        stack.clear();
+    }
+
+    stack.push(BorrowEntry { tag, kind });
 }
 
 fn sb_lite_check(
@@ -679,24 +693,46 @@ fn sb_lite_check(
 
     match access {
         AccessKind::Read => {
-            if top.kind == BorrowKind::Unique && top.tag != tag {
-                Some(format!(
-                    "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                    tmeta.kind, top.kind, top.tag
-                ))
-            } else {
-                None
+            let mut seen_unique = false;
+            for entry in stack.iter().rev() {
+                if entry.tag == tag {
+                    if seen_unique {
+                        return Some(format!(
+                            "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                            tmeta.kind, top.kind, top.tag
+                        ));
+                    }
+                    return None;
+                }
+                if entry.kind == BorrowKind::Unique {
+                    seen_unique = true;
+                }
             }
+            Some(format!(
+                "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                tmeta.kind, top.kind, top.tag
+            ))
         }
         AccessKind::Write => {
-            if top.kind == BorrowKind::Unique && top.tag == tag {
-                None
-            } else {
-                Some(format!(
-                    "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                    tmeta.kind, top.kind, top.tag
-                ))
+            let mut is_top = true;
+            for entry in stack.iter().rev() {
+                if entry.tag == tag {
+                    if is_top && entry.kind == BorrowKind::Unique {
+                        return None;
+                    }
+                    return Some(format!(
+                        "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                        tmeta.kind, top.kind, top.tag
+                    ));
+                }
+                if is_top {
+                    is_top = false;
+                }
             }
+            Some(format!(
+                "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                tmeta.kind, top.kind, top.tag
+            ))
         }
     }
 }
