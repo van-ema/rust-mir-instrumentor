@@ -1,0 +1,6 @@
+[package]
+name = "sb_lite_raw_from_ref_fn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

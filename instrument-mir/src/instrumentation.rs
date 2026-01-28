@@ -183,9 +183,17 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
 
+    // Raw pointer creation helpers.
+    EffectRule::one(MatchKind::Contains, "::ptr::from_ref", CallEffect::PtrDerive),
+    EffectRule::one(MatchKind::Contains, "::ptr::from_mut", CallEffect::PtrDerive),
+
     // Vec pointer extraction wrappers. Covers `alloc::vec::Vec` and `std::vec::Vec`, including monomorphized forms.
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
+
+    // Transmute-style helpers returning pointers should preserve lineage.
+    EffectRule::one(MatchKind::Contains, "::mem::transmute", CallEffect::PtrDerive),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::transmute", CallEffect::PtrDerive),
 
     // Volatile wrappers (free functions).
     EffectRule::one(MatchKind::Contains, "::ptr::read_volatile", CallEffect::Load),
@@ -1529,6 +1537,42 @@ impl MyOptimizationPass {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if self.is_pointer_ty(dst_ty) {
+                    let mut skip_tag_prop = false;
+
+                    // Casts to raw pointers should create a fresh raw tag with parent lineage,
+                    // rather than copying the source tag directly.
+                    if let Rvalue::Cast(
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion(_, _)
+                        | CastKind::Transmute,
+                        op,
+                        _to_ty,
+                    ) = rvalue
+                    {
+                        if let TyKind::RawPtr(_pointee, mutbl) = dst_ty.kind() {
+                            if let Some(src_place) = self.place_from_operand(op) {
+                                let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                                if self.is_pointer_ty(src_ty) {
+                                    let is_mut = matches!(mutbl, Mutability::Mut);
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    ptr_locals_needing_tag.insert(src_place.local);
+                                    tagged_ptr_locals.insert(dst_local);
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::Raw {
+                                            is_mut,
+                                            src: src_place.clone(),
+                                        },
+                                    });
+                                    skip_tag_prop = true;
+                                }
+                            }
+                        }
+                    }
                     let src_local_opt: Option<Local> = match rvalue {
                         Rvalue::Use(op) => self
                             .place_from_operand(op)
@@ -1564,23 +1608,24 @@ impl MyOptimizationPass {
                         }
                     }
 
-                    if let Some(src_local) = src_local_opt {
-                        let src_ty = body.local_decls[src_local].ty;
-                        if self.is_pointer_ty(src_ty) {
-                            ptr_locals_needing_tag.insert(dst_local);
-                            ptr_locals_needing_tag.insert(src_local);
+                    if !skip_tag_prop {
+                        if let Some(src_local) = src_local_opt {
+                            let src_ty = body.local_decls[src_local].ty;
+                            if self.is_pointer_ty(src_ty) {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                ptr_locals_needing_tag.insert(src_local);
 
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx,
-                                insert_before: false,
-                                source_info: stmt.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::TagProp { dst: dst_local, src: src_local },
-                            });
-                            tagged_ptr_locals.insert(dst_local);
-                        }
-                    } else {
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                });
+                                tagged_ptr_locals.insert(dst_local);
+                            }
+                        } else {
                         // If the RHS is a projected place, there may be no pointer local we can
                         // propagate from, but the destination still needs a tag for later derefs.
                         // Synthesize a fresh root tag so the runtime does not see UNKNOWN_TAG.
@@ -1610,13 +1655,13 @@ impl MyOptimizationPass {
                             );
                         }
 
-                        if rhs_is_projected_ptr {
-                            ptr_locals_needing_tag.insert(dst_local);
-                            // Do not synthesize a tag here; the destination local is still
-                            // being assigned, and inserting a RawRoot can read an uninitialized
-                            // pointer value. Let the first PtrRead/PtrWrite/PtrUse insert a
-                            // RawRoot after the assignment instead.
-                        } else {
+                            if rhs_is_projected_ptr {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                // Do not synthesize a tag here; the destination local is still
+                                // being assigned, and inserting a RawRoot can read an uninitialized
+                                // pointer value. Let the first PtrRead/PtrWrite/PtrUse insert a
+                                // RawRoot after the assignment instead.
+                            } else {
                             // If the RHS is a global/promoted pointer constant, record its allocation
                             // and synthesize a root tag for the destination.
                             let const_op: Option<&ConstOperand<'tcx>> = match rvalue {
@@ -1628,36 +1673,37 @@ impl MyOptimizationPass {
                                 _ => None,
                             };
 
-                            if let Some(c) = const_op {
-                                if let Some(info) = self.const_alloc_info(tcx, c) {
-                                    let is_mut = self.ptr_is_mut(dst_ty);
+                                if let Some(c) = const_op {
+                                    if let Some(info) = self.const_alloc_info(tcx, c) {
+                                        let is_mut = self.ptr_is_mut(dst_ty);
 
-                                    ptr_locals_needing_tag.insert(dst_local);
-                                    insert_points.push(InsertPoint {
-                                        bb,
-                                        stmt_idx,
-                                        insert_before: false,
-                                        source_info: stmt.source_info,
-                                        place: Place::from(dst_local),
-                                        kind: InstrKind::ConstAlloc {
-                                            ptr_local: dst_local,
-                                            size: info.size,
-                                            base_offset: info.base_offset,
-                                        },
-                                    });
-                                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                        ptr_locals_needing_tag.insert(dst_local);
                                         insert_points.push(InsertPoint {
                                             bb,
-                                            stmt_idx: stmt_idx + 1,
+                                            stmt_idx,
                                             insert_before: false,
                                             source_info: stmt.source_info,
                                             place: Place::from(dst_local),
-                                            kind: InstrKind::RawRoot {
+                                            kind: InstrKind::ConstAlloc {
                                                 ptr_local: dst_local,
-                                                is_mut,
+                                                size: info.size,
+                                                base_offset: info.base_offset,
                                             },
                                         });
-                                        tagged_ptr_locals.insert(dst_local);
+                                        if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                            insert_points.push(InsertPoint {
+                                                bb,
+                                                stmt_idx: stmt_idx + 1,
+                                                insert_before: false,
+                                                source_info: stmt.source_info,
+                                                place: Place::from(dst_local),
+                                                kind: InstrKind::RawRoot {
+                                                    ptr_local: dst_local,
+                                                    is_mut,
+                                                },
+                                            });
+                                            tagged_ptr_locals.insert(dst_local);
+                                        }
                                     }
                                 }
                             }

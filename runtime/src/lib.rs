@@ -669,7 +669,10 @@ fn sb_lite_check(
         return None;
     }
 
-    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+    if !matches!(
+        tmeta.kind,
+        PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
+    ) {
         return None;
     }
 
@@ -715,15 +718,26 @@ fn sb_lite_check(
         }
         AccessKind::Write => {
             let mut is_top = true;
+            let mut seen_unique = false;
             for entry in stack.iter().rev() {
                 if entry.tag == tag {
-                    if is_top && entry.kind == BorrowKind::Unique {
-                        return None;
+                    if entry.kind == BorrowKind::Unique {
+                        if is_top {
+                            return None;
+                        }
+                        // For raw writes derived from a unique ref, allow shared reborrows
+                        // above as a best-effort heuristic (we do not track reborrow ends).
+                        if matches!(tmeta.kind, PtrKind::RawMut) && !seen_unique {
+                            return None;
+                        }
                     }
                     return Some(format!(
                         "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                         tmeta.kind, top.kind, top.tag
                     ));
+                }
+                if entry.kind == BorrowKind::Unique {
+                    seen_unique = true;
                 }
                 if is_top {
                     is_top = false;
@@ -735,6 +749,23 @@ fn sb_lite_check(
             ))
         }
     }
+}
+
+fn sb_lite_find_ref_ancestor_tag(
+    tmap: &HashMap<u64, TagMeta>,
+    mut tag: u64,
+) -> Option<u64> {
+    for _ in 0..32 {
+        let t = tmap.get(&tag)?;
+        if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+            return Some(tag);
+        }
+        if t.parent == 0 {
+            return None;
+        }
+        tag = t.parent;
+    }
+    None
 }
 
 #[inline(never)]
@@ -894,7 +925,7 @@ pub extern "C" fn __rz_dump_state() {
 #[track_caller]
 pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    let tmeta = {
+    let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
         let Some(tmeta) = tmap.get(&tag) else {
             let msg = append_location_if_enabled(
@@ -908,15 +939,22 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             );
             return;
         };
-        tmeta.clone()
+        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+            sb_lite_find_ref_ancestor_tag(&tmap, tag)
+        } else {
+            Some(tag)
+        };
+        (tmeta.clone(), sb_tag)
     };
 
-    if let Some(msg) = sb_lite_check(tag, &tmeta, addr, size, AccessKind::Write) {
-        rz_violation(
-            "STACKED_BORROWS_VIOLATION",
-            append_location_if_enabled(msg, "RZ_LOG_LOC"),
-        );
-        return;
+    if let Some(sb_tag) = sb_tag_opt {
+        if let Some(msg) = sb_lite_check(sb_tag, &tmeta, addr, size, AccessKind::Write) {
+            rz_violation(
+                "STACKED_BORROWS_VIOLATION",
+                append_location_if_enabled(msg, "RZ_LOG_LOC"),
+            );
+            return;
+        }
     }
 
     // Range-based allocation lookup.
@@ -1113,7 +1151,7 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 #[track_caller]
 pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    let tmeta = {
+    let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
         let Some(tmeta) = tmap.get(&tag) else {
             let msg = append_location_if_enabled(
@@ -1127,15 +1165,22 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             );
             return;
         };
-        tmeta.clone()
+        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+            sb_lite_find_ref_ancestor_tag(&tmap, tag)
+        } else {
+            Some(tag)
+        };
+        (tmeta.clone(), sb_tag)
     };
 
-    if let Some(msg) = sb_lite_check(tag, &tmeta, addr, size, AccessKind::Read) {
-        rz_violation(
-            "STACKED_BORROWS_VIOLATION",
-            append_location_if_enabled(msg, "RZ_LOG_LOC"),
-        );
-        return;
+    if let Some(sb_tag) = sb_tag_opt {
+        if let Some(msg) = sb_lite_check(sb_tag, &tmeta, addr, size, AccessKind::Read) {
+            rz_violation(
+                "STACKED_BORROWS_VIOLATION",
+                append_location_if_enabled(msg, "RZ_LOG_LOC"),
+            );
+            return;
+        }
     }
 
     // Range-based allocation lookup.
