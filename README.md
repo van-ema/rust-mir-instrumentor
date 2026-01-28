@@ -75,7 +75,6 @@ make run EXAMPLE=hello PROFILE=release
 
 ### Instrumentation
 - `RZ_LOG`: Log level for the instrumentor pass (`trace`, `info`, `warn`); default is `warn`.
-- `RZ_STACK_ALLOCS`: Track stack allocation for all locals if set (`all`, `1`, `true`); default is only "interesting" locals.
 - `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
 - `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all *non-std-like*
   (non `std` / `core` / `alloc`) dependency crates as instrumented.
@@ -121,25 +120,21 @@ To prevent unbounded memory growth when pointer-argument tags are pushed but nev
 RZ_INSTRUMENT_ALL_DEPS=1 RZ_PRINT_CRATES=1 make instrument EXAMPLE=tag0_return_raw_ptr_from_arg
 ```
 
-## Stack allocation tracking (filtered vs all)
+## Stack allocation tracking
 
-By default, the instrumentor records stack allocation lifetime events (`StorageLive` / `StorageDead`) **only for "interesting" locals** to reduce noise and overhead. A local is considered interesting when its address is taken (e.g., via `&T` / `&raw`), or when optimized MIR introduces common pointer-related temporaries/casts around it.
+The instrumentor records stack allocation lifetime events only for "interesting"
+locals to reduce noise and overhead. A local is considered interesting when its
+address is taken (e.g., via `&T` / `&raw`), or when optimized MIR introduces
+common pointer-related temporaries/casts around it.
 
-If you want maximum coverage (useful when debugging or when validating against tricky MIR patterns), you can force the instrumentor to record `StorageLive` / `StorageDead` for **all locals** by setting `RZ_STACK_ALLOCS`:
+To avoid false positives from optimized MIR, we **do not honor `StorageDead`** for
+address-taken locals. Instead, we emit a `live=false` event at function return
+for tracked locals. This means we reliably catch use-after-return and stack
+address reuse through raw pointers, but may miss some intra-function
+use-after-scope cases.
 
-```bash
-
-# Instrument stack allocs for all locals (higher overhead, more logs)
-RZ_STACK_ALLOCS=all cargo instrument-mir ...
-
-# Equivalent values:
-RZ_STACK_ALLOCS=1 cargo instrument-mir ...
-RZ_STACK_ALLOCS=true cargo instrument-mir ...
-```
-
-Notes:
-- The toggle affects only stack allocation lifetime tracking; pointer creation/use tracking is unchanged.
-- The "all" mode can produce many more `__rz_record_alloc` events, especially in code that uses formatting/panic paths.
+At runtime, stack UAFs through **references** (`&T` / `&mut T`) are suppressed to
+avoid spurious violations, while **raw-pointer** UAFs remain reported.
 
 ## Debugging recipes
 
@@ -153,8 +148,6 @@ RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE_UNKNOWN_TAG=1 ./target/release/hello
 # See instrumented vs dep crates during compilation
 RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bin hello
 
-# Force stack alloc tracking for all locals (more noise)
-RZ_STACK_ALLOCS=all cargo instrument-mir --runtime-path=target/debug -p hello --bin hello
 ```
 
 
@@ -166,6 +159,6 @@ We can force loading extern crate with
 --extern=force:runtime={runtime_path}/libruntime.rlib
 ```
 
-- Performance:For best performance, disable tracing (`RZ_LOG=warn` or unset) and avoid
-  `RZ_STACK_ALLOCS=all`. Future work includes lock sharding, TLS fast paths,
+- Performance:For best performance, disable tracing (`RZ_LOG=warn` or unset). Future
+  work includes lock sharding, TLS fast paths,
   and optional native runtime backends for hot paths.

@@ -72,6 +72,16 @@ fn rz_abort_on_double_free() -> bool {
 }
 
 #[inline]
+fn rz_stack_addr_hint(addr: usize) -> bool {
+    // Heuristic: treat addresses within +/-8MiB of the current stack pointer as stack.
+    let local = 0u8;
+    let sp = &local as *const u8 as usize;
+    let lo = sp.saturating_sub(8 * 1024 * 1024);
+    let hi = sp.saturating_add(8 * 1024 * 1024);
+    addr >= lo && addr <= hi
+}
+
+#[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     if ptr.is_null() {
         return;
@@ -487,6 +497,8 @@ pub struct AllocMeta {
     pub epoch: u64,
     /// Optional size in bytes (0 if unknown).
     pub size: usize,
+    /// Whether this allocation came from stack tracking.
+    pub is_stack: bool,
 }
 
 /// Kind of pointer/tag we are tracking.
@@ -518,6 +530,8 @@ pub struct TagMeta {
     ///   - use allocation ranges instead of exact address equality
     ///   - reject accesses when tag.alloc_epoch != alloc.epoch
     pub alloc_epoch: u64,
+    /// Whether the tag was created while the containing allocation was live.
+    pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
 }
@@ -683,8 +697,8 @@ fn sb_lite_check(
             .unwrap_or(addr)
     };
 
-    let bmap = borrows().lock().unwrap();
-    let stack = match bmap.get(&base) {
+    let mut bmap = borrows().lock().unwrap();
+    let stack = match bmap.get_mut(&base) {
         Some(s) => s,
         None => return None,
     };
@@ -719,7 +733,7 @@ fn sb_lite_check(
         AccessKind::Write => {
             let mut is_top = true;
             let mut seen_unique = false;
-            for entry in stack.iter().rev() {
+            for (idx, entry) in stack.iter().enumerate().rev() {
                 if entry.tag == tag {
                     if entry.kind == BorrowKind::Unique {
                         if is_top {
@@ -728,6 +742,15 @@ fn sb_lite_check(
                         // For raw writes derived from a unique ref, allow shared reborrows
                         // above as a best-effort heuristic (we do not track reborrow ends).
                         if matches!(tmeta.kind, PtrKind::RawMut) && !seen_unique {
+                            return None;
+                        }
+                        // For unique refs, allow reactivation if only shared borrows are above.
+                        // Heuristic: if the current top is shared, assume prior unique reborrows
+                        // have ended and allow the parent unique to reactivate.
+                        if matches!(tmeta.kind, PtrKind::RefMut)
+                            && (!seen_unique || matches!(top.kind, BorrowKind::Shared))
+                        {
+                            stack.truncate(idx + 1);
                             return None;
                         }
                     }
@@ -862,13 +885,19 @@ fn origin_alloc_for_tag<'a>(
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     let _g = RzRuntimeGuard::enter();
     let mut m = allocs().lock().unwrap();
+    let is_stack = (live & 0x2) != 0;
     let entry = m.entry(base_addr).or_insert(AllocMeta {
         live: false,
         epoch: 0,
         size,
+        is_stack,
     });
 
-    let new_live = live != 0;
+    if is_stack {
+        entry.is_stack = true;
+    }
+
+    let new_live = (live & 0x1) != 0;
 
     // We treat `epoch` as an allocation-instance counter for a given base address.
     // We must bump it not only on death, but also on reuse (dead -> live), otherwise
@@ -1036,6 +1065,14 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     if !ameta.live {
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && (ameta.is_stack || rz_stack_addr_hint(addr))
+        {
+            return;
+        }
+        if ameta.is_stack && !tmeta.alloc_live_at_creation {
+            return;
+        }
         let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
@@ -1235,6 +1272,14 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     };
 
     if !ameta.live {
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && (ameta.is_stack || rz_stack_addr_hint(addr))
+        {
+            return;
+        }
+        if ameta.is_stack && !tmeta.alloc_live_at_creation {
+            return;
+        }
         let msg = append_location_if_enabled(
             format!(
                 "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
@@ -1399,21 +1444,19 @@ pub extern "C" fn __record_ref_creation(
     // IMPORTANT: On retagging/reborrows (parent_tag != 0), we must NOT refresh alloc_epoch by
     // consulting the current allocation map, because the same numeric address can be reused by
     // a different stack frame. Derived tags should inherit the snapshot from their parent tag.
-    let alloc_epoch = if parent_tag != 0 {
+    let (alloc_epoch, alloc_live_at_creation) = if parent_tag != 0 {
         tags()
             .lock()
             .unwrap()
             .get(&parent_tag)
-            .map(|p| p.alloc_epoch)
-            .unwrap_or(0)
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation))
+            .unwrap_or((0, false))
     } else {
         // Root creation: snapshot from the allocation that contains this address (range lookup).
-        {
-            let amap = allocs().lock().unwrap();
-            find_alloc_containing(&amap, pointee_addr)
-                .map(|(_base, m)| m.epoch)
-                .unwrap_or(0)
-        }
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, pointee_addr)
+            .map(|(_base, m)| (m.epoch, m.live))
+            .unwrap_or((0, false))
     };
 
     let tmeta = TagMeta {
@@ -1422,6 +1465,7 @@ pub extern "C" fn __record_ref_creation(
         parent: parent_tag,
         escaped: false,
         alloc_epoch,
+        alloc_live_at_creation,
         alias_exempt: alias_exempt != 0,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
@@ -1459,13 +1503,13 @@ pub extern "C" fn __record_raw_ptr_creation(
     // stack-slot reuse detectable as stale pointers. Exception: if the derived pointer
     // clearly points into a different allocation than the parent, refresh to the pointee's
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
-    let alloc_epoch = if derived_from != 0 {
-        let (parent_epoch, parent_pointee) = tags()
+    let (alloc_epoch, alloc_live_at_creation) = if derived_from != 0 {
+        let (parent_epoch, parent_live, parent_pointee) = tags()
             .lock()
             .unwrap()
             .get(&derived_from)
-            .map(|p| (p.alloc_epoch, Some(p.pointee_addr)))
-            .unwrap_or((0, None));
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr)))
+            .unwrap_or((0, false, None));
 
         if let Some(parent_pointee) = parent_pointee {
             let amap = allocs().lock().unwrap();
@@ -1475,21 +1519,21 @@ pub extern "C" fn __record_raw_ptr_creation(
                 (parent_alloc, pointee_alloc)
             {
                 if parent_base != pointee_base {
-                    pointee_meta.epoch
+                    (pointee_meta.epoch, pointee_meta.live)
                 } else {
-                    parent_epoch
+                    (parent_epoch, parent_live)
                 }
             } else {
-                parent_epoch
+                (parent_epoch, parent_live)
             }
         } else {
-            parent_epoch
+            (parent_epoch, parent_live)
         }
     } else {
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| m.epoch)
-            .unwrap_or(0)
+            .map(|(_base, m)| (m.epoch, m.live))
+            .unwrap_or((0, false))
     };
 
     let tmeta = TagMeta {
@@ -1498,6 +1542,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         parent: derived_from,
         escaped: false,
         alloc_epoch,
+        alloc_live_at_creation,
         alias_exempt: alias_exempt != 0,
     };
     tags().lock().unwrap().insert(tag, tmeta);

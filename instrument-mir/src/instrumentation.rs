@@ -138,6 +138,8 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
 
     // No-op helpers.
     EffectRule::one(MatchKind::EndsWith, "::is_null", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::ptr::eq", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::ptr::addr_eq", CallEffect::Ignore),
 
     // ---- Common std/core helpers (suppress unknown-call noise) ----
 
@@ -178,6 +180,8 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::byte_sub", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_byte_add", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::wrapping_byte_sub", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::cast", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::", MatchKind::EndsWith, "::offset_from", CallEffect::Ignore),
 
     // Slice pointer extraction wrappers.
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
@@ -186,6 +190,8 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // Raw pointer creation helpers.
     EffectRule::one(MatchKind::Contains, "::ptr::from_ref", CallEffect::PtrDerive),
     EffectRule::one(MatchKind::Contains, "::ptr::from_mut", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::new", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::new_unchecked", CallEffect::PtrDerive),
 
     // Vec pointer extraction wrappers. Covers `alloc::vec::Vec` and `std::vec::Vec`, including monomorphized forms.
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
@@ -483,6 +489,23 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Return true when we can safely extract a concrete address from a pointer type.
+    /// This is stricter than `is_thin_ptr_ty`: we also require the pointee to be sized
+    /// in the current typing environment.
+    fn is_addr_exposable_ptr_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                self.is_thin_ptr_ty(tcx, ty) && pointee.is_sized(tcx, body.typing_env(tcx))
+            }
+            _ => false,
+        }
+    }
+
     /// Produce a thin raw pointer type suitable for extracting the data pointer from a wide pointer.
     /// We only care about the address, so a pointer to unit keeps the correct size and mutability
     /// while discarding the metadata.
@@ -528,7 +551,7 @@ impl MyOptimizationPass {
         }
 
         let ptr_ty = body.local_decls[ptr_local].ty;
-        if !self.is_thin_ptr_ty(tcx, ptr_ty) {
+        if !self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
             // Do not attempt to RawRoot-tag wide pointers.
             return;
         }
@@ -580,9 +603,11 @@ impl MyOptimizationPass {
                         }
                     }
                     Rvalue::CopyForDeref(p) => {
-                        let src_ty = p.ty(&body.local_decls, tcx).ty;
-                        if self.is_pointer_ty(src_ty) {
-                            locals.insert(dst_local);
+                        if let Some(src_local) = p.as_local() {
+                            let src_ty = body.local_decls[src_local].ty;
+                            if self.is_pointer_ty(src_ty) {
+                                locals.insert(dst_local);
+                            }
                         }
                     }
                     Rvalue::Cast(
@@ -610,8 +635,7 @@ impl MyOptimizationPass {
 
     /// Build statements that compute `addr_local` from a pointer-typed place.
     /// For thin pointers we can expose provenance directly.
-    /// For wide pointers we first extract the data pointer, then expose provenance on that
-    /// thin pointer so codegen does not ICE and the runtime observes the data address.
+    /// For wide pointers, skip address extraction to avoid codegen ICEs on scalar-pair operands.
     fn addr_stmts_for_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -621,6 +645,11 @@ impl MyOptimizationPass {
         addr_local: Local,
     ) -> Option<(Option<Statement<'tcx>>, Statement<'tcx>)> {
         let place_ty = place.ty(&body.local_decls, tcx).ty;
+        if let TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) = place_ty.kind() {
+            if !pointee.is_sized(tcx, body.typing_env(tcx)) {
+                return None;
+            }
+        }
         if self.is_thin_ptr_ty(tcx, place_ty) {
             let addr_stmt = Statement::new(
                 source_info,
@@ -634,41 +663,6 @@ impl MyOptimizationPass {
                 ))),
             );
             return Some((None, addr_stmt));
-        }
-
-        if self.is_pointer_ty(place_ty) {
-            let data_ptr_ty = self.data_ptr_ty_for_ptr(tcx, place_ty)?;
-            let data_ptr_local = body
-                .local_decls
-                .push(LocalDecl::new(data_ptr_ty, source_info.span));
-
-            // `PtrToPtr` extracts the data pointer for wide pointers like slices and str,
-            // keeping only the address portion of the scalar pair.
-            let data_ptr_stmt = Statement::new(
-                source_info,
-                StatementKind::Assign(Box::new((
-                    Place::from(data_ptr_local),
-                    Rvalue::Cast(
-                        CastKind::PtrToPtr,
-                        Operand::Copy(place),
-                        data_ptr_ty,
-                    ),
-                ))),
-            );
-
-            let addr_stmt = Statement::new(
-                source_info,
-                StatementKind::Assign(Box::new((
-                    Place::from(addr_local),
-                    Rvalue::Cast(
-                        CastKind::PointerExposeProvenance,
-                        Operand::Copy(Place::from(data_ptr_local)),
-                        tcx.types.usize,
-                    ),
-                ))),
-            );
-
-            return Some((Some(data_ptr_stmt), addr_stmt));
         }
 
         None
@@ -846,8 +840,9 @@ impl MyOptimizationPass {
                 s
             } else if let Some(pos) = s.rfind("::<") {
                 // Only treat it as a trailing monomorphization if there is no further module separator
-                // after the `::<`.
-                if s[pos..].contains("::") {
+                // after the `::<` (excluding the `::` in the `::<` itself).
+                let after = &s[(pos + 3)..];
+                if after.contains("::") {
                     s
                 } else {
                     &s[..pos]
@@ -1081,6 +1076,9 @@ impl MyOptimizationPass {
         let mut def_id_opt: Option<DefId> = None;
 
         let const_ty = c.const_.ty();
+        if let TyKind::FnDef(def_id, args) = const_ty.kind() {
+            return Some(self.resolve_instance_def_id(tcx, body, *def_id, args));
+        }
         if const_ty.has_param()
             || const_ty.has_infer()
       
@@ -1093,9 +1091,7 @@ impl MyOptimizationPass {
             return None;
         }
 
-        if let TyKind::FnDef(def_id, args) = c.const_.ty().kind() {
-            def_id_opt = Some(self.resolve_instance_def_id(tcx, body, *def_id, args));
-        } else if let Some(scalar) =
+        if let Some(scalar) =
             c.const_.try_eval_scalar(tcx, TypingEnv::fully_monomorphized())
         {
             if let Some(ptr) = scalar.to_pointer(&tcx).discard_err() {
@@ -1336,9 +1332,7 @@ impl MyOptimizationPass {
     }
 
     fn track_all_stack_allocs_flag(&self) -> bool {
-        std::env::var("RZ_STACK_ALLOCS")
-            .map(|v| v == "all" || v == "ALL" || v == "1" || v == "true" || v == "TRUE")
-            .unwrap_or(false)
+        false
     }
 
     fn entry_insert_after_prologue<'tcx>(&self, body: &Body<'tcx>) -> usize {
@@ -1369,11 +1363,11 @@ impl MyOptimizationPass {
         };
         let callee_id = self.callee_id_u64(tcx, body.source.def_id());
 
-        // Retag all pointer arguments, including wide pointers, because later conversions
-        // often drop metadata and only carry the data pointer address.
+        // Retag pointer arguments. Skip wide pointers to avoid codegen ICEs
+        // from scalar-pair operands; this is best-effort and may miss some metadata.
         for (arg_index, arg_local) in body.args_iter().enumerate() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_pointer_ty(arg_ty) {
+            if self.is_addr_exposable_ptr_ty(tcx, body, arg_ty) {
                 ptr_locals_needing_tag.insert(arg_local);
                 tagged_ptr_locals.insert(arg_local);
                 insert_points.push(InsertPoint {
@@ -1409,11 +1403,22 @@ impl MyOptimizationPass {
     ) {
         // Stack allocation lifetime: StorageLive/StorageDead.
         match stmt.kind {
-            StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+            StatementKind::StorageDead(local) => {
+                // NOTE: optimized MIR can place StorageDead before the last use
+                // through an outstanding reference. Emitting a dead event here
+                // causes false UAFs (e.g., debug_assert reads after StorageDead).
+                // We instead rely on function-return live=false for tracked locals,
+                // accepting that some intra-function UAFs are missed.
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
-                    let live = matches!(stmt.kind, StatementKind::StorageLive(_));
+                    return;
+                }
+            }
+            StatementKind::StorageLive(local) => {
+                if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
+                    && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
+                {
                     let ty = body.local_decls[local].ty;
 
                     // Record pointer-typed locals only if their address is taken (interesting locals).
@@ -1427,7 +1432,11 @@ impl MyOptimizationPass {
                                 insert_before: false,
                                 source_info: stmt.source_info,
                                 place: Place::from(local),
-                                kind: InstrKind::StackAlloc { local, live, size_op },
+                                kind: InstrKind::StackAlloc {
+                                    local,
+                                    live: true,
+                                    size_op,
+                                },
                             });
                         }
                     }
@@ -1455,7 +1464,7 @@ impl MyOptimizationPass {
                         // `p` is a deref place `(*ptr_local) ...` so the base pointer local is `p.local`.
                         let ptr_local = p.local;
                         let ptr_ty = body.local_decls[ptr_local].ty;
-                        if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                        if self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
                             // Best-effort size: use the type of the *loaded place* (after projections).
                             // This is important for patterns where the destination is a projection
                             // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
@@ -1499,7 +1508,7 @@ impl MyOptimizationPass {
             if is_deref_write {
                 let ptr_local = lhs_place.local;
                 let ptr_ty = body.local_decls[ptr_local].ty;
-                if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                if self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
                     // Best-effort size: use the type of the *place being written* (after projections).
                     // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                     let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
@@ -1657,10 +1666,21 @@ impl MyOptimizationPass {
 
                             if rhs_is_projected_ptr {
                                 ptr_locals_needing_tag.insert(dst_local);
-                                // Do not synthesize a tag here; the destination local is still
-                                // being assigned, and inserting a RawRoot can read an uninitialized
-                                // pointer value. Let the first PtrRead/PtrWrite/PtrUse insert a
-                                // RawRoot after the assignment instead.
+                                // The destination local is initialized by this assignment.
+                                // Synthesize a root tag *after* the assignment so later uses
+                                // (including call operands) do not see UNKNOWN_TAG.
+                                if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                                    let is_mut = self.ptr_is_mut(dst_ty);
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx: stmt_idx + 1,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                                    });
+                                    tagged_ptr_locals.insert(dst_local);
+                                }
                             } else {
                             // If the RHS is a global/promoted pointer constant, record its allocation
                             // and synthesize a root tag for the destination.
@@ -1690,7 +1710,7 @@ impl MyOptimizationPass {
                                                 base_offset: info.base_offset,
                                             },
                                         });
-                                        if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                        if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                             insert_points.push(InsertPoint {
                                                 bb,
                                                 stmt_idx: stmt_idx + 1,
@@ -1721,7 +1741,7 @@ impl MyOptimizationPass {
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
-                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                     if let Rvalue::Cast(CastKind::Transmute, op, _to_ty) = rvalue {
                         let src_ty = op.ty(body, tcx);
                         let is_nonnull_like = match src_ty.kind() {
@@ -1764,7 +1784,7 @@ impl MyOptimizationPass {
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
-                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                     let (binop, lhs_op) = match rvalue {
                         Rvalue::BinaryOp(op, box (lhs, _rhs)) => (Some(*op), Some(lhs)),
                         // Newer nightlies no longer have `Rvalue::CheckedBinaryOp`. The checked/overflowing
@@ -2304,7 +2324,7 @@ impl MyOptimizationPass {
                 // Record the newly allocated pointer as live.
                 if let Some(dst_local) = destination.as_local() {
                     let dst_ty = body.local_decls[dst_local].ty;
-                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                         // Many std::alloc wrappers take a `Layout` as arg0 instead of (size, align).
                         // For Layout-taking forms we currently record unknown size=0.
                         // TODO: extract Layout.size so we can do precise OOB.
@@ -2369,7 +2389,7 @@ impl MyOptimizationPass {
                     if let Some(p) = self.place_from_operand(&first.node) {
                         let ptr_local = p.local;
                         let ptr_ty = body.local_decls[ptr_local].ty;
-                        if self.is_thin_ptr_ty(tcx, ptr_ty) {
+                        if self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
                             let size_op: Operand<'tcx> = if args.len() >= 2 {
                                 let arg1_ty = args[1].node.ty(body, tcx);
                                 if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
@@ -2406,7 +2426,7 @@ impl MyOptimizationPass {
                     if let Some(p) = self.place_from_operand(&first.node) {
                         let old_ptr_local = p.local;
                         let old_ptr_ty = body.local_decls[old_ptr_local].ty;
-                        if self.is_thin_ptr_ty(tcx, old_ptr_ty) {
+                        if self.is_addr_exposable_ptr_ty(tcx, body, old_ptr_ty) {
                             let old_size_op: Operand<'tcx> = if args.len() >= 2 {
                                 let arg1_ty = args[1].node.ty(body, tcx);
                                 if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
@@ -2438,7 +2458,7 @@ impl MyOptimizationPass {
 
                 if let Some(dst_local) = destination.as_local() {
                     let dst_ty = body.local_decls[dst_local].ty;
-                    if self.is_thin_ptr_ty(tcx, dst_ty) {
+                    if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                         let new_size_op: Operand<'tcx> = if args.len() >= 4 {
                             args[3].node.clone()
                         } else if args.len() >= 3 {
@@ -2526,6 +2546,8 @@ impl MyOptimizationPass {
         let mut classified_write_ptr_local: Option<Local> = None;
         let mut classified_read_ptr_local: Option<Local> = None;
         let mut classified_derive_ptr_local: Option<Local> = None;
+        let unknown_call_returns_ptr =
+            unknown_call && self.is_pointer_ty(destination.ty(&body.local_decls, tcx).ty);
 
         // Centralized emission for direct-call effects.
         if let Some(effect) = call_effect_opt {
@@ -2562,7 +2584,7 @@ impl MyOptimizationPass {
                             if let Some(dst_local) = destination.as_local() {
                                 let dst_ty = body.local_decls[dst_local].ty;
 
-                                if self.is_thin_ptr_ty(tcx, dst_ty) {
+                                if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                     ptr_locals_needing_tag.insert(dst_local);
 
                                     // IMPORTANT: destination local is initialized only after call returns.
@@ -2707,7 +2729,7 @@ impl MyOptimizationPass {
                     if !callee_instrumented {
                         if let Some(dst_local) = destination.as_local() {
                             let dst_ty = body.local_decls[dst_local].ty;
-                            if self.is_thin_ptr_ty(tcx, dst_ty) {
+                            if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                 // Find base pointer local in arg0 (thin ptr) or backtrack an unsize cast.
                                 let mut src_local_opt: Option<Local> = None;
                                 if let Some(first) = args.get(0) {
@@ -2752,7 +2774,7 @@ impl MyOptimizationPass {
                     if !callee_instrumented {
                         if let Some(dst_local) = destination.as_local() {
                             let dst_ty = body.local_decls[dst_local].ty;
-                            if self.is_thin_ptr_ty(tcx, dst_ty) {
+                            if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 self.push_box_into_raw_call(
                                     tcx,
@@ -2782,17 +2804,18 @@ impl MyOptimizationPass {
         }
 
 
-        // Treat any pointer argument as tag relevant, including wide pointers, so argument tags
-        // survive through metadata carrying types that later yield thin data pointers.
+        // Treat any pointer argument as tag relevant. For wide pointers we avoid emitting
+        // addr-based hooks (they would ICE in codegen); thin pointers get full modeling.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else { continue; };
             let ty = body.local_decls[p.local].ty;
             if !self.is_pointer_ty(ty) { continue; }
+            let is_addr_exposable = self.is_addr_exposable_ptr_ty(tcx, body, ty);
 
             let was_tagged = tagged_ptr_locals.contains(&p.local);
 
             // Ensure a tag exists before any call-boundary effects that consume it.
-            if !was_tagged {
+            if !was_tagged && is_addr_exposable {
                 let is_mut = match ty.kind() {
                     TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                     TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -2810,7 +2833,7 @@ impl MyOptimizationPass {
             }
         
             // Inter-procedural: push argument tag to callee if instrumented.
-            if callee_instrumented {
+            if callee_instrumented && is_addr_exposable {
                 if let Some(callee_id) = callee_id_opt {
                     ptr_locals_needing_tag.insert(p.local);
                     insert_points.push(InsertPoint {
@@ -2829,7 +2852,12 @@ impl MyOptimizationPass {
             }
 
             // Unknown call policy: conservatively model potential read/write through any pointer arg.
-            if unknown_call && was_tagged {
+            if unknown_call
+                && was_tagged
+                && is_addr_exposable
+                && !unknown_call_returns_ptr
+                && matches!(ty.kind(), TyKind::Ref(..))
+            {
                 let size_op = match ty.kind() {
                     TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
                         self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
@@ -2874,23 +2902,25 @@ impl MyOptimizationPass {
             });
         }
 
-        // Caller-side return-tag recovery for pointer returns, including wide pointers whose
-        // address is tracked through the data pointer.
+        // Caller-side return-tag recovery for pointer returns.
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
             if self.is_pointer_ty(dst_ty) {
+                let dst_is_thin = self.is_addr_exposable_ptr_ty(tcx, body, dst_ty);
                 if callee_instrumented {
                     if let Some(callee_id) = callee_id_opt {
-                        ptr_locals_needing_tag.insert(dst_local);
-                        tagged_ptr_locals.insert(dst_local);
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: Place::from(dst_local),
-                            kind: InstrKind::RetTake { callee_id, dst_local },
-                        });
+                        if dst_is_thin {
+                            ptr_locals_needing_tag.insert(dst_local);
+                            tagged_ptr_locals.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RetTake { callee_id, dst_local },
+                            });
+                        }
                     }
                 } else {
                     // Uninstrumented callee: synthesize a fresh return tag unless another effect already
@@ -2906,7 +2936,7 @@ impl MyOptimizationPass {
                         Some(CallEffect::PtrDerive | CallEffect::BoxIntoRaw)
                     ) || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
 
-                    if !return_tagged_by_effect {
+                    if !return_tagged_by_effect && dst_is_thin {
                         let is_mut = match dst_ty.kind() {
                             TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                             TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -3016,11 +3046,6 @@ impl MyOptimizationPass {
         }
 
         let track_all_stack_allocs = self.track_all_stack_allocs_flag();
-        eprintln!(
-            "[rusteze][trace] track_all_stack_allocs={} RZ_STACK_ALLOCS={:?}",
-            track_all_stack_allocs,
-            std::env::var("RZ_STACK_ALLOCS").ok()
-          );
           
         let entry_insert_at = self.entry_insert_after_prologue(body);
         self.push_arg_retags_at_entry(
@@ -3070,7 +3095,7 @@ impl MyOptimizationPass {
                 }
 
                 if let TerminatorKind::Return = &term.kind {
-                    if self.is_pointer_ty(body.return_ty()) {
+                    if self.is_addr_exposable_ptr_ty(tcx, body, body.return_ty()) {
                         let callee_id = self.callee_id_u64(tcx, body.source.def_id());
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
@@ -3323,10 +3348,26 @@ impl MyOptimizationPass {
             let place = ip.place;
             let creation_kind = ip.kind;
 
+            // Avoid emitting allow-untagged READ/WRITE for raw-pointer args from unknown calls.
+            // These are a common source of false positives (e.g., pointer casts).
+            if let InstrKind::PtrReadAllowUntagged { ptr_local, .. }
+                | InstrKind::PtrWriteAllowUntagged { ptr_local, .. } = creation_kind
+            {
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                if matches!(ptr_ty.kind(), TyKind::RawPtr(..)) {
+                    continue;
+                }
+            }
+
             // workaround for pointers produced from NonNull/Unique via Transmute
             // RawRoot lowering: we implement this by mirroring the existing Raw lowering code path:
             //   tag(ptr_local) = __record_raw_ptr_creation(expose(ptr_local), is_mut, 0)
             if let InstrKind::RawRoot { ptr_local, is_mut } = creation_kind.clone() {
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                if !self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
+                    // Skip wide pointers to avoid codegen ICEs on scalar-pair operands.
+                    continue;
+                }
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&ptr_local)
                     .expect("missing tag local for RawRoot");
@@ -3371,30 +3412,19 @@ impl MyOptimizationPass {
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
 
-                if let Some((data_ptr_stmt_opt, addr_stmt)) = self.addr_stmts_for_place(
+                let Some((data_ptr_stmt_opt, addr_stmt)) = self.addr_stmts_for_place(
                     tcx,
                     body,
                     source_info,
                     Place::from(ptr_local),
                     addr_local,
-                ) {
-                    if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
-                        body.basic_blocks_mut()[call_bb].statements.push(data_ptr_stmt);
-                    }
-                    body.basic_blocks_mut()[call_bb].statements.push(addr_stmt);
-                } else {
-                    body.basic_blocks_mut()[call_bb].statements.push(Statement::new(
-                        source_info,
-                        StatementKind::Assign(Box::new((
-                            Place::from(addr_local),
-                            Rvalue::Cast(
-                                CastKind::PointerExposeProvenance,
-                                Operand::Copy(Place::from(ptr_local)),
-                                tcx.types.usize,
-                            ),
-                        ))),
-                    ));
+                ) else {
+                    continue;
+                };
+                if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
+                    body.basic_blocks_mut()[call_bb].statements.push(data_ptr_stmt);
                 }
+                body.basic_blocks_mut()[call_bb].statements.push(addr_stmt);
 
                 let raw_func = Operand::function_handle(
                     tcx,
@@ -3813,18 +3843,6 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            let (orig_term, is_cleanup) = {
-                let bd = &mut body.basic_blocks_mut()[bb];
-                let term = bd.terminator.take();
-                let cleanup = bd.is_cleanup;
-                (term, cleanup)
-            };
-
-            let cont_block = {
-                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
-                body.basic_blocks_mut().push(cont_data)
-            };
-
             let func_operand = self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
 
             let insert_before: bool = ip.insert_before;
@@ -3864,6 +3882,9 @@ impl MyOptimizationPass {
                 InstrKind::StackAlloc { local, .. } => {
                     let local_ty = body.local_decls[local].ty;
                     let ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
+                    if !self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
+                        continue;
+                    }
                     let tmp_ptr = body
                         .local_decls
                         .push(LocalDecl::new(ptr_ty, source_info.span));
@@ -3909,6 +3930,18 @@ impl MyOptimizationPass {
                         None => continue,
                     }
                 }
+            };
+
+            let (orig_term, is_cleanup) = {
+                let bd = &mut body.basic_blocks_mut()[bb];
+                let term = bd.terminator.take();
+                let cleanup = bd.is_cleanup;
+                (term, cleanup)
+            };
+
+            let cont_block = {
+                let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                body.basic_blocks_mut().push(cont_data)
             };
 
             let heap_alloc_info = match &creation_kind {
@@ -3987,7 +4020,9 @@ impl MyOptimizationPass {
                         size_op,
                     );
                     extra_stmts.append(&mut size_stmts);
-                    let arg_live = self.const_u8(tcx, source_info.span, if live { 1 } else { 0 });
+                    // Encode stack-alloc flag in bit1; bit0 is the live flag.
+                    let live_bits: u8 = if live { 1 } else { 0 };
+                    let arg_live = self.const_u8(tcx, source_info.span, live_bits | 0x2);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
@@ -4676,5 +4711,29 @@ impl MyOptimizationPass {
         }
 
         self.init_tag_locals_to_zero(tcx, body, &tag_local_for_ptr_local, &arg_ptr_locals);
+
+        // Defensive fixup: instrumentation should always leave valid terminators, but avoid
+        // crashing rustc if a block ends up missing one in complex crates.
+        let mut missing_terminators = 0usize;
+        let body_span = body.span;
+        for (_bb, bd) in body.basic_blocks_mut().iter_enumerated_mut() {
+            if bd.terminator.is_none() {
+                missing_terminators += 1;
+                bd.terminator = Some(Terminator {
+                    source_info: SourceInfo {
+                        span: body_span,
+                        scope: OUTERMOST_SOURCE_SCOPE,
+                    },
+                    kind: TerminatorKind::Unreachable,
+                });
+            }
+        }
+        if missing_terminators > 0 {
+            rz_pass_warn!(
+                self,
+                "[rusteze][warn] inserted {} Unreachable terminators to repair malformed MIR",
+                missing_terminators
+            );
+        }
     }
 }
