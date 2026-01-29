@@ -1468,6 +1468,26 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
     ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0)
 }
 
+/// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
+///
+/// This avoids UNKNOWN_TAG when a callee didn't push a return tag (or the key mismatched),
+/// while still preserving inter-procedural tags when available.
+#[no_mangle]
+pub extern "C" fn __rz_take_ret_tag_or_root(
+    callee_id: u64,
+    addr: usize,
+    is_mut: u8,
+    alias_exempt: u8,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let tag = { ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0) };
+    if tag != 0 {
+        return tag;
+    }
+    // Fallback: synthesize a fresh raw-pointer tag rooted at this address.
+    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt)
+}
+
 #[macro_export]
 macro_rules! force_runtime {
     ($sym:path) => {

@@ -90,9 +90,10 @@ Exit Criteria
 	•	Violations are explainable and stable
 
 Next step
-	•	Finish call-classification for remaining noisy std/core helpers (cmp/hash/atomic-ptr paths),
-	  and wire a local wrapper script so we always build with `RZ_INSTRUMENT_ALL_DEPS=1`
-	  using the in-repo driver (no global install cache).
+	•	Chase the remaining `UNKNOWN_TAG` / untagged pointer uses seen in debug
+	  runs (e.g., `medium_smallvec_driver`), and fix missing tag propagation at
+	  raw-pointer creation or call boundaries.
+	•	Add a focused micro-example that reproduces the missing propagation.
 	•	Re-run medium crates (bytes/smallvec) in debug+release to confirm:
 	  - no unknown-call warnings from non-std crates
 	  - stable, explainable violations only

@@ -547,7 +547,7 @@ struct Hooks {
     def_id_push_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
     def_id_push_ret_tag: DefId,
-    def_id_take_ret_tag: DefId,
+    def_id_take_ret_tag_or_root: DefId,
 }
 
 impl MyOptimizationPass {
@@ -3699,7 +3699,7 @@ impl MyOptimizationPass {
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
             InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
-            InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag,
+            InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
         };
         Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
     }
@@ -3893,7 +3893,7 @@ impl MyOptimizationPass {
 
             // Caller-side: take return tag after a call returned a thin pointer into `dst_local`.
             // This must run after the call, so we rewrite the call's target to a fresh block that
-            // performs `__rz_take_ret_tag` and then jumps to the original target.
+            // performs `__rz_take_ret_tag_or_root` and then jumps to the original target.
             if let InstrKind::RetTake { callee_id, dst_local } = creation_kind {
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&dst_local)
@@ -3947,11 +3947,18 @@ impl MyOptimizationPass {
 
                 let take_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_take_ret_tag,
+                    hooks.def_id_take_ret_tag_or_root,
                     std::iter::empty(),
                     source_info.span,
                 );
 
+                let dst_ty = body.local_decls[dst_local].ty;
+                let is_mut = match dst_ty.kind() {
+                    TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                    TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                    _ => false,
+                };
+                let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
                 let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: self.const_u64(tcx, source_info.span, callee_id),
@@ -3959,6 +3966,14 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
                         span: source_info.span,
                     },
                 ]
@@ -5084,9 +5099,9 @@ impl MyOptimizationPass {
         let def_id_push_ret_tag = self
             .find_def_id_by_name(tcx, "__rz_push_ret_tag")
             .expect("missing '__rz_push_ret_tag' definition");
-        let def_id_take_ret_tag = self
-            .find_def_id_by_name(tcx, "__rz_take_ret_tag")
-            .expect("missing '__rz_take_ret_tag' definition");
+        let def_id_take_ret_tag_or_root = self
+            .find_def_id_by_name(tcx, "__rz_take_ret_tag_or_root")
+            .expect("missing '__rz_take_ret_tag_or_root' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -5100,7 +5115,7 @@ impl MyOptimizationPass {
             def_id_push_call_arg_tag,
             def_id_take_call_arg_tag,
             def_id_push_ret_tag,
-            def_id_take_ret_tag,
+            def_id_take_ret_tag_or_root,
         };
 
         let scan = self.scan_body(tcx, body);
