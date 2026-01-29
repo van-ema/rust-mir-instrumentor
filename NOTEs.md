@@ -123,18 +123,20 @@ explicit `Rvalue::Ref`/`Rvalue::RawPtr` in the statements. To avoid missing
 stack allocations that are only touched by drop glue, we treat `Drop` as an
 implicit address-of when computing the set of stack locals worth tracking.
 
-## Raw pointer reads into static metadata (vtables)
+## Static metadata reads (vtables) via raw pointers
 
 Optimized MIR often loads function pointers from vtables or other static
-metadata via raw-pointer reads. Because the runtime does not track static/global
-allocations, these reads would show up as WILD_POINTER even though they are
-valid.
+metadata via raw-pointer reads. These addresses live in the program image
+(\_\_TEXT/\_\_DATA/\_\_DATA\_CONST on macOS) and are not tracked by the heap/stack
+allocation map, so naive range lookup reports WILD_POINTER.
 
-Current behavior: suppress WILD_POINTER for raw-pointer **reads** where the tag
-has no known allocation origin (`alloc_epoch == 0`) and the access is a
-pointer-sized load. This avoids false positives in crates like `bytes`, but it
-means forged raw-pointer reads (e.g., integer-cast pointers) that happen to be
-pointer-sized can be missed. Raw-pointer writes are still reported.
+Current behavior (macOS + Linux): the runtime enumerates loaded image segments
+via dyld on macOS and via `dl_iterate_phdr` on Linux, treating their ranges as
+static allocations. Reads inside these segments are allowed; writes are allowed
+only if the segment is writable. Writes into read-only static segments report
+WRITE_TO_READONLY_STATIC.
 
-TODO: track static/global allocations or their embedded pointer provenance so
-these reads can be checked without suppression.
+Limitations:
+- OS-specific (macOS + Linux; other targets fall back to no static ranges).
+- Coarse: we do not recover embedded pointer provenance; we only check address
+  ranges for static segments.

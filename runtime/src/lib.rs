@@ -3,6 +3,10 @@
 #![allow(unused)]
 #![allow(internal_features)]
 use core::ptr;
+use std::sync::OnceLock;
+
+mod static_image;
+use static_image::StaticRange;
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -81,20 +85,18 @@ fn rz_stack_addr_hint(addr: usize) -> bool {
     addr >= lo && addr <= hi
 }
 
-#[cfg(unix)]
-#[inline]
-fn rz_addr_in_image(addr: usize) -> bool {
-    unsafe {
-        let mut info: libc::Dl_info = std::mem::zeroed();
-        libc::dladdr(addr as *const libc::c_void, &mut info) != 0
-    }
+fn rz_static_ranges() -> &'static Vec<StaticRange> {
+    static RANGES: OnceLock<Vec<StaticRange>> = OnceLock::new();
+    RANGES.get_or_init(static_image::collect_static_ranges)
 }
 
-#[cfg(not(unix))]
 #[inline]
-fn rz_addr_in_image(_addr: usize) -> bool {
-    false
+fn rz_static_range_for_addr(addr: usize) -> Option<&'static StaticRange> {
+    rz_static_ranges()
+        .iter()
+        .find(|r| addr >= r.start && addr < r.end)
 }
+
 
 #[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
@@ -198,7 +200,7 @@ static RZ_ALLOC: RzGlobalAlloc = RzGlobalAlloc;
 // === end global allocator wrapper ===========================================
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 #[cfg(feature = "rz_log")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1051,16 +1053,28 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             }
         }
 
-        if rz_addr_in_image(addr) {
-            return;
-        }
-        // Raw pointers with no allocation origin (alloc_epoch=0) can be static metadata (vtables).
-        // Suppress only pointer-sized READs to avoid masking forged writes like *p = 1.
-        if tmeta.alloc_epoch == 0
-            && matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
-            && size == std::mem::size_of::<usize>()
-        {
-            return;
+        if let Some(r) = rz_static_range_for_addr(addr) {
+            if size == 0 || addr.saturating_add(size) <= r.end {
+                if r.writable {
+                    return;
+                }
+                let msg = append_location_if_enabled(
+                    format!(
+                        "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(write to read-only static range 0x{:x}..0x{:x}) kind={:?} parent={} pointee=0x{:x}",
+                        r.start,
+                        r.end,
+                        tmeta.kind,
+                        tmeta.parent,
+                        tmeta.pointee_addr
+                    ),
+                    "RZ_LOG_LOC",
+                );
+                rz_violation(
+                    "WRITE_TO_READONLY_STATIC",
+                    msg,
+                );
+                return;
+            }
         }
 
         let msg = append_location_if_enabled(
@@ -1282,10 +1296,11 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             }
         }
 
-        if rz_addr_in_image(addr) {
-            return;
+        if let Some(r) = rz_static_range_for_addr(addr) {
+            if size == 0 || addr.saturating_add(size) <= r.end {
+                return;
+            }
         }
-        // Keep writes conservative: do not suppress WILD_POINTER for alloc_epoch==0.
 
         let msg = append_location_if_enabled(
             format!(
