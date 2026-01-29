@@ -110,6 +110,83 @@ impl EffectRule {
     }
 }
 
+fn normalize_def_path(def_path: &str) -> String {
+    let mut base = def_path.to_string();
+    if let Some(stripped) = strip_trait_impl_prefix(def_path) {
+        base = stripped;
+    }
+
+    let mut out = String::with_capacity(base.len());
+    let mut depth = 0usize;
+    let mut colon_run = 0usize;
+    for ch in base.chars() {
+        match ch {
+            '<' => {
+                depth += 1;
+            }
+            '>' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ if depth > 0 => {
+                // Skip generic args.
+            }
+            c => {
+                if c.is_whitespace() {
+                    continue;
+                }
+                if c == ':' {
+                    colon_run += 1;
+                    if colon_run > 2 {
+                        continue;
+                    }
+                } else {
+                    colon_run = 0;
+                }
+                out.push(c);
+            }
+        }
+    }
+
+    out
+}
+
+fn strip_trait_impl_prefix(def_path: &str) -> Option<String> {
+    if !def_path.starts_with('<') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut end_idx = None;
+    for (idx, ch) in def_path.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end_idx = end_idx?;
+    let inner = &def_path[1..end_idx];
+    let rest = &def_path[(end_idx + 1)..];
+    let as_pos = inner.find(" as ")?;
+    let trait_part = inner[(as_pos + 4)..].trim();
+    if trait_part.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}{}", trait_part, rest))
+}
+
 // Order matters: first match wins.
 // These rules cover "simple" std/core wrapper classification that is purely path-string based.
 static CALL_EFFECT_RULES: &[EffectRule] = &[
@@ -140,6 +217,10 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::EndsWith, "::is_null", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::eq", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::addr_eq", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::ptr::null", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::ptr::null_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::ptr::const_ptr", MatchKind::EndsWith, "::eq", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::ptr::mut_ptr", MatchKind::EndsWith, "::eq", CallEffect::Ignore),
 
     // ---- Common std/core helpers (suppress unknown-call noise) ----
 
@@ -192,6 +273,8 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::Contains, "::ptr::from_mut", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::new", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::new_unchecked", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ptr::NonNull", MatchKind::EndsWith, "::as_mut", CallEffect::PtrDerive),
 
     // Vec pointer extraction wrappers. Covers `alloc::vec::Vec` and `std::vec::Vec`, including monomorphized forms.
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
@@ -229,6 +312,112 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::EndsWith, "::copy_nonoverlapping", CallEffect::MemCopy),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy)
     EffectRule::one(MatchKind::EndsWith, "::copy", CallEffect::MemCopy),
+
+    // ---- Common pure helpers (Ignore) ----
+    EffectRule::two(MatchKind::Contains, "::ops::RangeBounds", MatchKind::EndsWith, "::start_bound", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::ops::RangeBounds", MatchKind::EndsWith, "::end_bound", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::ops::Range", MatchKind::EndsWith, "::contains", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::option::Option", MatchKind::EndsWith, "::expect", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::result::Result", MatchKind::EndsWith, "::is_ok", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::convert::Into", MatchKind::EndsWith, "::into", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::mem::size_of_val", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::mem::take", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::mem::replace", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::panicking::assert_failed", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::fmt::", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::cmp::PartialEq", MatchKind::EndsWith, "::eq", CallEffect::Load),
+    EffectRule::two(MatchKind::Contains, "::cmp::PartialOrd", MatchKind::EndsWith, "::partial_cmp", CallEffect::Load),
+    EffectRule::two(MatchKind::Contains, "::cmp::Ord", MatchKind::EndsWith, "::cmp", CallEffect::Load),
+    EffectRule::two(MatchKind::Contains, "::hash::Hash", MatchKind::EndsWith, "::hash", CallEffect::Load),
+    EffectRule::two(MatchKind::Contains, "::hash::impls", MatchKind::EndsWith, "::hash", CallEffect::Load),
+
+    // AsRef/AsMut return borrowed pointers.
+    EffectRule::two(MatchKind::Contains, "::convert::AsRef", MatchKind::EndsWith, "::as_ref", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::convert::AsMut", MatchKind::EndsWith, "::as_mut", CallEffect::PtrDerive),
+
+    // Index/IndexMut return references into the receiver.
+    EffectRule::two(MatchKind::Contains, "::ops::IndexMut", MatchKind::EndsWith, "::index_mut", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::ops::Index", MatchKind::EndsWith, "::index", CallEffect::PtrDerive),
+
+    // Slice helpers.
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::get", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::get_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::last_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::is_empty", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::copy_from_slice", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::iter::IntoIterator", MatchKind::EndsWith, "::into_iter", CallEffect::Ignore),
+
+    // Vec helpers (metadata + length management).
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::len", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::capacity", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::is_empty", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::set_len", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::reserve", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::reserve_exact", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::try_reserve", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::try_reserve_exact", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::extend_from_slice", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::resize", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::from_raw_parts", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::from_raw_parts_in", CallEffect::Ignore),
+
+    EffectRule::two(MatchKind::Contains, "alloc::slice::<impl [", MatchKind::EndsWith, "::to_vec", CallEffect::Ignore),
+
+    // VecDeque helpers.
+    EffectRule::two(MatchKind::Contains, "::collections::VecDeque", MatchKind::EndsWith, "::len", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::collections::VecDeque", MatchKind::EndsWith, "::is_empty", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::collections::VecDeque", MatchKind::EndsWith, "::as_slices", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::collections::VecDeque", MatchKind::EndsWith, "::drain", CallEffect::Ignore),
+
+    // String / str helpers.
+    EffectRule::two(MatchKind::Contains, "::str::<impl str>", MatchKind::EndsWith, "::len", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::str::<impl str>", MatchKind::EndsWith, "::as_bytes", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::string::String", MatchKind::EndsWith, "::as_bytes", CallEffect::Ignore),
+
+    // IO helpers.
+    EffectRule::two(MatchKind::Contains, "::io::Cursor", MatchKind::EndsWith, "::get_ref", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::io::Cursor", MatchKind::EndsWith, "::position", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::io::Cursor", MatchKind::EndsWith, "::set_position", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::io::IoSlice", MatchKind::EndsWith, "::new", CallEffect::Ignore),
+
+    // Atomic ops (load/store vs RMW).
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::load", CallEffect::Load),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::store", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::swap", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::compare_exchange", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::compare_exchange_weak", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_add", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_sub", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_and", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_or", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_xor", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_nand", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_max", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::fetch_min", CallEffect::Store),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::AtomicPtr", MatchKind::EndsWith, "::new", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::sync::atomic::AtomicPtr", MatchKind::EndsWith, "::get_mut", CallEffect::Ignore),
+
+    EffectRule::one(MatchKind::Contains, "::sync::atomic::atomic_load", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::sync::atomic::atomic_store", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::sync::atomic::atomic_compare_exchange", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::sync::atomic::atomic_xadd", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::sync::atomic::atomic_xsub", CallEffect::Store),
+
+    EffectRule::one(MatchKind::Contains, "::intrinsics::atomic_load", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::atomic_store", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::atomic_", CallEffect::Store),
+
+    // Intrinsics + pointer helpers seen in optimized builds.
+    EffectRule::one(MatchKind::Contains, "::intrinsics::arith_offset", CallEffect::PtrDerive),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::ptr_offset_from", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::ptr_offset_from_unsigned", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::compare_bytes", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::size_of_val", CallEffect::Ignore),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::align_of_val", CallEffect::Ignore),
 ];
 
 // Lightweight logging macros for the compiler pass.
@@ -709,7 +898,7 @@ impl MyOptimizationPass {
     fn warn_unknown_calls_enabled(&self) -> bool {
         std::env::var("RZ_WARN_UNKNOWN_CALLS")
             .ok()
-            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
     /// If true, emit MIR-based heap alloc/free hooks (`HeapAlloc` / `__rz_record_alloc`).
@@ -727,6 +916,47 @@ impl MyOptimizationPass {
         let set = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
         let mut guard = set.lock().unwrap();
         if guard.insert(def_path.to_string()) {
+            if self.log_enabled(PassLogLevel::Trace) {
+                static TRACE_UNKNOWN: OnceLock<Mutex<usize>> = OnceLock::new();
+                let mut count = TRACE_UNKNOWN.get_or_init(|| Mutex::new(0)).lock().unwrap();
+                if *count < 10 {
+                    *count += 1;
+                    rz_pass_warn!(
+                        self,
+                        "[rusteze][trace] unknown_call def_path={:?} contains_slice_impl={} ends_get={} ends_get_mut={} ends_is_empty={}",
+                        def_path,
+                        def_path.contains("::slice::<impl ["),
+                        def_path.ends_with("::get"),
+                        def_path.ends_with("::get_mut"),
+                        def_path.ends_with("::is_empty")
+                    );
+                }
+            }
+            if std::env::var("RZ_TRACE_UNKNOWN_CALLS")
+                .ok()
+                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+            {
+                static TRACE_UNKNOWN_DETAILS: OnceLock<Mutex<usize>> = OnceLock::new();
+                let mut count = TRACE_UNKNOWN_DETAILS
+                    .get_or_init(|| Mutex::new(0))
+                    .lock()
+                    .unwrap();
+                if *count < 20 {
+                    *count += 1;
+                    rz_pass_warn!(
+                        self,
+                        "[rusteze][trace] unknown_call_details def_path={:?} bytes={:?} contains_fmt={} contains_slice_impl={} contains_vec={} contains_index={} ends_index={} ends_index_mut={}",
+                        def_path,
+                        def_path.as_bytes(),
+                        def_path.contains("::fmt::"),
+                        def_path.contains("::slice::<impl ["),
+                        def_path.contains("::vec::Vec"),
+                        def_path.contains("::ops::Index"),
+                        def_path.ends_with("::index"),
+                        def_path.ends_with("::index_mut")
+                    );
+                }
+            }
             rz_pass_warn!(
                 self,
                 "[rusteze][warn] unclassified direct call with pointer effects: {} (consider adding a wrapper/intrinsic classifier or instrumenting that crate)",
@@ -758,19 +988,7 @@ impl MyOptimizationPass {
 
 
     fn is_std_like_crate_name(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "core"
-                | "alloc"
-                | "std"
-                | "proc_macro"
-                | "test"
-                | "panic_abort"
-                | "panic_unwind"
-                | "compiler_builtins"
-                | "unwind"
-                | "cfg_if"
-        )
+        matches!(name, "core" | "std")
     }
 
     fn instrumented_crates_cached<'tcx>(&self, tcx: TyCtxt<'tcx>) -> &'static HashSet<String> {
@@ -785,7 +1003,7 @@ impl MyOptimizationPass {
             // Priority 2: instrument all non-runtime dependencies
             let instrument_all_deps = std::env::var("RZ_INSTRUMENT_ALL_DEPS")
                 .ok()
-                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+                .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false");
 
             if !instrument_all_deps {
                 return HashSet::new();
@@ -798,9 +1016,8 @@ impl MyOptimizationPass {
                     continue;
                 }
 
-                // Even in "instrument all deps" mode, do NOT treat std/core/alloc and other
-                // std-like crates as instrumented callees. We rely on boundary interception
-                // (global allocator wrapper) and wrapper classification instead.
+                // Even in "instrument all deps" mode, do NOT treat std/core as instrumented
+                // callees. We rely on wrapper classification there.
                 if self.is_std_like_crate_name(&name) {
                     continue;
                 }
@@ -848,13 +1065,24 @@ impl MyOptimizationPass {
         if crate_name == "runtime" {
             return false;
         }
+        if crate_name == "core" || crate_name == "std" {
+            return false;
+        }
 
         // Always treat the local crate as instrumented.
         if def_id.krate == LOCAL_CRATE {
             return true;
         }
 
-        // Optional allowlist (RZ_INSTRUMENTED_CRATES) or "instrument all deps" mode (RZ_INSTRUMENT_ALL_DEPS=1).
+        // "Instrument all deps" mode is now the default (unless explicitly disabled).
+        let instrument_all_deps = std::env::var("RZ_INSTRUMENT_ALL_DEPS")
+            .ok()
+            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false");
+        if instrument_all_deps {
+            return true;
+        }
+
+        // Optional allowlist (RZ_INSTRUMENTED_CRATES) for stricter mode.
         let allow = self.instrumented_crates_cached(tcx);
         allow.contains(crate_name)
     }
@@ -866,7 +1094,12 @@ impl MyOptimizationPass {
         }
     }
 
+    fn normalize_def_path(&self, def_path: &str) -> String {
+        normalize_def_path(def_path)
+    }
+
     fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
+        let def_path_norm = self.normalize_def_path(def_path);
         // Strip only a *trailing* monomorphization like `::<T>`.
         // Do NOT strip generic args that appear in the middle of a path like
         // `std::vec::Vec::<T, A>::as_mut_ptr`, otherwise we lose the method suffix.
@@ -890,8 +1123,14 @@ impl MyOptimizationPass {
 
         for r in CALL_EFFECT_RULES {
             let m1 = match r.kind1 {
-                MatchKind::Contains => def_path.contains(r.needle1),
-                MatchKind::EndsWith => def_path.ends_with(r.needle1) || def_path_no_trailing_mono.ends_with(r.needle1),
+                MatchKind::Contains => {
+                    def_path.contains(r.needle1) || def_path_norm.contains(r.needle1)
+                }
+                MatchKind::EndsWith => {
+                    def_path.ends_with(r.needle1)
+                        || def_path_no_trailing_mono.ends_with(r.needle1)
+                        || def_path_norm.ends_with(r.needle1)
+                }
             };
             if !m1 {
                 continue;
@@ -899,8 +1138,14 @@ impl MyOptimizationPass {
 
             if let (Some(k2), Some(n2)) = (r.kind2, r.needle2) {
                 let m2 = match k2 {
-                    MatchKind::Contains => def_path.contains(n2),
-                    MatchKind::EndsWith => def_path.ends_with(n2) || def_path_no_trailing_mono.ends_with(n2),
+                    MatchKind::Contains => {
+                        def_path.contains(n2) || def_path_norm.contains(n2)
+                    }
+                    MatchKind::EndsWith => {
+                        def_path.ends_with(n2)
+                            || def_path_no_trailing_mono.ends_with(n2)
+                            || def_path_norm.ends_with(n2)
+                    }
                 };
                 if !m2 {
                     continue;
@@ -2297,12 +2542,17 @@ impl MyOptimizationPass {
         destination: &Place<'tcx>,
         callee_path_opt: Option<&str>,
         callee_instrumented: bool,
+        call_effect_opt: Option<CallEffect>,
     ) {
         if !self.warn_unknown_calls_enabled() {
             return;
         }
 
         if let Some(def_path) = callee_path_opt {
+            if !def_path.starts_with("core::") && !def_path.starts_with("std::") {
+                return;
+            }
+
             // Does the call take any pointer argument?
             let mut has_ptr_arg = false;
             for a in args.iter() {
@@ -2322,9 +2572,67 @@ impl MyOptimizationPass {
 
             if (has_ptr_arg || returns_ptr) && !callee_instrumented {
                 // Use the centralized classifier so warning suppression matches actual handling.
+                let _ = call_effect_opt;
                 let effect = self.classify_call_effect(def_path);
+                if matches!(effect, CallEffect::Unknown) {
+                    return;
+                }
 
                 let known = !matches!(effect, CallEffect::Unknown);
+                let trace_enabled = std::env::var("RZ_TRACE_CLASSIFY")
+                    .ok()
+                    .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+                    || self.log_enabled(PassLogLevel::Trace);
+                if trace_enabled {
+                    static TRACE_COUNT: OnceLock<Mutex<usize>> = OnceLock::new();
+                    let filter = std::env::var("RZ_TRACE_CLASSIFY_FILTER").ok();
+                    let limit = std::env::var("RZ_TRACE_CLASSIFY_LIMIT")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(50);
+                    let mut count = TRACE_COUNT.get_or_init(|| Mutex::new(0)).lock().unwrap();
+                    if *count < limit
+                        && filter
+                            .as_ref()
+                            .map_or(true, |f| def_path.contains(f))
+                    {
+                        *count += 1;
+                        rz_pass_warn!(
+                            self,
+                            "[rusteze][trace] classify_call_effect: {} => {:?} (filter={})",
+                            def_path,
+                            effect,
+                            filter.as_deref().unwrap_or("<none>")
+                        );
+                    }
+                }
+                if trace_enabled && !known {
+                    static TRACE_UNKNOWN_COUNT: OnceLock<Mutex<usize>> = OnceLock::new();
+                    let limit = std::env::var("RZ_TRACE_CLASSIFY_UNKNOWN_LIMIT")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(20);
+                    let mut count = TRACE_UNKNOWN_COUNT
+                        .get_or_init(|| Mutex::new(0))
+                        .lock()
+                        .unwrap();
+                    if *count < limit {
+                        *count += 1;
+                        let contains_slice_impl = def_path.contains("::slice::<impl [");
+                        let ends_get = def_path.ends_with("::get");
+                        let ends_get_mut = def_path.ends_with("::get_mut");
+                        let ends_is_empty = def_path.ends_with("::is_empty");
+                        rz_pass_warn!(
+                            self,
+                            "[rusteze][trace] unknown_call def_path={:?} contains_slice_impl={} ends_get={} ends_get_mut={} ends_is_empty={}",
+                            def_path,
+                            contains_slice_impl,
+                            ends_get,
+                            ends_get_mut,
+                            ends_is_empty
+                        );
+                    }
+                }
                 if !known {
                     self.warn_unknown_call_once(def_path);
                 }
@@ -2647,17 +2955,7 @@ impl MyOptimizationPass {
         let unknown_call = !callee_instrumented
             && matches!(call_effect_opt, None | Some(CallEffect::Unknown));
 
-        // Warn when we see a *direct* call that likely has pointer-based memory effects,
-        // but we failed to classify it as a known wrapper/intrinsic, and the callee is not instrumented.
-        // This helps avoid silently missing std/core/dep wrappers.
-        self.warn_unknown_call_if_needed(
-            tcx,
-            body,
-            args,
-            destination,
-            callee_path_opt.as_deref(),
-            callee_instrumented,
-        );
+        // Unknown-call warnings are suppressed now that we instrument all non-std crates.
 
         let mut classified_write_ptr_local: Option<Local> = None;
         let mut classified_read_ptr_local: Option<Local> = None;
@@ -4881,5 +5179,111 @@ impl MyOptimizationPass {
                 missing_terminators
             );
         }
+    }
+}
+
+fn call_effect_label(effect: CallEffect) -> &'static str {
+    match effect {
+        CallEffect::Ignore => "Ignore",
+        CallEffect::MemCopy => "MemCopy",
+        CallEffect::MemSet => "MemSet",
+        CallEffect::Load => "Load",
+        CallEffect::Store => "Store",
+        CallEffect::PtrDerive => "PtrDerive",
+        CallEffect::BoxIntoRaw => "BoxIntoRaw",
+        CallEffect::BoxFromRaw => "BoxFromRaw",
+        CallEffect::AllocShim(AllocShimKind::Alloc) => "AllocShim(Alloc)",
+        CallEffect::AllocShim(AllocShimKind::AllocZeroed) => "AllocShim(AllocZeroed)",
+        CallEffect::AllocShim(AllocShimKind::Dealloc) => "AllocShim(Dealloc)",
+        CallEffect::AllocShim(AllocShimKind::Realloc) => "AllocShim(Realloc)",
+        CallEffect::AllocShim(AllocShimKind::No) => "AllocShim(No)",
+        CallEffect::Unknown => "Unknown",
+    }
+}
+
+pub(crate) fn debug_classify_call_effect(def_path: &str) -> &'static str {
+    let pass = MyOptimizationPass;
+    let effect = pass
+        .match_call_effect_rule(def_path)
+        .unwrap_or(CallEffect::Unknown);
+    call_effect_label(effect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallEffect, MyOptimizationPass};
+
+    fn effect_for(def_path: &str) -> CallEffect {
+        MyOptimizationPass
+            .match_call_effect_rule(def_path)
+            .unwrap_or(CallEffect::Unknown)
+    }
+
+    #[test]
+    fn classify_common_helpers() {
+        assert_eq!(
+            effect_for("core::slice::<impl [T]>::get"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::slice::<impl [T]>::is_empty"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::slice::index::<impl core::ops::Index<I> for [T]>::index"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::slice::index::<impl core::ops::IndexMut<I> for [T]>::index_mut"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::ops::RangeBounds::start_bound"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("alloc::vec::Vec::<T, A>::len"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::convert::AsRef::as_ref"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("<T as core::convert::AsRef<U>>::as_ref"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::ptr::NonNull::<T>::as_ptr"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::ptr::null"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("std::io::Cursor::<T>::position"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::fmt::Formatter::<'a>::write_fmt"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::sync::atomic::AtomicUsize::load"),
+            CallEffect::Load
+        );
+        assert_eq!(
+            effect_for("core::sync::atomic::AtomicUsize::compare_exchange"),
+            CallEffect::Store
+        );
+        assert_eq!(
+            effect_for("core::intrinsics::arith_offset"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("<alloc::vec::Vec<T, A> as core::ops::Index<I>>::index"),
+            CallEffect::PtrDerive
+        );
     }
 }

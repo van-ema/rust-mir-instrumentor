@@ -22,9 +22,19 @@ use rustc_session::config::ErrorOutputType;
 use rustc_session::EarlyDiagCtxt;
 
 use crate::driver::{set_mir_output_paths, CompilerCallbacks};
+use crate::instrumentation::debug_classify_call_effect;
 use crate::util::prefixed_path;
 
 fn main() {
+    if let Ok(def_path) = std::env::var("RZ_DEBUG_MATCH") {
+        let effect = debug_classify_call_effect(&def_path);
+        eprintln!(
+            "[rusteze][trace] debug_classify_call_effect: {} => {}",
+            def_path, effect
+        );
+        std::process::exit(0);
+    }
+
     let mut callbacks = CompilerCallbacks {};
 
     let handler = EarlyDiagCtxt::new(ErrorOutputType::HumanReadable {

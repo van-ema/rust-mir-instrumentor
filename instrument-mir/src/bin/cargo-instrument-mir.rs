@@ -4,6 +4,12 @@ fn main() -> Result<(), i32> {
     let cargo = env::var("CARGO").unwrap_or("cargo".into());
     let mut cmd = std::process::Command::new(cargo);
     let driver = env::current_exe().unwrap().with_file_name("instrument-mir");
+    if env::var("RZ_DEBUG_DRIVER")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!("[rusteze][trace] cargo-instrument-mir driver={}", driver.display());
+    }
 
     // Collect all extra arguments passed after "cargo instrument-mir"
     let mut args: Vec<String> = env::args().skip(2).collect();
