@@ -50,6 +50,7 @@ Status
 	•	Argument passing escape events are emitted at call boundaries.
 	•	Unknown call policy implemented (read/write/escape for pointer args).
 	•	Common helpers classified (Deref, Iterator adaptors, slice iter).
+	•	Static metadata reads handled (macOS + Linux image segment scan); vtable/rodata reads no longer flagged as WILD_POINTER.
 
 2. Unknown Call Policy
 Adopt a single consistent policy:
@@ -87,6 +88,14 @@ Exit Criteria
 	•	No random violations across runs
 	•	Fewer “unknown call with pointer effects” warnings
 	•	Violations are explainable and stable
+
+Next step
+	•	Finish call-classification for remaining noisy std/core helpers (cmp/hash/atomic-ptr paths),
+	  and wire a local wrapper script so we always build with `RZ_INSTRUMENT_ALL_DEPS=1`
+	  using the in-repo driver (no global install cache).
+	•	Re-run medium crates (bytes/smallvec) in debug+release to confirm:
+	  - no unknown-call warnings from non-std crates
+	  - stable, explainable violations only
 
 ⸻
 
