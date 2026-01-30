@@ -63,6 +63,7 @@ members = [
     "examples/sb_lite_raw_cast_from_ref",
     "examples/sb_lite_raw_from_ref_fn",
     "examples/sb_lite_raw_transmute",
+    "examples/sb_miri_micro",
     "medium/bytes_driver",
     "medium/smallvec_driver",
     "instrument-mir",

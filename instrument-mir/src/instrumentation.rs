@@ -347,8 +347,10 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at_mut", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::copy_from_slice", CallEffect::Ignore),
-    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts", CallEffect::Ignore),
-    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts_mut", CallEffect::Ignore),
+    // from_raw_parts{,_mut} return slice references derived from the base pointer.
+    // This is heavily used by unsafe code; modeling it as PtrDerive avoids losing lineage.
+    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts", CallEffect::PtrDerive),
+    EffectRule::one(MatchKind::Contains, "::slice::from_raw_parts_mut", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::iter::IntoIterator", MatchKind::EndsWith, "::into_iter", CallEffect::Ignore),
 
     // Vec helpers (metadata + length management).
