@@ -1,293 +1,196 @@
+Roadmap
+
+Current status
+	•	Phase 0 (harness): completed
+	•	Phase 1 (call boundaries + std/core classification): completed (bytes/smallvec debug+release stable)
+	•	Phase 2 (alloc/realloc epochs): completed
+	•	Phase 3 (SB-lite): completed (micro-suite + example tests passing)
+Next step
+	•	Phase 4 (Tree Borrows) for higher precision (reduce SB-lite false positives)
+	•	In parallel: Phase 6 (Fuzzing + Evaluation) to generate real findings and paper-ready metrics
+
+⸻
+
 Phase 0 — Lock in a Repeatable Test Harness (COMPLETED)
 
 Goal
-
-Make failures reproducible, classifiable, and stable before adding new semantics.
+	•	Make failures reproducible, classifiable, and stable before adding new semantics.
 
 Tasks
 	•	Create a script: scripts/run_harness.sh
 	•	The script should:
-	1.	Run flaky micro-examples (e.g. memset_u8_dynamic) 200–1000 times
-	2.	Run a small set of medium crates once
-	3.	Capture:
-	•	Instrumentor crashes
-	•	Runtime violations
-	•	First violation signature per run
-	•	Canonicalize violation signatures (e.g., kind + access type + pointer kind + size) to avoid nondeterministic address noise
-	•	Define two execution profiles:
-	•	FAST
-	•	Minimal logging
-	•	Stop at first violation
-	•	DEBUG
-	•	RZ_LOG=Trace
-	•	Preserve MIR dumps for first failing case only
+		1.	Run flaky micro-examples (e.g. memset_u8_dynamic) 200–1000 times
+		2.	Run a small set of medium crates once
+		3.	Capture:
+			•	Instrumentor crashes
+			•	Runtime violations
+			•	First violation signature per run
+			•	Canonicalize violation signatures (kind + access type + pointer kind + size) to avoid nondeterministic address noise
+		4.	Define two execution profiles:
+			•	FAST: minimal logging, stop at first violation
+			•	DEBUG: RZ_LOG=Trace, preserve MIR dumps for first failing case only
 
 Exit Criteria
-	•	Running the harness twice yields:
-	•	the same outcome (pass or same first violation)
-	•	no nondeterministic crashes or random epoch mismatches
+	•	Running the harness twice yields the same outcome (pass or same first violation)
+	•	No nondeterministic crashes or random epoch mismatches
 
 Status
-	•	Completed: `scripts/run_harness.sh` exists with FAST/DEBUG profiles and capture logic.
+	•	Completed: scripts/run_harness.sh exists with FAST/DEBUG profiles and capture logic.
 
 ⸻
 
-Phase 1 — Call Boundary Semantics (High-Leverage, Low-Cost)
+Phase 1 — Call Boundary Semantics + Std/Core Classification (COMPLETED)
 
-This phase dramatically reduces false positives before SB/TB.
+Goal
+	•	Reduce false positives at call boundaries; remove “unknown call” noise when deps are instrumented.
 
 Implementation
-
-1. Argument Passing (Minimum Viable Semantics)
-	•	When a pointer/reference is passed as a function argument:
-	•	Record ESCAPE(tag) (conservative)
-	•	Do not treat argument passing as READ/WRITE.
-	•	Returned pointers:
-	•	Create a fresh tag
-	•	Parent = UNKNOWN (tag=0), snapshot alloc_epoch from pointee allocation
+	•	Argument passing:
+		•	record coarse ESCAPE/USE for pointer arguments (conservative)
+		•	do not treat argument passing itself as READ/WRITE
+	•	Pointer returns:
+		•	recover tags across instrumented calls via ret-tag side-channel
+		•	fallback when missing: synthesize a root raw tag (avoid UNKNOWN_TAG)
+	•	Unknown calls:
+		•	conservative policy (read/write/escape) when truly unclassified and uninstrumented
+	•	Std/core call classification:
+		•	extend matcher to cover def-path normalization cases
+	•	Static memory:
+		•	image/segment scan so vtable/.rodata reads are not flagged as WILD_POINTER
 
 Status
-	•	Argument passing escape events are emitted at call boundaries.
-	•	Unknown call policy implemented (read/write/escape for pointer args).
-	•	Common helpers classified (Deref, Iterator adaptors, slice iter).
-	•	Static metadata reads handled (macOS + Linux image segment scan); vtable/rodata reads no longer flagged as WILD_POINTER.
-
-2. Unknown Call Policy
-Adopt a single consistent policy:
-
-Unknown calls may read/write/escape all pointer arguments.
-
-Concretely:
-	•	For every pointer argument:
-	•	mark as escaped
-	•	Optionally log a warning (once per function)
-
-3. Small Call Classification Table
-Manually whitelist a few common patterns:
-	•	Deref::deref
-	•	iterator adaptors (next, nth)
-	•	slice helpers
-	•	Vec::as_ptr / Vec::as_mut_ptr
-	•	slice::as_ptr / slice::as_mut_ptr
-	•	ptr::copy*, memcpy, memset
-
-Even 5–10 entries reduce noise massively.
-
-Testing Gate
-
-Micro
-	•	Existing memcpy/memset examples
-	•	Run 1000× without nondeterminism
-
-Medium Crates (START NOW)
-	•	bytes
-	•	smallvec
-	•	serde (compile + subset of tests)
-
-Exit Criteria
-	•	No random violations across runs
-	•	Fewer “unknown call with pointer effects” warnings
-	•	Violations are explainable and stable
-
-Next step
-	•	Chase the remaining `UNKNOWN_TAG` / untagged pointer uses seen in debug
-	  runs (e.g., `medium_smallvec_driver`), and fix missing tag propagation at
-	  raw-pointer creation or call boundaries.
-	•	Add a focused micro-example that reproduces the missing propagation.
-	•	Re-run medium crates (bytes/smallvec) in debug+release to confirm:
-	  - no unknown-call warnings from non-std crates
-	  - stable, explainable violations only
+	•	Bytes/smallvec build+run stable in debug+release.
+	•	UNKNOWN_TAG in medium_smallvec_driver fixed via return-tag fallback (__rz_take_ret_tag_or_root).
 
 ⸻
 
-Phase 2 — Allocation Model Completeness (Epoch Soundness)
+Phase 2 — Allocation Model Completeness (Epoch Soundness) (COMPLETED)
 
-Before aliasing checks, allocation tracking must be correct.
+Goal
+	•	Make allocation tracking correct enough that safe code does not trip stale-epoch bugs.
 
 Implementation
 	•	Intercept and record:
-	•	allocation
-	•	deallocation
-	•	reallocation (critical for Vec)
+		•	allocation
+		•	deallocation
+		•	reallocation (critical for Vec)
 	•	On realloc:
-	•	if realloc returns same base: keep epoch, update size
-	•	if realloc moves: bump epoch on old base, mark old dead, new base gets fresh epoch
+		•	if realloc returns same base: keep epoch, update size
+		•	if realloc moves: bump epoch on old base, mark old dead, new base gets fresh epoch
 
 Status
-	•	Same-base realloc now preserves epoch; moved realloc marks old dead and records new base.
-	•	Added micro example: `examples/realloc_same_base` (expected ok).
-
-Store per allocation:
-	•	base
-	•	size
-	•	epoch
-	•	live/dead flag
-
-Testing Gate
-
-Micro
-	•	Stress tests:
-	•	Vec::push/pop/reserve/extend
-	•	String growth and shrink
-
-Medium
-	•	bytes
-	•	regex
-
-Exit Criteria
-	•	No stale-epoch violations from pure safe code
-	•	Realloc-heavy workloads are stable
+	•	Same-base realloc preserves epoch; moved realloc marks old dead and records new base.
+	•	Micro example added: examples/realloc_same_base (expected ok).
 
 ⸻
 
-Phase 3 — Stacked Borrows (Lite Version)
+Phase 3 — Stacked Borrows (Lite Version) (COMPLETED)
 
-This introduces real aliasing checks with minimal complexity.
+Goal
+	•	Add aliasing bugs as a first-class bug class with minimal complexity.
 
 Implementation (Lite)
-	•	Add retag points:
-	•	reference creation
-	•	function entry for reference arguments
-	•	Maintain a per-allocation stack:
-	•	&mut adds a unique entry
-	•	& adds a shared entry
-	•	On access:
-	•	READ allowed if compatible
-	•	WRITE requires top unique
-	•	Otherwise, report a violation
+	•	Retag points:
+		•	reference creation
+		•	function entry for reference arguments
+	•	Per-allocation borrow stack:
+		•	&mut adds a unique entry
+		•	& adds a shared entry
+		•	unique reborrow invalidates/truncates newer stack state (SB-style)
+	•	Access checks:
+		•	READ allowed if compatible
+		•	WRITE requires top unique
+	•	UnsafeCell carve-out / opt-out marker to avoid exploding on interior mutability patterns.
 
-Add an explicit UnsafeCell carve-out before Medium crates (skip alias checks for allocations containing UnsafeCell or an opt-out marker).
-
-Testing Gate
-
-Micro
-	•	Two &mut to same location
-	•	& + write through raw pointer
-	•	Reborrow chains
-
-Medium
-	•	smallvec
-	•	bytes
-	•	clap
-
-Exit Criteria
-	•	Expected micro violations are caught
-	•	Medium crates do not explode with false positives
+Status
+	•	SB-lite implemented with per-allocation stack + invalidation on unique reborrow.
+	•	Micro suite added; scripts/run_example_tests.py passes.
 
 ⸻
 
-Phase 4 — Tree Borrows (Precision Upgrade)
+Phase 4 — Tree Borrows (Precision Upgrade) (NEXT)
 
-Reduce false positives caused by stacked discipline.
+Goal
+	•	Reduce SB-lite false positives while keeping strong bug-finding power.
 
 Implementation
 	•	Replace stack with derivation tree:
-	•	parent pointer
-	•	permission bits
+		•	parent pointer
+		•	permission/state bits
 	•	On conflict:
-	•	invalidate subtree
-	•	Enforce parent-child permission rules
+		•	invalidate subtree
+		•	enforce parent-child permission rules on reads/writes
+	•	Maintain a clean “mode switch”:
+		•	coverage mode (low-FP, exploration)
+		•	precision mode (SB-lite/TB enabled)
 
 Testing Gate
-	•	Re-run all previous medium crates
+	•	Re-run all micro-suite + bytes/smallvec/serde in both modes
 	•	Compare violation count and stability vs SB-lite
+
+Exit Criteria
+	•	TB reduces false positives vs SB-lite on medium crates
+	•	Micro violations remain caught and stable
 
 ⸻
 
 Phase 5 — Bigger Crates & Ecosystem Coverage
 
-When to Start Big Crates
+Goal
+	•	Scale to real software without instrumentor crashes and without “noise storms”.
 
-You are ready when:
-	•	Medium crates run without instrumentor crashes
-	•	Violations are reproducible and classifiable
-
-Suggested Big Crates
+Suggested targets
 	•	ripgrep
 	•	reqwest / hyper
 	•	rust-analyzer components
 
-Run in:
-	•	coverage mode first (conservative unknown calls)
-	•	precision mode later (SB/TB enabled)
+Strategy
+	•	Run in coverage mode first (conservative unknown calls, minimal alias enforcement)
+	•	Then re-run in precision mode (SB-lite/TB enabled)
 
 ⸻
 
-Phase 6 — Evaluation & Fuzzing Integration (Publication-Grade)
+Phase 6 — Fuzzing + Evaluation (Paper Track)
 
 Goal
+	•	Make results defensible for a first-tier security paper and practical for fuzzing workflows.
 
-Make results defensible for a first-tier paper and practical for fuzzing workflows.
+What “paper-ready” requires
+	•	Clear claim/scope: dynamic MIR instrumentation + runtime checks for memory-safety bugs.
+	•	Stable toolchain story: reproducible outputs, low false positives on safe code, triage/dedup pipeline.
+	•	Real bugs: previously-unknown issues in widely-used crates (or strong results on known UB corpora + comparisons).
+	•	Quantitative evaluation: precision, coverage, overhead, stability.
 
 Implementation
-	•	Add a fuzzing harness (cargo-fuzz/libFuzzer) that:
-		•	runs instrumented binaries
-		•	deduplicates violations by canonical signature
-		•	saves minimal repro inputs
-	•	Add a triage script:
-		•	group by violation kind + access type + pointer kind + size
-		•	tag as true/false positive based on a small review set
-	•	Collect performance metrics:
-		•	run-time slowdown vs baseline
+	•	Fuzzing harness:
+		•	cargo-fuzz/libFuzzer (or AFL++), running instrumented targets
+		•	deduplicate by canonical signature (kind + access + ptr kind + size + callsite)
+		•	store repro inputs (+ optional minimization)
+	•	Triage pipeline:
+		•	group violations by signature
+		•	auto-attach: backtrace/location, crate/version, mode (coverage vs precision), seed
+	•	Metrics collection:
+		•	runtime slowdown vs baseline
 		•	peak memory overhead
+		•	instrumentation/build time overhead
+		•	stability across runs (same input => same signature)
 
-Evaluation Benchmarks
-	•	UB suites: core UB examples + public Rust UB test corpus
-	•	Medium crates: bytes, smallvec, serde (instrumented tests)
-	•	Larger crates: ripgrep, reqwest/hyper, rust-analyzer components
-	•	Comparisons: Miri, ASan, and at least one dynamic Rust tool (if feasible)
-
-Exit Criteria
-	•	Reproducible violation signatures across runs
-	•	Actionable bug reports from fuzzing on real crates
-	•	Clear precision/coverage tradeoff documented in main.tex
-
-⸻
-
-Phase 6 — Evaluation (Make Results Defensible)
-
-Metrics
-	•	Runtime overhead (median + p95 slowdown)
-	•	Memory overhead
-	•	Instrumentation time
-	•	Violation count and stability across runs
-
-Baselines
-	•	Uninstrumented build
-	•	Coverage-only instrumentation (no checks)
-	•	SB-lite and TB modes
-
-Datasets
-	•	Micro-suite (existing examples)
-	•	Medium crates: bytes, smallvec, serde
-	•	Large crate: ripgrep or hyper/reqwest
-	•	Curated UB corpus (known UAF/OOB repros)
+Benchmarks
+	•	Micro UB suite: existing examples + curated UB corpus
+	•	Medium “safe” set: bytes, smallvec, serde/serde_json (instrumented tests or drivers)
+	•	Large set: ripgrep or reqwest/hyper
+	•	Comparisons (as feasible): Miri, ASan/UBSan, at least one dynamic Rust tool
 
 Exit Criteria
-	•	Overhead numbers are reported for each profile
-	•	Violations are reproducible and explainable
-
-⸻
-
-Definition of “Done” (Practical)
-
-You are done when:
-	•	Fuzz targets run without ICEs or crashes
-	•	You reliably catch:
-	•	OOB
-	•	UAF
-	•	double free
-	•	write-through-shared-ref
-	•	cross-call aliasing bugs
-	•	Unknown-wrapper warnings are rare or non-fatal
-	•	Results are stable across runs
-
-⸻
+	•	Fuzz targets run without ICEs/crashes in the tool
+	•	Violations are reproducible and explainable (deduped signatures)
+	•	Non-trivial set of actionable issues with minimized repros
+	•	Overhead numbers reported for coverage vs precision modes
 
 Immediate Next Actions (Concrete)
-	1.	Implement SB-lite retagging + per-allocation borrow stack (behind a flag).
-	2.	Add UnsafeCell carve-out / opt-out marker before running medium crates.
-	3.	Run bytes + smallvec in SB-lite mode; keep coverage-only as fallback.
-	4.	Iterate on false positives, then move toward TB.
+	1.	Define TB design and implement Phase 4 behind a flag.
+	2.	Add a fuzzing integration (start with cargo-fuzz + one target crate).
+	3.	Add 3 initial fuzz targets: bytes, smallvec, serde_json.
+	4.	Run for fixed budgets (e.g., 6–24 CPU hours/target), dedup and triage, file reports upstream.
+	5.	Collect overhead + stability metrics on the benchmark sets and write up methodology in main.tex.
 
-⸻
