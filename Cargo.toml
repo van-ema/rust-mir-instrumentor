@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "afl_harness",
     "dynamic_loader",
     "examples/call_arg_offset",
     "examples/call_arg_offset_add_sub",
@@ -63,6 +64,7 @@ members = [
     "examples/sb_lite_raw_cast_from_ref",
     "examples/sb_lite_raw_from_ref_fn",
     "examples/sb_lite_raw_transmute",
+    "examples/sb_lite_unsafe_cell_raw_read_ok",
     "examples/sb_miri_micro",
     "fuzz/afl_harness",
     "medium/bytes_driver",

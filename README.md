@@ -60,9 +60,13 @@ make run EXAMPLE=hello PROFILE=release
 - `RZ_LOG`: Log level for runtime output (`trace`, `info`, `warn`); default is `warn`.
 - `RZ_LOG_LOC`: If set to `1` or `true`, include caller location information in runtime violation logs.
 - `RZ_BACKTRACE_UNKNOWN_TAG`: If set to `1` or `true`, include a backtrace on `UNKNOWN_TAG` violations.
+- `RZ_BACKTRACE`: If set to `1` or `true`, include a backtrace on **any** violation.
 - `RUSTEZE_FAILFAST`: If non-zero, panic on violation; default is log-and-continue.
+- `RZ_ABORT_ON_VIOLATION`: If non-zero, abort immediately after reporting a violation.
 - `RZ_ABORT_ON_DOUBLE_FREE`: If non-zero, abort the process on `DOUBLE_FREE` after reporting.
 - `RZ_STRICT_FREE_CHECK`: If non-zero, treat frees of unknown bases as violations (and skip system dealloc).
+- `RZ_SB_LITE`: If set to `0` or `false`, disable SB-lite aliasing checks; default is enabled.
+- `RZ_SB_DUMP`: If set to `1` or `true`, include SB-lite borrow stack + tag ancestry on SB violations.
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a
   `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap
@@ -145,16 +149,35 @@ RZ_LOG=trace RZ_LOG_LOC=1 ./target/release/hello
 # Include a backtrace on UNKNOWN_TAG violations
 RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE_UNKNOWN_TAG=1 ./target/release/hello
 
+# Include backtraces on any violation
+RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE=1 ./target/release/hello
+
+# Dump SB-lite stacks on SB violations
+RZ_LOG=trace RZ_LOG_LOC=1 RZ_SB_DUMP=1 ./target/release/hello
+
 # See instrumented vs dep crates during compilation
 RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bin hello
 
 ```
 
-## AFL++ (Docker)
+## AFL++ (Docker + harness)
 
-If you want AFL++ tooling on Linux (useful for crash reproduction and minimization),
-see `docker/afl/README.md`. This is especially handy on macOS hosts where AFL++
-shared-memory can be unreliable.
+The repo includes an AFL++ harness crate with drivers: `afl_bytes_driver` and
+`afl_smallvec_driver`.
+
+On macOS, AFL++ shared-memory can be unreliable; the recommended workflow is to
+use the Linux container described in `docker/afl/README.md`.
+
+```bash
+# Build the harness (requires AFL++ runtime object `afl-compiler-rt.o`)
+TARGET=bytes PROFILE=release ./scripts/afl_build.sh
+
+# Run AFL++
+TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
+
+# Reproduce a single crash
+TARGET=bytes PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/bytes/default/crashes/id:...
+```
 
 
 

@@ -19,12 +19,15 @@ case "$TARGET" in
   *) echo "unknown TARGET=$TARGET (expected bytes|smallvec)" >&2; exit 2 ;;
 esac
 
-HARNESS_TARGET_DIR="./target/afl-${PROFILE}"
+HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
 RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
+export RUSTC_TMPDIR="${RUSTC_TMPDIR:-${CARGO_TARGET_DIR}/tmp}"
+export TMPDIR="${TMPDIR:-${CARGO_TARGET_DIR}/tmp}"
+mkdir -p "$RUSTC_TMPDIR"
 
 if [[ -z "$AFL_COMPILER_RT" ]]; then
   if [[ -n "$AFL_PATH" && -f "${AFL_PATH}/afl-compiler-rt.o" ]]; then

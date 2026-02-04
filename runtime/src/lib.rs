@@ -76,6 +76,13 @@ fn rz_abort_on_double_free() -> bool {
 }
 
 #[inline]
+fn rz_abort_on_violation() -> bool {
+    std::env::var("RZ_ABORT_ON_VIOLATION")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
 fn rz_stack_addr_hint(addr: usize) -> bool {
     // Heuristic: treat addresses within +/-8MiB of the current stack pointer as stack.
     let local = 0u8;
@@ -590,6 +597,13 @@ fn rz_sb_lite_enabled() -> bool {
         .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+#[inline]
+fn rz_sb_dump_enabled() -> bool {
+    std::env::var("RZ_SB_DUMP")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
 fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -690,7 +704,8 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
 }
 
 fn sb_lite_check(
-    tag: u64,
+    sb_tag: u64,
+    orig_tag: u64,
     tmeta: &TagMeta,
     addr: usize,
     size: usize,
@@ -707,11 +722,12 @@ fn sb_lite_check(
         return None;
     }
 
-    let base = {
+    let (base, alloc_meta) = {
         let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, addr)
-            .map(|(b, _)| b)
-            .unwrap_or(addr)
+        match find_alloc_containing(&amap, addr) {
+            Some((b, m)) => (b, Some(m.clone())),
+            None => (addr, None),
+        }
     };
 
     let mut bmap = borrows().lock().unwrap();
@@ -725,16 +741,101 @@ fn sb_lite_check(
         None => return None,
     };
 
+    // If the ref ancestor is alias-exempt (UnsafeCell/interior mutability), skip SB-lite checks.
+    if let Some(sb_meta) = tags().lock().unwrap().get(&sb_tag) {
+        if sb_meta.alias_exempt {
+            return None;
+        }
+    }
+
+    let dump = if rz_sb_dump_enabled() {
+        let tmap = tags().lock().unwrap();
+        let mut out = String::new();
+        out.push_str("\n-- sb-lite dump --\n");
+        out.push_str(&format!("base=0x{base:x} addr=0x{addr:x} size={size}\n"));
+        if let Some(ameta) = alloc_meta.as_ref() {
+            out.push_str(&format!(
+                "alloc: live={} epoch={} size={} is_stack={}\n",
+                ameta.live, ameta.epoch, ameta.size, ameta.is_stack
+            ));
+        } else {
+            out.push_str("alloc: <none>\n");
+        }
+        out.push_str(&format!(
+            "tag_meta: orig_tag={} sb_tag={} kind={:?} parent={} pointee=0x{:x} alloc_epoch={} live_at_creation={} escaped={} alias_exempt={}\n",
+            orig_tag,
+            sb_tag,
+            tmeta.kind,
+            tmeta.parent,
+            tmeta.pointee_addr,
+            tmeta.alloc_epoch,
+            tmeta.alloc_live_at_creation,
+            tmeta.escaped,
+            tmeta.alias_exempt
+        ));
+        out.push_str("tag_ancestry:\n");
+        let mut cur = sb_tag;
+        for i in 0..32 {
+            match tmap.get(&cur) {
+                Some(tm) => {
+                    out.push_str(&format!(
+                        "  {i}: tag={} kind={:?} parent={} pointee=0x{:x} alloc_epoch={} escaped={} alias_exempt={}\n",
+                        cur,
+                        tm.kind,
+                        tm.parent,
+                        tm.pointee_addr,
+                        tm.alloc_epoch,
+                        tm.escaped,
+                        tm.alias_exempt
+                    ));
+                    if tm.parent == 0 {
+                        break;
+                    }
+                    cur = tm.parent;
+                }
+                None => {
+                    out.push_str(&format!("  {i}: tag={} <missing>\n", cur));
+                    break;
+                }
+            }
+        }
+        out.push_str("borrow_stack (bottom->top):\n");
+        for (i, entry) in stack.iter().enumerate() {
+            if let Some(tm) = tmap.get(&entry.tag) {
+                out.push_str(&format!(
+                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} alias_exempt={}\n",
+                    entry.tag,
+                    entry.kind,
+                    tm.kind,
+                    tm.parent,
+                    tm.pointee_addr,
+                    tm.alias_exempt
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {i}: tag={} stack_kind={:?} <missing>\n",
+                    entry.tag, entry.kind
+                ));
+            }
+        }
+        out.push_str("-- end sb-lite dump --\n");
+        out
+    } else {
+        String::new()
+    };
+
     match access {
         AccessKind::Read => {
             let mut seen_unique = false;
             for entry in stack.iter().rev() {
-                if entry.tag == tag {
+                if entry.tag == sb_tag {
                     if seen_unique {
-                        return Some(format!(
-                            "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                        let mut msg = format!(
+                            "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                             tmeta.kind, top.kind, top.tag
-                        ));
+                        );
+                        msg.push_str(&dump);
+                        return Some(msg);
                     }
                     return None;
                 }
@@ -742,16 +843,18 @@ fn sb_lite_check(
                     seen_unique = true;
                 }
             }
-            Some(format!(
-                "READ via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+            let mut msg = format!(
+                "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                 tmeta.kind, top.kind, top.tag
-            ))
+            );
+            msg.push_str(&dump);
+            Some(msg)
         }
         AccessKind::Write => {
             let mut is_top = true;
             let mut seen_unique = false;
             for (idx, entry) in stack.iter().enumerate().rev() {
-                if entry.tag == tag {
+                if entry.tag == sb_tag {
                     if entry.kind == BorrowKind::Unique {
                         if is_top {
                             return None;
@@ -771,10 +874,12 @@ fn sb_lite_check(
                             return None;
                         }
                     }
-                    return Some(format!(
-                        "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+                    let mut msg = format!(
+                        "WRITE via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                         tmeta.kind, top.kind, top.tag
-                    ));
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
                 }
                 if entry.kind == BorrowKind::Unique {
                     seen_unique = true;
@@ -783,10 +888,12 @@ fn sb_lite_check(
                     is_top = false;
                 }
             }
-            Some(format!(
-                "WRITE via tag={tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
+            let mut msg = format!(
+                "WRITE via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                 tmeta.kind, top.kind, top.tag
-            ))
+            );
+            msg.push_str(&dump);
+            Some(msg)
         }
     }
 }
@@ -814,11 +921,16 @@ fn rz_violation(kind: &str, msg: String) {
     rz_emit_str("\n================ RUSTEZE VIOLATION ================\n");
     rz_emit_str(kind);
     rz_emit_str("\n");
+    let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE");
     rz_emit_str(&msg);
     if !msg.ends_with('\n') {
         rz_emit_str("\n");
     }
     rz_emit_str("===================================================\n\n");
+
+    if rz_abort_on_violation() {
+        std::process::abort();
+    }
 
     // Fail-fast only if requested
     let failfast = std::env::var("RUSTEZE_FAILFAST").ok().map_or(false, |v| v != "0");
@@ -994,7 +1106,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     };
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = sb_lite_check(sb_tag, &tmeta, addr, size, AccessKind::Write) {
+        if let Some(msg) = sb_lite_check(sb_tag, tag, &tmeta, addr, size, AccessKind::Write) {
             rz_violation(
                 "STACKED_BORROWS_VIOLATION",
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -1252,7 +1364,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     };
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = sb_lite_check(sb_tag, &tmeta, addr, size, AccessKind::Read) {
+        if let Some(msg) = sb_lite_check(sb_tag, tag, &tmeta, addr, size, AccessKind::Read) {
             rz_violation(
                 "STACKED_BORROWS_VIOLATION",
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),

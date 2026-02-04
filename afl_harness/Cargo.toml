@@ -1,0 +1,8 @@
+[package]
+name = "afl_harness"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { path = "../third_party/bytes" }
+smallvec = { path = "../third_party/smallvec" }

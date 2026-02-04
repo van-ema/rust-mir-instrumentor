@@ -17,7 +17,7 @@ case "$TARGET" in
   *) echo "unknown TARGET=$TARGET (expected bytes|smallvec)" >&2; exit 2 ;;
 esac
 
-HARNESS_TARGET_DIR="./target/afl-${PROFILE}"
+HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
 BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
 IN_DIR="fuzz/corpus/${TARGET}"
 OUT_DIR="fuzz/out/${TARGET}"
