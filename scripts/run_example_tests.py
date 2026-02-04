@@ -141,10 +141,22 @@ def main() -> int:
     profile_args: list[str] = []
     runtime_path = repo_root / "target" / "debug"
     bin_dir = repo_root / "target" / "debug"
+    tool_dir = repo_root / "target" / "debug"
     if build_profile == "release":
         runtime_path = repo_root / "target" / "release"
         bin_dir = repo_root / "target" / "release"
+        tool_dir = repo_root / "target" / "release"
         profile_args = ["--release"]
+
+    # Prefer locally built tools if present, to avoid accidental mismatches between
+    # the workspace state and any globally-installed `cargo-instrument-mir`.
+    #
+    # This is especially important for tests that exercise new instrumentation logic:
+    # the example expectations track the repo's behavior, not the system install.
+    local_cargo_tool = tool_dir / "cargo-instrument-mir"
+    local_inst_tool = tool_dir / "instrument-mir"
+    if local_cargo_tool.exists() and local_inst_tool.exists():
+        env["PATH"] = f"{tool_dir}{os.pathsep}{env.get('PATH', '')}"
 
     build_cmd = [cargo, "build", "-p", "runtime"] + profile_args
     subprocess.run(build_cmd, env=env, check=True)

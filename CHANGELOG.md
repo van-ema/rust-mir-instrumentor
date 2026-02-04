@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Instrumentation: handle wide/fat pointers (`&[T]`, `&str`, `dyn Trait`) by extracting a thin data pointer (`*const ()`/`*mut ()`) before `PointerExposeProvenance`, so tags/epochs are keyed by the data address.
+- Instrumentation: treat wide pointer locals as tag-relevant for deref read/write and raw-root synthesis so lineage isn’t dropped to tag=0 before a thin data pointer is extracted.
+- Examples: add wide-pointer micro-examples (`wide_ptr_slice_uaf_read`, `wide_ptr_slice_uaf_write`, `wide_ptr_raw_slice_cast_ok`, `wide_ptr_raw_str_cast_ok`).
 - SB-lite: invalidate on new unique reborrow (truncate/clear stack) and tighten access checks to require the accessing tag to be present and not blocked by a newer unique borrow.
 - SB-lite: raw pointers now check against the nearest reference ancestor (SB-style), with a heuristic to allow raw writes when only shared reborrows are above the unique ancestor.
 - Instrumentation: avoid inserting `RawRoot` for pointer locals that already have a real tag source to prevent tag overwrite in control-flow orderings.

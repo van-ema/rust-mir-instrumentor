@@ -81,11 +81,14 @@ else
   runtime_features=(--features rz_log)
 fi
 
+build_runtime_cmd=("${CARGO}" build -p runtime)
 if (( ${#profile_flag[@]} )); then
-  "${CARGO}" build -p runtime "${profile_flag[@]}" "${runtime_features[@]}"
-else
-  "${CARGO}" build -p runtime "${runtime_features[@]}"
+  build_runtime_cmd+=("${profile_flag[@]}")
 fi
+if (( ${#runtime_features[@]} )); then
+  build_runtime_cmd+=("${runtime_features[@]}")
+fi
+"${build_runtime_cmd[@]}"
 
 extract_signature() {
   local log_file="$1"

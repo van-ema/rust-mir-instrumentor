@@ -758,7 +758,10 @@ impl MyOptimizationPass {
     }
 
     /// Ensure `ptr_local` has a tag by synthesizing a `RawRoot` before the current statement
-    /// if it hasn't been tagged yet. Only applies to THIN pointers.
+    /// if it hasn't been tagged yet.
+    ///
+    /// For wide pointers (`&[T]`, `&str`, `dyn Trait`), RawRoot lowering will first extract the
+    /// thin data pointer (dropping metadata) and root-tag that address.
     fn ensure_raw_root_before<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -777,8 +780,7 @@ impl MyOptimizationPass {
         }
 
         let ptr_ty = body.local_decls[ptr_local].ty;
-        if !self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
-            // Do not attempt to RawRoot-tag wide pointers.
+        if !self.is_pointer_ty(ptr_ty) {
             return;
         }
 
@@ -861,8 +863,11 @@ impl MyOptimizationPass {
     }
 
     /// Build statements that compute `addr_local` from a pointer-typed place.
-    /// For thin pointers we can expose provenance directly.
-    /// For wide pointers, skip address extraction to avoid codegen ICEs on scalar-pair operands.
+    ///
+    /// - For thin pointers we can `PointerExposeProvenance` directly.
+    /// - For wide pointers (`&[T]`, `&str`, `dyn Trait`), we first cast to a thin raw pointer
+    ///   to unit (`*const ()` / `*mut ()`) to drop metadata, then expose provenance from the
+    ///   thin data pointer.
     fn addr_stmts_for_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -872,11 +877,6 @@ impl MyOptimizationPass {
         addr_local: Local,
     ) -> Option<(Option<Statement<'tcx>>, Statement<'tcx>)> {
         let place_ty = place.ty(&body.local_decls, tcx).ty;
-        if let TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) = place_ty.kind() {
-            if !pointee.is_sized(tcx, body.typing_env(tcx)) {
-                return None;
-            }
-        }
         if self.is_thin_ptr_ty(tcx, place_ty) {
             let addr_stmt = Statement::new(
                 source_info,
@@ -892,7 +892,33 @@ impl MyOptimizationPass {
             return Some((None, addr_stmt));
         }
 
-        None
+        // Wide pointer: extract data pointer first.
+        let data_ptr_ty = self.data_ptr_ty_for_ptr(tcx, place_ty)?;
+        let data_ptr_local = body
+            .local_decls
+            .push(LocalDecl::new(data_ptr_ty, source_info.span));
+
+        let data_ptr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(data_ptr_local),
+                Rvalue::Cast(CastKind::PtrToPtr, Operand::Copy(place), data_ptr_ty),
+            ))),
+        );
+
+        let addr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(addr_local),
+                Rvalue::Cast(
+                    CastKind::PointerExposeProvenance,
+                    Operand::Copy(Place::from(data_ptr_local)),
+                    tcx.types.usize,
+                ),
+            ))),
+        );
+
+        Some((Some(data_ptr_stmt), addr_stmt))
     }
 
     /// Whether to warn about unknown (unclassified) direct calls that may read/write memory via pointers.
@@ -1765,10 +1791,7 @@ impl MyOptimizationPass {
                         let skip_static_ref_read =
                             matches!(ptr_ty.kind(), TyKind::Ref(region, ..) if region.is_static());
                         let skip_vtable_read = self.is_vtable_like_ptr_ty(tcx, ptr_ty);
-                        if !skip_static_ref_read
-                            && !skip_vtable_read
-                            && self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty)
-                        {
+                        if !skip_static_ref_read && !skip_vtable_read && self.is_pointer_ty(ptr_ty) {
                             // Best-effort size: use the type of the *loaded place* (after projections).
                             // This is important for patterns where the destination is a projection
                             // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
@@ -1836,10 +1859,7 @@ impl MyOptimizationPass {
                 let skip_static_ref_write =
                     matches!(ptr_ty.kind(), TyKind::Ref(region, ..) if region.is_static());
                 let skip_vtable_write = self.is_vtable_like_ptr_ty(tcx, ptr_ty);
-                if !skip_static_ref_write
-                    && !skip_vtable_write
-                    && self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty)
-                {
+                if !skip_static_ref_write && !skip_vtable_write && self.is_pointer_ty(ptr_ty) {
                     // Best-effort size: use the type of the *place being written* (after projections).
                     // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                     let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
@@ -3794,8 +3814,7 @@ impl MyOptimizationPass {
             //   tag(ptr_local) = __record_raw_ptr_creation(expose(ptr_local), is_mut, 0)
             if let InstrKind::RawRoot { ptr_local, is_mut } = creation_kind.clone() {
                 let ptr_ty = body.local_decls[ptr_local].ty;
-                if !self.is_addr_exposable_ptr_ty(tcx, body, ptr_ty) {
-                    // Skip wide pointers to avoid codegen ICEs on scalar-pair operands.
+                if !self.is_pointer_ty(ptr_ty) {
                     continue;
                 }
                 let dst_tag = *tag_local_for_ptr_local

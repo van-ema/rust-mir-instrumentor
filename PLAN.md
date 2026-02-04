@@ -9,6 +9,7 @@ Current status
 Next step
 	•	Phase 4 (Tree Borrows) for higher precision (reduce SB-lite false positives)
 	•	In parallel: continue Phase 6 to turn fuzz findings into minimized, reproducible, triaged reports
+	•	Phase 7 (Wide/Fat pointers) to support slices/str/dyn Trait and reduce blind spots in real crates
 
 ⸻
 
@@ -212,3 +213,45 @@ Immediate Next Actions (Concrete)
 		•	run overhead on examples + medium (`scripts/bench_overhead.py`), baseline vs rusteze vs ASan
 		•	track “violations per hour” and “unique signatures” for each fuzz target/mode
 	5.	Define TB design and implement Phase 4 behind a flag once fuzzing produces stable signal.
+
+⸻
+
+Phase 7 — Wide/Fat Pointer Support (Slices/str/dyn Trait) (NEXT)
+
+Goal
+	•	Handle Rust wide pointers so real-world crates using `&[T]`, `&str`, and `dyn Trait` are not
+	  silently untracked or incorrectly tagged.
+
+Current limitation
+	•	The instrumentation/runtime primarily assumes thin pointers. Wide pointers carry metadata
+	  (slice length, vtable) and require extracting the *data pointer* for allocation lookup and tagging.
+	•	We often fall back to `size=0` for unsized pointees, weakening OOB checks and lineage propagation.
+
+Implementation plan (incremental)
+	1.	Data-pointer extraction:
+		•	for wide pointer locals used in deref/read/write hooks, extract the data pointer and pass it to runtime hooks
+		  (`expose_provenance` on the data pointer, not on the wide pointer container).
+	2.	Tag association:
+		•	associate tags with the *data pointer address* (thin `*const ()` / `*mut ()`) even when the source is wide.
+		•	ensure derivations (casts, unsize coercions, from_raw_parts) preserve lineage of the data pointer.
+	3.	Best-effort access sizing:
+		•	slices: size = `len * size_of::<T>()` when available
+		•	str: size = `len`
+		•	dyn Trait: size unknown (keep size=0 but still track address/epoch)
+	4.	Tests:
+		•	add micro-examples for raw reads/writes through `&[u8]` and `&str`
+		•	add at least one example for vtable/dyn-trait data-pointer tracking
+
+Exit criteria
+	•	No UNKNOWN_TAG / WILD_POINTER for ordinary slice/str operations in bytes/smallvec drivers.
+	•	Micro-suite covers wide pointer cases and remains stable.
+
+Status (as of 2026-02-04)
+	•	(1) + (2) implemented for the most common paths:
+		•	address extraction for hooks uses a thin data pointer for wide pointers
+		•	wide pointer locals are treated as tag relevant so lineage isn’t dropped before data-pointer extraction
+		•	best-effort same-block unsize backtracking preserves the source local for `&[T]` produced via coercion
+	•	(4) partially implemented:
+		•	new wide-pointer micro-examples exist and are stable under `scripts/run_example_tests.py`
+	•	(3) still pending:
+		•	metadata-aware access sizing (slice/str length) is not implemented yet; unsized accesses often use `size=0`

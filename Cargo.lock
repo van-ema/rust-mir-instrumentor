@@ -1056,6 +1056,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "wide_ptr_dyn_trait_cast_ok"
+version = "0.1.0"
+
+[[package]]
+name = "wide_ptr_dyn_trait_uaf_read"
+version = "0.1.0"
+
+[[package]]
+name = "wide_ptr_raw_slice_cast_ok"
+version = "0.1.0"
+
+[[package]]
+name = "wide_ptr_raw_str_cast_ok"
+version = "0.1.0"
+
+[[package]]
+name = "wide_ptr_slice_uaf_read"
+version = "0.1.0"
+
+[[package]]
+name = "wide_ptr_slice_uaf_write"
+version = "0.1.0"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -140,6 +140,37 @@ use-after-scope cases.
 At runtime, stack UAFs through **references** (`&T` / `&mut T`) are suppressed to
 avoid spurious violations, while **raw-pointer** UAFs remain reported.
 
+## Wide / Fat pointers (slices, `str`, `dyn Trait`)
+
+Rust has *wide* pointers (a.k.a. fat pointers) that carry metadata in addition
+to the data address: `&[T]` / `*const [T]` (length), `&str` / `*const str`
+(length), and `&dyn Trait` / `*const dyn Trait` (vtable).
+
+Rusteze tracks these by treating wide pointers as tag-carrying like any other
+pointer, but extracting a **thin data pointer** whenever we need a concrete
+address for tagging / range lookup:
+
+- In MIR instrumentation, when a hook needs `addr = expose_provenance(ptr)`:
+  - thin pointers: use `PointerExposeProvenance` directly
+  - wide pointers: first cast `ptr` to `*const ()` / `*mut ()` via `PtrToPtr`
+    (dropping metadata), then `PointerExposeProvenance` on that thin data
+    pointer
+- This keeps the runtime metadata keyed by the *data address* even when the
+  source pointer is wide, so later derived thin pointers (e.g. `slice.as_ptr()`)
+  keep the expected tag/epoch lineage.
+
+Current limitations:
+- We do not yet use wide-pointer metadata (slice length / vtable) for precise
+  access-size computation, so OOB checks for `*const [T]` / `*const str` may be
+  weaker when the access size depends on metadata.
+- `dyn Trait` pointee sizes remain unknown; we still track the data address and
+  allocation epoch, but typically use `size=0` for access checks.
+
+Examples:
+- `examples/wide_ptr_slice_uaf_read`, `examples/wide_ptr_slice_uaf_write`
+- `examples/wide_ptr_dyn_trait_uaf_read`
+- `examples/wide_ptr_raw_slice_cast_ok`, `examples/wide_ptr_raw_str_cast_ok`, `examples/wide_ptr_dyn_trait_cast_ok`
+
 ## Debugging recipes
 
 ```bash

@@ -10,6 +10,21 @@ is deferred to codegen/runtime and we no longer query layouts during
 instrumentation. Unsized types or non-thin pointers still fall back to size=0
 as a conservative unknown.
 
+## Wide (fat) pointers: use the data pointer address
+
+Wide pointers (`&[T]`, `&str`, `dyn Trait`) carry metadata in addition to the
+data address, and `PointerExposeProvenance` expects a pointer value.
+
+To keep tag/epoch tracking keyed by a concrete address, the instrumentor
+extracts a **thin** data pointer first:
+
+- thin pointers: `addr = expose_provenance(ptr)`
+- wide pointers: `thin = (ptr as *const ()/*mut ())` then `addr = expose_provenance(thin)`
+
+This drops the metadata (length / vtable) on purpose: the runtime’s allocation
+map is keyed by the data address. Metadata-aware checks (e.g., slice-length OOB)
+are a follow-up step.
+
 ## Unknown-call allow-untagged reads/writes
 
 When we see a direct call that is unclassified and not instrumented, we insert

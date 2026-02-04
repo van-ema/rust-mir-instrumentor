@@ -1,0 +1,7 @@
+[package]
+name = "wide_ptr_slice_uaf_read"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
