@@ -43,12 +43,12 @@ afl-tmin -i crashes/id:000000,* -o minimized \
   -- ./target/afl-release/release/afl_bytes_driver @@
 ```
 
-## Build harnesses inside the container
+## Build harnesses
 
 Inside the container:
 
 ```bash
-TARGET=bytes PROFILE=release ./scripts/afl_build.sh
+RUNTIME_FEATURES="--features rz_log" TARGET=bytes PROFILE=release ./scripts/afl_build.sh
 ```
 
 Then you can run/minimize with `afl-tmin` / `afl-cmin` without doing any fuzzing.

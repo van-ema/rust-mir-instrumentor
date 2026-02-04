@@ -6,7 +6,7 @@ fn main() {
         return;
     }
 
-    let mut v: SmallVec<[u8; 8]> = SmallVec::new();
+    let mut v: SmallVec<u8, 8> = SmallVec::new();
     let mut idx = 0usize;
 
     while idx < data.len() {

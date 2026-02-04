@@ -1085,6 +1085,16 @@ pub extern "C" fn __rz_dump_state() {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    if size == 0 {
+        if rz_log_enabled(LogLevel::Trace) {
+            rz_trace!(
+                "[rusteze-runtime] zero-size WRITE: tag={} addr=0x{:x}",
+                tag,
+                addr
+            );
+        }
+        return;
+    }
     let _g = RzRuntimeGuard::enter();
     let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
@@ -1389,6 +1399,16 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+    if size == 0 {
+        if rz_log_enabled(LogLevel::Trace) {
+            rz_trace!(
+                "[rusteze-runtime] zero-size READ: tag={} addr=0x{:x}",
+                tag,
+                addr
+            );
+        }
+        return;
+    }
     let _g = RzRuntimeGuard::enter();
     let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();

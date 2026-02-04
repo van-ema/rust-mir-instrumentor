@@ -49,11 +49,12 @@ if [[ -z "$AFL_COMPILER_RT" || ! -f "$AFL_COMPILER_RT" ]]; then
 fi
 
 # Build rusteze toolchain + runtime in the chosen profile.
+RUNTIME_FEATURES="${RUNTIME_FEATURES:-}"
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build -p runtime --release
+  cargo build -p runtime --release ${RUNTIME_FEATURES}
   cargo build -p instrument-mir --release
 else
-  cargo build -p runtime
+  cargo build -p runtime ${RUNTIME_FEATURES}
   cargo build -p instrument-mir
 fi
 

@@ -66,6 +66,7 @@ members = [
     "examples/sb_lite_raw_from_ref_fn",
     "examples/sb_lite_raw_transmute",
     "examples/sb_lite_unsafe_cell_raw_read_ok",
+    "examples/zero_size_copy_ok",
     "examples/sb_miri_micro",
     "examples/wide_ptr_raw_slice_cast_ok",
     "examples/wide_ptr_raw_str_cast_ok",
