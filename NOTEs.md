@@ -140,3 +140,13 @@ Limitations:
 - OS-specific (macOS + Linux; other targets fall back to no static ranges).
 - Coarse: we do not recover embedded pointer provenance; we only check address
   ranges for static segments.
+
+## AFL++ on macOS (shared memory)
+
+On this macOS setup, AFL++ shared-memory initialization can fail due to OS restrictions:
+
+- SysV shared memory: `shmget()` / `shmat()` failures (often “Invalid argument” or attach failure)
+- POSIX shared memory: `shm_open()` can fail with `EPERM` depending on sandboxing / policies
+
+Workaround: run AFL++ on Linux (native, VM, or Docker). For a Docker workflow that is
+useful for crash reproduction and minimization, see `docker/afl/README.md`.

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${AFL_PATH:?Set AFL_PATH to your AFLplusplus checkout (must contain afl-fuzz)}"
+# AFL++ location:
+# - If you have an AFLplusplus *checkout*, set `AFL_PATH` to that directory.
+# - If you have an AFL++ *system install* (afl-fuzz in PATH), you can leave `AFL_PATH` unset.
+AFL_PATH="${AFL_PATH:-}"
+AFL_FUZZ="${AFL_FUZZ:-}"
 
 PROFILE="${PROFILE:-release}"
 TARGET="${TARGET:-bytes}" # bytes | smallvec
@@ -18,10 +22,16 @@ BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
 IN_DIR="fuzz/corpus/${TARGET}"
 OUT_DIR="fuzz/out/${TARGET}"
 
+mkdir -p "$IN_DIR"
 mkdir -p "$OUT_DIR"
 
 if [[ ! -x "$BIN_PATH" ]]; then
   PROFILE="$PROFILE" TARGET="$TARGET" ./scripts/afl_build.sh
+fi
+
+# AFL++ requires at least one seed file.
+if ! find "$IN_DIR" -maxdepth 1 -type f -print -quit | grep -q .; then
+  printf '\x00' > "${IN_DIR}/seed0"
 fi
 
 export RUSTEZE_FAILFAST=1
@@ -48,7 +58,29 @@ if [[ -n "$TIMEOUT_MS" ]]; then
 fi
 
 if [[ ${#extra[@]} -gt 0 ]]; then
-  "${AFL_PATH}/afl-fuzz" -i "$IN_DIR" -o "$OUT_DIR" "${extra[@]}" -- "$BIN_PATH" @@
+  if [[ -z "$AFL_FUZZ" ]]; then
+    if [[ -n "$AFL_PATH" && -x "${AFL_PATH}/afl-fuzz" ]]; then
+      AFL_FUZZ="${AFL_PATH}/afl-fuzz"
+    else
+      AFL_FUZZ="$(command -v afl-fuzz || true)"
+    fi
+  fi
+  if [[ -z "$AFL_FUZZ" ]]; then
+    echo "error: afl-fuzz not found (set AFL_FUZZ or AFL_PATH, or install AFL++)." >&2
+    exit 2
+  fi
+  "$AFL_FUZZ" -i "$IN_DIR" -o "$OUT_DIR" "${extra[@]}" -- "$BIN_PATH" @@
 else
-  "${AFL_PATH}/afl-fuzz" -i "$IN_DIR" -o "$OUT_DIR" -- "$BIN_PATH" @@
+  if [[ -z "$AFL_FUZZ" ]]; then
+    if [[ -n "$AFL_PATH" && -x "${AFL_PATH}/afl-fuzz" ]]; then
+      AFL_FUZZ="${AFL_PATH}/afl-fuzz"
+    else
+      AFL_FUZZ="$(command -v afl-fuzz || true)"
+    fi
+  fi
+  if [[ -z "$AFL_FUZZ" ]]; then
+    echo "error: afl-fuzz not found (set AFL_FUZZ or AFL_PATH, or install AFL++)." >&2
+    exit 2
+  fi
+  "$AFL_FUZZ" -i "$IN_DIR" -o "$OUT_DIR" -- "$BIN_PATH" @@
 fi

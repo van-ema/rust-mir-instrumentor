@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "afl_harness"
+version = "0.1.0"
+dependencies = [
+ "bytes 1.11.0",
+ "smallvec 2.0.0-alpha.12",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

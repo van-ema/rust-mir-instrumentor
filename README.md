@@ -150,6 +150,12 @@ RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bi
 
 ```
 
+## AFL++ (Docker)
+
+If you want AFL++ tooling on Linux (useful for crash reproduction and minimization),
+see `docker/afl/README.md`. This is especially handy on macOS hosts where AFL++
+shared-memory can be unreliable.
+
 
 
 ## Notes
