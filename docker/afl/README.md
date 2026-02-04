@@ -33,7 +33,7 @@ If you already have a crash input in `crashes/id:000000,...`, just run the
 target binary with that input file (AFL uses `@@` to pass the file name):
 
 ```bash
-./target/afl-release/release/afl_bytes_driver crashes/id:000000,*
+RUSTEZE_FAILFAST=1 RZ_LOG=trace RZ_LOG_LOC=1 ./target/afl-release/release/afl_bytes_driver crashes/id:000000,*
 ```
 
 Or use AFL tools to minimize:

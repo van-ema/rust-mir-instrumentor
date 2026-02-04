@@ -1209,6 +1209,19 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
+        // SB-lite currently approximates Rust's aliasing rules using a per-allocation
+        // borrow stack, but it does **not** model interior mutability soundly.
+        //
+        // In Rust, types that contain an `UnsafeCell` are *not* `Freeze`, meaning they
+        // may be legally mutated through a shared reference (via `Cell`/`RefCell` or
+        // other unsafe code patterns). Treating such accesses as ordinary shared reads
+        // and enforcing "no write while shared is live" would yield many false positives
+        // in real-world code (e.g., `bytes::BytesMut` internals).
+        //
+        // Policy: if a pointee type is not `Freeze` (or we cannot reliably reason about
+        // it in this typing context), mark derived tags as `alias_exempt` so the runtime
+        // skips SB-lite enforcement for that tag. This is a deliberate precision/soundness
+        // trade-off: missing metadata is acceptable; incorrect metadata is not.
         if ty.has_param()
             || ty.has_infer()
             || ty.has_aliases()
