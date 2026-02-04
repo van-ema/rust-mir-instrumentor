@@ -5,9 +5,10 @@ Current status
 	•	Phase 1 (call boundaries + std/core classification): completed (bytes/smallvec debug+release stable)
 	•	Phase 2 (alloc/realloc epochs): completed
 	•	Phase 3 (SB-lite): completed (micro-suite + example tests passing)
+	•	Phase 6 (Fuzzing + Evaluation): in progress (AFL++ harness + Docker workflow; bytes fuzzing started)
 Next step
 	•	Phase 4 (Tree Borrows) for higher precision (reduce SB-lite false positives)
-	•	In parallel: Phase 6 (Fuzzing + Evaluation) to generate real findings and paper-ready metrics
+	•	In parallel: continue Phase 6 to turn fuzz findings into minimized, reproducible, triaged reports
 
 ⸻
 
@@ -163,14 +164,20 @@ What “paper-ready” requires
 
 Implementation
 	•	Fuzzing harness:
-		•	cargo-fuzz/libFuzzer (or AFL++), running instrumented targets
+		•	AFL++ harness (current): `afl_harness` crate with `afl_bytes_driver` / `afl_smallvec_driver`
+			•	build: `scripts/afl_build.sh`
+			•	fuzz: `scripts/afl_fuzz.sh`
+			•	repro: `scripts/afl_repro.sh`
+			•	Docker (Linux): `docker/afl/README.md` + `scripts/docker_afl.sh`
+		•	Optional: cargo-fuzz/libFuzzer later for tighter in-process integration
 		•	deduplicate by canonical signature (kind + access + ptr kind + size + callsite)
 		•	store repro inputs (+ optional minimization)
 	•	Triage pipeline:
 		•	group violations by signature
 		•	auto-attach: backtrace/location, crate/version, mode (coverage vs precision), seed
 	•	Metrics collection:
-		•	runtime slowdown vs baseline
+		•	runtime slowdown vs baseline (+ ASan)
+			•	`python3 scripts/bench_overhead.py --include-asan ...`
 		•	peak memory overhead
 		•	instrumentation/build time overhead
 		•	stability across runs (same input => same signature)
@@ -188,9 +195,20 @@ Exit Criteria
 	•	Overhead numbers reported for coverage vs precision modes
 
 Immediate Next Actions (Concrete)
-	1.	Define TB design and implement Phase 4 behind a flag.
-	2.	Add a fuzzing integration (start with cargo-fuzz + one target crate).
-	3.	Add 3 initial fuzz targets: bytes, smallvec, serde_json.
-	4.	Run for fixed budgets (e.g., 6–24 CPU hours/target), dedup and triage, file reports upstream.
-	5.	Collect overhead + stability metrics on the benchmark sets and write up methodology in main.tex.
-
+	1.	Fuzzing hygiene:
+		•	ensure `fuzz/out/` is never committed (gitignore + `git rm --cached` if needed)
+		•	build fuzz targets with `-C panic=abort` to avoid unwind cascades masking the first violation
+	2.	Crash triage loop (bytes first):
+		•	repro each crash with `scripts/afl_repro.sh`
+		•	minimize with `afl-tmin` and keep a `fuzz/repro/<target>/` folder with minimized repros
+		•	classify: real UB in target crate vs false positive (e.g., `alias_exempt` / missing modeling)
+		•	turn stable crashes into:
+			•	a new `examples/*` regression, or
+			•	a pinned repro input + a short write-up under `reports/`
+	3.	Add initial fuzz targets:
+		•	smallvec (same pipeline as bytes)
+		•	serde_json (driver/harness once third_party is available)
+	4.	Evaluation (start lightweight, then scale):
+		•	run overhead on examples + medium (`scripts/bench_overhead.py`), baseline vs rusteze vs ASan
+		•	track “violations per hour” and “unique signatures” for each fuzz target/mode
+	5.	Define TB design and implement Phase 4 behind a flag once fuzzing produces stable signal.

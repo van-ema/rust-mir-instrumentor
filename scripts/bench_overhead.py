@@ -154,6 +154,39 @@ def cargo_build_asan(
     return bin_path
 
 
+def cargo_miri_available(cargo: str, env: dict[str, str]) -> bool:
+    try:
+        subprocess.run([cargo, "+nightly", "miri", "--version"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def run_miri(
+    cargo: str,
+    env: dict[str, str],
+    target: Target,
+    runs: int,
+    timeout_s: float | None,
+) -> tuple[list[float], list[int]]:
+    times: list[float] = []
+    codes: list[int] = []
+    env = strip_rz_env(env)
+    for _ in range(runs):
+        start = time.perf_counter()
+        proc = subprocess.run(
+            [cargo, "+nightly", "miri", "run", "-p", target.pkg, "--bin", target.bin],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s,
+        )
+        end = time.perf_counter()
+        times.append(end - start)
+        codes.append(proc.returncode)
+    return times, codes
+
+
 def cargo_build_rusteze(
     cargo: str,
     env: dict[str, str],
@@ -263,6 +296,8 @@ def main() -> int:
         default="-Zsanitizer=address",
         help="Extra rustc flags for ASan builds (default: -Zsanitizer=address)",
     )
+    ap.add_argument("--include-miri", action="store_true", help="Also run under Miri (nightly; very slow)")
+    ap.add_argument("--miri-runs", type=int, default=1, help="Number of Miri runs per target (default: 1)")
     args = ap.parse_args()
 
     env = os.environ.copy()
@@ -293,6 +328,10 @@ def main() -> int:
     if args.include_asan:
         # Quick sanity check early so we fail fast with a clear message.
         subprocess.run([cargo, "+nightly", "--version"], env=env, check=True, stdout=subprocess.DEVNULL)
+
+    if args.include_miri:
+        if not cargo_miri_available(cargo, env):
+            die("Miri not available. Install with: rustup +nightly component add miri")
 
     targets: list[Target] = []
     if args.targets:
@@ -369,9 +408,17 @@ def main() -> int:
                 timeout_s=timeout_s,
             )
 
+        miri_times: list[float] = []
+        miri_codes: list[int] = []
+        if args.include_miri:
+            # Miri does not have a meaningful "release" mode; it interprets MIR and is orders of
+            # magnitude slower. Include it for completeness, but do not interpret as overhead.
+            miri_times, miri_codes = run_miri(cargo, env, t, runs=args.miri_runs, timeout_s=timeout_s)
+
         base_sum = summarize(base_times)
         rz_sum = summarize(rz_times)
         asan_sum = summarize(asan_times) if asan_bin is not None else None
+        miri_sum = summarize(miri_times) if args.include_miri else None
         overhead = None
         if base_sum.get("mean_s", 0.0) > 0.0 and rz_sum.get("mean_s", 0.0) > 0.0:
             overhead = rz_sum["mean_s"] / base_sum["mean_s"]
@@ -395,6 +442,11 @@ def main() -> int:
                     if asan_bin is None
                     else {"bin": str(asan_bin), "times_s": asan_times, "exit_codes": asan_codes, "summary": asan_sum}
                 ),
+                "miri": (
+                    None
+                    if not args.include_miri
+                    else {"times_s": miri_times, "exit_codes": miri_codes, "summary": miri_sum}
+                ),
                 "overhead_mean_ratio_rusteze_over_baseline": overhead,
                 "overhead_mean_ratio_asan_over_baseline": asan_overhead,
                 "overhead_mean_ratio_rusteze_over_asan": rz_vs_asan,
@@ -403,10 +455,15 @@ def main() -> int:
 
     (report_dir / "results.json").write_text(json.dumps(results, indent=2))
 
+    header = ["target", "base_mean_s", "rz_mean_s"]
     if args.include_asan:
-        lines = ["target\tbase_mean_s\trz_mean_s\tasan_mean_s\trz_over_base\tasan_over_base\trz_over_asan"]
+        header += ["asan_mean_s", "rz_over_base", "asan_over_base", "rz_over_asan"]
     else:
-        lines = ["target\tbase_mean_s\trz_mean_s\trz_over_base"]
+        header += ["rz_over_base"]
+    if args.include_miri:
+        header += ["miri_mean_s"]
+    lines = ["\t".join(header)]
+
     for r in results:
         base_mean = r["baseline"]["summary"].get("mean_s", 0.0)
         rz_mean = r["rusteze"]["summary"].get("mean_s", 0.0)
@@ -419,20 +476,46 @@ def main() -> int:
             asan_over_base_s = "-" if asan_over_base is None else f"{asan_over_base:.3f}"
             rz_over_asan = r.get("overhead_mean_ratio_rusteze_over_asan")
             rz_over_asan_s = "-" if rz_over_asan is None else f"{rz_over_asan:.3f}"
-            lines.append(
-                f"{r['target']}\t{base_mean:.6f}\t{rz_mean:.6f}\t{asan_mean:.6f}\t{rz_over_base_s}\t{asan_over_base_s}\t{rz_over_asan_s}"
-            )
+            row = [r["target"], f"{base_mean:.6f}", f"{rz_mean:.6f}", f"{asan_mean:.6f}", rz_over_base_s, asan_over_base_s, rz_over_asan_s]
         else:
-            lines.append(f"{r['target']}\t{base_mean:.6f}\t{rz_mean:.6f}\t{rz_over_base_s}")
+            row = [r["target"], f"{base_mean:.6f}", f"{rz_mean:.6f}", rz_over_base_s]
+
+        if args.include_miri:
+            miri = r.get("miri")
+            miri_mean = "-" if miri is None else f"{miri['summary'].get('mean_s', 0.0):.6f}"
+            row.append(miri_mean)
+
+        lines.append("\t".join(row))
     (report_dir / "summary.tsv").write_text("\n".join(lines) + "\n")
 
-    md = ["# Overhead summary", "", f"- profile: `{args.profile}`", f"- suite: `{args.suite}`", f"- runs: `{args.runs}`", f"- warmup: `{args.warmup}`", ""]
+    md = [
+        "# Overhead summary",
+        "",
+        f"- profile: `{args.profile}`",
+        f"- suite: `{args.suite}`",
+        f"- runs: `{args.runs}`",
+        f"- warmup: `{args.warmup}`",
+    ]
+    if args.include_miri:
+        md.append("- miri: included (not comparable to native runtime)")
+    md.append("")
+
     if args.include_asan:
-        md.append("| target | baseline mean (s) | rusteze mean (s) | ASan mean (s) | rusteze/baseline (x) | ASan/baseline (x) | rusteze/ASan (x) |")
-        md.append("|---|---:|---:|---:|---:|---:|---:|")
+        header = "| target | baseline mean (s) | rusteze mean (s) | ASan mean (s) | rusteze/baseline (x) | ASan/baseline (x) | rusteze/ASan (x) |"
+        sep = "|---|---:|---:|---:|---:|---:|---:|"
+        if args.include_miri:
+            header = header[:-1] + " Miri mean (s) |"
+            sep = sep[:-1] + "---:|"
+        md.append(header)
+        md.append(sep)
     else:
-        md.append("| target | baseline mean (s) | rusteze mean (s) | rusteze/baseline (x) |")
-        md.append("|---|---:|---:|---:|")
+        header = "| target | baseline mean (s) | rusteze mean (s) | rusteze/baseline (x) |"
+        sep = "|---|---:|---:|---:|"
+        if args.include_miri:
+            header = header[:-1] + " Miri mean (s) |"
+            sep = sep[:-1] + "---:|"
+        md.append(header)
+        md.append(sep)
     for r in results:
         base_mean = r["baseline"]["summary"].get("mean_s")
         rz_mean = r["rusteze"]["summary"].get("mean_s")
@@ -442,14 +525,21 @@ def main() -> int:
             asan_mean = None if asan is None else asan["summary"].get("mean_s")
             asan_over_base = r.get("overhead_mean_ratio_asan_over_baseline")
             rz_over_asan = r.get("overhead_mean_ratio_rusteze_over_asan")
-            md.append(
+            row = (
                 f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_mean)} | {fmt_s(asan_mean)} | "
                 f"{'-' if rz_over_base is None else f'{rz_over_base:.3f}'} | "
                 f"{'-' if asan_over_base is None else f'{asan_over_base:.3f}'} | "
                 f"{'-' if rz_over_asan is None else f'{rz_over_asan:.3f}'} |"
             )
         else:
-            md.append(f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_mean)} | {'-' if rz_over_base is None else f'{rz_over_base:.3f}'} |")
+            row = f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_mean)} | {'-' if rz_over_base is None else f'{rz_over_base:.3f}'} |"
+
+        if args.include_miri:
+            miri = r.get("miri")
+            miri_mean = None if miri is None else miri["summary"].get("mean_s")
+            row = row[:-1] + f" {fmt_s(miri_mean)} |"
+
+        md.append(row)
     (report_dir / "summary.md").write_text("\n".join(md) + "\n")
 
     print(f"Wrote {report_dir/'summary.tsv'}")

@@ -160,6 +160,74 @@ RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bi
 
 ```
 
+## Benchmarking / Overhead
+
+### End-to-end wall-clock overhead (baseline vs rusteze vs ASan, optional Miri)
+
+Use `scripts/bench_overhead.py` to build and repeatedly run binaries, producing
+`reports/overhead/<timestamp>/summary.tsv` and `summary.md`.
+
+Key knobs:
+- `--suite`: `examples` | `medium` | `fuzz`
+- `--targets`: optional list of `pkg` or `pkg::bin`
+- `--profile`: `release` recommended for steady-state
+- `--include-asan`: adds an ASan build+run column (requires `cargo +nightly`)
+- `--include-miri`: adds a Miri timing column (very slow; not comparable to native runtime)
+- `--runs` / `--warmup`: sampling controls
+
+```bash
+# Examples suite (release)
+python3 scripts/bench_overhead.py --suite examples --profile release --include-asan
+
+# Medium crates (bytes + smallvec drivers)
+python3 scripts/bench_overhead.py --suite medium --profile release --include-asan
+
+# Single target
+python3 scripts/bench_overhead.py --suite medium --profile release --include-asan --targets medium_bytes_driver
+
+# Optional: include Miri timings (not comparable to native runtime)
+python3 scripts/bench_overhead.py --suite medium --profile release --include-asan --include-miri --miri-runs 1
+```
+
+### Criterion microbenches (bytes/smallvec workloads)
+
+The workspace includes a dedicated Criterion bench crate: `benchmarks/rz_bench`.
+
+```bash
+cargo bench -p rz_bench --bench bytes
+cargo bench -p rz_bench --bench smallvec
+```
+
+Criterion output already includes statistical summaries. Use this for micro-level
+API comparisons, and use `scripts/bench_overhead.py` for end-to-end overhead.
+
+This crate also provides a normal binary (`rz_bench`) that can be instrumented and
+timed end-to-end:
+
+```bash
+cargo run -p rz_bench --release -- --iters 100000 --which bytes
+```
+
+### Compare `rz_bench` across tools (baseline vs rusteze vs ASan, optional Miri)
+
+Use `scripts/bench_compare_rz_bench.py` to run a fixed workload (`--iters`, `--which`)
+under:
+- baseline native build
+- rusteze-instrumented build
+- ASan build (optional)
+- Miri (optional; not comparable to native runtime)
+
+```bash
+python3 scripts/bench_compare_rz_bench.py --profile release --which bytes --iters 200000 --include-asan
+
+# Optional Miri column (very slow)
+python3 scripts/bench_compare_rz_bench.py --profile release --which bytes --iters 200000 --include-asan --include-miri --miri-runs 1
+```
+
+This writes:
+- `reports/bench_compare/<timestamp>/summary.tsv`
+- `reports/bench_compare/<timestamp>/result.json` (full samples and build commands)
+
 ## AFL++ (Docker + harness)
 
 The repo includes an AFL++ harness crate with drivers: `afl_bytes_driver` and

@@ -1,0 +1,20 @@
+[package]
+name = "rz_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { path = "../../third_party/bytes" }
+smallvec = { path = "../../third_party/smallvec" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "bytes"
+harness = false
+
+[[bench]]
+name = "smallvec"
+harness = false
+
