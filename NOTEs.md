@@ -25,6 +25,22 @@ This drops the metadata (length / vtable) on purpose: the runtime’s allocation
 map is keyed by the data address. Metadata-aware checks (e.g., slice-length OOB)
 are a follow-up step.
 
+Known limitation demos:
+- `examples/wide_ptr_slice_len_oob_read_not_detected`
+- `examples/wide_ptr_slice_len_oob_write_not_detected`
+
+## Slice/str bounds via metadata length
+
+When a tag is created from a wide pointer, the instrumentor now passes the
+metadata length (slice length in bytes / str length) to the runtime. The runtime
+stores this as `TagMeta.bounds_len` and checks reads/writes against
+`[pointee_addr, pointee_addr + bounds_len)` in addition to allocation bounds.
+
+This improves detection of forged or mismatched metadata, but it still depends
+on the access address being computed with the correct element offset. In some
+MIR patterns, the pointer-offset computation is not reflected in the addr we
+pass to the runtime, so index-based OOB can still slip through.
+
 ## Unknown-call allow-untagged reads/writes
 
 When we see a direct call that is unclassified and not instrumented, we insert

@@ -1,0 +1,7 @@
+[package]
+name = "wide_ptr_slice_len_oob_write_not_detected"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+

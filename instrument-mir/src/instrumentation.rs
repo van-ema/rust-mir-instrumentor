@@ -455,6 +455,10 @@ enum SizeOperand<'tcx> {
     Const(Operand<'tcx>),
     SizeOf(Ty<'tcx>),
     ElemCount { elem_ty: Ty<'tcx>, count_op: Operand<'tcx> },
+    /// Size derived from wide-pointer metadata (slice length).
+    PtrMetadataSlice { ptr_local: Local, elem_ty: Ty<'tcx> },
+    /// Size derived from wide-pointer metadata (str length).
+    PtrMetadataStr { ptr_local: Local },
 }
 
 #[derive(Clone, Debug)]
@@ -1220,10 +1224,68 @@ impl MyOptimizationPass {
         span: Span,
     ) -> SizeOperand<'tcx> {
         if !ty.is_sized(tcx, body.typing_env(tcx)) {
+            // TODO(wide-ptr): for unsized pointees (slice/str), use metadata length to compute
+            // access size instead of returning 0. This would enable precise OOB checks for
+            // `*const [T]` / `*const str` derefs and indexing.
             return SizeOperand::Const(self.const_usize(tcx, span, 0));
         }
         // Emit MIR size_of to avoid layout normalization during instrumentation.
         SizeOperand::SizeOf(ty)
+    }
+
+    /// Compute access size for a deref of `ptr_local` producing `access_ty`.
+    /// For wide pointers to slices/str, derive the size from pointer metadata.
+    fn size_operand_for_deref<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        access_ty: Ty<'tcx>,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        if access_ty.is_sized(tcx, body.typing_env(tcx)) {
+            return self.size_operand_for_ty(tcx, body, access_ty, span);
+        }
+
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        let pointee = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        };
+
+        match pointee.kind() {
+            TyKind::Slice(elem_ty) => SizeOperand::PtrMetadataSlice {
+                ptr_local,
+                elem_ty: *elem_ty,
+            },
+            TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        }
+    }
+
+    /// Best-effort bounds length for wide pointers (slice/str), in bytes.
+    /// Returns 0 for thin pointers or unknown metadata.
+    fn bounds_len_operand_for_ptr_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        let pointee = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        };
+
+        match pointee.kind() {
+            TyKind::Slice(elem_ty) => SizeOperand::PtrMetadataSlice {
+                ptr_local,
+                elem_ty: *elem_ty,
+            },
+            TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        }
     }
 
     /// Returns true when alias checks should be skipped for this pointee type.
@@ -1813,8 +1875,13 @@ impl MyOptimizationPass {
                             if skip_fn_ptr_read || skip_vtable_field_read {
                                 // Skip only the READ instrumentation; continue scanning this stmt.
                             } else {
-                                let size_op =
-                                    self.size_operand_for_ty(tcx, body, loaded_ty, stmt.source_info.span);
+                                let size_op = self.size_operand_for_deref(
+                                    tcx,
+                                    body,
+                                    ptr_local,
+                                    loaded_ty,
+                                    stmt.source_info.span,
+                                );
 
                                 self.ensure_raw_root_before(
                                     tcx,
@@ -1863,8 +1930,13 @@ impl MyOptimizationPass {
                     // Best-effort size: use the type of the *place being written* (after projections).
                     // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                     let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                    let size_op =
-                        self.size_operand_for_ty(tcx, body, lhs_ty, stmt.source_info.span);
+                    let size_op = self.size_operand_for_deref(
+                        tcx,
+                        body,
+                        ptr_local,
+                        lhs_ty,
+                        stmt.source_info.span,
+                    );
 
                     self.ensure_raw_root_before(
                         tcx,
@@ -2301,7 +2373,7 @@ impl MyOptimizationPass {
     ) -> SizeOperand<'tcx> {
         let ptr_ty = body.local_decls[ptr_local].ty;
         if !self.is_thin_ptr_ty(tcx, ptr_ty) {
-            return SizeOperand::Const(self.const_usize(tcx, span, 0));
+            return self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, span);
         }
 
         let elem_ty = match ptr_ty.kind() {
@@ -2313,6 +2385,7 @@ impl MyOptimizationPass {
         };
 
         if !elem_ty.is_sized(tcx, body.typing_env(tcx)) {
+            // TODO(wide-ptr): support unsized element types by using metadata length when available.
             return SizeOperand::Const(self.const_usize(tcx, span, 0));
         }
 
@@ -2374,6 +2447,69 @@ impl MyOptimizationPass {
                     Operand::Copy(Place::from(bytes_local)),
                     vec![size_stmt, bytes_stmt],
                 )
+            }
+            SizeOperand::PtrMetadataSlice { ptr_local, elem_ty } => {
+                let meta_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let size_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let bytes_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let meta_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(meta_local),
+                        Rvalue::UnaryOp(
+                            UnOp::PtrMetadata,
+                            Operand::Copy(Place::from(*ptr_local)),
+                        ),
+                    ))),
+                );
+                let size_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(size_local),
+                        Rvalue::NullaryOp(NullOp::SizeOf, *elem_ty),
+                    ))),
+                );
+                let bytes_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(bytes_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Mul,
+                            Box::new((
+                                Operand::Copy(Place::from(meta_local)),
+                                Operand::Copy(Place::from(size_local)),
+                            )),
+                        ),
+                    ))),
+                );
+
+                (
+                    Operand::Copy(Place::from(bytes_local)),
+                    vec![meta_stmt, size_stmt, bytes_stmt],
+                )
+            }
+            SizeOperand::PtrMetadataStr { ptr_local } => {
+                let meta_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let meta_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(meta_local),
+                        Rvalue::UnaryOp(
+                            UnOp::PtrMetadata,
+                            Operand::Copy(Place::from(*ptr_local)),
+                        ),
+                    ))),
+                );
+                (Operand::Copy(Place::from(meta_local)), vec![meta_stmt])
             }
         }
     }
@@ -3888,6 +4024,23 @@ impl MyOptimizationPass {
                     body,
                     body.local_decls[ptr_local].ty,
                 );
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    ptr_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
+                if !bounds_len_stmts.is_empty() {
+                    body.basic_blocks_mut()[call_bb]
+                        .statements
+                        .append(&mut bounds_len_stmts);
+                }
                 let args_raw: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
@@ -3903,6 +4056,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_bounds_len,
                         span: source_info.span,
                     },
                 ]
@@ -3993,6 +4150,18 @@ impl MyOptimizationPass {
                     _ => false,
                 };
                 let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    dst_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
                 let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: self.const_u64(tcx, source_info.span, callee_id),
@@ -4008,6 +4177,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_bounds_len,
                         span: source_info.span,
                     },
                 ]
@@ -4031,6 +4204,9 @@ impl MyOptimizationPass {
                     take_bd.statements.push(addr_stmt1);
                 }
                 take_bd.statements.push(addr_stmt2);
+                if !bounds_len_stmts.is_empty() {
+                    take_bd.statements.append(&mut bounds_len_stmts);
+                }
                 take_bd.terminator = Some(take_term);
 
                 continue;
@@ -4202,6 +4378,31 @@ impl MyOptimizationPass {
                     )
                     .expect("ArgRetag on non-pointer local");
 
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    ptr_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    ptr_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
+
                 let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                 let arg_index = self.const_u64(tcx, source_info.span, arg_index);
                 let arg_addr = Operand::Copy(Place::from(addr_local));
@@ -4225,6 +4426,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_bounds_len,
                         span: source_info.span,
                     },
                 ]
@@ -4297,6 +4502,9 @@ impl MyOptimizationPass {
                         bd.statements.push(addr_stmt1);
                     }
                     bd.statements.push(addr_stmt2);
+                    if !bounds_len_stmts.is_empty() {
+                        bd.statements.append(&mut bounds_len_stmts);
+                    }
                     bd.terminator = Some(take_term);
                     rem
                 };
@@ -4665,12 +4873,26 @@ impl MyOptimizationPass {
                     let dst_ty = body.local_decls[dst].ty;
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
                     let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
+                    let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                        tcx,
+                        body,
+                        dst,
+                        source_info.span,
+                    );
+                    let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                        tcx,
+                        body,
+                        source_info,
+                        &bounds_len_op,
+                    );
+                    extra_stmts.append(&mut bounds_len_stmts);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_mut, span: source_info.span },
                         Spanned { node: parent_tag_op, span: source_info.span },
                         Spanned { node: arg_alias, span: source_info.span },
+                        Spanned { node: arg_bounds_len, span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -4718,11 +4940,29 @@ impl MyOptimizationPass {
                     };
                     let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
 
+                    let bounds_ptr_local = match &creation_kind {
+                        InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
+                        InstrKind::RawRoot { ptr_local, .. } => Some(*ptr_local),
+                        InstrKind::RetRoot { dst_local, .. } => Some(*dst_local),
+                        _ => None,
+                    };
+                    let bounds_len_op = bounds_ptr_local
+                        .map(|pl| self.bounds_len_operand_for_ptr_local(tcx, body, pl, source_info.span))
+                        .unwrap_or_else(|| SizeOperand::Const(self.const_usize(tcx, source_info.span, 0)));
+                    let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                        tcx,
+                        body,
+                        source_info,
+                        &bounds_len_op,
+                    );
+                    extra_stmts.append(&mut bounds_len_stmts);
+
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
                         Spanned { node: arg_mut, span: source_info.span },
                         Spanned { node: arg_parent, span: source_info.span },
                         Spanned { node: arg_alias, span: source_info.span },
+                        Spanned { node: arg_bounds_len, span: source_info.span },
                     ]
                     .into_boxed_slice();
 
@@ -4784,6 +5024,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_usize(tcx, source_info.span, 0),
                         span: source_info.span,
                     },
                 ]
@@ -4893,6 +5137,19 @@ impl MyOptimizationPass {
                     )
                     .expect("ArgRetag on non-pointer local");
 
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    ptr_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
+
                 let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                 let arg_index = self.const_u64(tcx, source_info.span, arg_index);
                 let arg_addr = Operand::Copy(Place::from(addr_local));
@@ -4916,6 +5173,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_bounds_len,
                         span: source_info.span,
                     },
                 ]
@@ -4988,6 +5249,9 @@ impl MyOptimizationPass {
                         bd.statements.push(addr_stmt1);
                     }
                     bd.statements.push(addr_stmt2);
+                    if !bounds_len_stmts.is_empty() {
+                        bd.statements.append(&mut bounds_len_stmts);
+                    }
                     bd.terminator = Some(take_term);
                     rem
                 };

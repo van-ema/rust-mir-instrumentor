@@ -558,6 +558,9 @@ pub struct TagMeta {
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
+    /// Optional bounds length in bytes for wide pointers (slice/str metadata).
+    /// 0 means unknown / not provided.
+    pub bounds_len: usize,
 }
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
@@ -1265,6 +1268,52 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         return;
     }
 
+    // Bounds check against wide-pointer metadata (slice/str) if available.
+    if tmeta.bounds_len != 0 && size != 0 {
+        let access_end = match addr.checked_add(size) {
+            Some(e) => e,
+            None => {
+                let msg = append_location_if_enabled(
+                    format!(
+                        "WRITE via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nbounds_base=0x{:x} bounds_len={}\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                        tmeta.pointee_addr,
+                        tmeta.bounds_len,
+                        ameta.size,
+                        tmeta.kind,
+                        tmeta.parent,
+                        tmeta.pointee_addr
+                    ),
+                    "RZ_LOG_LOC",
+                );
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
+                return;
+            }
+        };
+        let bounds_end = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
+        if addr < tmeta.pointee_addr || access_end > bounds_end {
+            let msg = append_location_if_enabled(
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{access_end:x} bounds_base=0x{:x} bounds_end=0x{bounds_end:x} bounds_len={}\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                    tmeta.pointee_addr,
+                    tmeta.bounds_len,
+                    ameta.size,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
+            return;
+        }
+    }
+
     // OOB check if both the access size and allocation size are known.
     if size != 0 && ameta.size != 0 {
         let end = match addr.checked_add(size) {
@@ -1478,6 +1527,52 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         return;
     }
 
+    // Bounds check against wide-pointer metadata (slice/str) if available.
+    if tmeta.bounds_len != 0 && size != 0 {
+        let access_end = match addr.checked_add(size) {
+            Some(e) => e,
+            None => {
+                let msg = append_location_if_enabled(
+                    format!(
+                        "READ via tag={tag} addr=0x{addr:x} size={size}\naddress overflow\nbounds_base=0x{:x} bounds_len={}\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                        tmeta.pointee_addr,
+                        tmeta.bounds_len,
+                        ameta.size,
+                        tmeta.kind,
+                        tmeta.parent,
+                        tmeta.pointee_addr
+                    ),
+                    "RZ_LOG_LOC",
+                );
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
+                return;
+            }
+        };
+        let bounds_end = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
+        if addr < tmeta.pointee_addr || access_end > bounds_end {
+            let msg = append_location_if_enabled(
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{access_end:x} bounds_base=0x{:x} bounds_end=0x{bounds_end:x} bounds_len={}\nalloc_base=0x{base:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
+                    tmeta.pointee_addr,
+                    tmeta.bounds_len,
+                    ameta.size,
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
+            return;
+        }
+    }
+
     // OOB check if both the access size and allocation size are known.
     if size != 0 && ameta.size != 0 {
         let end = match addr.checked_add(size) {
@@ -1590,6 +1685,7 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     addr: usize,
     is_mut: u8,
     alias_exempt: u8,
+    bounds_len: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = { ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0) };
@@ -1597,14 +1693,14 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
         return tag;
     }
     // Fallback: synthesize a fresh raw-pointer tag rooted at this address.
-    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt)
+    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len)
 }
 
 #[macro_export]
 macro_rules! force_runtime {
     ($sym:path) => {
         #[used]
-        static _FORCE_RUNTIME: fn(usize, u8, u64, u8) -> u64 = $sym;
+        static _FORCE_RUNTIME: fn(usize, u8, u64, u8, usize) -> u64 = $sym;
     };
 }
 
@@ -1615,6 +1711,7 @@ pub extern "C" fn __record_ref_creation(
     is_mut: u8,
     parent_tag: u64,
     alias_exempt: u8,
+    bounds_len: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
@@ -1623,20 +1720,21 @@ pub extern "C" fn __record_ref_creation(
     // IMPORTANT: On retagging/reborrows (parent_tag != 0), we must NOT refresh alloc_epoch by
     // consulting the current allocation map, because the same numeric address can be reused by
     // a different stack frame. Derived tags should inherit the snapshot from their parent tag.
-    let (alloc_epoch, alloc_live_at_creation) = if parent_tag != 0 {
+    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len) = if parent_tag != 0 {
         tags()
             .lock()
             .unwrap()
             .get(&parent_tag)
-            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation))
-            .unwrap_or((0, false))
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, p.bounds_len))
+            .unwrap_or((0, false, 0))
     } else {
         // Root creation: snapshot from the allocation that contains this address (range lookup).
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| (m.epoch, m.live))
-            .unwrap_or((0, false))
+            .map(|(_base, m)| (m.epoch, m.live, 0))
+            .unwrap_or((0, false, 0))
     };
+    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -1646,6 +1744,7 @@ pub extern "C" fn __record_ref_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt != 0,
+        bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
     sb_lite_push(tag, &tmeta);
@@ -1672,6 +1771,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     is_mut: u8,
     derived_from: u64,
     alias_exempt: u8,
+    bounds_len: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
@@ -1682,13 +1782,13 @@ pub extern "C" fn __record_raw_ptr_creation(
     // stack-slot reuse detectable as stale pointers. Exception: if the derived pointer
     // clearly points into a different allocation than the parent, refresh to the pointee's
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
-    let (alloc_epoch, alloc_live_at_creation) = if derived_from != 0 {
-        let (parent_epoch, parent_live, parent_pointee) = tags()
+    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len) = if derived_from != 0 {
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
             .lock()
             .unwrap()
             .get(&derived_from)
-            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr)))
-            .unwrap_or((0, false, None));
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
+            .unwrap_or((0, false, None, 0));
 
         if let Some(parent_pointee) = parent_pointee {
             let amap = allocs().lock().unwrap();
@@ -1698,22 +1798,23 @@ pub extern "C" fn __record_raw_ptr_creation(
                 (parent_alloc, pointee_alloc)
             {
                 if parent_base != pointee_base {
-                    (pointee_meta.epoch, pointee_meta.live)
+                    (pointee_meta.epoch, pointee_meta.live, 0)
                 } else {
-                    (parent_epoch, parent_live)
+                    (parent_epoch, parent_live, inherited_bounds_len)
                 }
             } else {
-                (parent_epoch, parent_live)
+                (parent_epoch, parent_live, inherited_bounds_len)
             }
         } else {
-            (parent_epoch, parent_live)
+            (parent_epoch, parent_live, inherited_bounds_len)
         }
     } else {
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| (m.epoch, m.live))
-            .unwrap_or((0, false))
+            .map(|(_base, m)| (m.epoch, m.live, 0))
+            .unwrap_or((0, false, 0))
     };
+    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -1723,6 +1824,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt != 0,
+        bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta);
 

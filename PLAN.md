@@ -251,7 +251,11 @@ Status (as of 2026-02-04)
 		•	address extraction for hooks uses a thin data pointer for wide pointers
 		•	wide pointer locals are treated as tag relevant so lineage isn’t dropped before data-pointer extraction
 		•	best-effort same-block unsize backtracking preserves the source local for `&[T]` produced via coercion
+	•	(3) partially implemented:
+		•	slice/str metadata length is recorded in tags and checked against accesses when available
+		•	index-based OOB can still slip through when MIR does not expose the element offset
 	•	(4) partially implemented:
 		•	new wide-pointer micro-examples exist and are stable under `scripts/run_example_tests.py`
-	•	(3) still pending:
-		•	metadata-aware access sizing (slice/str length) is not implemented yet; unsized accesses often use `size=0`
+	•	Remaining:
+		•	metadata-aware sizing for memcpy/memmove-like intrinsics on wide pointers
+		•	dyn-trait size remains unknown (size=0)

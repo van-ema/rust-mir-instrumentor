@@ -73,6 +73,8 @@ members = [
     "examples/wide_ptr_slice_uaf_read",
     "examples/wide_ptr_dyn_trait_cast_ok",
     "examples/wide_ptr_dyn_trait_uaf_read",
+    "examples/wide_ptr_slice_len_oob_read_not_detected",
+    "examples/wide_ptr_slice_len_oob_write_not_detected",
     "medium/bytes_driver",
     "medium/smallvec_driver",
     "instrument-mir",

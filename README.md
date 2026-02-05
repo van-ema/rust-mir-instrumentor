@@ -160,9 +160,9 @@ address for tagging / range lookup:
   keep the expected tag/epoch lineage.
 
 Current limitations:
-- We do not yet use wide-pointer metadata (slice length / vtable) for precise
-  access-size computation, so OOB checks for `*const [T]` / `*const str` may be
-  weaker when the access size depends on metadata.
+- We do use metadata length for bounds checks when the access size can be tied
+  to the wide pointer, but some index-based accesses still miss the element
+  offset due to coarse address tracking in MIR.
 - `dyn Trait` pointee sizes remain unknown; we still track the data address and
   allocation epoch, but typically use `size=0` for access checks.
 
@@ -170,6 +170,9 @@ Examples:
 - `examples/wide_ptr_slice_uaf_read`, `examples/wide_ptr_slice_uaf_write`
 - `examples/wide_ptr_dyn_trait_uaf_read`
 - `examples/wide_ptr_raw_slice_cast_ok`, `examples/wide_ptr_raw_str_cast_ok`, `examples/wide_ptr_dyn_trait_cast_ok`
+- Known limitation demos:
+  - `examples/wide_ptr_slice_len_oob_read_not_detected`
+  - `examples/wide_ptr_slice_len_oob_write_not_detected`
 
 ## Debugging recipes
 
