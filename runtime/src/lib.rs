@@ -1401,7 +1401,6 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
                 "RZ_LOG_LOC",
             );
-            let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
             rz_violation(
                 "UNKNOWN_TAG",
                 msg,
@@ -1733,7 +1732,6 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
                 "RZ_LOG_LOC",
             );
-            let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE_UNKNOWN_TAG");
             rz_violation(
                 "UNKNOWN_TAG",
                 msg,
