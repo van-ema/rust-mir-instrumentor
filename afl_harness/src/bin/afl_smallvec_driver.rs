@@ -8,15 +8,29 @@ fn main() {
 
     let mut v: SmallVec<u8, 8> = SmallVec::new();
     let mut idx = 0usize;
+    let mut steps = 0usize;
 
-    while idx < data.len() {
+    // Keep per-input work bounded so AFL doesn't get stuck on quadratic behaviors.
+    let max_steps: usize = std::env::var("AFL_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let max_len: usize = std::env::var("AFL_MAX_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_096);
+
+    while idx < data.len() && steps < max_steps {
         let op = data[idx] % 6;
         idx += 1;
+        steps += 1;
 
         match op {
             0 => {
                 if idx < data.len() {
-                    v.push(data[idx]);
+                    if v.len() < max_len {
+                        v.push(data[idx]);
+                    }
                     idx += 1;
                 }
             }
@@ -25,6 +39,11 @@ fn main() {
             }
             2 => {
                 if idx < data.len() {
+                    if v.len() >= max_len {
+                        // Avoid unbounded growth via inserts.
+                        idx = idx.saturating_add(2).min(data.len());
+                        continue;
+                    }
                     let pos = (data[idx] as usize) % (v.len() + 1);
                     idx += 1;
                     let val = if idx < data.len() { data[idx] } else { 0 };
@@ -46,7 +65,11 @@ fn main() {
                     idx += 1;
                     let end = (idx + len).min(data.len());
                     if end > idx {
-                        v.extend_from_slice(&data[idx..end]);
+                        if v.len() < max_len {
+                            let room = max_len - v.len();
+                            let actual_end = idx + (end - idx).min(room);
+                            v.extend_from_slice(&data[idx..actual_end]);
+                        }
                         idx = end;
                     }
                 }

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Enable shell tracing with TRACE=1 to see executed commands and env.
+if [[ "${TRACE:-}" == "1" ]]; then
+  set -x
+fi
+
 # AFL++ location:
 # - If you have an AFLplusplus *checkout*, set `AFL_PATH` to that directory.
 # - If you have an AFL++ *system install* (e.g. `/usr/local/bin/afl-fuzz`), you can leave
@@ -20,13 +25,19 @@ case "$TARGET" in
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
-RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}"
+# Use absolute paths so TMPDIR/RUSTC_TMPDIR are stable even if Cargo changes CWD.
+HARNESS_TARGET_DIR="$(realpath -m "$HARNESS_TARGET_DIR")"
+# `cargo build -p runtime` places `libruntime.rlib` in `${target_dir}/${profile}/deps/`.
+# If we point `--runtime-path` at `${profile}/`, a stale `${profile}/libruntime.rlib` can be
+# picked up and cause E0460 "found possibly newer version of crate `runtime`".
+RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/deps"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
-export RUSTC_TMPDIR="${RUSTC_TMPDIR:-${CARGO_TARGET_DIR}/tmp}"
-export TMPDIR="${TMPDIR:-${CARGO_TARGET_DIR}/tmp}"
+# Put temp files in the same directory that rustc writes metadata (`deps/`) to avoid EXDEV.
+export RUSTC_TMPDIR="${RUSTC_TMPDIR:-$(realpath -m "${RUNTIME_PATH}")}"
+export TMPDIR="${TMPDIR:-$(realpath -m "${RUNTIME_PATH}")}"
 mkdir -p "$RUSTC_TMPDIR"
 
 if [[ -z "$AFL_COMPILER_RT" ]]; then
@@ -51,12 +62,16 @@ fi
 # Build rusteze toolchain + runtime in the chosen profile.
 RUNTIME_FEATURES="${RUNTIME_FEATURES:-}"
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build -p runtime --release ${RUNTIME_FEATURES}
   cargo build -p instrument-mir --release
+  # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
+  cargo build -p runtime --release ${RUNTIME_FEATURES}
 else
-  cargo build -p runtime ${RUNTIME_FEATURES}
   cargo build -p instrument-mir
+  cargo build -p runtime ${RUNTIME_FEATURES}
 fi
+
+# Avoid accidental linking against a stale top-level `libruntime.rlib` if one exists.
+rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
 
 TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
 if [[ ! -x "$TOOL" ]]; then
@@ -72,6 +87,7 @@ fi
 #
 # NOTE: These are LLVM-internal flags; they may need adjustment across LLVM versions.
 AFL_RUSTFLAGS=(
+  "-Ztemps-dir=${RUSTC_TMPDIR}"
   "-Cpasses=sancov-module"
   "-Cllvm-args=-sanitizer-coverage-level=3"
   "-Cllvm-args=-sanitizer-coverage-trace-pc-guard"

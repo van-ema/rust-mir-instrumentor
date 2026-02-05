@@ -207,6 +207,7 @@ static RZ_ALLOC: RzGlobalAlloc = RzGlobalAlloc;
 // === end global allocator wrapper ===========================================
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 
 #[cfg(feature = "rz_log")]
@@ -622,10 +623,12 @@ fn find_alloc_containing<'a>(
     amap: &'a BTreeMap<usize, AllocMeta>,
     addr: usize,
 ) -> Option<(usize, &'a AllocMeta)> {
-    // Allocations are half-open ranges: [base, base+size). 
-    // Choose the containing allocation with the largest end.
+    // Allocations are half-open ranges: [base, base+size).
+    // Prefer a LIVE containing allocation. If none exist, fall back to DEAD,
+    // and only then fall back to unknown-size (exact-base) matches.
 
-    let mut best: Option<(usize, &'a AllocMeta, usize)> = None; // (base, meta, end)
+    let mut best_live: Option<(usize, &'a AllocMeta, usize)> = None; // (base, meta, end)
+    let mut best_dead: Option<(usize, &'a AllocMeta, usize)> = None;
     let mut best_unknown: Option<(usize, &'a AllocMeta)> = None;
 
     for (base, meta) in amap.range(..=addr).rev() {
@@ -634,7 +637,7 @@ fn find_alloc_containing<'a>(
         if size == 0 {
             // Unknown-size allocations: only treat as containing if addr == base.
             // Keep as fallback only if we never find a known-size containing allocation.
-            if *base == addr && best.is_none() {
+            if *base == addr && best_live.is_none() && best_dead.is_none() {
                 best_unknown = Some((*base, meta));
             }
             continue;
@@ -646,22 +649,25 @@ fn find_alloc_containing<'a>(
         };
 
         if addr < end {
-            match best {
-                None => best = Some((*base, meta, end)),
+            let slot = if meta.live { &mut best_live } else { &mut best_dead };
+            match slot {
+                None => *slot = Some((*base, meta, end)),
                 Some((_b, _m, best_end)) => {
-                    if end > best_end {
-                        best = Some((*base, meta, end));
+                    if end > *best_end {
+                        *slot = Some((*base, meta, end));
                     }
                 }
             }
         }
     }
 
-    if let Some((b, m, _end)) = best {
-        Some((b, m))
-    } else {
-        best_unknown
+    if let Some((b, m, _end)) = best_live {
+        return Some((b, m));
     }
+    if let Some((b, m, _end)) = best_dead {
+        return Some((b, m));
+    }
+    best_unknown
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -924,6 +930,9 @@ fn rz_violation(kind: &str, msg: String) {
     rz_emit_str("\n================ RUSTEZE VIOLATION ================\n");
     rz_emit_str(kind);
     rz_emit_str("\n");
+    if rz_dump_alloc_on_violation() {
+        alloc_log_dump();
+    }
     let msg = append_backtrace_if_enabled(msg, "RZ_BACKTRACE");
     rz_emit_str(&msg);
     if !msg.ends_with('\n') {
@@ -948,6 +957,51 @@ fn backtrace_enabled(var: &str) -> bool {
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
+
+#[cfg(feature = "rz_alloc_dump")]
+#[inline]
+fn rz_dump_alloc_on_violation() -> bool {
+    std::env::var("RZ_DUMP_ALLOC_ON_VIOLATION")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[cfg(not(feature = "rz_alloc_dump"))]
+#[inline]
+fn rz_dump_alloc_on_violation() -> bool {
+    false
+}
+
+#[cfg(feature = "rz_alloc_dump")]
+#[inline]
+fn rz_dump_alloc_match_addr_enabled() -> bool {
+    std::env::var("RZ_DUMP_ALLOC_MATCH_ADDR")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[cfg(not(feature = "rz_alloc_dump"))]
+#[inline]
+fn rz_dump_alloc_match_addr_enabled() -> bool {
+    false
+}
+
+#[inline]
+fn rz_log_alloc_enabled() -> bool {
+    std::env::var("RZ_LOG_ALLOC")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[cfg(feature = "rz_log")]
+#[inline]
+fn rz_emit_alloc(args: core::fmt::Arguments<'_>) {
+    rz_emit_args(args);
+}
+
+#[cfg(not(feature = "rz_log"))]
+#[inline]
+fn rz_emit_alloc(_args: core::fmt::Arguments<'_>) {}
 
 fn append_backtrace_if_enabled(mut msg: String, var: &str) -> String {
     if backtrace_enabled(var) {
@@ -1016,6 +1070,34 @@ fn origin_alloc_for_tag<'a>(
 #[no_mangle]
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     let _g = RzRuntimeGuard::enter();
+
+    // Record allocation events into a fixed-size ring buffer for post-mortem dumps.
+    alloc_log_record(base_addr, size, live);
+
+    if rz_log_alloc_enabled() {
+        // Emit allocation events regardless of RZ_LOG level.
+        let new_live = (live & 0x1) != 0;
+        let is_stack = (live & 0x2) != 0;
+        rz_emit_alloc(format_args!(
+            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
+            base_addr,
+            size,
+            new_live,
+            is_stack
+        ));
+    } else if rz_log_enabled(LogLevel::Trace) {
+        // `live` bit 0: live/dead. bit 1: stack marker.
+        let new_live = (live & 0x1) != 0;
+        let is_stack = (live & 0x2) != 0;
+        rz_trace!(
+            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
+            base_addr,
+            size,
+            new_live,
+            is_stack
+        );
+    }
+
     let mut m = allocs().lock().unwrap();
     let is_stack = (live & 0x2) != 0;
     let entry = m.entry(base_addr).or_insert(AllocMeta {
@@ -1067,6 +1149,222 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         borrows().lock().unwrap().remove(&base_addr);
     }
 }
+
+// === allocation event ring buffer (no-alloc, best-effort) ===================
+
+#[cfg(feature = "rz_alloc_dump")]
+const ALLOC_LOG_SIZE: usize = 4096;
+#[cfg(feature = "rz_alloc_dump")]
+const ALLOC_LOG_HEAP_SIZE: usize = 4096;
+
+#[cfg(feature = "rz_alloc_dump")]
+#[derive(Copy, Clone)]
+struct AllocLogEntry {
+    seq: u64,
+    base: usize,
+    size: usize,
+    live: u8,
+}
+
+#[cfg(feature = "rz_alloc_dump")]
+impl AllocLogEntry {
+    const fn empty() -> Self {
+        Self { seq: 0, base: 0, size: 0, live: 0 }
+    }
+}
+
+#[cfg(feature = "rz_alloc_dump")]
+static ALLOC_LOG_IDX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "rz_alloc_dump")]
+static ALLOC_LOG_SEQ: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "rz_alloc_dump")]
+static mut ALLOC_LOG: [AllocLogEntry; ALLOC_LOG_SIZE] = [AllocLogEntry::empty(); ALLOC_LOG_SIZE];
+#[cfg(feature = "rz_alloc_dump")]
+static ALLOC_LOG_HEAP_IDX: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "rz_alloc_dump")]
+static ALLOC_LOG_HEAP_SEQ: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "rz_alloc_dump")]
+static mut ALLOC_LOG_HEAP: [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] =
+    [AllocLogEntry::empty(); ALLOC_LOG_HEAP_SIZE];
+
+#[cfg(feature = "rz_alloc_dump")]
+#[inline]
+fn alloc_log_record(base_addr: usize, size: usize, live: u8) {
+    let idx = ALLOC_LOG_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_SIZE;
+    let seq = ALLOC_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        ALLOC_LOG[idx] = AllocLogEntry { seq, base: base_addr, size, live };
+    }
+    // Also keep a heap-only ring buffer to avoid stack noise.
+    if (live & 0x2) == 0 {
+        let hidx = ALLOC_LOG_HEAP_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_HEAP_SIZE;
+        let hseq = ALLOC_LOG_HEAP_SEQ.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            ALLOC_LOG_HEAP[hidx] = AllocLogEntry { seq: hseq, base: base_addr, size, live };
+        }
+    }
+}
+
+#[cfg(not(feature = "rz_alloc_dump"))]
+#[inline]
+fn alloc_log_record(_base_addr: usize, _size: usize, _live: u8) {}
+
+#[cfg(feature = "rz_alloc_dump")]
+fn alloc_log_dump() {
+    // Write last N entries in reverse order (most recent first).
+    struct LocalBuf {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl LocalBuf {
+        #[inline]
+        fn new() -> Self {
+            Self { buf: [0u8; 256], len: 0 }
+        }
+        #[inline]
+        fn as_bytes(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
+    impl core::fmt::Write for LocalBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let cap = self.buf.len().saturating_sub(self.len);
+            let n = core::cmp::min(cap, bytes.len());
+            if n == 0 {
+                return Ok(());
+            }
+            self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+
+    let heap_only = std::env::var("RZ_DUMP_ALLOC_HEAP_ONLY")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+    if heap_only {
+        rz_emit_str("\n[rusteze-runtime] last heap alloc events (most recent first):\n");
+    } else {
+        rz_emit_str("\n[rusteze-runtime] last alloc events (most recent first):\n");
+    }
+
+    let mut seen = 0usize;
+    let (head, cap, buf_ptr) = if heap_only {
+        (
+            ALLOC_LOG_HEAP_IDX.load(Ordering::Relaxed),
+            ALLOC_LOG_HEAP_SIZE,
+            unsafe { &raw const ALLOC_LOG_HEAP as *const [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] }
+        )
+    } else {
+        (
+            ALLOC_LOG_IDX.load(Ordering::Relaxed),
+            ALLOC_LOG_SIZE,
+            unsafe { &raw const ALLOC_LOG as *const [AllocLogEntry; ALLOC_LOG_SIZE] }
+        )
+    };
+
+    for i in 0..cap {
+        let idx = (head.wrapping_sub(1 + i)) % cap;
+        let entry = unsafe { (*buf_ptr)[idx] };
+        if entry.seq == 0 {
+            continue;
+        }
+        let new_live = (entry.live & 0x1) != 0;
+        let is_stack = (entry.live & 0x2) != 0;
+        if heap_only && is_stack {
+            continue;
+        }
+        let mut buf = LocalBuf::new();
+        let _ = core::fmt::write(
+            &mut buf,
+            format_args!(
+                "  seq={} base=0x{:x} size={} live={} is_stack={}\n",
+                entry.seq, entry.base, entry.size, new_live, is_stack
+            ),
+        );
+        rz_emit_str(core::str::from_utf8(buf.as_bytes()).unwrap_or(""));
+        seen += 1;
+        if seen >= 256 {
+            break;
+        }
+    }
+    if seen == 0 {
+        rz_emit_str("  (no entries)\n");
+    }
+}
+
+#[cfg(not(feature = "rz_alloc_dump"))]
+fn alloc_log_dump() {}
+
+#[cfg(feature = "rz_alloc_dump")]
+fn alloc_log_dump_contains(addr: usize) {
+    struct LocalBuf {
+        buf: [u8; 256],
+        len: usize,
+    }
+    impl LocalBuf {
+        #[inline]
+        fn new() -> Self {
+            Self { buf: [0u8; 256], len: 0 }
+        }
+        #[inline]
+        fn as_bytes(&self) -> &[u8] {
+            &self.buf[..self.len]
+        }
+    }
+    impl core::fmt::Write for LocalBuf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let cap = self.buf.len().saturating_sub(self.len);
+            let n = core::cmp::min(cap, bytes.len());
+            if n == 0 {
+                return Ok(());
+            }
+            self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+
+    rz_emit_str("\n[rusteze-runtime] heap alloc events containing addr:\n");
+    let mut seen = 0usize;
+    let head = ALLOC_LOG_HEAP_IDX.load(Ordering::Relaxed);
+    for i in 0..ALLOC_LOG_HEAP_SIZE {
+        let idx = (head.wrapping_sub(1 + i)) % ALLOC_LOG_HEAP_SIZE;
+        let entry = unsafe { ALLOC_LOG_HEAP[idx] };
+        if entry.seq == 0 || entry.size == 0 {
+            continue;
+        }
+        let end = match entry.base.checked_add(entry.size) {
+            Some(e) => e,
+            None => usize::MAX,
+        };
+        if addr < entry.base || addr >= end {
+            continue;
+        }
+        let new_live = (entry.live & 0x1) != 0;
+        let mut buf = LocalBuf::new();
+        let _ = core::fmt::write(
+            &mut buf,
+            format_args!(
+                "  seq={} base=0x{:x} end=0x{:x} size={} live={}\n",
+                entry.seq, entry.base, end, entry.size, new_live
+            ),
+        );
+        rz_emit_str(core::str::from_utf8(buf.as_bytes()).unwrap_or(""));
+        seen += 1;
+        if seen >= 32 {
+            break;
+        }
+    }
+    if seen == 0 {
+        rz_emit_str("  (no matches)\n");
+    }
+}
+
+#[cfg(not(feature = "rz_alloc_dump"))]
+fn alloc_log_dump_contains(_addr: usize) {}
 
 /// Read-only helper for debugging/testing.
 #[no_mangle]
@@ -1169,6 +1467,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                         ),
                         "RZ_LOG_LOC",
                     );
+                    if rz_dump_alloc_match_addr_enabled() {
+                        alloc_log_dump_contains(addr);
+                    }
                     rz_violation(
                         "OUT_OF_BOUNDS",
                         msg,
@@ -1211,6 +1512,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "WILD_POINTER",
             msg,
@@ -1251,6 +1555,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "USE_AFTER_DEAD",
             msg,
@@ -1271,6 +1578,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "STALE_POINTER_EPOCH_MISMATCH",
             msg,
@@ -1339,6 +1649,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
+                if rz_dump_alloc_match_addr_enabled() {
+                    alloc_log_dump_contains(addr);
+                }
                 rz_violation(
                     "OUT_OF_BOUNDS",
                     msg,
@@ -1363,6 +1676,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
+            if rz_dump_alloc_match_addr_enabled() {
+                alloc_log_dump_contains(addr);
+            }
             rz_violation(
                 "OUT_OF_BOUNDS",
                 msg,
@@ -1468,6 +1784,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                         ),
                         "RZ_LOG_LOC",
                     );
+                    if rz_dump_alloc_match_addr_enabled() {
+                        alloc_log_dump_contains(addr);
+                    }
                     rz_violation(
                         "OUT_OF_BOUNDS",
                         msg,
@@ -1492,6 +1811,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "WILD_POINTER",
             msg,
@@ -1520,6 +1842,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "USE_AFTER_DEAD",
             msg,
@@ -1540,6 +1865,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             ),
             "RZ_LOG_LOC",
         );
+        if rz_dump_alloc_match_addr_enabled() {
+            alloc_log_dump_contains(addr);
+        }
         rz_violation(
             "STALE_POINTER_EPOCH_MISMATCH",
             msg,
@@ -1608,6 +1936,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
+                if rz_dump_alloc_match_addr_enabled() {
+                    alloc_log_dump_contains(addr);
+                }
                 rz_violation(
                     "OUT_OF_BOUNDS",
                     msg,
@@ -1632,6 +1963,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
+            if rz_dump_alloc_match_addr_enabled() {
+                alloc_log_dump_contains(addr);
+            }
             rz_violation(
                 "OUT_OF_BOUNDS",
                 msg,
