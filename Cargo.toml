@@ -82,6 +82,9 @@ members = [
     "lib_hello",
     "runtime",
 ]
+exclude = [
+    "third_party/serde",
+]
 
 # Optional but recommended for reproducibility:
 resolver = "2"

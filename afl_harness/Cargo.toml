@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 bytes = { path = "../third_party/bytes" }
 smallvec = { path = "../third_party/smallvec" }
+serde = { path = "../third_party/serde/serde", features = ["derive"] }
+serde_json = { path = "../third_party/serde_json" }

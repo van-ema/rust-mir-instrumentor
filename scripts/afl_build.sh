@@ -16,12 +16,13 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json
 
 case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec)" >&2; exit 2 ;;
+  serde_json|serde) BIN="afl_serde_json_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json)" >&2; exit 2 ;;
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"

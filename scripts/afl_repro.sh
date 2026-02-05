@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="${TARGET:-bytes}" # bytes | smallvec
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${OUT_DIR:-fuzz/out/${TARGET}}"
 ONLY=""
@@ -43,7 +43,8 @@ done
 case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec)" >&2; exit 2 ;;
+  serde_json|serde) BIN="afl_serde_json_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json)" >&2; exit 2 ;;
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"
@@ -85,6 +86,7 @@ for f in "${files[@]}"; do
     exit 2
   fi
   echo "=== repro: $f ==="
+  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 \"$BIN_PATH\" \"$f\""
   RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 "$BIN_PATH" "$f" || true
   echo
 done
