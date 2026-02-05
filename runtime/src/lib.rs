@@ -987,6 +987,20 @@ fn rz_dump_alloc_match_addr_enabled() -> bool {
 }
 
 #[inline]
+fn rz_allow_untagged() -> bool {
+    std::env::var("RZ_ALLOW_UNTAGGED")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+fn rz_tag0_as_root() -> bool {
+    std::env::var("RZ_TAG0_AS_ROOT")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
 fn rz_log_alloc_enabled() -> bool {
     std::env::var("RZ_LOG_ALLOC")
         .ok()
@@ -1383,6 +1397,18 @@ pub extern "C" fn __rz_dump_state() {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    let tag = if tag == 0 {
+        if rz_allow_untagged() {
+            return;
+        }
+        if rz_tag0_as_root() {
+            __record_raw_ptr_creation(addr, 1, 0, 0)
+        } else {
+            tag
+        }
+    } else {
+        tag
+    };
     if size == 0 {
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!(
@@ -1714,6 +1740,18 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+    let tag = if tag == 0 {
+        if rz_allow_untagged() {
+            return;
+        }
+        if rz_tag0_as_root() {
+            __record_raw_ptr_creation(addr, 0, 0, 0)
+        } else {
+            tag
+        }
+    } else {
+        tag
+    };
     if size == 0 {
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!(

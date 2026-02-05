@@ -858,6 +858,17 @@ impl MyOptimizationPass {
                             }
                         }
                     }
+                    Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                        if let Some(src_local) = self
+                            .place_from_operand(op)
+                            .and_then(|p| p.as_local())
+                        {
+                            let src_ty = body.local_decls[src_local].ty;
+                            if self.is_pointer_ty(src_ty) || src_ty.is_integral() {
+                                locals.insert(dst_local);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1631,6 +1642,12 @@ impl MyOptimizationPass {
                     }
                     return None;
                 }
+                Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _to_ty) => {
+                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
+                    }
+                    return None;
+                }
                 _ => return None,
             }
         }
@@ -2004,6 +2021,27 @@ impl MyOptimizationPass {
                                     skip_tag_prop = true;
                                 }
                             }
+                        }
+                    }
+
+                    // Pointer-from-integer (exposed provenance) casts drop tag lineage unless we
+                    // synthesize a fresh tag. This avoids UNKNOWN_TAG on the first deref.
+                    if let Rvalue::Cast(CastKind::PointerWithExposedProvenance, _op, _to_ty) =
+                        rvalue
+                    {
+                        if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                            let is_mut = self.ptr_is_mut(dst_ty);
+                            ptr_locals_needing_tag.insert(dst_local);
+                            tagged_ptr_locals.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                            });
+                            skip_tag_prop = true;
                         }
                     }
                     let src_local_opt: Option<Local> = match rvalue {
