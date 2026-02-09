@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 mod static_image;
 use static_image::StaticRange;
+mod alias_model;
+use alias_model::{active_alias_model, AliasAccessKind};
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -589,7 +591,6 @@ pub struct TagMeta {
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
-static BORROWS: OnceLock<Mutex<HashMap<usize, Vec<BorrowEntry>>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
 
@@ -599,36 +600,6 @@ fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
 
 fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
     TAGS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn borrows() -> &'static Mutex<HashMap<usize, Vec<BorrowEntry>>> {
-    BORROWS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum BorrowKind {
-    Shared,
-    Unique,
-}
-
-#[derive(Clone, Debug)]
-struct BorrowEntry {
-    tag: u64,
-    kind: BorrowKind,
-}
-
-#[inline]
-fn rz_sb_lite_enabled() -> bool {
-    std::env::var("RZ_SB_LITE")
-        .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
-}
-
-#[inline]
-fn rz_sb_dump_enabled() -> bool {
-    std::env::var("RZ_SB_DUMP")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
@@ -691,518 +662,6 @@ fn find_alloc_containing<'a>(
         return Some((b, m));
     }
     best_unknown
-}
-
-#[derive(Copy, Clone, Debug)]
-enum AccessKind {
-    Read,
-    Write,
-}
-
-fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
-    if !rz_sb_lite_enabled() || tmeta.alias_exempt {
-        return;
-    }
-
-    let kind = match tmeta.kind {
-        PtrKind::RefShared => BorrowKind::Shared,
-        PtrKind::RefMut => BorrowKind::Unique,
-        _ => return,
-    };
-
-    let base = {
-        let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, tmeta.pointee_addr)
-            .map(|(b, _)| b)
-            .unwrap_or(tmeta.pointee_addr)
-    };
-
-    let mut bmap = borrows().lock().unwrap();
-    let stack = bmap.entry(base).or_default();
-
-    // Retagging: if we know the parent, truncate to it (invalidate younger tags).
-    // For fresh unique borrows, clear the stack to invalidate all prior aliases.
-    if tmeta.parent != 0 {
-        if let Some(pos) = stack.iter().rposition(|entry| entry.tag == tmeta.parent) {
-            stack.truncate(pos + 1);
-        } else if kind == BorrowKind::Unique {
-            stack.clear();
-        }
-    } else if kind == BorrowKind::Unique {
-        stack.clear();
-    }
-
-    stack.push(BorrowEntry { tag, kind });
-}
-
-fn sb_lite_validate_ref_creation(
-    pointee_addr: usize,
-    new_kind: PtrKind,
-    parent_tag: u64,
-    alias_exempt: bool,
-    bounds_len: usize,
-) -> Option<String> {
-    if !rz_sb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
-        return None;
-    }
-    // Keep default behavior for thin refs. We only add an early violation for mutable wide
-    // reborrows (slice/str-like) where lineage has no same-base ref ancestor.
-    if !matches!(new_kind, PtrKind::RefMut) || parent_tag == 0 || bounds_len == 0 {
-        return None;
-    }
-
-    let base = {
-        let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, pointee_addr)
-            .map(|(b, _)| b)
-            .unwrap_or(pointee_addr)
-    };
-
-    let parent_ref = if parent_tag != 0 {
-        let tmap = tags().lock().unwrap();
-        let mut cur = parent_tag;
-        let mut found: Option<(u64, PtrKind)> = None;
-        for _ in 0..32 {
-            let Some(tm) = tmap.get(&cur) else { break };
-            if matches!(tm.kind, PtrKind::RefShared | PtrKind::RefMut) {
-                let pbase = {
-                    let amap = allocs().lock().unwrap();
-                    find_alloc_containing(&amap, tm.pointee_addr)
-                        .map(|(b, _)| b)
-                        .unwrap_or(tm.pointee_addr)
-                };
-                if pbase == base {
-                    found = Some((cur, tm.kind));
-                }
-                break;
-            }
-            if tm.parent == 0 {
-                break;
-            }
-            cur = tm.parent;
-        }
-        found
-    } else {
-        None
-    };
-
-    let bmap = borrows().lock().unwrap();
-    let stack = match bmap.get(&base) {
-        Some(s) => s,
-        None => return None,
-    };
-    let top = match stack.last() {
-        Some(t) => t,
-        None => return None,
-    };
-
-    // Helper for byte-range overlap checks on wide borrows.
-    let ranges_overlap = |a_start: usize, a_len: usize, b_start: usize, b_len: usize| -> bool {
-        if a_len == 0 || b_len == 0 {
-            return false;
-        }
-        let a_end = a_start.saturating_add(a_len);
-        let b_end = b_start.saturating_add(b_len);
-        a_start < b_end && b_start < a_end
-    };
-
-    // For mutable wide reborrows, reject creating a sibling unique borrow that overlaps
-    // the currently active unique top. This preserves valid disjoint split patterns and
-    // catches buggy overlapping constructions (e.g. wrong lengths in split_at_mut).
-    if let Some((pref_tag, _pref_kind)) = parent_ref {
-        if top.kind == BorrowKind::Unique && top.tag != pref_tag {
-            let tmap = tags().lock().unwrap();
-            if let Some(top_tm) = tmap.get(&top.tag) {
-                if ranges_overlap(
-                    pointee_addr,
-                    bounds_len,
-                    top_tm.pointee_addr,
-                    top_tm.bounds_len,
-                ) {
-                    return Some(format!(
-                        "REBORROW mutable overlaps active unique sibling: new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x}) parent_ref={}",
-                        pointee_addr,
-                        pointee_addr.saturating_add(bounds_len),
-                        top.tag,
-                        top_tm.pointee_addr,
-                        top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
-                        pref_tag
-                    ));
-                }
-            }
-        }
-    }
-
-    // No same-base ref ancestor is common for raw-parts based builders.
-    // Keep this conservative: only report when we can prove overlap with an
-    // active unique top (otherwise we risk false positives in real crates).
-    if parent_ref.is_none() && top.kind == BorrowKind::Unique {
-        let tmap = tags().lock().unwrap();
-        if let Some(top_tm) = tmap.get(&top.tag) {
-            if ranges_overlap(
-                pointee_addr,
-                bounds_len,
-                top_tm.pointee_addr,
-                top_tm.bounds_len,
-            ) {
-                return Some(format!(
-                    "REBORROW mutable without same-base ref parent overlaps active unique: base=0x{base:x} new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x})",
-                    pointee_addr,
-                    pointee_addr.saturating_add(bounds_len),
-                    top.tag,
-                    top_tm.pointee_addr,
-                    top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
-                ));
-            }
-        }
-    }
-
-    None
-}
-
-fn sb_lite_check(
-    sb_tag: u64,
-    orig_tag: u64,
-    tmeta: &TagMeta,
-    addr: usize,
-    size: usize,
-    access: AccessKind,
-) -> Option<String> {
-    if !rz_sb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
-        return None;
-    }
-
-    if !matches!(
-        tmeta.kind,
-        PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
-    ) {
-        return None;
-    }
-
-    let (base, alloc_meta) = {
-        let amap = allocs().lock().unwrap();
-        match find_alloc_containing(&amap, addr) {
-            Some((b, m)) => (b, Some(m.clone())),
-            None => (addr, None),
-        }
-    };
-
-    let mut bmap = borrows().lock().unwrap();
-    let stack = match bmap.get_mut(&base) {
-        Some(s) => s,
-        None => {
-            // Fallback for coarse base-key misses: for non-RefMut reads, conservatively
-            // check whether another borrow bucket currently holds a unique tag with the
-            // same pointee address. This keeps raw/shared conflict detection robust.
-            if matches!(access, AccessKind::Read) && !matches!(tmeta.kind, PtrKind::RefMut) {
-                let tmap = tags().lock().unwrap();
-                let sb_pointee = tmap.get(&sb_tag).map(|m| m.pointee_addr).unwrap_or(0);
-                let found_conflicting_unique = bmap.values().any(|st| {
-                    st.iter().any(|e| {
-                        e.kind == BorrowKind::Unique
-                            && e.tag != sb_tag
-                            && tmap
-                                .get(&e.tag)
-                                .map(|m| m.pointee_addr == sb_pointee)
-                                .unwrap_or(false)
-                    })
-                });
-                if found_conflicting_unique {
-                    return Some(format!(
-                        "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top=<missing>",
-                        tmeta.kind
-                    ));
-                }
-            }
-            return None;
-        }
-    };
-
-    let top = match stack.last() {
-        Some(t) => t.clone(),
-        None => return None,
-    };
-
-    // If the ref ancestor is alias-exempt (UnsafeCell/interior mutability), skip SB-lite checks.
-    if let Some(sb_meta) = tags().lock().unwrap().get(&sb_tag) {
-        if sb_meta.alias_exempt {
-            return None;
-        }
-    }
-
-    let dump = if rz_sb_dump_enabled() {
-        let tmap = tags().lock().unwrap();
-        let mut out = String::new();
-        out.push_str("\n-- sb-lite dump --\n");
-        out.push_str(&format!("base=0x{base:x} addr=0x{addr:x} size={size}\n"));
-        if let Some(ameta) = alloc_meta.as_ref() {
-            out.push_str(&format!(
-                "alloc: live={} epoch={} size={} is_stack={}\n",
-                ameta.live, ameta.epoch, ameta.size, ameta.is_stack
-            ));
-        } else {
-            out.push_str("alloc: <none>\n");
-        }
-        out.push_str(&format!(
-            "tag_meta: orig_tag={} sb_tag={} kind={:?} parent={} pointee=0x{:x} alloc_epoch={} live_at_creation={} escaped={} alias_exempt={}\n",
-            orig_tag,
-            sb_tag,
-            tmeta.kind,
-            tmeta.parent,
-            tmeta.pointee_addr,
-            tmeta.alloc_epoch,
-            tmeta.alloc_live_at_creation,
-            tmeta.escaped,
-            tmeta.alias_exempt
-        ));
-        out.push_str("tag_ancestry:\n");
-        let mut cur = sb_tag;
-        for i in 0..32 {
-            match tmap.get(&cur) {
-                Some(tm) => {
-                    out.push_str(&format!(
-                        "  {i}: tag={} kind={:?} parent={} pointee=0x{:x} alloc_epoch={} escaped={} alias_exempt={}\n",
-                        cur,
-                        tm.kind,
-                        tm.parent,
-                        tm.pointee_addr,
-                        tm.alloc_epoch,
-                        tm.escaped,
-                        tm.alias_exempt
-                    ));
-                    if tm.parent == 0 {
-                        break;
-                    }
-                    cur = tm.parent;
-                }
-                None => {
-                    out.push_str(&format!("  {i}: tag={} <missing>\n", cur));
-                    break;
-                }
-            }
-        }
-        out.push_str("borrow_stack (bottom->top):\n");
-        for (i, entry) in stack.iter().enumerate() {
-            if let Some(tm) = tmap.get(&entry.tag) {
-                out.push_str(&format!(
-                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} alias_exempt={}\n",
-                    entry.tag,
-                    entry.kind,
-                    tm.kind,
-                    tm.parent,
-                    tm.pointee_addr,
-                    tm.alias_exempt
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  {i}: tag={} stack_kind={:?} <missing>\n",
-                    entry.tag, entry.kind
-                ));
-            }
-        }
-        out.push_str("-- end sb-lite dump --\n");
-        out
-    } else {
-        String::new()
-    };
-
-    match access {
-        AccessKind::Read => {
-            let mut seen_unique = false;
-            let mut saw_related = false;
-            let (sb_root, sb_pointee) = {
-                let tmap = tags().lock().unwrap();
-                let root = sb_lite_root_tag(&tmap, sb_tag);
-                let pointee = tmap.get(&sb_tag).map(|m| m.pointee_addr).unwrap_or(0);
-                (root, pointee)
-            };
-            for idx in (0..stack.len()).rev() {
-                let entry = &stack[idx];
-                if entry.tag == sb_tag {
-                    saw_related = true;
-                    if seen_unique {
-                        // Best-effort reactivation for parent unique refs:
-                        // if all blockers above are unique descendants of this tag,
-                        // treat them as ended and reactivate the parent.
-                        if matches!(tmeta.kind, PtrKind::RefMut) {
-                            let can_reactivate = {
-                                let tmap = tags().lock().unwrap();
-                                stack[idx + 1..].iter().all(|e| {
-                                    e.kind == BorrowKind::Unique
-                                        && sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
-                                })
-                            };
-                            if can_reactivate {
-                                stack.truncate(idx + 1);
-                                return None;
-                            }
-                        }
-                        let mut msg = format!(
-                            "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                            tmeta.kind, top.kind, top.tag
-                        );
-                        msg.push_str(&dump);
-                        return Some(msg);
-                    }
-                    return None;
-                }
-                if entry.kind == BorrowKind::Unique {
-                    let blocker_is_related = {
-                        if matches!(tmeta.kind, PtrKind::RefMut) {
-                            let tmap = tags().lock().unwrap();
-                            let same_root = sb_lite_root_tag(&tmap, entry.tag) == sb_root;
-                            let same_pointee = tmap
-                                .get(&entry.tag)
-                                .map(|m| m.pointee_addr == sb_pointee)
-                                .unwrap_or(false);
-                            same_root || same_pointee
-                        } else {
-                            // Keep strict SB-lite behavior for non-RefMut accesses.
-                            true
-                        }
-                    };
-                    if blocker_is_related {
-                        seen_unique = true;
-                        saw_related = true;
-                    }
-                }
-            }
-            // No related stack entries means this read belongs to a different borrow lineage.
-            // Treat as non-conflicting in SB-lite (best-effort, avoids cross-lineage false positives).
-            if !saw_related && matches!(tmeta.kind, PtrKind::RefMut) {
-                return None;
-            }
-            // If the accessing unique tag is missing from stack, but the current stack consists
-            // only of unique descendants of that tag, treat this as parent reactivation.
-            // This can happen when intermediate reborrows truncated older entries.
-            if matches!(tmeta.kind, PtrKind::RefMut) && !stack.is_empty() {
-                let can_reactivate_missing_parent = {
-                    let tmap = tags().lock().unwrap();
-                    stack.iter().all(|e| {
-                        e.kind == BorrowKind::Unique
-                            && sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
-                    })
-                };
-                if can_reactivate_missing_parent {
-                    stack.clear();
-                    stack.push(BorrowEntry {
-                        tag: sb_tag,
-                        kind: BorrowKind::Unique,
-                    });
-                    return None;
-                }
-            }
-            let mut msg = format!(
-                "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                tmeta.kind, top.kind, top.tag
-            );
-            msg.push_str(&dump);
-            Some(msg)
-        }
-        AccessKind::Write => {
-            let mut is_top = true;
-            let mut seen_unique = false;
-            for (idx, entry) in stack.iter().enumerate().rev() {
-                if entry.tag == sb_tag {
-                    if entry.kind == BorrowKind::Unique {
-                        if is_top {
-                            return None;
-                        }
-                        // For raw writes derived from a unique ref, allow shared reborrows
-                        // above as a best-effort heuristic (we do not track reborrow ends).
-                        if matches!(tmeta.kind, PtrKind::RawMut) && !seen_unique {
-                            return None;
-                        }
-                        // For unique refs, allow reactivation if only shared borrows are above.
-                        // Heuristic: if the current top is shared, assume prior unique reborrows
-                        // have ended and allow the parent unique to reactivate.
-                        if matches!(tmeta.kind, PtrKind::RefMut)
-                            && (!seen_unique || matches!(top.kind, BorrowKind::Shared))
-                        {
-                            stack.truncate(idx + 1);
-                            return None;
-                        }
-                    }
-                    let mut msg = format!(
-                        "WRITE via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                        tmeta.kind, top.kind, top.tag
-                    );
-                    msg.push_str(&dump);
-                    return Some(msg);
-                }
-                if entry.kind == BorrowKind::Unique {
-                    seen_unique = true;
-                }
-                if is_top {
-                    is_top = false;
-                }
-            }
-            let mut msg = format!(
-                "WRITE via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
-                tmeta.kind, top.kind, top.tag
-            );
-            msg.push_str(&dump);
-            Some(msg)
-        }
-    }
-}
-
-fn sb_lite_find_ref_ancestor_tag(
-    tmap: &HashMap<u64, TagMeta>,
-    mut tag: u64,
-) -> Option<u64> {
-    for _ in 0..32 {
-        let t = tmap.get(&tag)?;
-        if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
-            return Some(tag);
-        }
-        if t.parent == 0 {
-            return None;
-        }
-        tag = t.parent;
-    }
-    None
-}
-
-#[inline]
-fn sb_lite_tag_is_descendant_of(
-    tmap: &HashMap<u64, TagMeta>,
-    mut tag: u64,
-    ancestor: u64,
-) -> bool {
-    if tag == ancestor {
-        return true;
-    }
-    for _ in 0..64 {
-        let Some(t) = tmap.get(&tag) else {
-            return false;
-        };
-        if t.parent == 0 {
-            return false;
-        }
-        if t.parent == ancestor {
-            return true;
-        }
-        tag = t.parent;
-    }
-    false
-}
-
-#[inline]
-fn sb_lite_root_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> u64 {
-    if tag == 0 {
-        return 0;
-    }
-    for _ in 0..64 {
-        let Some(t) = tmap.get(&tag) else {
-            return tag;
-        };
-        if t.parent == 0 {
-            return tag;
-        }
-        tag = t.parent;
-    }
-    tag
 }
 
 #[inline]
@@ -1453,11 +912,8 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         entry.size = entry.size.max(size);
     }
 
-    // Clear any SB-lite borrow stack when the allocation dies.
-    if !new_live && rz_sb_lite_enabled() {
-        drop(m);
-        borrows().lock().unwrap().remove(&base_addr);
-    }
+    drop(m);
+    active_alias_model().on_alloc_state_change(base_addr, new_live);
 }
 
 // === allocation event ring buffer (no-alloc, best-effort) ===================
@@ -1730,7 +1186,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             return;
         };
         let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-            sb_lite_find_ref_ancestor_tag(&tmap, tag)
+            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
         } else {
             Some(tag)
         };
@@ -1738,7 +1194,14 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     };
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = sb_lite_check(sb_tag, tag, &tmeta, addr, size, AccessKind::Write) {
+        if let Some(msg) = active_alias_model().check_access(
+            sb_tag,
+            tag,
+            &tmeta,
+            addr,
+            size,
+            AliasAccessKind::Write,
+        ) {
             rz_violation(
                 "STACKED_BORROWS_VIOLATION",
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -1895,6 +1358,18 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        // Shared references in safe code frequently get recreated across allocator-address reuse;
+        // treating their epoch mismatch as hard UB is too noisy.
+        if matches!(tmeta.kind, PtrKind::RefShared) {
+            return;
+        }
+        // Best-effort stack policy: optimized MIR can miss precise stack liveness boundaries,
+        // so Ref*/stack epoch mismatches are often frame-reuse noise.
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && (ameta.is_stack || rz_stack_addr_hint(addr))
+        {
+            return;
+        }
         if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
             return;
         }
@@ -2085,7 +1560,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             return;
         };
         let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-            sb_lite_find_ref_ancestor_tag(&tmap, tag)
+            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
         } else {
             Some(tag)
         };
@@ -2093,7 +1568,14 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     };
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = sb_lite_check(sb_tag, tag, &tmeta, addr, size, AccessKind::Read) {
+        if let Some(msg) = active_alias_model().check_access(
+            sb_tag,
+            tag,
+            &tmeta,
+            addr,
+            size,
+            AliasAccessKind::Read,
+        ) {
             rz_violation(
                 "STACKED_BORROWS_VIOLATION",
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -2205,6 +1687,18 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        // Shared references in safe code frequently get recreated across allocator-address reuse;
+        // treating their epoch mismatch as hard UB is too noisy.
+        if matches!(tmeta.kind, PtrKind::RefShared) {
+            return;
+        }
+        // Best-effort stack policy: optimized MIR can miss precise stack liveness boundaries,
+        // so Ref*/stack epoch mismatches are often frame-reuse noise.
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && (ameta.is_stack || rz_stack_addr_hint(addr))
+        {
+            return;
+        }
         if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
             return;
         }
@@ -2427,7 +1921,7 @@ pub extern "C" fn __record_ref_creation(
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
 
-    if let Some(msg) = sb_lite_validate_ref_creation(
+    if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
         kind,
         parent_tag,
@@ -2440,16 +1934,40 @@ pub extern "C" fn __record_ref_creation(
         );
     }
 
-    // IMPORTANT: On retagging/reborrows (parent_tag != 0), we must NOT refresh alloc_epoch by
-    // consulting the current allocation map, because the same numeric address can be reused by
-    // a different stack frame. Derived tags should inherit the snapshot from their parent tag.
+    // IMPORTANT: On retagging/reborrows (parent_tag != 0), prefer inheriting the parent's
+    // allocation snapshot to keep stack-slot reuse detectable.
+    // Exception: if the new ref clearly points into a different allocation than the parent
+    // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
     let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len) = if parent_tag != 0 {
-        tags()
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
             .lock()
             .unwrap()
             .get(&parent_tag)
-            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, p.bounds_len))
-            .unwrap_or((0, false, 0))
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
+            .unwrap_or((0, false, None, 0));
+
+        if let Some(parent_pointee) = parent_pointee {
+            let amap = allocs().lock().unwrap();
+            let parent_alloc = find_alloc_containing(&amap, parent_pointee);
+            let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+            if let (Some((parent_base, _)), Some((pointee_base, pointee_meta))) =
+                (parent_alloc, pointee_alloc)
+            {
+                if parent_base != pointee_base
+                    || (parent_epoch != 0
+                        && pointee_meta.epoch != 0
+                        && parent_epoch != pointee_meta.epoch)
+                {
+                    (pointee_meta.epoch, pointee_meta.live, 0)
+                } else {
+                    (parent_epoch, parent_live, inherited_bounds_len)
+                }
+            } else {
+                (parent_epoch, parent_live, inherited_bounds_len)
+            }
+        } else {
+            (parent_epoch, parent_live, inherited_bounds_len)
+        }
     } else {
         // Root creation: snapshot from the allocation that contains this address (range lookup).
         let amap = allocs().lock().unwrap();
@@ -2470,7 +1988,7 @@ pub extern "C" fn __record_ref_creation(
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
-    sb_lite_push(tag, &tmeta);
+    active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
@@ -2549,7 +2067,8 @@ pub extern "C" fn __record_raw_ptr_creation(
         alias_exempt: alias_exempt != 0,
         bounds_len,
     };
-    tags().lock().unwrap().insert(tag, tmeta);
+    tags().lock().unwrap().insert(tag, tmeta.clone());
+    active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
         PtrKind::RawConst => "const",
