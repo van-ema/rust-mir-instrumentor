@@ -19,6 +19,9 @@ use static_image::StaticRange;
 
     // Temporarily suppress SB-lite enforcement for coarse "unknown call" hooks.
     static RZ_SB_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
+
+    // Temporarily relax epoch-mismatch checks for coarse allow-untagged hooks.
+    static RZ_RELAX_EPOCH_CHECK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
 }
 
 struct RzRuntimeGuard;
@@ -57,6 +60,21 @@ impl Drop for SbSuppressGuard {
     }
 }
 
+struct RelaxEpochGuard;
+impl RelaxEpochGuard {
+    #[inline]
+    fn enter() -> Self {
+        RZ_RELAX_EPOCH_CHECK.with(|c| c.set(c.get().saturating_add(1)));
+        Self
+    }
+}
+impl Drop for RelaxEpochGuard {
+    #[inline]
+    fn drop(&mut self) {
+        RZ_RELAX_EPOCH_CHECK.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 #[inline]
 fn rz_in_runtime_hook() -> bool {
     RZ_IN_RUNTIME_HOOK.with(|c| c.get() != 0)
@@ -65,6 +83,11 @@ fn rz_in_runtime_hook() -> bool {
 #[inline]
 fn rz_sb_suppressed() -> bool {
     RZ_SB_SUPPRESS.with(|c| c.get())
+}
+
+#[inline]
+fn rz_epoch_check_relaxed() -> bool {
+    RZ_RELAX_EPOCH_CHECK.with(|c| c.get() != 0)
 }
 
 #[inline]
@@ -746,7 +769,7 @@ fn sb_lite_check(
     };
 
     let top = match stack.last() {
-        Some(t) => t,
+        Some(t) => t.clone(),
         None => return None,
     };
 
@@ -836,9 +859,32 @@ fn sb_lite_check(
     match access {
         AccessKind::Read => {
             let mut seen_unique = false;
-            for entry in stack.iter().rev() {
+            let mut saw_related = false;
+            let sb_root = {
+                let tmap = tags().lock().unwrap();
+                sb_lite_root_tag(&tmap, sb_tag)
+            };
+            for idx in (0..stack.len()).rev() {
+                let entry = &stack[idx];
                 if entry.tag == sb_tag {
+                    saw_related = true;
                     if seen_unique {
+                        // Best-effort reactivation for parent unique refs:
+                        // if all blockers above are unique descendants of this tag,
+                        // treat them as ended and reactivate the parent.
+                        if matches!(tmeta.kind, PtrKind::RefMut) {
+                            let can_reactivate = {
+                                let tmap = tags().lock().unwrap();
+                                stack[idx + 1..].iter().all(|e| {
+                                    e.kind == BorrowKind::Unique
+                                        && sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
+                                })
+                            };
+                            if can_reactivate {
+                                stack.truncate(idx + 1);
+                                return None;
+                            }
+                        }
                         let mut msg = format!(
                             "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top={:?} stack_tag={}",
                             tmeta.kind, top.kind, top.tag
@@ -849,7 +895,39 @@ fn sb_lite_check(
                     return None;
                 }
                 if entry.kind == BorrowKind::Unique {
-                    seen_unique = true;
+                    let blocker_is_related = {
+                        let tmap = tags().lock().unwrap();
+                        sb_lite_root_tag(&tmap, entry.tag) == sb_root
+                    };
+                    if blocker_is_related {
+                        seen_unique = true;
+                        saw_related = true;
+                    }
+                }
+            }
+            // No related stack entries means this read belongs to a different borrow lineage.
+            // Treat as non-conflicting in SB-lite (best-effort, avoids cross-lineage false positives).
+            if !saw_related {
+                return None;
+            }
+            // If the accessing unique tag is missing from stack, but the current stack consists
+            // only of unique descendants of that tag, treat this as parent reactivation.
+            // This can happen when intermediate reborrows truncated older entries.
+            if matches!(tmeta.kind, PtrKind::RefMut) && !stack.is_empty() {
+                let can_reactivate_missing_parent = {
+                    let tmap = tags().lock().unwrap();
+                    stack.iter().all(|e| {
+                        e.kind == BorrowKind::Unique
+                            && sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
+                    })
+                };
+                if can_reactivate_missing_parent {
+                    stack.clear();
+                    stack.push(BorrowEntry {
+                        tag: sb_tag,
+                        kind: BorrowKind::Unique,
+                    });
+                    return None;
                 }
             }
             let mut msg = format!(
@@ -922,6 +1000,47 @@ fn sb_lite_find_ref_ancestor_tag(
         tag = t.parent;
     }
     None
+}
+
+#[inline]
+fn sb_lite_tag_is_descendant_of(
+    tmap: &HashMap<u64, TagMeta>,
+    mut tag: u64,
+    ancestor: u64,
+) -> bool {
+    if tag == ancestor {
+        return true;
+    }
+    for _ in 0..64 {
+        let Some(t) = tmap.get(&tag) else {
+            return false;
+        };
+        if t.parent == 0 {
+            return false;
+        }
+        if t.parent == ancestor {
+            return true;
+        }
+        tag = t.parent;
+    }
+    false
+}
+
+#[inline]
+fn sb_lite_root_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> u64 {
+    if tag == 0 {
+        return 0;
+    }
+    for _ in 0..64 {
+        let Some(t) = tmap.get(&tag) else {
+            return tag;
+        };
+        if t.parent == 0 {
+            return tag;
+        }
+        tag = t.parent;
+    }
+    tag
 }
 
 #[inline(never)]
@@ -1402,7 +1521,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 1, 0, 0)
+            __record_raw_ptr_creation(addr, 1, 0, 0, 0)
         } else {
             tag
         }
@@ -1591,6 +1710,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
+            return;
+        }
         let msg = append_location_if_enabled(
             format!(
                 "WRITE via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
@@ -1729,6 +1851,7 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
         return;
     }
     let _sb = SbSuppressGuard::enter();
+    let _relax = RelaxEpochGuard::enter();
     __rz_ptr_write(tag, addr, size);
 }
 
@@ -1745,7 +1868,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 0, 0, 0)
+            __record_raw_ptr_creation(addr, 0, 0, 0, 0)
         } else {
             tag
         }
@@ -1889,6 +2012,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
 
     if tmeta.alloc_epoch != 0 && ameta.epoch != 0 && tmeta.alloc_epoch != ameta.epoch {
+        if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
+            return;
+        }
         let msg = append_location_if_enabled(
             format!(
                 "READ via tag={tag} addr=0x{addr:x} size={size}\nalloc_base=0x{base:x} alloc_size={} alloc_epoch={} tag_epoch={} kind={:?} parent={}\npointee=0x{:x}",
@@ -2027,6 +2153,7 @@ pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
         return;
     }
     let _sb = SbSuppressGuard::enter();
+    let _relax = RelaxEpochGuard::enter();
     __rz_ptr_read(tag, addr, size);
 }
 

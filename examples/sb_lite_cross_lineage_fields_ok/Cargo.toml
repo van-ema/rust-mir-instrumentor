@@ -1,0 +1,6 @@
+[package]
+name = "sb_lite_cross_lineage_fields_ok"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

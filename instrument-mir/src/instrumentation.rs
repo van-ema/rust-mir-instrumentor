@@ -706,13 +706,13 @@ impl MyOptimizationPass {
     /// Instead, classify fat pointers syntactically by looking at the pointee type:
     /// references/raw-pointers to DSTs (`[T]`, `str`, `dyn Trait`) are fat; everything else is
     /// treated as thin.
-    fn is_thin_ptr_ty<'tcx>(&self, _tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    fn is_thin_ptr_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => match pointee.kind() {
                 TyKind::Slice(..) | TyKind::Str | TyKind::Dynamic(..) => false,
                 // `extern type` is unsized but uses `()` metadata, so pointers are thin.
                 TyKind::Foreign(..) => true,
-                _ => true,
+                _ => pointee.is_sized(tcx, body.typing_env(tcx)),
             },
             _ => false,
         }
@@ -729,7 +729,7 @@ impl MyOptimizationPass {
     ) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                self.is_thin_ptr_ty(tcx, ty) && pointee.is_sized(tcx, body.typing_env(tcx))
+                self.is_thin_ptr_ty(tcx, body, ty) && pointee.is_sized(tcx, body.typing_env(tcx))
             }
             _ => false,
         }
@@ -892,7 +892,7 @@ impl MyOptimizationPass {
         addr_local: Local,
     ) -> Option<(Option<Statement<'tcx>>, Statement<'tcx>)> {
         let place_ty = place.ty(&body.local_decls, tcx).ty;
-        if self.is_thin_ptr_ty(tcx, place_ty) {
+        if self.is_thin_ptr_ty(tcx, body, place_ty) {
             let addr_stmt = Statement::new(
                 source_info,
                 StatementKind::Assign(Box::new((
@@ -1028,7 +1028,6 @@ impl MyOptimizationPass {
         }
         Some(set)
     }
-
 
     fn is_std_like_crate_name(&self, name: &str) -> bool {
         matches!(name, "core" | "std")
@@ -1764,11 +1763,11 @@ impl MyOptimizationPass {
         };
         let callee_id = self.callee_id_u64(tcx, body.source.def_id());
 
-        // Retag pointer arguments. Skip wide pointers to avoid codegen ICEs
-        // from scalar-pair operands; this is best-effort and may miss some metadata.
+        // Retag pointer arguments. Wide pointers are handled by extracting the data pointer
+        // during lowering, so we can safely retag them here.
         for (arg_index, arg_local) in body.args_iter().enumerate() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if self.is_addr_exposable_ptr_ty(tcx, body, arg_ty) {
+            if self.is_pointer_ty(arg_ty) {
                 ptr_locals_needing_tag.insert(arg_local);
                 tagged_ptr_locals.insert(arg_local);
                 insert_points.push(InsertPoint {
@@ -2024,12 +2023,19 @@ impl MyOptimizationPass {
                         }
                     }
 
-                    // Pointer-from-integer (exposed provenance) casts drop tag lineage unless we
-                    // synthesize a fresh tag. This avoids UNKNOWN_TAG on the first deref.
-                    if let Rvalue::Cast(CastKind::PointerWithExposedProvenance, _op, _to_ty) =
-                        rvalue
+                    // Pointer-from-non-pointer casts (including exposed provenance and transmute)
+                    // drop lineage unless we synthesize a fresh root tag for the destination.
+                    if let Rvalue::Cast(
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion(_, _)
+                        | CastKind::Transmute
+                        | CastKind::PointerWithExposedProvenance,
+                        op,
+                        _to_ty,
+                    ) = rvalue
                     {
-                        if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                        let src_ty = op.ty(&body.local_decls, tcx);
+                        if !self.is_pointer_ty(src_ty) && self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                             let is_mut = self.ptr_is_mut(dst_ty);
                             ptr_locals_needing_tag.insert(dst_local);
                             tagged_ptr_locals.insert(dst_local);
@@ -2065,6 +2071,32 @@ impl MyOptimizationPass {
                     if src_local_opt.is_none() {
                         if let Rvalue::Use(op) = rvalue {
                             if let Some(p) = self.place_from_operand(op) {
+                                // If we are extracting the data pointer from a wide pointer
+                                // (e.g., `(*slice).0`), preserve the base tag.
+                                if !p.projection.is_empty() {
+                                    let base_local = p.local;
+                                    let base_ty = body.local_decls[base_local].ty;
+                                    if self.is_pointer_ty(base_ty)
+                                        && !self.is_thin_ptr_ty(tcx, body, base_ty)
+                                    {
+                                        if p.projection.len() >= 1
+                                            && matches!(p.projection[0], ProjectionElem::Deref)
+                                        {
+                                            if p.projection.len() >= 2 {
+                                                if let ProjectionElem::Field(field, _) = p.projection[1] {
+                                                    if field.index() == 0 {
+                                                        src_local_opt = Some(base_local);
+                                                    }
+                                                }
+                                            }
+                                        } else if let ProjectionElem::Field(field, _) = p.projection[0] {
+                                            if field.index() == 0 {
+                                                src_local_opt = Some(base_local);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if p.projection.len() == 1 {
                                     if let ProjectionElem::Field(field, _ty) = p.projection[0] {
                                         let field_idx = field.index();
@@ -2300,11 +2332,14 @@ impl MyOptimizationPass {
                     };
 
                     if let (Some(op), Some(lhs)) = (binop, lhs_op) {
-                        if matches!(op, BinOp::Add | BinOp::Sub) {
+                        // Raw pointer arithmetic frequently lowers to `BinOp::Offset`.
+                        // Treat it like Add/Sub for tag-derivation so the derived pointer
+                        // local does not remain untagged.
+                        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Offset) {
                             if let Some(src_place) = self.place_from_operand(lhs) {
                                 let src_local = src_place.local;
                                 let src_ty = body.local_decls[src_local].ty;
-                                if self.is_thin_ptr_ty(tcx, src_ty) {
+                                if self.is_thin_ptr_ty(tcx, body, src_ty) {
                                     let is_mut = match dst_ty.kind() {
                                         TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                                         TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -2410,7 +2445,7 @@ impl MyOptimizationPass {
         span: Span,
     ) -> SizeOperand<'tcx> {
         let ptr_ty = body.local_decls[ptr_local].ty;
-        if !self.is_thin_ptr_ty(tcx, ptr_ty) {
+        if !self.is_thin_ptr_ty(tcx, body, ptr_ty) {
             return self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, span);
         }
 
@@ -3427,8 +3462,7 @@ impl MyOptimizationPass {
         }
 
 
-        // Treat any pointer argument as tag relevant. For wide pointers we avoid emitting
-        // addr-based hooks (they would ICE in codegen); thin pointers get full modeling.
+        // Treat any pointer argument as tag relevant.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else { continue; };
             let ty = body.local_decls[p.local].ty;
@@ -3438,7 +3472,7 @@ impl MyOptimizationPass {
             let was_tagged = tagged_ptr_locals.contains(&p.local);
 
             // Ensure a tag exists before any call-boundary effects that consume it.
-            if !was_tagged && is_addr_exposable {
+            if !was_tagged {
                 let is_mut = match ty.kind() {
                     TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                     TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -3457,7 +3491,7 @@ impl MyOptimizationPass {
             }
         
             // Inter-procedural: push argument tag to callee if instrumented.
-            if callee_instrumented && is_addr_exposable {
+            if callee_instrumented {
                 if let Some(callee_id) = callee_id_opt {
                     ptr_locals_needing_tag.insert(p.local);
                     insert_points.push(InsertPoint {
@@ -5390,6 +5424,12 @@ impl MyOptimizationPass {
                 "Skipping optimization for item in runtime crate: {:?}",
                 def_id
             );
+            return;
+        }
+
+        // Skip build scripts to avoid ICEs in codegen (e.g. wide ptr operands in build.rs).
+        if crate_name.as_str() == "build_script_build" || def_path.contains("build_script_build") {
+            println!("Skipping optimization for build script: {:?}", def_id);
             return;
         }
 
