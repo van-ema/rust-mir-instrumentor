@@ -1418,8 +1418,12 @@ impl MyOptimizationPass {
                     // Nested deref: we do not try to follow multiple levels here.
                     return None;
                 }
-                ProjectionElem::Downcast(_, variant_idx) => {
-                    place_ty = PlaceTy { ty: place_ty.ty, variant_index: Some(*variant_idx) };
+                ProjectionElem::Downcast(_, _variant_idx) => {
+                    // Keep `place_ty` unchanged here and let the canonical
+                    // `projection_ty` update happen once at the end of the loop.
+                    // Setting `variant_index` manually here and then calling
+                    // `projection_ty(Downcast)` again triggers rustc's
+                    // "non field projection on downcasted place" ICE.
                 }
                 ProjectionElem::Field(field, _) => {
                     let offset_bytes =
@@ -3936,13 +3940,26 @@ impl MyOptimizationPass {
                 };
                 tagged_ptr_locals.insert(p.local);
                 ptr_locals_needing_tag.insert(p.local);
+                let root_kind = if matches!(ty.kind(), TyKind::Ref(..)) {
+                    // For reference-typed args, preserve ref semantics at the root.
+                    // Emitting RawRoot here loses that information and can produce
+                    // spurious stack wild-pointer reports when call-boundary tags
+                    // are missing for optimized/indirect calls.
+                    InstrKind::RetRoot {
+                        dst_local: p.local,
+                        is_mut,
+                        is_ref: true,
+                    }
+                } else {
+                    InstrKind::RawRoot { ptr_local: p.local, is_mut }
+                };
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx: block_data.statements.len(),
                     insert_before: false,
                     source_info: term.source_info,
                     place: Place::from(p.local),
-                    kind: InstrKind::RawRoot { ptr_local: p.local, is_mut },
+                    kind: root_kind,
                 });
             }
         

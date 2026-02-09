@@ -1212,6 +1212,14 @@ fn rz_allow_untracked_stack_ref(tmeta: &TagMeta, addr: usize) -> bool {
         && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
 }
 
+#[inline]
+fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
+    matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        && tmeta.parent == 0
+        && tmeta.alloc_epoch == 0
+        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
+}
+
 #[inline(never)]
 fn rz_violation(kind: &str, msg: String) {
     // Always print the report. Avoid stdio re-entrancy by writing directly to fd=2.
@@ -1757,7 +1765,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let Some((base, ameta)) = alloc_opt else {
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
-        if rz_allow_untracked_stack_ref(&tmeta, addr) {
+        if rz_allow_untracked_stack_ref(&tmeta, addr)
+            || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+        {
             return;
         }
 
@@ -2099,7 +2109,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let Some((base, ameta)) = alloc_opt else {
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
-        if rz_allow_untracked_stack_ref(&tmeta, addr) {
+        if rz_allow_untracked_stack_ref(&tmeta, addr)
+            || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+        {
             return;
         }
 
