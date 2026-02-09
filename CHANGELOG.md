@@ -6,6 +6,7 @@
 - SB-lite false-positive fix: read checks now ignore unique blockers from a different root tag lineage to avoid cross-lineage conflicts when multiple independent `&mut` args share the same coarse allocation bucket.
 - SB-lite false-positive fix: when a parent `&mut` tag is missing from stack (due to reborrow truncation), read checks now reactivate it if the remaining stack contains only unique descendants of that parent.
 - Examples: add `sb_lite_parent_read_after_field_reborrow` and mark expected result as `ok` to lock in the fixed behavior.
+- Runtime false-positive fix: in no-allocation branches, allow untracked stack `&/&mut` (epoch unknown) instead of reporting `WILD_POINTER` when addresses are within stack-hint range.
 - Instrumentation: handle wide/fat pointers (`&[T]`, `&str`, `dyn Trait`) by extracting a thin data pointer (`*const ()`/`*mut ()`) before `PointerExposeProvenance`, so tags/epochs are keyed by the data address.
 - Instrumentation: treat wide pointer locals as tag-relevant for deref read/write and raw-root synthesis so lineage isn’t dropped to tag=0 before a thin data pointer is extracted.
 - Examples: add wide-pointer micro-examples (`wide_ptr_slice_uaf_read`, `wide_ptr_slice_uaf_write`, `wide_ptr_raw_slice_cast_ok`, `wide_ptr_raw_str_cast_ok`).

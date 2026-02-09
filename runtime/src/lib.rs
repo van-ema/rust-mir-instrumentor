@@ -765,7 +765,32 @@ fn sb_lite_check(
     let mut bmap = borrows().lock().unwrap();
     let stack = match bmap.get_mut(&base) {
         Some(s) => s,
-        None => return None,
+        None => {
+            // Fallback for coarse base-key misses: for non-RefMut reads, conservatively
+            // check whether another borrow bucket currently holds a unique tag with the
+            // same pointee address. This keeps raw/shared conflict detection robust.
+            if matches!(access, AccessKind::Read) && !matches!(tmeta.kind, PtrKind::RefMut) {
+                let tmap = tags().lock().unwrap();
+                let sb_pointee = tmap.get(&sb_tag).map(|m| m.pointee_addr).unwrap_or(0);
+                let found_conflicting_unique = bmap.values().any(|st| {
+                    st.iter().any(|e| {
+                        e.kind == BorrowKind::Unique
+                            && e.tag != sb_tag
+                            && tmap
+                                .get(&e.tag)
+                                .map(|m| m.pointee_addr == sb_pointee)
+                                .unwrap_or(false)
+                    })
+                });
+                if found_conflicting_unique {
+                    return Some(format!(
+                        "READ via tag={sb_tag} addr=0x{addr:x} size={size} kind={:?}\nstack_top=<missing>",
+                        tmeta.kind
+                    ));
+                }
+            }
+            return None;
+        }
     };
 
     let top = match stack.last() {
@@ -860,9 +885,11 @@ fn sb_lite_check(
         AccessKind::Read => {
             let mut seen_unique = false;
             let mut saw_related = false;
-            let sb_root = {
+            let (sb_root, sb_pointee) = {
                 let tmap = tags().lock().unwrap();
-                sb_lite_root_tag(&tmap, sb_tag)
+                let root = sb_lite_root_tag(&tmap, sb_tag);
+                let pointee = tmap.get(&sb_tag).map(|m| m.pointee_addr).unwrap_or(0);
+                (root, pointee)
             };
             for idx in (0..stack.len()).rev() {
                 let entry = &stack[idx];
@@ -896,8 +923,18 @@ fn sb_lite_check(
                 }
                 if entry.kind == BorrowKind::Unique {
                     let blocker_is_related = {
-                        let tmap = tags().lock().unwrap();
-                        sb_lite_root_tag(&tmap, entry.tag) == sb_root
+                        if matches!(tmeta.kind, PtrKind::RefMut) {
+                            let tmap = tags().lock().unwrap();
+                            let same_root = sb_lite_root_tag(&tmap, entry.tag) == sb_root;
+                            let same_pointee = tmap
+                                .get(&entry.tag)
+                                .map(|m| m.pointee_addr == sb_pointee)
+                                .unwrap_or(false);
+                            same_root || same_pointee
+                        } else {
+                            // Keep strict SB-lite behavior for non-RefMut accesses.
+                            true
+                        }
                     };
                     if blocker_is_related {
                         seen_unique = true;
@@ -907,7 +944,7 @@ fn sb_lite_check(
             }
             // No related stack entries means this read belongs to a different borrow lineage.
             // Treat as non-conflicting in SB-lite (best-effort, avoids cross-lineage false positives).
-            if !saw_related {
+            if !saw_related && matches!(tmeta.kind, PtrKind::RefMut) {
                 return None;
             }
             // If the accessing unique tag is missing from stack, but the current stack consists
@@ -1041,6 +1078,13 @@ fn sb_lite_root_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> u64 {
         tag = t.parent;
     }
     tag
+}
+
+#[inline]
+fn rz_allow_untracked_stack_ref(tmeta: &TagMeta, addr: usize) -> bool {
+    matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+        && tmeta.alloc_epoch == 0
+        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
 }
 
 #[inline(never)]
@@ -1586,6 +1630,12 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     let Some((base, ameta)) = alloc_opt else {
+        // Best-effort: when stack allocation metadata is missing, do not classify
+        // references into the current stack window as wild pointers.
+        if rz_allow_untracked_stack_ref(&tmeta, addr) {
+            return;
+        }
+
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!("[rusteze-runtime] WRITE lookup result: no containing allocation");
         }
@@ -1922,6 +1972,12 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let alloc_opt = find_alloc_containing(&amap, addr);
 
     let Some((base, ameta)) = alloc_opt else {
+        // Best-effort: when stack allocation metadata is missing, do not classify
+        // references into the current stack window as wild pointers.
+        if rz_allow_untracked_stack_ref(&tmeta, addr) {
+            return;
+        }
+
         // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
         let tmap = tags().lock().unwrap();
