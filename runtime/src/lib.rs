@@ -735,6 +735,131 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
     stack.push(BorrowEntry { tag, kind });
 }
 
+fn sb_lite_validate_ref_creation(
+    pointee_addr: usize,
+    new_kind: PtrKind,
+    parent_tag: u64,
+    alias_exempt: bool,
+    bounds_len: usize,
+) -> Option<String> {
+    if !rz_sb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
+        return None;
+    }
+    // Keep default behavior for thin refs. We only add an early violation for mutable wide
+    // reborrows (slice/str-like) where lineage has no same-base ref ancestor.
+    if !matches!(new_kind, PtrKind::RefMut) || parent_tag == 0 || bounds_len == 0 {
+        return None;
+    }
+
+    let base = {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, pointee_addr)
+            .map(|(b, _)| b)
+            .unwrap_or(pointee_addr)
+    };
+
+    let parent_ref = if parent_tag != 0 {
+        let tmap = tags().lock().unwrap();
+        let mut cur = parent_tag;
+        let mut found: Option<(u64, PtrKind)> = None;
+        for _ in 0..32 {
+            let Some(tm) = tmap.get(&cur) else { break };
+            if matches!(tm.kind, PtrKind::RefShared | PtrKind::RefMut) {
+                let pbase = {
+                    let amap = allocs().lock().unwrap();
+                    find_alloc_containing(&amap, tm.pointee_addr)
+                        .map(|(b, _)| b)
+                        .unwrap_or(tm.pointee_addr)
+                };
+                if pbase == base {
+                    found = Some((cur, tm.kind));
+                }
+                break;
+            }
+            if tm.parent == 0 {
+                break;
+            }
+            cur = tm.parent;
+        }
+        found
+    } else {
+        None
+    };
+
+    let bmap = borrows().lock().unwrap();
+    let stack = match bmap.get(&base) {
+        Some(s) => s,
+        None => return None,
+    };
+    let top = match stack.last() {
+        Some(t) => t,
+        None => return None,
+    };
+
+    // Helper for byte-range overlap checks on wide borrows.
+    let ranges_overlap = |a_start: usize, a_len: usize, b_start: usize, b_len: usize| -> bool {
+        if a_len == 0 || b_len == 0 {
+            return false;
+        }
+        let a_end = a_start.saturating_add(a_len);
+        let b_end = b_start.saturating_add(b_len);
+        a_start < b_end && b_start < a_end
+    };
+
+    // For mutable wide reborrows, reject creating a sibling unique borrow that overlaps
+    // the currently active unique top. This preserves valid disjoint split patterns and
+    // catches buggy overlapping constructions (e.g. wrong lengths in split_at_mut).
+    if let Some((pref_tag, _pref_kind)) = parent_ref {
+        if top.kind == BorrowKind::Unique && top.tag != pref_tag {
+            let tmap = tags().lock().unwrap();
+            if let Some(top_tm) = tmap.get(&top.tag) {
+                if ranges_overlap(
+                    pointee_addr,
+                    bounds_len,
+                    top_tm.pointee_addr,
+                    top_tm.bounds_len,
+                ) {
+                    return Some(format!(
+                        "REBORROW mutable overlaps active unique sibling: new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x}) parent_ref={}",
+                        pointee_addr,
+                        pointee_addr.saturating_add(bounds_len),
+                        top.tag,
+                        top_tm.pointee_addr,
+                        top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
+                        pref_tag
+                    ));
+                }
+            }
+        }
+    }
+
+    // No same-base ref ancestor is common for raw-parts based builders.
+    // Keep this conservative: only report when we can prove overlap with an
+    // active unique top (otherwise we risk false positives in real crates).
+    if parent_ref.is_none() && top.kind == BorrowKind::Unique {
+        let tmap = tags().lock().unwrap();
+        if let Some(top_tm) = tmap.get(&top.tag) {
+            if ranges_overlap(
+                pointee_addr,
+                bounds_len,
+                top_tm.pointee_addr,
+                top_tm.bounds_len,
+            ) {
+                return Some(format!(
+                    "REBORROW mutable without same-base ref parent overlaps active unique: base=0x{base:x} new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x})",
+                    pointee_addr,
+                    pointee_addr.saturating_add(bounds_len),
+                    top.tag,
+                    top_tm.pointee_addr,
+                    top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 fn sb_lite_check(
     sb_tag: u64,
     orig_tag: u64,
@@ -2289,6 +2414,19 @@ pub extern "C" fn __record_ref_creation(
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
+
+    if let Some(msg) = sb_lite_validate_ref_creation(
+        pointee_addr,
+        kind,
+        parent_tag,
+        alias_exempt != 0,
+        bounds_len,
+    ) {
+        rz_violation(
+            "STACKED_BORROWS_VIOLATION",
+            append_location_if_enabled(msg, "RZ_LOG_LOC"),
+        );
+    }
 
     // IMPORTANT: On retagging/reborrows (parent_tag != 0), we must NOT refresh alloc_epoch by
     // consulting the current allocation map, because the same numeric address can be reused by

@@ -29,3 +29,8 @@
 
 - Runtime: record wide-pointer metadata length in tags and enforce bounds against it for reads/writes.
 - Instrumentation: compute access sizes for wide-pointer derefs using `PtrMetadata` (slice/str length).
+
+## Since 487b00526d7fe9755d37f4109b01c85af1c23dfd
+
+- Instrumentation: compute deref-access addresses with projection offsets (field/index/subslice) so reads/writes use the actual element address.
+- Examples: kept wide-pointer slice-index OOB demos as `ok` because Rust inserts bounds-check panics before runtime hooks execute.

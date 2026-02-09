@@ -160,9 +160,10 @@ address for tagging / range lookup:
   keep the expected tag/epoch lineage.
 
 Current limitations:
-- We do use metadata length for bounds checks when the access size can be tied
-  to the wide pointer, but some index-based accesses still miss the element
-  offset due to coarse address tracking in MIR.
+- We use metadata length for bounds checks and compute offsets for deref
+  projections (field/index/subslice), but offsets can still be missed when
+  pointer arithmetic happens in separate temporaries or through nested-deref
+  patterns not reflected in a single MIR place.
 - `dyn Trait` pointee sizes remain unknown; we still track the data address and
   allocation epoch, but typically use `size=0` for access checks.
 
@@ -170,7 +171,7 @@ Examples:
 - `examples/wide_ptr_slice_uaf_read`, `examples/wide_ptr_slice_uaf_write`
 - `examples/wide_ptr_dyn_trait_uaf_read`
 - `examples/wide_ptr_raw_slice_cast_ok`, `examples/wide_ptr_raw_str_cast_ok`, `examples/wide_ptr_dyn_trait_cast_ok`
-- Known limitation demos:
+- Slice-length OOB panic demos (Rust bounds check triggers before runtime hook):
   - `examples/wide_ptr_slice_len_oob_read_not_detected`
   - `examples/wide_ptr_slice_len_oob_write_not_detected`
 

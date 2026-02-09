@@ -64,6 +64,14 @@ def extract_signature(log_path: Path) -> str | None:
     return f"{kind}|{access}|{pkind}|{size}"
 
 
+def did_panic(log_path: Path) -> bool:
+    try:
+        data = log_path.read_text(errors="replace")
+    except FileNotFoundError:
+        return False
+    return "panicked at" in data or "thread 'main' panicked" in data
+
+
 def read_expectation(pkg_dir: Path, bin_name: str) -> str | None:
     expect_file = pkg_dir / f"expected.{bin_name}.rz"
     if not expect_file.exists():
@@ -217,9 +225,10 @@ def main() -> int:
 
         bin_path = bin_dir / bin_name
         with run_log.open("w") as f:
-            subprocess.run([str(bin_path)], env=env, stdout=f, stderr=subprocess.STDOUT)
+            run_result = subprocess.run([str(bin_path)], env=env, stdout=f, stderr=subprocess.STDOUT)
 
         observed = extract_signature(run_log)
+        panicked = did_panic(run_log) or run_result.returncode != 0
 
         if expected is None and record_expect:
             expected = observed or "ok"
@@ -239,6 +248,16 @@ def main() -> int:
             else:
                 with summary_file.open("a") as f:
                     f.write(f"{label}\tmismatch\t{expected}\t{observed}\n")
+                failures += 1
+        elif expected_lower in ("panic", "panics"):
+            # "panic" means we expect a Rust panic/abort without a RUSTEZE violation signature.
+            if panicked and observed is None:
+                with summary_file.open("a") as f:
+                    f.write(f"{label}\tok\t{expected}\tpanic\n")
+            else:
+                observed_text = observed or ("-" if not panicked else "panic")
+                with summary_file.open("a") as f:
+                    f.write(f"{label}\tmismatch\t{expected}\t{observed_text}\n")
                 failures += 1
         else:
             if observed == expected:

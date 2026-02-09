@@ -21,13 +21,9 @@ extracts a **thin** data pointer first:
 - thin pointers: `addr = expose_provenance(ptr)`
 - wide pointers: `thin = (ptr as *const ()/*mut ())` then `addr = expose_provenance(thin)`
 
-This drops the metadata (length / vtable) on purpose: the runtime’s allocation
-map is keyed by the data address. Metadata-aware checks (e.g., slice-length OOB)
-are a follow-up step.
-
-Known limitation demos:
-- `examples/wide_ptr_slice_len_oob_read_not_detected`
-- `examples/wide_ptr_slice_len_oob_write_not_detected`
+This drops the metadata (length / vtable) on purpose for address identity: the
+runtime’s allocation map is keyed by the data address. Metadata length is still
+recorded separately in tag metadata for slice/str bounds checks.
 
 ## Slice/str bounds via metadata length
 
@@ -36,10 +32,11 @@ metadata length (slice length in bytes / str length) to the runtime. The runtime
 stores this as `TagMeta.bounds_len` and checks reads/writes against
 `[pointee_addr, pointee_addr + bounds_len)` in addition to allocation bounds.
 
-This improves detection of forged or mismatched metadata, but it still depends
-on the access address being computed with the correct element offset. In some
-MIR patterns, the pointer-offset computation is not reflected in the addr we
-pass to the runtime, so index-based OOB can still slip through.
+This improves detection of forged or mismatched metadata. We now compute
+projection-based offsets for deref reads/writes (field/index/subslice), so
+index-based OOB is detected when the access stays in a single MIR place.
+Offsets can still be missed when pointer arithmetic is performed in a separate
+local/call or when projections use `from_end`/nested deref patterns.
 
 ## Unknown-call allow-untagged reads/writes
 
@@ -103,48 +100,21 @@ We still rely on the "reverse insertion" rule when splitting terminators:
 later-applied hooks execute earlier at runtime. The explicit priorities keep
 the ordering stable when multiple hooks share the same insertion point.
 
-## PtrWrite address precision caveat
+## Access address precision for deref projections
 
-Right now, the `PtrWrite` instrumentation computes the write address as:
+For deref reads/writes, we now compute the **actual accessed address** by
+walking projections after the first `Deref`:
 
-- `addr = expose_provenance(ptr_local)`
+- `Field` offsets are derived from layout when available.
+- `Index`/`ConstantIndex`/`Subslice` offsets use element size × index.
 
-This is the **pointer value** stored in the base pointer local (e.g., `_p`), turned into a `usize`.
+This fixes common cases like `(*p).field`, `slice[i]`, and enables slice-length
+OOB detection with wide-pointer metadata.
 
-### What this catches well
-
-This is correct for *simple deref writes* where the write happens at the pointer's base address:
-
-```rust
-unsafe { *p = 43; }
-```
-
-In MIR terms, this is essentially a store to `(*p)` with no additional offset.
-
-### What it does NOT capture yet
-
-For *interior writes*, the actual store address is **base + offset**, but we currently only pass the base pointer value.
-
-Examples:
-
-```rust
-unsafe { (*p).field = 1; }      // field offset
-unsafe { p.add(3).write(7); }   // pointer arithmetic
-unsafe { slice[i] = 9; }        // indexing
-```
-
-In MIR these show up as a `Deref` plus additional projections (e.g., `Field`, `Index`, etc.). The real accessed address depends on the projection chain.
-
-### TODO to improve later
-
-Compute the **actual accessed address** for a deref write by accounting for projections after `Deref`:
-
-- walk `lhs_place.projection` after the first `Deref`
-- use type/layout info to compute field offsets
-- handle indexing and pointer arithmetic
-- then pass `addr = base + computed_offset` to `__rz_ptr_write`
-
-This will be necessary to correctly track writes like `(*p).field = ...` and other interior accesses.
+Remaining limitations (best-effort):
+- Pointer arithmetic done in separate locals/calls (e.g. `p.add(i)` then write)
+  may still use the base address if MIR does not encode the offset in the place.
+- Projections with `from_end` or nested deref chains are not modeled yet.
 
 ## Drop glue and implicit address-of
 

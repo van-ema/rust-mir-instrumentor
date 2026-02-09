@@ -11,9 +11,9 @@ fn main() {
         // OOB with respect to the *slice length* (index 7 >= 1),
         // but still in-bounds for the allocation.
         //
-        // TODO: once slice-length metadata is enforced, this should be an OOB violation.
+        // This panics in Rust before the runtime hook because slice indexing
+        // performs an explicit bounds check on length metadata.
         (*fat)[7] = 42;
         black_box(*p);
     }
 }
-
