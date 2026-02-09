@@ -4,8 +4,10 @@ use std::sync::OnceLock;
 use crate::{PtrKind, TagMeta};
 
 mod stacked_borrows_lite;
+mod tree_borrows_lite;
 
 pub(crate) use stacked_borrows_lite::StackedBorrowsLiteModel;
+pub(crate) use tree_borrows_lite::TreeBorrowsLiteModel;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum AliasAccessKind {
@@ -58,10 +60,12 @@ impl AliasModel for NoAliasModel {
 
 static NO_ALIAS_MODEL: NoAliasModel = NoAliasModel;
 static SB_LITE_MODEL: StackedBorrowsLiteModel = StackedBorrowsLiteModel;
+static TB_LITE_MODEL: TreeBorrowsLiteModel = TreeBorrowsLiteModel;
 
 #[derive(Copy, Clone, Debug)]
 enum ActiveModel {
     SbLite,
+    TbLite,
     None,
 }
 
@@ -73,6 +77,7 @@ fn active_model_choice() -> ActiveModel {
             .to_ascii_lowercase();
         match raw.as_str() {
             "" | "sb" | "sb_lite" | "stacked_borrows" => ActiveModel::SbLite,
+            "tb" | "tb_lite" | "tree_borrows" => ActiveModel::TbLite,
             "none" | "off" => ActiveModel::None,
             // Keep unknown values non-fatal; default to the current model.
             _ => ActiveModel::SbLite,
@@ -83,6 +88,7 @@ fn active_model_choice() -> ActiveModel {
 pub(crate) fn active_alias_model() -> &'static dyn AliasModel {
     match active_model_choice() {
         ActiveModel::SbLite => &SB_LITE_MODEL,
+        ActiveModel::TbLite => &TB_LITE_MODEL,
         ActiveModel::None => &NO_ALIAS_MODEL,
     }
 }
