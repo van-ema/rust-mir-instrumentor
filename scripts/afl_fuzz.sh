@@ -15,7 +15,7 @@ case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
   serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json)" >&2; exit 2 ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
@@ -42,13 +42,11 @@ export RZ_INSTRUMENT_ALL_DEPS=1
 export AFL_SKIP_CPUFREQ=1
 export AFL_NO_AFFINITY=1
 
-# macOS: System V shmget() appears to require page-aligned sizes.
-# AFL++ uses `MAP_SIZE + 8` when the map is exactly the default MAP_SIZE, which
-# breaks alignment on 16K-page systems. Avoid this by picking a different
-# page-aligned size unless the user already set `AFL_MAP_SIZE`.
+# macOS: shared-memory limits are often tighter and large maps can make
+# `shmget()` fail with ENOMEM. Use a conservative default unless the user
+# already set `AFL_MAP_SIZE`/`AFL_MAPSIZE`.
 if [[ "$(uname -s)" == "Darwin" ]] && [[ -z "${AFL_MAP_SIZE:-}" && -z "${AFL_MAPSIZE:-}" ]]; then
-  pagesize="$(sysctl -n hw.pagesize 2>/dev/null || echo 16384)"
-  export AFL_MAP_SIZE="$((1048576 + pagesize))"
+  export AFL_MAP_SIZE=131072
 fi
 
 # Bash treats empty arrays as "unset" under `set -u` when expanded as `${arr[@]}`.

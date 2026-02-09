@@ -44,7 +44,7 @@ case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
   serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json)" >&2; exit 2 ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"

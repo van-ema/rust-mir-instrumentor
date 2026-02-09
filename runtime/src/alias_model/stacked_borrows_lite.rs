@@ -235,6 +235,14 @@ fn sb_lite_validate_ref_creation(
                 } else {
                     false
                 };
+                let same_range = pointee_addr == top_tm.pointee_addr
+                    && bounds_len == top_tm.bounds_len;
+                // Missing-parent fallback is intentionally conservative to limit false positives
+                // when lineage is incomplete (e.g., wrapper types like NonNull). If roots differ,
+                // report only on exact-range duplicates; partial overlaps are too noisy.
+                if parent_root != top_root && !same_range {
+                    return None;
+                }
                 return Some(format!(
                     "REBORROW mutable without same-base ref parent overlaps active unique: base=0x{base:x} new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x}) parent_tag={} parent_root={} top_root={} parent_has_ref_ancestor={}",
                     pointee_addr,

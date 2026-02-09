@@ -11,6 +11,10 @@ From the repo root:
 docker build -t rusteze-afl -f docker/afl/Dockerfile .
 ```
 
+The image preinstalls the repo-pinned Rust toolchain (`nightly-2025-08-01`)
+with components required by this project (`rust-src`, `rustc-dev`,
+`llvm-tools-preview`).
+
 ## Run an interactive shell
 
 ```bash
@@ -26,6 +30,13 @@ Or, using the repo helper script:
 ```bash
 ./scripts/docker_afl.sh
 ```
+
+The helper mounts persistent Docker volumes for rustup/cargo caches by default:
+- `rusteze-afl-rustup` -> `/opt/rustup`
+- `rusteze-afl-cargo` -> `/opt/cargo`
+
+This avoids repeated toolchain downloads across `--rm` container runs.
+Disable with `USE_RUST_CACHE=0`.
 
 ## Reproduce a crash (no fuzzing)
 
@@ -49,6 +60,7 @@ Inside the container:
 
 ```bash
 RUNTIME_FEATURES="--features rz_log" TARGET=bytes PROFILE=release ./scripts/afl_build.sh
+TARGET=serde PROFILE=release ./scripts/afl_build.sh
 ```
 
 Then you can run/minimize with `afl-tmin` / `afl-cmin` without doing any fuzzing.

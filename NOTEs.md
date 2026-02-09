@@ -77,6 +77,30 @@ Example (SmallVec::len):
 This is the necessary plumbing to avoid UNKNOWN_TAG on plain reads of `&self`
 in instrumented dependencies like `smallvec`.
 
+## Return-tag recovery must update ref-ancestor locals
+
+Caller-side return recovery (`InstrKind::RetTake`) writes the recovered tag into
+the destination tag local. After introducing ref-ancestor-aware parent lowering,
+that was not sufficient: `PtrDerive` prefers the destination's ref-ancestor
+local when selecting `derived_from`.
+
+Bug pattern:
+
+- `RetTake` updated `tag_local(dst)` but left `ref_ancestor_local(dst)` at `0`.
+- Later pointer derivation (e.g. `Vec::as_ptr().add(n)`) used parent `0`.
+- The derived tag lost provenance and reads/writes were classified as
+  `WILD_POINTER` instead of provenance-aware `OUT_OF_BOUNDS`.
+
+Fix:
+
+- `RetTake` now also initializes `ref_ancestor_local(dst)` from the recovered
+  destination tag before control returns to the original call target block.
+
+Outcome:
+
+- OOB examples like one-past-end deref through returned pointers now keep
+  lineage and classify as `OUT_OF_BOUNDS` instead of `WILD_POINTER`.
+
 ### Instrumentation priority order
 
 When multiple hooks target the same basic block and statement index, we order
@@ -115,6 +139,29 @@ Remaining limitations (best-effort):
 - Pointer arithmetic done in separate locals/calls (e.g. `p.add(i)` then write)
   may still use the base address if MIR does not encode the offset in the place.
 - Projections with `from_end` or nested deref chains are not modeled yet.
+
+## Runtime parent-allocation inheritance: detached-parent fallback
+
+Runtime tag creation (`__record_ref_creation`) normally inherits allocation
+epoch/live snapshots from the parent tag when `parent_tag != 0`. This preserves
+stale-pointer detection across reborrows.
+
+However, if parent metadata is already detached from any current allocation and
+we continue inheriting it, we can produce cascading false positives (notably
+spurious OOB/UAF in wrapper-heavy optimized code paths).
+
+Current fallback:
+
+- If parent and pointee resolve to concrete allocations, we keep/refresh
+  metadata based on base/epoch compatibility (existing behavior).
+- If parent resolves but pointee does not and pointee is clearly outside parent
+  range, we break lineage for this tag (`parent=0`, epoch/live reset).
+- If parent does not resolve but pointee does, we refresh from pointee alloc.
+- If neither resolves and parent carried nonzero epoch metadata, we break
+  lineage to avoid propagating stale allocation snapshots.
+
+This keeps true OOB/UAF examples detectable while reducing false positives from
+detached ancestry.
 
 ## Drop glue and implicit address-of
 

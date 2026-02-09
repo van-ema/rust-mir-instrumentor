@@ -23,9 +23,15 @@ ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH=/opt/cargo/bin:$PATH
 
+ARG RUST_TOOLCHAIN=nightly-2025-08-01
+
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-    && rustup toolchain install nightly \
-    && rustup default nightly
+    && rustup toolchain install "${RUST_TOOLCHAIN}" \
+      --profile minimal \
+      --component rust-src \
+      --component rustc-dev \
+      --component llvm-tools-preview \
+    && rustup default "${RUST_TOOLCHAIN}"
 
 # ---- AFL++ ----
 # We build from source to get LLVM mode and consistent paths.

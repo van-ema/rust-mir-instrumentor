@@ -22,12 +22,33 @@ case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
   serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json)" >&2; exit 2 ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
 esac
+
+if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then
+  if [[ ! -f "third_party/serde/serde/Cargo.toml" ]]; then
+    echo "missing third_party/serde checkout (needed by third_party/serde_json path dependency)." >&2
+    echo "run: git clone https://github.com/serde-rs/serde.git third_party/serde" >&2
+    exit 2
+  fi
+fi
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
 # Use absolute paths so TMPDIR/RUSTC_TMPDIR are stable even if Cargo changes CWD.
-HARNESS_TARGET_DIR="$(realpath -m "$HARNESS_TARGET_DIR")"
+canonical_path() {
+  local p="$1"
+  if realpath -m "$p" >/dev/null 2>&1; then
+    realpath -m "$p"
+    return 0
+  fi
+  if realpath "$p" >/dev/null 2>&1; then
+    realpath "$p"
+    return 0
+  fi
+  python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$p"
+}
+
+HARNESS_TARGET_DIR="$(canonical_path "$HARNESS_TARGET_DIR")"
 # `cargo build -p runtime` places `libruntime.rlib` in `${target_dir}/${profile}/deps/`.
 # If we point `--runtime-path` at `${profile}/`, a stale `${profile}/libruntime.rlib` can be
 # picked up and cause E0460 "found possibly newer version of crate `runtime`".
@@ -37,8 +58,8 @@ export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
 # Put temp files in the same directory that rustc writes metadata (`deps/`) to avoid EXDEV.
-export RUSTC_TMPDIR="${RUSTC_TMPDIR:-$(realpath -m "${RUNTIME_PATH}")}"
-export TMPDIR="${TMPDIR:-$(realpath -m "${RUNTIME_PATH}")}"
+export RUSTC_TMPDIR="${RUSTC_TMPDIR:-$(canonical_path "${RUNTIME_PATH}")}"
+export TMPDIR="${TMPDIR:-$(canonical_path "${RUNTIME_PATH}")}"
 mkdir -p "$RUSTC_TMPDIR"
 
 if [[ -z "$AFL_COMPILER_RT" ]]; then

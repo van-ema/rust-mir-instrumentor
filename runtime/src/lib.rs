@@ -1938,7 +1938,7 @@ pub extern "C" fn __record_ref_creation(
     // allocation snapshot to keep stack-slot reuse detectable.
     // Exception: if the new ref clearly points into a different allocation than the parent
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
-    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len) = if parent_tag != 0 {
+    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len, resolved_parent_tag) = if parent_tag != 0 {
         let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
             .lock()
             .unwrap()
@@ -1950,37 +1950,61 @@ pub extern "C" fn __record_ref_creation(
             let amap = allocs().lock().unwrap();
             let parent_alloc = find_alloc_containing(&amap, parent_pointee);
             let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
-            if let (Some((parent_base, _)), Some((pointee_base, pointee_meta))) =
-                (parent_alloc, pointee_alloc)
-            {
-                if parent_base != pointee_base
-                    || (parent_epoch != 0
-                        && pointee_meta.epoch != 0
-                        && parent_epoch != pointee_meta.epoch)
-                {
-                    (pointee_meta.epoch, pointee_meta.live, 0)
-                } else {
-                    (parent_epoch, parent_live, inherited_bounds_len)
+            match (parent_alloc, pointee_alloc) {
+                (Some((parent_base, _parent_meta)), Some((pointee_base, pointee_meta))) => {
+                    if parent_base != pointee_base
+                        || (parent_epoch != 0
+                            && pointee_meta.epoch != 0
+                            && parent_epoch != pointee_meta.epoch)
+                    {
+                        (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
+                    } else {
+                        (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
+                    }
                 }
-            } else {
-                (parent_epoch, parent_live, inherited_bounds_len)
+                (Some((parent_base, parent_meta)), None) => {
+                    let parent_end = parent_base.saturating_add(parent_meta.size);
+                    // If the new pointee is clearly outside the parent's allocation and we
+                    // cannot resolve any allocation for it, lineage is likely crossing objects
+                    // (e.g., wrapper/metadata paths). Break ancestry to avoid false OOB/UAF
+                    // classification from inherited parent allocation metadata.
+                    if parent_meta.size != 0
+                        && !(pointee_addr >= parent_base && pointee_addr < parent_end)
+                    {
+                        (0, false, 0, 0)
+                    } else {
+                        (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
+                    }
+                }
+                (None, Some((_pointee_base, pointee_meta))) => {
+                    (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
+                }
+                (None, None) => {
+                    // Parent metadata already detached from a concrete allocation.
+                    // Continuing to inherit it creates cascading false OOB/UAF reports.
+                    if parent_epoch != 0 {
+                        (0, false, 0, 0)
+                    } else {
+                        (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
+                    }
+                }
             }
         } else {
-            (parent_epoch, parent_live, inherited_bounds_len)
+            (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
         }
     } else {
         // Root creation: snapshot from the allocation that contains this address (range lookup).
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| (m.epoch, m.live, 0))
-            .unwrap_or((0, false, 0))
+            .map(|(_base, m)| (m.epoch, m.live, 0, 0))
+            .unwrap_or((0, false, 0, 0))
     };
     let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
         pointee_addr,
         kind,
-        parent: parent_tag,
+        parent: resolved_parent_tag,
         escaped: false,
         alloc_epoch,
         alloc_live_at_creation,

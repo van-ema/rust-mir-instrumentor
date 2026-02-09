@@ -754,6 +754,28 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Return true when call-boundary return tagging is safe and useful for this pointer type.
+    ///
+    /// We always include thin pointers. For wide pointers, we currently include slice/str
+    /// pointers (metadata is a length and we can derive byte bounds precisely), but skip
+    /// `dyn Trait`/other DST metadata forms to avoid conservative false positives.
+    fn supports_call_boundary_ret_tag_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                if self.is_addr_exposable_ptr_ty(tcx, body, ty) {
+                    return true;
+                }
+                matches!(pointee.kind(), TyKind::Slice(..) | TyKind::Str)
+            }
+            _ => false,
+        }
+    }
+
     /// Produce a thin raw pointer type suitable for extracting the data pointer from a wide pointer.
     /// We only care about the address, so a pointer to unit keeps the correct size and mutability
     /// while discarding the metadata.
@@ -4036,22 +4058,19 @@ impl MyOptimizationPass {
         // Caller-side return-tag recovery for pointer returns.
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
-            if self.is_pointer_ty(dst_ty) {
-                let dst_is_thin = self.is_addr_exposable_ptr_ty(tcx, body, dst_ty);
+            if self.supports_call_boundary_ret_tag_ty(tcx, body, dst_ty) {
                 if callee_instrumented {
                     if let Some(callee_id) = callee_id_opt {
-                        if dst_is_thin {
-                            ptr_locals_needing_tag.insert(dst_local);
-                            tagged_ptr_locals.insert(dst_local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::RetTake { callee_id, dst_local },
-                            });
-                        }
+                        ptr_locals_needing_tag.insert(dst_local);
+                        tagged_ptr_locals.insert(dst_local);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(dst_local),
+                            kind: InstrKind::RetTake { callee_id, dst_local },
+                        });
                     }
                 } else {
                     // Uninstrumented callee: synthesize a fresh return tag unless another effect already
@@ -4067,7 +4086,7 @@ impl MyOptimizationPass {
                         Some(CallEffect::PtrDerive | CallEffect::BoxIntoRaw)
                     ) || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
 
-                    if !return_tagged_by_effect && dst_is_thin {
+                    if !return_tagged_by_effect {
                         let is_mut = match dst_ty.kind() {
                             TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
                             TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -4226,7 +4245,7 @@ impl MyOptimizationPass {
                 }
 
                 if let TerminatorKind::Return = &term.kind {
-                    if self.is_addr_exposable_ptr_ty(tcx, body, body.return_ty()) {
+                    if self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty()) {
                         let callee_id = self.callee_id_u64(tcx, body.source.def_id());
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
@@ -4428,6 +4447,7 @@ impl MyOptimizationPass {
         body: &mut Body<'tcx>,
         insert_points: Vec<InsertPoint<'tcx>>,
         tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
         hooks: Hooks,
     ) {
         fn instr_priority(kind: &InstrKind<'_>) -> u8 {
@@ -4625,6 +4645,21 @@ impl MyOptimizationPass {
                     },
                 });
 
+                if let Some(dst_ref_ancestor_local) =
+                    ref_ancestor_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    body.basic_blocks_mut()[cont_bb].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(dst_ref_ancestor_local),
+                                Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                            ))),
+                        ),
+                    );
+                }
+
                 // Done handling this insert point.
                 continue;
             }
@@ -4756,6 +4791,25 @@ impl MyOptimizationPass {
                 }
                 take_bd.terminator = Some(take_term);
 
+                // Keep ref-ancestor in sync for return-tag recovery.
+                // Without this, later PtrDerive on the returned pointer may pick an
+                // uninitialized ref-ancestor local (0) and lose provenance, causing
+                // OOB accesses to degrade into WILD_POINTER.
+                if let Some(dst_ref_ancestor_local) =
+                    ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
+                {
+                    body.basic_blocks_mut()[orig_target].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(dst_ref_ancestor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(dst_tag))),
+                            ))),
+                        ),
+                    );
+                }
+
                 continue;
             }
 
@@ -4864,6 +4918,23 @@ impl MyOptimizationPass {
                     ))),
                 );
 
+                let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
+                    .get(&dst)
+                    .expect("missing ref-ancestor local for TagProp dst");
+                let src_ref_ancestor_op: Operand<'tcx> =
+                    if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*src_ref_ancestor))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+                let prop_ref_ancestor_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(dst_ref_ancestor),
+                        Rvalue::Use(src_ref_ancestor_op),
+                    ))),
+                );
+
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let insert_at = if stmt_idx >= bd.statements.len() {
                     bd.statements.len()
@@ -4871,6 +4942,7 @@ impl MyOptimizationPass {
                     stmt_idx + 1
                 };
                 bd.statements.insert(insert_at, prop_stmt);
+                bd.statements.insert(insert_at + 1, prop_ref_ancestor_stmt);
                 continue;
             }
 
@@ -5038,6 +5110,37 @@ impl MyOptimizationPass {
                     bd.terminator = Some(take_term);
                     rem
                 };
+
+                if let Some(arg_ref_ancestor_local) =
+                    ref_ancestor_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    let ref_ancestor_stmt = match body.local_decls[ptr_local].ty.kind() {
+                        TyKind::Ref(..) => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(tag_local))),
+                            ))),
+                        ),
+                        TyKind::RawPtr(..) => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(parent_tag_local))),
+                            ))),
+                        ),
+                        _ => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                            ))),
+                        ),
+                    };
+                    body.basic_blocks_mut()[cont_block]
+                        .statements
+                        .insert(0, ref_ancestor_stmt);
+                }
 
                 body.basic_blocks_mut()[cont_block]
                     .statements
@@ -5418,12 +5521,32 @@ impl MyOptimizationPass {
                         .get(&dst)
                         .expect("missing tag local for PtrDerive dst");
 
-                    let parent_tag_op: Operand<'tcx> =
-                        if let Some(tl) = tag_local_for_ptr_local.get(&src) {
-                            Operand::Copy(Place::from(*tl))
-                        } else {
-                            self.const_u64(tcx, source_info.span, 0)
-                        };
+                    let parent_tag_op: Operand<'tcx> = match &creation_kind {
+                        // For ref derivations (e.g., from_raw_parts_mut), pass the nearest
+                        // tracked ref-ancestor if available. This avoids runtime parent recovery
+                        // heuristics on raw-heavy code paths.
+                        InstrKind::PtrDerive { is_ref: true, .. } => {
+                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
+                                Operand::Copy(Place::from(*tl))
+                            } else if let Some(tl) = tag_local_for_ptr_local.get(&src) {
+                                Operand::Copy(Place::from(*tl))
+                            } else {
+                                self.const_u64(tcx, source_info.span, 0)
+                            }
+                        }
+                        _ => {
+                            // Keep raw-derivation lineage anchored to the nearest ref ancestor
+                            // when available; this avoids raw-only parent chains that trigger
+                            // conservative SB-lite fallback checks in safe code.
+                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
+                                Operand::Copy(Place::from(*tl))
+                            } else if let Some(tl) = tag_local_for_ptr_local.get(&src) {
+                                Operand::Copy(Place::from(*tl))
+                            } else {
+                                self.const_u64(tcx, source_info.span, 0)
+                            }
+                        }
+                    };
 
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let dst_ty = body.local_decls[dst].ty;
@@ -5468,9 +5591,21 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                        InstrKind::Ref { src, .. } => {
                             let base = src.local;
                             if let Some(tl) = tag_local_for_ptr_local.get(&base) {
+                                Operand::Copy(Place::from(*tl))
+                            } else {
+                                self.const_u64(tcx, source_info.span, 0)
+                            }
+                        }
+                        InstrKind::Raw { src, .. } => {
+                            let base = src.local;
+                            // Same policy as PtrDerive raw paths: prefer ref-ancestor lineage
+                            // to preserve alias-model parent recovery through raw-heavy code.
+                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&base) {
+                                Operand::Copy(Place::from(*tl))
+                            } else if let Some(tl) = tag_local_for_ptr_local.get(&base) {
                                 Operand::Copy(Place::from(*tl))
                             } else {
                                 self.const_u64(tcx, source_info.span, 0)
@@ -5603,6 +5738,137 @@ impl MyOptimizationPass {
                 });
             }
 
+            let ref_ancestor_init_stmt_opt: Option<Statement<'tcx>> = match &creation_kind {
+                InstrKind::Ref { .. } => {
+                    if let Some(dst_local) = place.as_local() {
+                        if let (Some(dst_ref_ancestor_local), Some(dst_tag_local)) = (
+                            ref_ancestor_local_for_ptr_local.get(&dst_local).copied(),
+                            tag_local_for_ptr_local.get(&dst_local).copied(),
+                        ) {
+                            Some(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                ))),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                InstrKind::Raw { src, .. } => {
+                    if let Some(dst_local) = place.as_local() {
+                        if let Some(dst_ref_ancestor_local) =
+                            ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
+                        {
+                            let src_ref_ancestor_op: Operand<'tcx> =
+                                if let Some(src_ref_ancestor_local) =
+                                    ref_ancestor_local_for_ptr_local.get(&src.local)
+                                {
+                                    Operand::Copy(Place::from(*src_ref_ancestor_local))
+                                } else {
+                                    self.const_u64(tcx, source_info.span, 0)
+                                };
+                            Some(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(src_ref_ancestor_op),
+                                ))),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                InstrKind::RawRoot { ptr_local, .. } => {
+                    ref_ancestor_local_for_ptr_local
+                        .get(ptr_local)
+                        .copied()
+                        .map(|dst_ref_ancestor_local| {
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                                ))),
+                            )
+                        })
+                }
+                InstrKind::RetRoot {
+                    dst_local, is_ref, ..
+                } => {
+                    if let Some(dst_ref_ancestor_local) =
+                        ref_ancestor_local_for_ptr_local.get(dst_local).copied()
+                    {
+                        if *is_ref {
+                            tag_local_for_ptr_local.get(dst_local).copied().map(|dst_tag_local| {
+                                Statement::new(
+                                    source_info,
+                                    StatementKind::Assign(Box::new((
+                                        Place::from(dst_ref_ancestor_local),
+                                        Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                    ))),
+                                )
+                            })
+                        } else {
+                            Some(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                                ))),
+                            ))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                InstrKind::PtrDerive {
+                    dst, src, is_ref, ..
+                } => {
+                    if let Some(dst_ref_ancestor_local) =
+                        ref_ancestor_local_for_ptr_local.get(dst).copied()
+                    {
+                        if *is_ref {
+                            tag_local_for_ptr_local.get(dst).copied().map(|dst_tag_local| {
+                                Statement::new(
+                                    source_info,
+                                    StatementKind::Assign(Box::new((
+                                        Place::from(dst_ref_ancestor_local),
+                                        Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                    ))),
+                                )
+                            })
+                        } else {
+                            let src_ref_ancestor_op: Operand<'tcx> =
+                                if let Some(src_ref_ancestor_local) =
+                                    ref_ancestor_local_for_ptr_local.get(src)
+                                {
+                                    Operand::Copy(Place::from(*src_ref_ancestor_local))
+                                } else {
+                                    self.const_u64(tcx, source_info.span, 0)
+                                };
+                            Some(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(src_ref_ancestor_op),
+                                ))),
+                            ))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
             let remaining_stmts = {
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
 
@@ -5632,6 +5898,11 @@ impl MyOptimizationPass {
                 rem
             };
 
+            if let Some(ref_ancestor_init_stmt) = ref_ancestor_init_stmt_opt {
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .insert(0, ref_ancestor_init_stmt);
+            }
             body.basic_blocks_mut()[cont_block]
                 .statements
                 .extend(remaining_stmts);
@@ -5811,6 +6082,37 @@ impl MyOptimizationPass {
                     bd.terminator = Some(take_term);
                     rem
                 };
+
+                if let Some(arg_ref_ancestor_local) =
+                    ref_ancestor_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    let ref_ancestor_stmt = match body.local_decls[ptr_local].ty.kind() {
+                        TyKind::Ref(..) => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(tag_local))),
+                            ))),
+                        ),
+                        TyKind::RawPtr(..) => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(parent_tag_local))),
+                            ))),
+                        ),
+                        _ => Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(arg_ref_ancestor_local),
+                                Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                            ))),
+                        ),
+                    };
+                    body.basic_blocks_mut()[cont_block]
+                        .statements
+                        .insert(0, ref_ancestor_stmt);
+                }
 
                 body.basic_blocks_mut()[cont_block]
                     .statements
@@ -6029,6 +6331,19 @@ impl MyOptimizationPass {
 
         let scan = self.scan_body(tcx, body);
         let tag_local_for_ptr_local =
+            self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag.clone());
+        // Per-pointer local "nearest reference ancestor" tag.
+        // This is used as the preferred parent for raw/derived pointer creations so
+        // provenance survives wrapper-heavy flows (casts, calls, ret-take, etc.).
+        //
+        // Example:
+        //   let r: &u32 = &x;            // ref tag R
+        //   let p1: *const u32 = r as *const u32;   // raw tag P1
+        //   let p2 = unsafe { p1.add(1) };          // raw tag P2
+        // For P2 we want parent lineage to stay anchored to R (nearest ref ancestor),
+        // not collapse to an uninitialized/zero parent through raw-only hops.
+        // Keep this map synchronized with `tag_local_for_ptr_local` initialization paths.
+        let ref_ancestor_local_for_ptr_local =
             self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag);
 
         let mut insert_points = scan.insert_points;
@@ -6064,6 +6379,7 @@ impl MyOptimizationPass {
             body,
             insert_points,
             &tag_local_for_ptr_local,
+            &ref_ancestor_local_for_ptr_local,
             hooks,
         );
 
@@ -6079,6 +6395,12 @@ impl MyOptimizationPass {
         }
 
         self.init_tag_locals_to_zero(tcx, body, &tag_local_for_ptr_local, &arg_ptr_locals);
+        self.init_tag_locals_to_zero(
+            tcx,
+            body,
+            &ref_ancestor_local_for_ptr_local,
+            &arg_ptr_locals,
+        );
 
         // Defensive fixup: instrumentation should always leave valid terminators, but avoid
         // crashing rustc if a block ends up missing one in complex crates.

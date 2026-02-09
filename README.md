@@ -265,8 +265,9 @@ This writes:
 
 ## AFL++ (Native vs Docker)
 
-The repo includes an AFL++ harness crate with drivers: `afl_bytes_driver` and
-`afl_smallvec_driver`.
+The repo includes an AFL++ harness crate with drivers:
+`afl_bytes_driver`, `afl_smallvec_driver`, and `afl_serde_json_driver`
+(`TARGET=serde_json` or `TARGET=serde`).
 
 On macOS, AFL++ shared-memory can be unreliable; the recommended workflow is to
 use the Linux container described in `docker/afl/README.md`.
@@ -277,18 +278,33 @@ use the Linux container described in `docker/afl/README.md`.
 # Build the harness (requires AFL++ runtime object `afl-compiler-rt.o`)
 export AFL_PATH=/path/to/AFLplusplus   # or set AFL_COMPILER_RT=/path/to/afl-compiler-rt.o
 TARGET=bytes PROFILE=release ./scripts/afl_build.sh
+TARGET=serde PROFILE=release ./scripts/afl_build.sh
 
 # Run AFL++
 TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
+TARGET=serde PROFILE=release ./scripts/afl_fuzz.sh
 
 # Reproduce a single crash
 TARGET=bytes PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/bytes/default/crashes/id:...
+TARGET=serde PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/serde/default/crashes/id:...
 ```
 
 **Docker (Linux container)**
 
 See `docker/afl/README.md` for the container workflow. The scripts above work inside
 the container as well (with AFL++ preinstalled in the image).
+
+After updating `docker/afl/Dockerfile`, rebuild the image:
+
+```bash
+docker build -t rusteze-afl -f docker/afl/Dockerfile .
+```
+
+You can also pass env vars directly through the helper:
+
+```bash
+./scripts/docker_afl.sh TARGET=serde PROFILE=release ./scripts/afl_build.sh
+```
 
 
 ## Notes
