@@ -20,7 +20,7 @@ enum BorrowKind {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TbPerm {
-    Reserved,
+    Reserved { conflicted: bool },
     Active,
     Frozen,
     Disabled,
@@ -339,7 +339,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let base = tb_base_for_addr(tmeta.pointee_addr);
     let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let perm = match kind {
-        BorrowKind::Unique => TbPerm::Reserved,
+        BorrowKind::Unique => TbPerm::Reserved { conflicted: false },
         BorrowKind::RawMut => TbPerm::Active,
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
@@ -469,55 +469,72 @@ fn tb_lite_check(
         return Some(msg);
     }
 
-    match access {
-        AliasAccessKind::Read => {
-            // TB-style freeze approximation: reading through a unique ancestor invalidates
-            // overlapping descendants, including raw descendants.
-            if node.kind == BorrowKind::Unique {
-                let victims: Vec<u64> = tree
-                    .nodes
-                    .values()
-                    .filter(|n| tb_is_live_node(n) && n.tag != access_tag)
-                    .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
-                    .filter(|n| tb_is_ancestor(&tree.nodes, access_tag, n.tag))
-                    .map(|n| n.tag)
-                    .collect();
-                for victim in victims {
-                    if let Some(n) = tree.nodes.get_mut(&victim) {
-                        match n.kind {
-                            BorrowKind::Shared | BorrowKind::RawConst => {
-                                n.perm = TbPerm::Frozen;
-                            }
-                            BorrowKind::Unique | BorrowKind::RawMut => {
-                                tb_disable_node(n);
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-        AliasAccessKind::Write => {
-            if let Some(protected) = tree
-                .nodes
-                .values()
-                .find(|n| {
-                    tb_is_live_node(n)
-                        && n.protected
-                        && n.tag != access_tag
-                        && tb_ranges_overlap(addr, size, n.start, n.len)
-                })
-                .cloned()
-            {
+    // Apply a TB-lite transition to all overlapping nodes.
+    // `child` means the access goes through this node's lineage (node is an ancestor
+    // of the accessing tag, including itself). `foreign` means all other overlaps.
+    let overlapping_tags: Vec<u64> = tree
+        .nodes
+        .values()
+        .filter(|n| tb_is_live_node(n))
+        .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
+        .map(|n| n.tag)
+        .collect();
+
+    let mut updates: Vec<(u64, TbPerm)> = Vec::new();
+    for tag in overlapping_tags {
+        let Some(n) = tree.nodes.get(&tag).cloned() else {
+            continue;
+        };
+        let child = tb_is_ancestor(&tree.nodes, n.tag, access_tag);
+
+        let next = match (access, child, n.perm, n.protected) {
+            // Child/local read: everything except Disabled is unchanged.
+            (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
                 let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
-                    access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+                    "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
+                    access_tag, addr, size, tmeta.kind, n.tag
                 );
                 msg.push_str(&dump);
                 return Some(msg);
             }
+            (AliasAccessKind::Read, true, perm, _) => perm,
 
-            if node.perm == TbPerm::Frozen {
+            // Foreign read:
+            // - protected Reserved becomes conflicted
+            // - Active becomes Frozen (or Disabled if protected)
+            // - Frozen/Disabled unchanged
+            (
+                AliasAccessKind::Read,
+                false,
+                TbPerm::Reserved { conflicted: false },
+                true,
+            ) => TbPerm::Reserved { conflicted: true },
+            (AliasAccessKind::Read, false, TbPerm::Reserved { .. }, _) => n.perm,
+            (AliasAccessKind::Read, false, TbPerm::Active, true) => TbPerm::Disabled,
+            (AliasAccessKind::Read, false, TbPerm::Active, false) => TbPerm::Frozen,
+            (AliasAccessKind::Read, false, TbPerm::Frozen, _) => TbPerm::Frozen,
+            (AliasAccessKind::Read, false, TbPerm::Disabled, _) => TbPerm::Disabled,
+
+            // Child/local write:
+            // - Reserved(conflicted) while protected is UB (2-phase noalias violation)
+            // - Reserved/Active activate to Active
+            // - Frozen/Disabled cannot be written through
+            (
+                AliasAccessKind::Write,
+                true,
+                TbPerm::Reserved { conflicted: true },
+                true,
+            ) => {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
+                    access_tag, addr, size, tmeta.kind, n.tag
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+            (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
+            (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
+            (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
                     access_tag, addr, size, tmeta.kind
@@ -525,39 +542,54 @@ fn tb_lite_check(
                 msg.push_str(&dump);
                 return Some(msg);
             }
-
-            if !matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
+            (AliasAccessKind::Write, true, TbPerm::Disabled, _) => {
                 let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_NON_UNIQUE_WRITE",
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_WRITE",
                     access_tag, addr, size, tmeta.kind
                 );
                 msg.push_str(&dump);
                 return Some(msg);
             }
 
-            if let Some(n) = tree.nodes.get_mut(&access_tag) {
-                n.perm = TbPerm::Active;
-                n.alive = true;
-            }
+            // Foreign write: disable.
+            (AliasAccessKind::Write, false, _, _) => TbPerm::Disabled,
+        };
 
-            // Tree-borrows-style "use": writing through this unique branch invalidates
-            // overlapping nodes outside its ancestor chain.
-            let victims: Vec<u64> = tree
-                .nodes
-                .values()
-                .filter(|n| tb_is_live_node(n) && n.tag != access_tag)
-                .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
-                .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, access_tag))
-                .map(|n| n.tag)
-                .collect();
-            for victim in victims {
-                if let Some(n) = tree.nodes.get_mut(&victim) {
-                    tb_disable_node(n);
-                }
-            }
-            None
+        if next != n.perm {
+            updates.push((tag, next));
         }
     }
+
+    if matches!(access, AliasAccessKind::Write) {
+        // Keep dedicated protector diagnostic for write-through-other-tag while protected.
+        if let Some(protected) = tree
+            .nodes
+            .values()
+            .find(|n| tb_is_live_node(n) && n.protected && n.tag != access_tag)
+            .cloned()
+        {
+            let touched_protected = updates
+                .iter()
+                .any(|(t, next)| *t == protected.tag && *next == TbPerm::Disabled);
+            if touched_protected {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+                    access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+        }
+    }
+
+    for (tag, next) in updates {
+        if let Some(n) = tree.nodes.get_mut(&tag) {
+            n.perm = next;
+            n.alive = next != TbPerm::Disabled;
+        }
+    }
+
+    None
 }
 
 #[inline]

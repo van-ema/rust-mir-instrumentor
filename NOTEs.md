@@ -210,20 +210,23 @@ Checks implemented in TB-lite:
 
 `tb_lite` now tracks an explicit per-tag permission state:
 
-- `Reserved`
+- `Reserved(conflicted=false/true)`
 - `Active`
 - `Frozen`
 - `Disabled`
 
 Current transitions (node-level, range-overlap based):
 
-- New `RefMut` starts `Reserved`; write through it promotes to `Active`.
+- New `RefMut` starts `Reserved(conflicted=false)`; write through it promotes to `Active`.
 - New `RawMut` starts `Active`.
 - New shared/raw-const tags start `Frozen`.
 - Unique/raw-mut writes disable overlapping non-ancestor branches.
-- Unique reads:
-  - freeze shared/raw-const descendants
-  - disable unique/raw-mut descendants
+- Foreign reads over protected `Reserved(conflicted=false)` set
+  `Reserved(conflicted=true)`.
+- Child writes through protected `Reserved(conflicted=true)` are rejected
+  (`TB_LITE_2PHASE_CONFLICT`).
+- Foreign reads over `Active` degrade to `Frozen` (or `Disabled` if protected).
+- Foreign writes disable the overlapping node.
 - `Disabled` tags are treated as invalidated.
 
 This is still intentionally lite compared to full Miri Tree Borrows: transitions
