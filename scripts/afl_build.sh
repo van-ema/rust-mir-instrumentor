@@ -16,13 +16,20 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
+RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
+RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
 
 case "$TARGET" in
-  bytes) BIN="afl_bytes_driver" ;;
-  smallvec) BIN="afl_smallvec_driver" ;;
-  serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
+  bytes) BIN="afl_bytes_driver"; FEATURE="bytes_driver" ;;
+  smallvec) BIN="afl_smallvec_driver"; FEATURE="smallvec_driver" ;;
+  serde_json|serde) BIN="afl_serde_json_driver"; FEATURE="serde_json_driver" ;;
+  toml) BIN="afl_toml_driver"; FEATURE="toml_driver" ;;
+  base64) BIN="afl_base64_driver"; FEATURE="base64_driver" ;;
+  uuid) BIN="afl_uuid_driver"; FEATURE="uuid_driver" ;;
+  itoa) BIN="afl_itoa_driver"; FEATURE="itoa_driver" ;;
+  quick_xml|quick-xml) BIN="afl_quick_xml_driver"; FEATURE="quick_xml_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml)" >&2; exit 2 ;;
 esac
 
 if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then
@@ -33,7 +40,7 @@ if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then
   fi
 fi
 
-HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
+HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
 # Use absolute paths so TMPDIR/RUSTC_TMPDIR are stable even if Cargo changes CWD.
 canonical_path() {
   local p="$1"
@@ -56,6 +63,9 @@ RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/deps"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
+# Build-time host tools (build scripts / proc-macros) may execute instrumented code.
+# Keep SB-lite disabled during compilation to avoid compile-time-only alias reports.
+export RZ_SB_LITE="${RZ_SB_LITE:-0}"
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
 # Put temp files in the same directory that rustc writes metadata (`deps/`) to avoid EXDEV.
 export RUSTC_TMPDIR="${RUSTC_TMPDIR:-$(canonical_path "${RUNTIME_PATH}")}"
@@ -87,9 +97,11 @@ if [[ "$PROFILE" == "release" ]]; then
   cargo build -p instrument-mir --release
   # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
   cargo build -p runtime --release ${RUNTIME_FEATURES}
+  PROFILE_FLAG="--release"
 else
   cargo build -p instrument-mir
   cargo build -p runtime ${RUNTIME_FEATURES}
+  PROFILE_FLAG=""
 fi
 
 # Avoid accidental linking against a stale top-level `libruntime.rlib` if one exists.
@@ -119,6 +131,49 @@ AFL_RUSTFLAGS=(
 
 export RUSTFLAGS="${RUSTFLAGS:-} ${AFL_RUSTFLAGS[*]}"
 
-"$TOOL" instrument-mir --runtime-path="$RUNTIME_PATH" ${PROFILE/release/--release} -p afl_harness --bin "$BIN"
+"$TOOL" instrument-mir --runtime-path="$RUNTIME_PATH" $PROFILE_FLAG -p afl_harness --features "$FEATURE" --bin "$BIN"
 
-echo "built: ${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
+BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
+echo "built: ${BIN_PATH}"
+
+if [[ "${RZ_VERIFY_HOOKS}" == "1" || "${RZ_VERIFY_HOOKS}" == "true" ]]; then
+  hooks_found=0
+  # Check for known hook symbol names. We inspect multiple symbol sources
+  # because some builds only expose dynamic symbols.
+  hook_tokens=(
+    "__rz_ptr_read"
+    "__rz_ptr_write"
+    "__record_ref_creation"
+    "__record_raw_ptr_creation"
+  )
+  symbol_dump=""
+  if command -v nm >/dev/null 2>&1; then
+    symbol_dump+=$'\n'"$(nm -an "${BIN_PATH}" 2>/dev/null || true)"
+    symbol_dump+=$'\n'"$(nm -D "${BIN_PATH}" 2>/dev/null || true)"
+  fi
+  if command -v readelf >/dev/null 2>&1; then
+    symbol_dump+=$'\n'"$(readelf -Ws "${BIN_PATH}" 2>/dev/null || true)"
+  fi
+  if command -v strings >/dev/null 2>&1; then
+    symbol_dump+=$'\n'"$(strings "${BIN_PATH}" 2>/dev/null || true)"
+  fi
+
+  for tok in "${hook_tokens[@]}"; do
+    # Use a here-string instead of a pipe to avoid SIGPIPE/pipefail false negatives.
+    if grep -F -q "${tok}" <<<"${symbol_dump}"; then
+      hooks_found=1
+      break
+    fi
+  done
+
+  if [[ "${hooks_found}" == "1" ]]; then
+    echo "[rusteze] hook check: found rusteze hooks (__rz_*) in ${BIN}"
+  else
+    msg="[rusteze] hook check: no rusteze hooks (__rz_*) found in ${BIN} (possible non-instrumented build)"
+    if [[ "${RZ_VERIFY_HOOKS_STRICT}" == "1" || "${RZ_VERIFY_HOOKS_STRICT}" == "true" ]]; then
+      echo "${msg}" >&2
+      exit 3
+    fi
+    echo "${msg}" >&2
+  fi
+fi

@@ -16,13 +16,25 @@ forward_env=()
 
 # Forward commonly used build/fuzz environment variables when set.
 for var in \
-  TARGET PROFILE AFL_PATH AFL_COMPILER_RT RUNTIME_FEATURES \
+  TARGET PROFILE AFL_COMPILER_RT RUNTIME_FEATURES \
   HARNESS_TARGET_DIR CARGO_TARGET_DIR RUSTFLAGS AFL_FUZZ \
   TIMEOUT_MS OUT_DIR
 do
   if [[ -n "${!var:-}" ]]; then
     forward_env+=(-e "${var}=${!var}")
   fi
+done
+
+# Forward rusteze debug/tuning knobs when exported on the host so
+# instrumentation tracing is visible inside the container as well.
+for var in $(compgen -e); do
+  case "$var" in
+    RZ_*|RUSTEZE_*|TRACE|RUST_BACKTRACE)
+      if [[ -n "${!var:-}" ]]; then
+        forward_env+=(-e "${var}=${!var}")
+      fi
+      ;;
+  esac
 done
 
 # Also support inline env assignments passed as leading args, e.g.:

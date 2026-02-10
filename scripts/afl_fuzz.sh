@@ -8,17 +8,22 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_FUZZ="${AFL_FUZZ:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
 TIMEOUT_MS="${TIMEOUT_MS:-}" # optional, forwarded to AFL++ via -t
 
 case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
   serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
+  toml) BIN="afl_toml_driver" ;;
+  base64) BIN="afl_base64_driver" ;;
+  uuid) BIN="afl_uuid_driver" ;;
+  itoa) BIN="afl_itoa_driver" ;;
+  quick_xml|quick-xml) BIN="afl_quick_xml_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml)" >&2; exit 2 ;;
 esac
 
-HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
+HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
 BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
 IN_DIR="fuzz/corpus/${TARGET}"
 OUT_DIR="fuzz/out/${TARGET}"
@@ -37,6 +42,14 @@ fi
 
 export RUSTEZE_FAILFAST=1
 export RZ_INSTRUMENT_ALL_DEPS=1
+# Default to memory-safety checks without SB-lite to keep large-crate fuzzing stable.
+# Set `RZ_SB_LITE=1` explicitly when you want alias-model violations.
+export RZ_SB_LITE="${RZ_SB_LITE:-0}"
+
+# We do not fuzz with ASan in this pipeline; avoid inheriting host/container
+# ASAN_* environment variables that make AFL++ enforce ASan-specific checks.
+unset ASAN_OPTIONS
+unset ASAN_SYMBOLIZER_PATH
 
 # macOS friendliness
 export AFL_SKIP_CPUFREQ=1

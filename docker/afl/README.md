@@ -59,25 +59,57 @@ afl-tmin -i crashes/id:000000,* -o minimized \
 Inside the container:
 
 ```bash
-RUNTIME_FEATURES="--features rz_log" TARGET=bytes PROFILE=release ./scripts/afl_build.sh
-TARGET=serde PROFILE=release ./scripts/afl_build.sh
+TARGET=toml PROFILE=debug ./scripts/afl_build.sh
+TARGET=base64 PROFILE=debug ./scripts/afl_build.sh
+TARGET=uuid PROFILE=debug ./scripts/afl_build.sh
+TARGET=quick_xml PROFILE=debug ./scripts/afl_build.sh
+TARGET=itoa PROFILE=debug ./scripts/afl_build.sh
 ```
 
 Then you can run/minimize with `afl-tmin` / `afl-cmin` without doing any fuzzing.
+
+Available `TARGET` values:
+
+```text
+bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
+```
 
 ## Fuzzing (optional)
 
 You can fuzz inside the container (slower than native Linux, but good for quick checks):
 
 ```bash
-./scripts/docker_afl.sh
-TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
+FUZZ=1 ./scripts/docker_afl.sh TARGET=toml PROFILE=debug ./scripts/afl_fuzz.sh
 ```
 
 If the host requires relaxed sandboxing for AFL++ forkserver, start the container with:
 
 ```bash
 FUZZ=1 ./scripts/docker_afl.sh
+```
+
+Reproduce crashes from host-generated outputs:
+
+```bash
+./scripts/docker_afl.sh TARGET=toml PROFILE=debug ./scripts/afl_repro.sh
+```
+
+Build-only (no fuzzing) from host:
+
+```bash
+./scripts/docker_afl.sh TARGET=toml PROFILE=debug ./scripts/afl_build.sh
+```
+
+Show instrumentation diagnostics during build:
+
+```bash
+RZ_PRINT_CRATES=1 RZ_TRACE_PASS=1 TRACE=1 ./scripts/docker_afl.sh TARGET=itoa PROFILE=debug ./scripts/afl_build.sh
+```
+
+Strict hook verification (fails build if `__rz_*` hooks are not found in the final binary):
+
+```bash
+RZ_VERIFY_HOOKS=1 RZ_VERIFY_HOOKS_STRICT=1 ./scripts/docker_afl.sh TARGET=toml PROFILE=debug ./scripts/afl_build.sh
 ```
 
 ## Notes
@@ -89,5 +121,7 @@ FUZZ=1 ./scripts/docker_afl.sh
 
   ```bash
   export AFL_COMPILER_RT=/opt/aflpp/afl-compiler-rt.o
-  TARGET=bytes PROFILE=release ./scripts/afl_build.sh
+  TARGET=toml PROFILE=debug ./scripts/afl_build.sh
   ```
+- `scripts/docker_afl.sh` forwards host `RZ_*` / `RUSTEZE_*` / `TRACE` / `RUST_BACKTRACE`
+  variables into the container.

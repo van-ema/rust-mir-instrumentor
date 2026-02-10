@@ -266,8 +266,15 @@ This writes:
 ## AFL++ (Native vs Docker)
 
 The repo includes an AFL++ harness crate with drivers:
-`afl_bytes_driver`, `afl_smallvec_driver`, and `afl_serde_json_driver`
-(`TARGET=serde_json` or `TARGET=serde`).
+`afl_bytes_driver`, `afl_smallvec_driver`, `afl_serde_json_driver`,
+`afl_toml_driver`, `afl_base64_driver`, `afl_uuid_driver`,
+`afl_itoa_driver`, and `afl_quick_xml_driver`.
+
+Bootstrap third-party checkouts and env hints first:
+
+```bash
+./scripts/afl_setup.sh
+```
 
 On macOS, AFL++ shared-memory can be unreliable; the recommended workflow is to
 use the Linux container described in `docker/afl/README.md`.
@@ -278,15 +285,24 @@ use the Linux container described in `docker/afl/README.md`.
 # Build the harness (requires AFL++ runtime object `afl-compiler-rt.o`)
 export AFL_PATH=/path/to/AFLplusplus   # or set AFL_COMPILER_RT=/path/to/afl-compiler-rt.o
 TARGET=bytes PROFILE=release ./scripts/afl_build.sh
-TARGET=serde PROFILE=release ./scripts/afl_build.sh
+TARGET=serde_json PROFILE=release ./scripts/afl_build.sh
 
 # Run AFL++
 TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
-TARGET=serde PROFILE=release ./scripts/afl_fuzz.sh
+TARGET=serde_json PROFILE=release ./scripts/afl_fuzz.sh
 
 # Reproduce a single crash
 TARGET=bytes PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/bytes/default/crashes/id:...
-TARGET=serde PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/serde/default/crashes/id:...
+TARGET=serde_json PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/serde_json/default/crashes/id:...
+```
+
+`scripts/afl_build.sh` includes a post-build hook check and prints:
+`[rusteze] hook check: found rusteze hooks (__rz_*) ...` when instrumentation hooks are present.
+
+For strict CI-style verification:
+
+```bash
+RZ_VERIFY_HOOKS=1 RZ_VERIFY_HOOKS_STRICT=1 TARGET=bytes PROFILE=debug ./scripts/afl_build.sh
 ```
 
 **Docker (Linux container)**
@@ -303,7 +319,14 @@ docker build -t rusteze-afl -f docker/afl/Dockerfile .
 You can also pass env vars directly through the helper:
 
 ```bash
-./scripts/docker_afl.sh TARGET=serde PROFILE=release ./scripts/afl_build.sh
+./scripts/docker_afl.sh TARGET=serde_json PROFILE=release ./scripts/afl_build.sh
+```
+
+`scripts/docker_afl.sh` now forwards host `RZ_*` / `RUSTEZE_*` / `TRACE` vars, so
+instrumentation diagnostics are visible inside the container. Example:
+
+```bash
+RZ_PRINT_CRATES=1 RZ_TRACE_PASS=1 TRACE=1 ./scripts/docker_afl.sh TARGET=itoa PROFILE=debug ./scripts/afl_build.sh
 ```
 
 

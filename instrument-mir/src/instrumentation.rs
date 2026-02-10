@@ -6243,11 +6243,16 @@ impl MyOptimizationPass {
     }
 
     pub(crate) fn run_pass<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        let trace_pass = std::env::var("RZ_TRACE_PASS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
         let def_id = body.source.def_id();
         let def_path = tcx.def_path_str(def_id);
 
         if def_path.contains("runtime") {
-            println!("Skipping optimization for {}", def_path);
+            if trace_pass {
+                println!("Skipping optimization for {}", def_path);
+            }
             return;
         }
 
@@ -6255,24 +6260,46 @@ impl MyOptimizationPass {
 
         // Skip the `runtime` crate
         if crate_name.as_str() == "runtime" {
-            println!(
-                "Skipping optimization for item in runtime crate: {:?}",
-                def_id
-            );
+            if trace_pass {
+                println!(
+                    "Skipping optimization for item in runtime crate: {:?}",
+                    def_id
+                );
+            }
             return;
         }
 
         // Skip build scripts to avoid ICEs in codegen (e.g. wide ptr operands in build.rs).
         if crate_name.as_str() == "build_script_build" || def_path.contains("build_script_build") {
-            println!("Skipping optimization for build script: {:?}", def_id);
+            if trace_pass {
+                println!("Skipping optimization for build script: {:?}", def_id);
+            }
             return;
         }
 
-        println!(
-            "Running MyOptimizationPass on {:?} {:?}",
-            body.source.def_id(),
-            def_path
-        );
+        // Skip proc-macro crates: they execute on the host during compilation
+        // (derive/attribute expansion). Instrumenting them causes compile-time
+        // runtime reports that are unrelated to the fuzz target itself.
+        if tcx
+            .sess
+            .opts
+            .crate_types
+            .iter()
+            .any(|ct| matches!(ct, rustc_session::config::CrateType::ProcMacro))
+        {
+            if trace_pass {
+                println!("Skipping optimization for proc-macro crate: {:?}", def_id);
+            }
+            return;
+        }
+
+        if trace_pass {
+            println!(
+                "Running MyOptimizationPass on {:?} {:?}",
+                body.source.def_id(),
+                def_path
+            );
+        }
 
 
         // self.print_runtime_items(tcx);

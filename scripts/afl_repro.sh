@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${OUT_DIR:-fuzz/out/${TARGET}}"
 ONLY=""
@@ -44,7 +44,12 @@ case "$TARGET" in
   bytes) BIN="afl_bytes_driver" ;;
   smallvec) BIN="afl_smallvec_driver" ;;
   serde_json|serde) BIN="afl_serde_json_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde)" >&2; exit 2 ;;
+  toml) BIN="afl_toml_driver" ;;
+  base64) BIN="afl_base64_driver" ;;
+  uuid) BIN="afl_uuid_driver" ;;
+  itoa) BIN="afl_itoa_driver" ;;
+  quick_xml|quick-xml) BIN="afl_quick_xml_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml)" >&2; exit 2 ;;
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"
@@ -53,7 +58,7 @@ if [[ ! -d "$CRASH_DIR" ]]; then
   exit 2
 fi
 
-HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}}"
+HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
 BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
 
 if [[ ! -x "$BIN_PATH" ]]; then
@@ -86,7 +91,8 @@ for f in "${files[@]}"; do
     exit 2
   fi
   echo "=== repro: $f ==="
-  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 \"$BIN_PATH\" \"$f\""
-  RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 "$BIN_PATH" "$f" || true
+  sb_lite="${RZ_SB_LITE:-0}"
+  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_SB_LITE=${sb_lite} \"$BIN_PATH\" \"$f\""
+  RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_SB_LITE="${sb_lite}" "$BIN_PATH" "$f" || true
   echo
 done

@@ -50,7 +50,6 @@ ENV AFL_PATH=/usr/local/lib/afl
 # Helpful defaults for fuzzing/repro in containers.
 ENV CARGO_INCREMENTAL=0 \
     RZ_INSTRUMENT_ALL_DEPS=1 \
-    RZ_LOG=warn \
-    ASAN_OPTIONS=detect_leaks=0
+    RZ_LOG=warn
 
 WORKDIR /work

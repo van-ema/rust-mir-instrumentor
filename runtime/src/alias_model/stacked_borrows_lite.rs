@@ -17,12 +17,25 @@ enum BorrowKind {
 struct BorrowEntry {
     tag: u64,
     kind: BorrowKind,
+    start: usize,
+    end: usize,
 }
 
 static BORROWS: OnceLock<Mutex<HashMap<usize, Vec<BorrowEntry>>>> = OnceLock::new();
 
 fn borrows() -> &'static Mutex<HashMap<usize, Vec<BorrowEntry>>> {
     BORROWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn range_from_ptr(addr: usize, len: usize) -> (usize, usize) {
+    let size = len.max(1);
+    (addr, addr.saturating_add(size))
+}
+
+#[inline]
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start < b_end && b_start < a_end
 }
 
 #[inline]
@@ -102,6 +115,7 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
 
     let mut bmap = borrows().lock().unwrap();
     let stack = bmap.entry(base).or_default();
+    let (start, end) = range_from_ptr(tmeta.pointee_addr, tmeta.bounds_len);
 
     // Retagging: if we know the parent, truncate to it (invalidate younger tags).
     // For fresh unique borrows, clear the stack to invalidate all prior aliases.
@@ -115,7 +129,12 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
         stack.clear();
     }
 
-    stack.push(BorrowEntry { tag, kind });
+    stack.push(BorrowEntry {
+        tag,
+        kind,
+        start,
+        end,
+    });
 }
 
 fn sb_lite_validate_ref_creation(
@@ -328,8 +347,14 @@ fn sb_lite_check(
         }
     };
 
-    let top = match stack.last() {
-        Some(t) => t.clone(),
+    let (access_start, access_end) = range_from_ptr(addr, size);
+    let top = match stack
+        .iter()
+        .rev()
+        .find(|e| ranges_overlap(e.start, e.end, access_start, access_end))
+        .cloned()
+    {
+        Some(t) => t,
         None => return None,
     };
 
@@ -428,6 +453,9 @@ fn sb_lite_check(
             };
             for idx in (0..stack.len()).rev() {
                 let entry = &stack[idx];
+                if !ranges_overlap(entry.start, entry.end, access_start, access_end) {
+                    continue;
+                }
                 if entry.tag == sb_tag {
                     saw_related = true;
                     if seen_unique {
@@ -489,8 +517,7 @@ fn sb_lite_check(
                 let can_reactivate_missing_parent = {
                     let tmap = tags().lock().unwrap();
                     stack.iter().all(|e| {
-                        e.kind == BorrowKind::Unique
-                            && sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
+                        sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
                     })
                 };
                 if can_reactivate_missing_parent {
@@ -498,6 +525,8 @@ fn sb_lite_check(
                     stack.push(BorrowEntry {
                         tag: sb_tag,
                         kind: BorrowKind::Unique,
+                        start: access_start,
+                        end: access_end,
                     });
                     return None;
                 }
@@ -513,10 +542,33 @@ fn sb_lite_check(
             let mut is_top = true;
             let mut seen_unique = false;
             for (idx, entry) in stack.iter().enumerate().rev() {
+                if !ranges_overlap(entry.start, entry.end, access_start, access_end) {
+                    continue;
+                }
                 if entry.tag == sb_tag {
                     if entry.kind == BorrowKind::Unique {
                         if is_top {
                             return None;
+                        }
+                        if matches!(tmeta.kind, PtrKind::RefMut) {
+                            let can_reactivate = {
+                                let tmap = tags().lock().unwrap();
+                                stack[idx + 1..]
+                                    .iter()
+                                    .filter(|e| {
+                                        ranges_overlap(
+                                            e.start,
+                                            e.end,
+                                            access_start,
+                                            access_end,
+                                        )
+                                    })
+                                    .all(|e| sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag))
+                            };
+                            if can_reactivate {
+                                stack.truncate(idx + 1);
+                                return None;
+                            }
                         }
                         // For raw writes derived from a unique ref, allow shared reborrows
                         // above as a best-effort heuristic (we do not track reborrow ends).
