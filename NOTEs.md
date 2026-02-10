@@ -189,6 +189,27 @@ Limitations:
 - Coarse: we do not recover embedded pointer provenance; we only check address
   ranges for static segments.
 
+## Tree Borrows lite protectors at call boundaries
+
+`tb_lite` now models a lightweight protector rule for call arguments:
+
+- when the callee consumes a caller-pushed parent tag (`__rz_take_call_arg_tag`),
+  the runtime records that parent in a call frame;
+- the immediate child `Ref*` tag created from that parent is marked as protected;
+- the frame is popped on callee return (`__rz_exit_fn`), inserted at each MIR
+  `Return` terminator.
+
+Checks implemented in TB-lite:
+
+- `TB_LITE_PROTECTOR_CONFLICT`: overlapping write via a different tag while a
+  protected tag is active;
+- `TB_LITE_PROTECTOR_DEALLOC`: heap deallocation of an allocation that still has
+  an active protected tag.
+
+This is intentionally a lite approximation of full Tree Borrows protectors: it
+tracks the immediate argument-child protection window, but not the full Miri
+state machine (all reserved/active transitions and protector variants).
+
 ## AFL++ on macOS (shared memory)
 
 On this macOS setup, AFL++ shared-memory initialization can fail due to OS restrictions:

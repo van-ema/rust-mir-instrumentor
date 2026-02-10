@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{allocs, find_alloc_containing, rz_sb_suppressed, tags, PtrKind, TagMeta};
+use crate::{
+    allocs, append_location_if_enabled, find_alloc_containing, rz_sb_suppressed, rz_violation, tags, PtrKind,
+    TagMeta,
+};
 
 use super::{AliasAccessKind, AliasModel};
 
@@ -23,6 +26,7 @@ struct TbNode {
     start: usize,
     len: usize,
     alive: bool,
+    protected: bool,
 }
 
 #[derive(Default)]
@@ -30,10 +34,22 @@ struct TbAllocState {
     nodes: HashMap<u64, TbNode>,
 }
 
+#[derive(Default)]
+struct TbProtectorFrame {
+    callee_id: u64,
+    pending_parent_tags: Vec<u64>,
+    protected_tags: Vec<u64>,
+}
+
 static TB_STATE: OnceLock<Mutex<HashMap<usize, TbAllocState>>> = OnceLock::new();
+static TB_PROTECTOR_FRAMES: OnceLock<Mutex<Vec<TbProtectorFrame>>> = OnceLock::new();
 
 fn tb_state() -> &'static Mutex<HashMap<usize, TbAllocState>> {
     TB_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tb_protector_frames() -> &'static Mutex<Vec<TbProtectorFrame>> {
+    TB_PROTECTOR_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[inline]
@@ -71,6 +87,7 @@ impl AliasModel for TreeBorrowsLiteModel {
 
     fn on_alloc_state_change(&self, base_addr: usize, new_live: bool) {
         if !new_live && rz_tb_lite_enabled() {
+            tb_lite_check_protected_dealloc(base_addr);
             tb_state().lock().unwrap().remove(&base_addr);
         }
     }
@@ -90,6 +107,14 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_on_tag_created(tag, tmeta);
     }
 
+    fn on_call_arg_taken(&self, callee_id: u64, parent_tag: u64) {
+        tb_lite_on_call_arg_taken(callee_id, parent_tag);
+    }
+
+    fn on_call_exit(&self, callee_id: u64) {
+        tb_lite_on_call_exit(callee_id);
+    }
+
     fn find_ref_ancestor_tag(&self, tmap: &HashMap<u64, TagMeta>, tag: u64) -> Option<u64> {
         tb_lite_find_ref_ancestor_tag(tmap, tag)
     }
@@ -104,6 +129,95 @@ impl AliasModel for TreeBorrowsLiteModel {
         access: AliasAccessKind,
     ) -> Option<String> {
         tb_lite_check(sb_tag, orig_tag, tmeta, addr, size, access)
+    }
+}
+
+fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
+    if !rz_tb_lite_enabled() || parent_tag == 0 {
+        return;
+    }
+    let mut frames = tb_protector_frames().lock().unwrap();
+    match frames.last_mut() {
+        Some(top) if top.callee_id == callee_id => {
+            top.pending_parent_tags.push(parent_tag);
+        }
+        _ => {
+            frames.push(TbProtectorFrame {
+                callee_id,
+                pending_parent_tags: vec![parent_tag],
+                protected_tags: Vec::new(),
+            });
+        }
+    }
+}
+
+fn tb_lite_on_call_exit(callee_id: u64) {
+    if !rz_tb_lite_enabled() {
+        return;
+    }
+
+    let popped = {
+        let mut frames = tb_protector_frames().lock().unwrap();
+        frames
+            .iter()
+            .rposition(|f| f.callee_id == callee_id)
+            .map(|idx| frames.remove(idx))
+    };
+
+    let Some(frame) = popped else {
+        return;
+    };
+    if frame.protected_tags.is_empty() {
+        return;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut all = tb_state().lock().unwrap();
+    for tag in frame.protected_tags {
+        let Some(tmeta) = tmap.get(&tag) else {
+            continue;
+        };
+        let base = tb_base_for_addr(tmeta.pointee_addr);
+        let Some(tree) = all.get_mut(&base) else {
+            continue;
+        };
+        if let Some(node) = tree.nodes.get_mut(&tag) {
+            node.protected = false;
+        }
+    }
+}
+
+fn tb_lite_check_protected_dealloc(base_addr: usize) {
+    let is_stack = {
+        let amap = allocs().lock().unwrap();
+        amap.get(&base_addr).map_or(false, |m| m.is_stack)
+    };
+    if is_stack {
+        return;
+    }
+
+    let protected = {
+        let all = tb_state().lock().unwrap();
+        let Some(tree) = all.get(&base_addr) else {
+            return;
+        };
+        tree.nodes
+            .values()
+            .find(|n| n.alive && n.protected)
+            .map(|n| (n.tag, n.kind))
+    };
+
+    if let Some((tag, kind)) = protected {
+        rz_violation(
+            "STACKED_BORROWS_VIOLATION",
+            append_location_if_enabled(
+                format!(
+                    "DEALLOC base=0x{:x}\nreason=TB_LITE_PROTECTOR_DEALLOC tag={} kind={:?}",
+                    base_addr, tag, kind
+                ),
+                "RZ_LOG_LOC",
+            ),
+        );
     }
 }
 
@@ -214,6 +328,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     };
 
     let base = tb_base_for_addr(tmeta.pointee_addr);
+    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let node = TbNode {
         tag,
         parent,
@@ -221,6 +336,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         start: tmeta.pointee_addr,
         len: tb_effective_len(tmeta.bounds_len),
         alive: true,
+        protected,
     };
 
     let mut all = tb_state().lock().unwrap();
@@ -246,6 +362,33 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
             }
         }
     }
+}
+
+// Protector approximation used by tb_lite:
+// - when an argument retag consumes a caller parent tag, we store that parent tag in the
+//   current call frame (`pending_parent_tags`);
+// - the immediate child Ref created from that parent becomes "protected" for the duration
+//   of the frame (until `__rz_exit_fn`).
+//
+// Example:
+//   fn callee(x: &mut u8, y: *mut u8) { unsafe { *y = 1; } }
+//   let n = &mut 0u8;
+//   let y = n as *mut u8;
+//   callee(n, y); // x is protected in callee; write through y should violate.
+fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) -> bool {
+    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique) || parent == 0 {
+        return false;
+    }
+    let mut frames = tb_protector_frames().lock().unwrap();
+    let Some(top) = frames.last_mut() else {
+        return false;
+    };
+    let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
+        return false;
+    };
+    top.pending_parent_tags.swap_remove(pos);
+    top.protected_tags.push(tag);
+    true
 }
 
 fn tb_lite_check(
@@ -333,6 +476,25 @@ fn tb_lite_check(
             None
         }
         AliasAccessKind::Write => {
+            if let Some(protected) = tree
+                .nodes
+                .values()
+                .find(|n| {
+                    n.alive
+                        && n.protected
+                        && n.tag != access_tag
+                        && tb_ranges_overlap(addr, size, n.start, n.len)
+                })
+                .cloned()
+            {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+                    access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+
             if !matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_NON_UNIQUE_WRITE",
@@ -388,11 +550,12 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} kind={:?} alive={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} kind={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
             n.tag,
             n.parent,
             n.kind,
             n.alive,
+            n.protected,
             n.start,
             n.start.saturating_add(n.len)
         ));

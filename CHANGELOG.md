@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Tree Borrows (lite): added call-boundary protector plumbing.
+  - Runtime now notifies the active alias model when call-argument parent tags are consumed (`__rz_take_call_arg_tag`) and when instrumented callees exit (`__rz_exit_fn`).
+  - Instrumentation now inserts `FnExit` hooks at each MIR `Return` terminator.
+- Tree Borrows (lite): implemented protector checks for:
+  - overlapping writes through non-protected tags (`TB_LITE_PROTECTOR_CONFLICT`)
+  - heap deallocation while a protected tag is still active (`TB_LITE_PROTECTOR_DEALLOC`)
+- Examples: added protector-focused TB micro tests:
+  - `tb_miri_micro::protected_raw_write`
+  - `tb_miri_micro::protected_dealloc`
+  with model-specific expected outputs.
 - Tree Borrows (lite): decoupled `tb_lite` runtime checks from SB-lite delegation, so `RZ_ALIAS_MODEL=tb_lite` now executes its own alias decisions.
 - Tree Borrows (lite): track raw tags in TB state and use original tag when available, enabling descendant invalidation checks to apply to raw accesses.
 - Tree Borrows (lite): add parent-read invalidation approximation for unique ancestors (`TB_LITE_INVALIDATED` on subsequent conflicting raw writes).

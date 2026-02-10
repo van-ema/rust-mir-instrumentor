@@ -33,6 +33,13 @@ pub(crate) trait AliasModel: Sync {
 
     fn on_tag_created(&self, _tag: u64, _tmeta: &TagMeta) {}
 
+    /// Called when a callee consumes a caller-pushed argument tag.
+    /// Alias models can use this to seed call-scope metadata (e.g., protectors).
+    fn on_call_arg_taken(&self, _callee_id: u64, _parent_tag: u64) {}
+
+    /// Called at instrumented function return.
+    fn on_call_exit(&self, _callee_id: u64) {}
+
     fn find_ref_ancestor_tag(&self, _tmap: &HashMap<u64, TagMeta>, _tag: u64) -> Option<u64> {
         None
     }

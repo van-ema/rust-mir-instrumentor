@@ -5,10 +5,10 @@ Current status
 	•	Phase 1 (call boundaries + std/core classification): completed (bytes/smallvec debug+release stable)
 	•	Phase 2 (alloc/realloc epochs): completed
 	•	Phase 3 (SB-lite): completed (micro-suite + example tests passing)
-	•	Phase 4 (Tree Borrows, runtime-first): in progress (`tb_lite` selectable, dedicated micro-suite added, medium/fuzz smoke stable)
+	•	Phase 4 (Tree Borrows, runtime-first): in progress (`tb_lite` selectable, dedicated micro-suite added, call-argument protectors + dealloc/write checks implemented)
 	•	Phase 6 (Fuzzing + Evaluation): in progress (AFL++ harness + Docker workflow; bytes/smallvec/serde_json smoke loops stable)
 Next step
-	•	Complete Phase 4 by adding more Miri-inspired TB tests (especially call-boundary / return-boundary cases)
+	•	Complete Phase 4 by expanding protector/state-machine coverage (2-phase/reserved transitions, stronger state transitions)
 	•	In parallel: continue Phase 6 to turn fuzz findings into minimized, reproducible, triaged reports
 	•	Phase 7 (Wide/Fat pointers) to support slices/str/dyn Trait and reduce blind spots in real crates
 
@@ -144,13 +144,20 @@ Work packages
 		•	READ: check current node and relevant ancestors/active blockers
 		•	WRITE: require write-capable path; invalidate conflicting branches
 		•	preserve `UnsafeCell` / alias-exempt carve-outs
-	5. Lifetime integration
+	5. Call-boundary protectors (implemented in current lite form)
+		•	record consumed call-arg parent tags (`__rz_take_call_arg_tag`)
+		•	mark immediate child ref tags as protected for callee lifetime
+		•	enforce:
+			•	write via overlapping non-protected tag => `TB_LITE_PROTECTOR_CONFLICT`
+			•	heap dealloc while protected tag still active => `TB_LITE_PROTECTOR_DEALLOC`
+		•	pop protector frame at callee return via `__rz_exit_fn` hook
+	6. Lifetime integration
 		•	drop per-allocation tree state on alloc death (`on_alloc_state_change`)
 		•	avoid stale-tree conflicts across epoch reuse
-	6. Diagnostics
+	7. Diagnostics
 		•	emit TB-specific violation reasons with parent/root/range context
 		•	keep violation kind stable (`STACKED_BORROWS_VIOLATION`) initially, then split if needed
-	7. Model-specific test expectations
+	8. Model-specific test expectations
 		•	`scripts/run_example_tests.py` supports model-specific expectation files:
 			•	`expected.<bin>.<model>.rz`
 			•	`expected.<model>.rz`

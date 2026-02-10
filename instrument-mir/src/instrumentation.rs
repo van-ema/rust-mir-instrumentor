@@ -521,6 +521,8 @@ enum InstrKind<'tcx> {
     RetTake { callee_id: u64, dst_local: Local },
     /// Caller-side: synthesize a fresh tag for an uninstrumented call return.
     RetRoot { dst_local: Local, is_mut: bool, is_ref: bool },
+    /// Callee-side: notify runtime alias models that this function is exiting.
+    FnExit { callee_id: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -559,6 +561,7 @@ struct Hooks {
     def_id_take_call_arg_tag: DefId,
     def_id_push_ret_tag: DefId,
     def_id_take_ret_tag_or_root: DefId,
+    def_id_exit_fn: DefId,
 }
 
 impl MyOptimizationPass {
@@ -4302,10 +4305,18 @@ impl MyOptimizationPass {
                 }
 
                 if let TerminatorKind::Return = &term.kind {
+                    let callee_id = self.callee_id_u64(tcx, body.source.def_id());
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(RETURN_PLACE),
+                        kind: InstrKind::FnExit { callee_id },
+                    });
                     if self.ret_push_enabled()
                         && self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty())
                     {
-                        let callee_id = self.callee_id_u64(tcx, body.source.def_id());
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
                             bb,
@@ -4496,6 +4507,7 @@ impl MyOptimizationPass {
             InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
+            InstrKind::FnExit { .. } => hooks.def_id_exit_fn,
         };
         Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
     }
@@ -4515,6 +4527,7 @@ impl MyOptimizationPass {
                 | InstrKind::Raw { .. }
                 | InstrKind::RawRoot { .. }
                 | InstrKind::ArgRetag { .. }
+                | InstrKind::FnExit { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. } => 0,
                 InstrKind::PtrRead { .. }
@@ -5205,6 +5218,47 @@ impl MyOptimizationPass {
                 body.basic_blocks_mut()[cont_block]
                     .statements
                     .extend(remaining_stmts);
+                continue;
+            }
+
+            if let InstrKind::FnExit { callee_id } = creation_kind {
+                let exit_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_exit_fn,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let args_exit: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: self.const_u64(tcx, source_info.span, callee_id),
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let call_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: exit_func,
+                        args: args_exit,
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                body.basic_blocks_mut()[bb].terminator = Some(call_term);
                 continue;
             }
 
@@ -6400,6 +6454,9 @@ impl MyOptimizationPass {
         let def_id_take_ret_tag_or_root = self
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag_or_root", 5)
             .expect("missing '__rz_take_ret_tag_or_root' definition");
+        let def_id_exit_fn = self
+            .find_runtime_fn_def_id(tcx, "__rz_exit_fn", 1)
+            .expect("missing '__rz_exit_fn' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -6414,6 +6471,7 @@ impl MyOptimizationPass {
             def_id_take_call_arg_tag,
             def_id_push_ret_tag,
             def_id_take_ret_tag_or_root,
+            def_id_exit_fn,
         };
 
         let scan = self.scan_body(tcx, body);

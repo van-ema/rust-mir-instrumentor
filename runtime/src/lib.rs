@@ -1858,11 +1858,15 @@ pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    call_arg_tags()
+    let tag = call_arg_tags()
         .lock()
         .unwrap()
         .remove(&(callee_id, arg_index, addr))
-        .unwrap_or(0)
+        .unwrap_or(0);
+    if tag != 0 {
+        active_alias_model().on_call_arg_taken(callee_id, tag);
+    }
+    tag
 }
 
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
@@ -1898,6 +1902,13 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     }
     // Fallback: synthesize a fresh raw-pointer tag rooted at this address.
     __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len)
+}
+
+/// Notify runtime alias models that the current instrumented function is exiting.
+#[no_mangle]
+pub extern "C" fn __rz_exit_fn(callee_id: u64) {
+    let _g = RzRuntimeGuard::enter();
+    active_alias_model().on_call_exit(callee_id);
 }
 
 #[macro_export]
