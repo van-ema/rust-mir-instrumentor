@@ -91,18 +91,48 @@ if [[ -z "$AFL_COMPILER_RT" || ! -f "$AFL_COMPILER_RT" ]]; then
   exit 2
 fi
 
+hash_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+    return 0
+  fi
+  cksum "$file" | awk '{print $1":"$2}'
+}
+
+find_runtime_rlib() {
+  local deps_dir="$1"
+  local candidate=""
+  candidate="$(ls -t "${deps_dir}"/libruntime-*.rlib 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${candidate}" || ! -f "${candidate}" ]]; then
+    candidate="${deps_dir}/libruntime.rlib"
+    if [[ ! -f "${candidate}" ]]; then
+      candidate=""
+    fi
+  fi
+  echo "${candidate}"
+}
+
+build_tools_and_runtime() {
+  if [[ "$PROFILE" == "release" ]]; then
+    cargo build -p instrument-mir --release
+    # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
+    cargo build -p runtime --release ${RUNTIME_FEATURES}
+    PROFILE_FLAG="--release"
+  else
+    cargo build -p instrument-mir
+    cargo build -p runtime ${RUNTIME_FEATURES}
+    PROFILE_FLAG=""
+  fi
+}
+
 # Build rusteze toolchain + runtime in the chosen profile.
 RUNTIME_FEATURES="${RUNTIME_FEATURES:-}"
-if [[ "$PROFILE" == "release" ]]; then
-  cargo build -p instrument-mir --release
-  # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
-  cargo build -p runtime --release ${RUNTIME_FEATURES}
-  PROFILE_FLAG="--release"
-else
-  cargo build -p instrument-mir
-  cargo build -p runtime ${RUNTIME_FEATURES}
-  PROFILE_FLAG=""
-fi
+build_tools_and_runtime
 
 # Avoid accidental linking against a stale top-level `libruntime.rlib` if one exists.
 rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
@@ -115,6 +145,68 @@ if [[ -z "$TOOL" || ! -x "$TOOL" ]]; then
   echo "missing cargo-instrument-mir (instrument-mir build/install failed?)" >&2
   exit 2
 fi
+
+STAMP_FILE="${HARNESS_TARGET_DIR}/.rusteze-toolchain-stamp"
+runtime_rlib="$(find_runtime_rlib "${RUNTIME_PATH}")"
+if [[ -z "${runtime_rlib}" || ! -f "${runtime_rlib}" ]]; then
+  echo "missing runtime rlib under ${RUNTIME_PATH} (runtime build failed?)" >&2
+  exit 2
+fi
+
+current_stamp="$(
+  {
+    echo "tool=$(hash_file "${TOOL}")"
+    echo "runtime=$(hash_file "${runtime_rlib}")"
+    echo "profile=${PROFILE}"
+    echo "runtime_features=${RUNTIME_FEATURES}"
+  } | tr '\n' ';'
+)"
+clean_needed=0
+
+# Legacy target dirs created before stamp support can keep stale instrumented artifacts.
+if [[ ! -f "${STAMP_FILE}" && -f "${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}" ]]; then
+  clean_needed=1
+fi
+
+if [[ -f "${STAMP_FILE}" ]]; then
+  old_stamp="$(cat "${STAMP_FILE}" || true)"
+  if [[ "${old_stamp}" != "${current_stamp}" ]]; then
+    clean_needed=1
+  fi
+fi
+
+if [[ "${clean_needed}" == "1" ]]; then
+  echo "[rusteze] instrumentation toolchain changed; cleaning ${HARNESS_TARGET_DIR} to avoid stale MIR artifacts"
+  cargo clean --target-dir "${HARNESS_TARGET_DIR}"
+  build_tools_and_runtime
+  rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
+
+  TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
+  if [[ ! -x "$TOOL" ]]; then
+    TOOL="$(command -v cargo-instrument-mir || true)"
+  fi
+  if [[ -z "$TOOL" || ! -x "$TOOL" ]]; then
+    echo "missing cargo-instrument-mir after clean/rebuild" >&2
+    exit 2
+  fi
+
+  runtime_rlib="$(find_runtime_rlib "${RUNTIME_PATH}")"
+  if [[ -z "${runtime_rlib}" || ! -f "${runtime_rlib}" ]]; then
+    echo "missing runtime rlib after clean/rebuild under ${RUNTIME_PATH}" >&2
+    exit 2
+  fi
+
+  current_stamp="$(
+    {
+      echo "tool=$(hash_file "${TOOL}")"
+      echo "runtime=$(hash_file "${runtime_rlib}")"
+      echo "profile=${PROFILE}"
+      echo "runtime_features=${RUNTIME_FEATURES}"
+    } | tr '\n' ';'
+  )"
+fi
+
+echo "${current_stamp}" > "${STAMP_FILE}"
 
 # AFL++ coverage for Rust via LLVM SanitizerCoverage (PCGUARD).
 # This mirrors the approach used by rust-fuzz/afl.rs and AFL++ Rust guidance.

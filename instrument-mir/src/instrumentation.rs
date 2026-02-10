@@ -994,6 +994,21 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    /// Caller-side return-tag recovery is always enabled.
+    ///
+    /// We keep this as a helper to make call-boundary policy explicit in one place.
+    fn ret_take_enabled(&self) -> bool {
+        true
+    }
+
+    /// Callee-side return-tag push is always enabled.
+    ///
+    /// Together with `ret_take_enabled`, this keeps return-pointer provenance connected
+    /// across instrumented call boundaries by default.
+    fn ret_push_enabled(&self) -> bool {
+        true
+    }
+
     /// Print an "unknown call" warning once per callee def-path to avoid spam.
     fn warn_unknown_call_once(&self, def_path: &str) {
         static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -3664,6 +3679,7 @@ impl MyOptimizationPass {
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
+        let ret_take_enabled = self.ret_take_enabled();
 
         // 6a: Remove is_plain_store/is_plain_load computation.
 
@@ -4060,7 +4076,48 @@ impl MyOptimizationPass {
             let dst_ty = body.local_decls[dst_local].ty;
             if self.supports_call_boundary_ret_tag_ty(tcx, body, dst_ty) {
                 if callee_instrumented {
-                    if let Some(callee_id) = callee_id_opt {
+                    if !ret_take_enabled {
+                        let is_mut = match dst_ty.kind() {
+                            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+                            _ => false,
+                        };
+                        let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+                        let call_target_bb: Option<BasicBlock> = match &term.kind {
+                            TerminatorKind::Call { target, .. } => *target,
+                            _ => None,
+                        };
+
+                        ptr_locals_needing_tag.insert(dst_local);
+                        tagged_ptr_locals.insert(dst_local);
+                        if let Some(tgt_bb) = call_target_bb {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RetRoot {
+                                    dst_local,
+                                    is_mut,
+                                    is_ref,
+                                },
+                            });
+                        } else {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::RetRoot {
+                                    dst_local,
+                                    is_mut,
+                                    is_ref,
+                                },
+                            });
+                        }
+                    } else if let Some(callee_id) = callee_id_opt {
                         ptr_locals_needing_tag.insert(dst_local);
                         tagged_ptr_locals.insert(dst_local);
                         insert_points.push(InsertPoint {
@@ -4245,7 +4302,9 @@ impl MyOptimizationPass {
                 }
 
                 if let TerminatorKind::Return = &term.kind {
-                    if self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty()) {
+                    if self.ret_push_enabled()
+                        && self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty())
+                    {
                         let callee_id = self.callee_id_u64(tcx, body.source.def_id());
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
@@ -4524,6 +4583,43 @@ impl MyOptimizationPass {
                     .get(&ptr_local)
                     .expect("missing tag local for RawRoot");
 
+                // Compute exposed address first. This is fallible for some pointer shapes, and we must
+                // not mutate CFG until we know RawRoot lowering can be emitted completely.
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let Some((data_ptr_stmt_opt, addr_stmt)) = self.addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    Place::from(ptr_local),
+                    addr_local,
+                ) else {
+                    continue;
+                };
+                let is_mut_u8: u8 = if is_mut { 1 } else { 0 };
+                let alias_exempt = self.alias_exempt_for_ptr_ty(
+                    tcx,
+                    body,
+                    body.local_decls[ptr_local].ty,
+                );
+                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
+                    tcx,
+                    body,
+                    ptr_local,
+                    source_info.span,
+                );
+                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
+                    tcx,
+                    body,
+                    source_info,
+                    &bounds_len_op,
+                );
+                if !bounds_len_stmts.is_empty() {
+                    // Appended after address statements once call_bb exists.
+                }
+
                 // We insert using the same “split block with a call terminator” style used elsewhere.
                 // Create fresh block that will run the call and then continue.
                 let is_cleanup = body.basic_blocks[bb].is_cleanup;
@@ -4559,24 +4655,15 @@ impl MyOptimizationPass {
                     kind: TerminatorKind::Goto { target: call_bb },
                 });
 
-                // In the call block, compute exposed address.
-                let addr_local = body
-                    .local_decls
-                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
-
-                let Some((data_ptr_stmt_opt, addr_stmt)) = self.addr_stmts_for_place(
-                    tcx,
-                    body,
-                    source_info,
-                    Place::from(ptr_local),
-                    addr_local,
-                ) else {
-                    continue;
-                };
                 if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
                     body.basic_blocks_mut()[call_bb].statements.push(data_ptr_stmt);
                 }
                 body.basic_blocks_mut()[call_bb].statements.push(addr_stmt);
+                if !bounds_len_stmts.is_empty() {
+                    body.basic_blocks_mut()[call_bb]
+                        .statements
+                        .append(&mut bounds_len_stmts);
+                }
 
                 let raw_func = Operand::function_handle(
                     tcx,
@@ -4584,30 +4671,6 @@ impl MyOptimizationPass {
                     std::iter::empty(),
                     source_info.span,
                 );
-
-                let is_mut_u8: u8 = if is_mut { 1 } else { 0 };
-                let alias_exempt = self.alias_exempt_for_ptr_ty(
-                    tcx,
-                    body,
-                    body.local_decls[ptr_local].ty,
-                );
-                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
-                    tcx,
-                    body,
-                    ptr_local,
-                    source_info.span,
-                );
-                let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
-                    tcx,
-                    body,
-                    source_info,
-                    &bounds_len_op,
-                );
-                if !bounds_len_stmts.is_empty() {
-                    body.basic_blocks_mut()[call_bb]
-                        .statements
-                        .append(&mut bounds_len_stmts);
-                }
                 let args_raw: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
@@ -4665,14 +4728,12 @@ impl MyOptimizationPass {
             }
 
             // Caller-side: take return tag after a call returned a thin pointer into `dst_local`.
-            // This must run after the call, so we rewrite the call's target to a fresh block that
-            // performs `__rz_take_ret_tag_or_root` and then jumps to the original target.
+            // This must run after the call, but we intentionally avoid rewriting the call edge.
+            // Instead, we splice the take call at the start of the existing call-target block.
             if let InstrKind::RetTake { callee_id, dst_local } = creation_kind {
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&dst_local)
                     .expect("missing tag local for RetTake");
-
-                let is_cleanup = body.basic_blocks[bb].is_cleanup;
 
                 let (orig_target, call_source, fn_span) = {
                     let term = body.basic_blocks_mut()[bb]
@@ -4687,20 +4748,7 @@ impl MyOptimizationPass {
                         _ => panic!("RetTake expected a Call terminator"),
                     }
                 };
-
-                // New block that runs after the call returns.
-                let take_bb = body.basic_blocks_mut().push(BasicBlockData::new(None, is_cleanup));
-
-                // Redirect original call to take_bb.
-                {
-                    let term = body.basic_blocks_mut()[bb]
-                        .terminator
-                        .as_mut()
-                        .expect("missing terminator for RetTake");
-                    if let TerminatorKind::Call { target, .. } = &mut term.kind {
-                        *target = Some(take_bb);
-                    }
-                }
+                let is_cleanup = body.basic_blocks[orig_target].is_cleanup;
 
                 // Compute the address from the return place. For wide pointers we extract the
                 // data pointer first so the tag maps to the same address used by raw reads.
@@ -4768,20 +4816,32 @@ impl MyOptimizationPass {
                 ]
                 .into_boxed_slice();
 
+                let cont_bb = {
+                    let (orig_stmts, orig_term) = {
+                        let bd = &mut body.basic_blocks_mut()[orig_target];
+                        let stmts = std::mem::take(&mut bd.statements);
+                        let term = bd.terminator.take();
+                        (stmts, term)
+                    };
+                    let mut cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    cont_data.statements = orig_stmts;
+                    body.basic_blocks_mut().push(cont_data)
+                };
+
                 let take_term = Terminator {
                     source_info,
                     kind: TerminatorKind::Call {
                         func: take_func,
                         args: args_take,
                         destination: Place::from(dst_tag),
-                        target: Some(orig_target),
+                        target: Some(cont_bb),
                         unwind: UnwindAction::Continue,
                         call_source,
                         fn_span,
                     },
                 };
 
-                let take_bd = &mut body.basic_blocks_mut()[take_bb];
+                let take_bd = &mut body.basic_blocks_mut()[orig_target];
                 if let Some(addr_stmt1) = addr_stmt1_opt {
                     take_bd.statements.push(addr_stmt1);
                 }
@@ -4798,7 +4858,7 @@ impl MyOptimizationPass {
                 if let Some(dst_ref_ancestor_local) =
                     ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                 {
-                    body.basic_blocks_mut()[orig_target].statements.insert(
+                    body.basic_blocks_mut()[cont_bb].statements.insert(
                         0,
                         Statement::new(
                             source_info,
@@ -6431,11 +6491,11 @@ impl MyOptimizationPass {
 
         // Defensive fixup: instrumentation should always leave valid terminators, but avoid
         // crashing rustc if a block ends up missing one in complex crates.
-        let mut missing_terminators = 0usize;
+        let mut missing_terminators: Vec<BasicBlock> = Vec::new();
         let body_span = body.span;
-        for (_bb, bd) in body.basic_blocks_mut().iter_enumerated_mut() {
+        for (bb, bd) in body.basic_blocks_mut().iter_enumerated_mut() {
             if bd.terminator.is_none() {
-                missing_terminators += 1;
+                missing_terminators.push(bb);
                 bd.terminator = Some(Terminator {
                     source_info: SourceInfo {
                         span: body_span,
@@ -6445,12 +6505,48 @@ impl MyOptimizationPass {
                 });
             }
         }
-        if missing_terminators > 0 {
+        if !missing_terminators.is_empty() {
+            let mut pred_map: HashMap<BasicBlock, Vec<BasicBlock>> = HashMap::new();
+            for (pred_bb, pred_bd) in body.basic_blocks.iter_enumerated() {
+                if let Some(pred_term) = pred_bd.terminator.as_ref() {
+                    for succ_bb in pred_term.kind.successors() {
+                        pred_map.entry(succ_bb).or_default().push(pred_bb);
+                    }
+                }
+            }
             rz_pass_warn!(
                 self,
-                "[rusteze][warn] inserted {} Unreachable terminators to repair malformed MIR",
-                missing_terminators
+                "[rusteze][warn] inserted {} Unreachable terminators to repair malformed MIR in {}",
+                missing_terminators.len(),
+                def_path
             );
+            for bb in missing_terminators.iter().take(16) {
+                let preds = pred_map.get(bb).cloned().unwrap_or_default();
+                let stmt_preview = body.basic_blocks[*bb]
+                    .statements
+                    .iter()
+                    .take(3)
+                    .map(|s| format!("{:?}", s.kind))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][warn] malformed bb{}: cleanup={} pred_count={} preds={:?} stmt_count={} stmt_preview={}",
+                    bb.index(),
+                    body.basic_blocks[*bb].is_cleanup,
+                    preds.len(),
+                    preds.iter().map(|p| p.index()).collect::<Vec<_>>(),
+                    body.basic_blocks[*bb].statements.len(),
+                    stmt_preview
+                );
+            }
+            if missing_terminators.len() > 16 {
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][warn] malformed MIR diagnostics truncated: {} additional blocks",
+                    missing_terminators.len() - 16
+                );
+            }
         }
     }
 }

@@ -55,6 +55,7 @@ members = [
     "examples/volatile_wrappers",
     "examples/ret_ptr_local",
     "examples/realloc_same_base",
+    "examples/ret_provenance_cases",
     "examples/sb_lite_conflict",
     "examples/sb_lite_two_mut",
     "examples/sb_lite_shared_then_write_ok",
