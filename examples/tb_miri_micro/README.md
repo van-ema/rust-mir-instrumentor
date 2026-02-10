@@ -11,3 +11,6 @@ Per-model expectations are stored as `expected.<bin>.<model>.rz`.
 Protector-focused bins:
 - `protected_raw_write`: raw write while argument protector is active.
 - `protected_dealloc`: deallocation while argument protector is active.
+- `fnentry_invalidation`: write through stale raw after fn-entry retag.
+- `protector_write_lazy`: lazy pointer pattern with protector-end sensitivity.
+- `reservedim_spurious_write`: simplified interior-mutability/Reserved interaction.

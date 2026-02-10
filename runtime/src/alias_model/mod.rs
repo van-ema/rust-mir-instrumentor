@@ -18,6 +18,10 @@ pub(crate) enum AliasAccessKind {
 pub(crate) trait AliasModel: Sync {
     fn name(&self) -> &'static str;
 
+    fn violation_kind(&self) -> &'static str {
+        "STACKED_BORROWS_VIOLATION"
+    }
+
     fn on_alloc_state_change(&self, _base_addr: usize, _new_live: bool) {}
 
     fn validate_ref_creation(

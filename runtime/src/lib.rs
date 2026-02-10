@@ -1203,7 +1203,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             AliasAccessKind::Write,
         ) {
             rz_violation(
-                "STACKED_BORROWS_VIOLATION",
+                active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
             );
             return;
@@ -1577,7 +1577,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             AliasAccessKind::Read,
         ) {
             rz_violation(
-                "STACKED_BORROWS_VIOLATION",
+                active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
             );
             return;
@@ -1940,7 +1940,7 @@ pub extern "C" fn __record_ref_creation(
         bounds_len,
     ) {
         rz_violation(
-            "STACKED_BORROWS_VIOLATION",
+            active_alias_model().violation_kind(),
             append_location_if_enabled(msg, "RZ_LOG_LOC"),
         );
     }

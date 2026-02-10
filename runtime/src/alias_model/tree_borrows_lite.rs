@@ -94,6 +94,10 @@ impl AliasModel for TreeBorrowsLiteModel {
         "tb_lite"
     }
 
+    fn violation_kind(&self) -> &'static str {
+        "TREE_BORROWS_VIOLATION"
+    }
+
     fn on_alloc_state_change(&self, base_addr: usize, new_live: bool) {
         if !new_live && rz_tb_lite_enabled() {
             tb_lite_check_protected_dealloc(base_addr);
@@ -218,7 +222,7 @@ fn tb_lite_check_protected_dealloc(base_addr: usize) {
 
     if let Some((tag, kind)) = protected {
         rz_violation(
-            "STACKED_BORROWS_VIOLATION",
+            "TREE_BORROWS_VIOLATION",
             append_location_if_enabled(
                 format!(
                     "DEALLOC base=0x{:x}\nreason=TB_LITE_PROTECTOR_DEALLOC tag={} kind={:?}",

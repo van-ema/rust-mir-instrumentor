@@ -233,6 +233,35 @@ This is still intentionally lite compared to full Miri Tree Borrows: transitions
 are modeled at tag/range granularity (not per-byte location state), and some
 protector/2-phase details remain to be implemented.
 
+## What "byte-granular Miri TB conformance" means
+
+Miri's Tree Borrows model tracks permissions at fine location granularity
+(effectively per-byte / tiny subranges inside an allocation), not as one state
+for an entire tag range.
+
+Why this matters:
+
+- A pointer/tag may be `Active` on one subrange and `Frozen`/`Disabled` on
+  another.
+- Partial-overlap field/slice accesses are evaluated on exactly touched bytes.
+- Protector-end behavior and UB checks apply only where the protected access
+  footprint exists.
+
+Current `tb_lite` behavior:
+
+- One permission state per tag node over its tracked range.
+- This is cheaper and robust for fuzzing, but can over-approximate or
+  under-approximate in partial-overlap cases compared to Miri.
+
+## Tree Borrows: remaining gaps (priority order)
+
+1. Byte-granular permission state tracking (instead of one state per full tag range).
+2. Full weak vs strong protector semantics (currently approximated in `tb_lite`).
+3. Full protector-end access semantics on `FnExit` per permission/state.
+4. Interior mutability split parity (`ReservedFrz` vs `ReservedIM`/Cell-like behavior).
+5. Full transition parity with Miri for all child/foreign read/write combinations.
+6. Expanded Miri-derived TB tests for partial-overlap and protector interactions.
+
 ## AFL++ on macOS (shared memory)
 
 On this macOS setup, AFL++ shared-memory initialization can fail due to OS restrictions:

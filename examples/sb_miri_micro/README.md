@@ -22,6 +22,10 @@ SB-lite ("Stacked Borrows lite") checking in rusteze.
 3. Run `python3 scripts/run_example_tests.py` from the repo root.
    - For package-scoped runs: `EXAMPLE_FILTER=sb_miri_micro python3 scripts/run_example_tests.py`
 
+Recently added ports:
+- `return_invalid_mut`
+- `invalidate_against_protector1`
+
 ## Notes / current limitations
 
 - Prefer **thin pointers / sized pointees** in these micro-tests.
