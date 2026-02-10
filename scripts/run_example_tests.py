@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -72,12 +73,31 @@ def did_panic(log_path: Path) -> bool:
     return "panicked at" in data or "thread 'main' panicked" in data
 
 
-def read_expectation(pkg_dir: Path, bin_name: str) -> str | None:
-    expect_file = pkg_dir / f"expected.{bin_name}.rz"
-    if not expect_file.exists():
-        expect_file = pkg_dir / "expected.rz"
+def normalize_alias_model(raw: str | None) -> str:
+    if not raw:
+        return "sb_lite"
+    model = raw.strip().lower()
+    if model in ("", "sb", "sb_lite", "stacked_borrows"):
+        return "sb_lite"
+    if model in ("tb", "tb_lite", "tree_borrows"):
+        return "tb_lite"
+    if model in ("none", "off"):
+        return "none"
+    return model
 
-    if expect_file.exists():
+
+def read_expectation(pkg_dir: Path, bin_name: str, alias_model: str) -> str | None:
+    candidate_files = [
+        pkg_dir / f"expected.{bin_name}.{alias_model}.rz",
+        pkg_dir / f"expected.{alias_model}.{bin_name}.rz",
+        pkg_dir / f"expected.{alias_model}.rz",
+        pkg_dir / f"expected.{bin_name}.rz",
+        pkg_dir / "expected.rz",
+    ]
+
+    for expect_file in candidate_files:
+        if not expect_file.exists():
+            continue
         for line in expect_file.read_text(errors="replace").splitlines():
             line = trim(line)
             if not line or line.startswith("#"):
@@ -98,8 +118,11 @@ def read_expectation(pkg_dir: Path, bin_name: str) -> str | None:
     return None
 
 
-def write_expectation(pkg_dir: Path, value: str) -> None:
-    expect_file = pkg_dir / "expected.rz"
+def write_expectation(pkg_dir: Path, bin_name: str, alias_model: str, value: str) -> None:
+    if alias_model == "sb_lite":
+        expect_file = pkg_dir / f"expected.{bin_name}.rz"
+    else:
+        expect_file = pkg_dir / f"expected.{bin_name}.{alias_model}.rz"
     expect_file.write_text(f"{value}\n")
 
 
@@ -133,6 +156,8 @@ def main() -> int:
     report_dir = Path(env.get("REPORT_DIR", "reports/example_tests"))
     allow_missing = env.get("ALLOW_MISSING_EXPECT", "0") != "0"
     record_expect = env.get("RECORD_EXPECT", "0") != "0"
+    alias_model = normalize_alias_model(env.get("RZ_ALIAS_MODEL"))
+    example_filter = env.get("EXAMPLE_FILTER", "").strip()
 
     if build_profile not in ("debug", "release"):
         die(f"Unknown BUILD_PROFILE={build_profile}. Use debug or release.")
@@ -182,9 +207,14 @@ def main() -> int:
 
     failures = 0
     missing = 0
+    ran = 0
 
     for pkg_name, bin_name, pkg_dir in examples:
         label = pkg_name if bin_name == pkg_name else f"{pkg_name}::{bin_name}"
+        if example_filter and not re.search(example_filter, label):
+            continue
+
+        ran += 1
         log_dir_name = pkg_name if bin_name == pkg_name else f"{pkg_name}__{bin_name}"
         log_dir = run_dir / log_dir_name
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -193,12 +223,12 @@ def main() -> int:
         run_log = log_dir / "run.log"
         mir_out = log_dir / f"out.{pkg_name}.mir"
 
-        expected = read_expectation(pkg_dir, bin_name)
+        expected = read_expectation(pkg_dir, bin_name, alias_model)
         if expected is None and not allow_missing and not record_expect:
             with summary_file.open("a") as f:
                 f.write(f"{label}\tmissing\t-\t-\n")
             print(
-                f"missing expectation for {label} (add expected.rz or RZ_EXPECT comment)",
+                f"missing expectation for {label} (model={alias_model}; add expected*.rz or RZ_EXPECT comment)",
                 file=sys.stderr,
             )
             missing += 1
@@ -232,7 +262,15 @@ def main() -> int:
 
         if expected is None and record_expect:
             expected = observed or "ok"
-            write_expectation(pkg_dir, expected)
+            write_expectation(pkg_dir, bin_name, alias_model, expected)
+        elif record_expect and alias_model != "sb_lite":
+            # For non-default models, allow recording only the behavioral deltas:
+            # if observed differs from the default expectation, materialize a
+            # model-specific expected.<bin>.<model>.rz file.
+            model_observed = observed or ("panic" if panicked else "ok")
+            if expected != model_observed:
+                write_expectation(pkg_dir, bin_name, alias_model, model_observed)
+                expected = model_observed
 
         if expected is None:
             # Missing expectations are allowed; record what we saw and move on.
@@ -267,6 +305,9 @@ def main() -> int:
                 with summary_file.open("a") as f:
                     f.write(f"{label}\tmismatch\t{expected}\t{observed or '-'}\n")
                 failures += 1
+
+    if ran == 0:
+        die(f"No examples matched EXAMPLE_FILTER={example_filter!r}")
 
     if missing and not allow_missing and not record_expect:
         print(f"Missing expectations: {missing}. Set ALLOW_MISSING_EXPECT=1 to ignore.", file=sys.stderr)

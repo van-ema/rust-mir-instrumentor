@@ -5,9 +5,10 @@ Current status
 	•	Phase 1 (call boundaries + std/core classification): completed (bytes/smallvec debug+release stable)
 	•	Phase 2 (alloc/realloc epochs): completed
 	•	Phase 3 (SB-lite): completed (micro-suite + example tests passing)
-	•	Phase 6 (Fuzzing + Evaluation): in progress (AFL++ harness + Docker workflow; bytes fuzzing started)
+	•	Phase 4 (Tree Borrows, runtime-first): in progress (`tb_lite` selectable, dedicated micro-suite added, medium/fuzz smoke stable)
+	•	Phase 6 (Fuzzing + Evaluation): in progress (AFL++ harness + Docker workflow; bytes/smallvec/serde_json smoke loops stable)
 Next step
-	•	Phase 4 (Tree Borrows) for higher precision (reduce SB-lite false positives)
+	•	Complete Phase 4 by adding more Miri-inspired TB tests (especially call-boundary / return-boundary cases)
 	•	In parallel: continue Phase 6 to turn fuzz findings into minimized, reproducible, triaged reports
 	•	Phase 7 (Wide/Fat pointers) to support slices/str/dyn Trait and reduce blind spots in real crates
 
@@ -110,29 +111,72 @@ Status
 
 ⸻
 
-Phase 4 — Tree Borrows (Precision Upgrade) (NEXT)
+Phase 4 — Tree Borrows (Precision Upgrade, Runtime-First) (IN PROGRESS)
 
 Goal
-	•	Reduce SB-lite false positives while keeping strong bug-finding power.
+	•	Introduce a Tree-Borrows-style alias model with better precision than SB-lite while
+	  preserving existing bug-finding power and fuzzing stability.
 
-Implementation
-	•	Replace stack with derivation tree:
-		•	parent pointer
-		•	permission/state bits
-	•	On conflict:
-		•	invalidate subtree
-		•	enforce parent-child permission rules on reads/writes
-	•	Maintain a clean “mode switch”:
-		•	coverage mode (low-FP, exploration)
-		•	precision mode (SB-lite/TB enabled)
+Approach
+	•	Runtime-first implementation in the existing pluggable alias-model layer:
+		•	add `tb_lite` as a new `AliasModel`
+		•	select with `RZ_ALIAS_MODEL=tb_lite` (keep `sb_lite` as default until stable)
+	•	Instrumentation stays unchanged in the first iteration.
+	•	If needed, add targeted instrumentation events only after measuring concrete TB gaps.
 
-Testing Gate
-	•	Re-run all micro-suite + bytes/smallvec/serde in both modes
-	•	Compare violation count and stability vs SB-lite
+Work packages
+	1.	Model scaffold (runtime)
+		•	add `runtime/src/alias_model/tree_borrows_lite.rs`
+		•	register in `runtime/src/alias_model/mod.rs` and env selector
+		•	add optional tracing envs (`RZ_TB_LITE`, `RZ_TB_DUMP`) mirroring SB-lite style
+	2.	Tree state representation
+		•	per-allocation forest keyed by tag/root
+		•	node metadata:
+			•	parent
+			•	range (`pointee_addr`, `bounds_len`)
+			•	permission/state (initially minimal, then refined)
+			•	alive/invalidated marker
+	3. Retag + creation rules
+		•	on `RefMut` creation: enforce uniqueness/child transition rules
+		•	on `RefShared` creation: create shared child without eager global invalidation
+		•	raw creation keeps lineage and participates in access checks through nearest ref ancestor
+	4. Access rules (tb_lite semantics)
+		•	READ: check current node and relevant ancestors/active blockers
+		•	WRITE: require write-capable path; invalidate conflicting branches
+		•	preserve `UnsafeCell` / alias-exempt carve-outs
+	5. Lifetime integration
+		•	drop per-allocation tree state on alloc death (`on_alloc_state_change`)
+		•	avoid stale-tree conflicts across epoch reuse
+	6. Diagnostics
+		•	emit TB-specific violation reasons with parent/root/range context
+		•	keep violation kind stable (`STACKED_BORROWS_VIOLATION`) initially, then split if needed
+	7. Model-specific test expectations
+		•	`scripts/run_example_tests.py` supports model-specific expectation files:
+			•	`expected.<bin>.<model>.rz`
+			•	`expected.<model>.rz`
+		•	added `examples/tb_miri_micro` with Miri-inspired tests and per-model expectations
 
-Exit Criteria
-	•	TB reduces false positives vs SB-lite on medium crates
-	•	Micro violations remain caught and stable
+Validation gates
+	•	Gate A: examples
+		•	run `scripts/run_example_tests.py` in both `sb_lite` and `tb_lite`
+		•	no regressions in known must-catch UB examples
+	•	Gate B: medium crates
+		•	run bytes/smallvec debug+release in both models
+		•	verify lower or equal false-positive count in `tb_lite`
+	•	Gate C: fuzzing sanity
+		•	run short AFL++ sessions on bytes/smallvec/serde_json
+		•	ensure no runtime panics/ICE-equivalent behavior introduced by `tb_lite`
+
+Expected follow-up (if runtime-only is insufficient)
+	•	Add minimal instrumentation support for TB-specific events:
+		•	explicit invalidation points for fresh unique borrows
+		•	protector/lifetime hints for call boundaries and returns
+	•	Only add these after a reproducible failing case demonstrates missing signal.
+
+Exit criteria
+	•	`tb_lite` selectable and stable on examples + medium crates.
+	•	At least one previously noisy SB-lite pattern is clean in `tb_lite`.
+	•	No loss of detection on core UB examples (UAF/OOB/alias conflicts).
 
 ⸻
 
@@ -213,6 +257,8 @@ Immediate Next Actions (Concrete)
 		•	run overhead on examples + medium (`scripts/bench_overhead.py`), baseline vs rusteze vs ASan
 		•	track “violations per hour” and “unique signatures” for each fuzz target/mode
 	5.	Define TB design and implement Phase 4 behind a flag once fuzzing produces stable signal.
+		•	Update: proceed runtime-first now (`RZ_ALIAS_MODEL=tb_lite`), then add instrumentation
+		  events only for demonstrated missing-signal cases.
 
 ⸻
 

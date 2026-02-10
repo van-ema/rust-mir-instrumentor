@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{allocs, find_alloc_containing, rz_sb_suppressed, tags, PtrKind, TagMeta};
 
-use super::{stacked_borrows_lite::StackedBorrowsLiteModel, AliasAccessKind, AliasModel};
+use super::{AliasAccessKind, AliasModel};
 
 pub(crate) struct TreeBorrowsLiteModel;
 
@@ -11,6 +11,8 @@ pub(crate) struct TreeBorrowsLiteModel;
 enum BorrowKind {
     Shared,
     Unique,
+    RawConst,
+    RawMut,
 }
 
 #[derive(Clone, Debug)]
@@ -55,14 +57,19 @@ fn rz_tb_strict_creation_enabled() -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+#[inline]
+fn rz_tb_strict_invalidated_refs_enabled() -> bool {
+    std::env::var("RZ_TB_STRICT_INVALIDATED_REFS")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
 impl AliasModel for TreeBorrowsLiteModel {
     fn name(&self) -> &'static str {
         "tb_lite"
     }
 
     fn on_alloc_state_change(&self, base_addr: usize, new_live: bool) {
-        let sb = StackedBorrowsLiteModel;
-        sb.on_alloc_state_change(base_addr, new_live);
         if !new_live && rz_tb_lite_enabled() {
             tb_state().lock().unwrap().remove(&base_addr);
         }
@@ -76,22 +83,10 @@ impl AliasModel for TreeBorrowsLiteModel {
         alias_exempt: bool,
         bounds_len: usize,
     ) -> Option<String> {
-        let sb = StackedBorrowsLiteModel;
-        if let Some(msg) = sb.validate_ref_creation(
-            pointee_addr,
-            new_kind,
-            parent_tag,
-            alias_exempt,
-            bounds_len,
-        ) {
-            return Some(msg);
-        }
         tb_lite_validate_ref_creation(pointee_addr, new_kind, parent_tag, alias_exempt, bounds_len)
     }
 
     fn on_tag_created(&self, tag: u64, tmeta: &TagMeta) {
-        let sb = StackedBorrowsLiteModel;
-        sb.on_tag_created(tag, tmeta);
         tb_lite_on_tag_created(tag, tmeta);
     }
 
@@ -108,11 +103,7 @@ impl AliasModel for TreeBorrowsLiteModel {
         size: usize,
         access: AliasAccessKind,
     ) -> Option<String> {
-        let sb = StackedBorrowsLiteModel;
-        if let Some(msg) = sb.check_access(sb_tag, orig_tag, tmeta, addr, size, access) {
-            return Some(msg);
-        }
-        tb_lite_check(sb_tag, tmeta, addr, size, access)
+        tb_lite_check(sb_tag, orig_tag, tmeta, addr, size, access)
     }
 }
 
@@ -210,6 +201,8 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let kind = match tmeta.kind {
         PtrKind::RefShared => BorrowKind::Shared,
         PtrKind::RefMut => BorrowKind::Unique,
+        PtrKind::RawConst => BorrowKind::RawConst,
+        PtrKind::RawMut => BorrowKind::RawMut,
         _ => return,
     };
 
@@ -217,7 +210,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         0
     } else {
         let tmap = tags().lock().unwrap();
-        tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(0)
+        tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(tmeta.parent)
     };
 
     let base = tb_base_for_addr(tmeta.pointee_addr);
@@ -234,7 +227,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let tree = all.entry(base).or_default();
     tree.nodes.insert(tag, node.clone());
 
-    // Eager invalidation for unique creation keeps the tree state monotonic and
+    // Eager invalidation for mutable-reference creation keeps the tree state monotonic and
     // catches "two overlapping unique sibling" constructions immediately.
     if kind == BorrowKind::Unique {
         let victim_tags: Vec<u64> = tree
@@ -257,6 +250,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 
 fn tb_lite_check(
     sb_tag: u64,
+    orig_tag: u64,
     tmeta: &TagMeta,
     addr: usize,
     size: usize,
@@ -278,27 +272,37 @@ fn tb_lite_check(
         return None;
     };
 
-    let Some(node) = tree.nodes.get(&sb_tag).cloned() else {
+    // Use the original tag when TB tracked it (notably raw tags); otherwise fall back to
+    // the nearest-ref tag used by the generic fast path.
+    let access_tag = if tree.nodes.contains_key(&orig_tag) {
+        orig_tag
+    } else {
+        sb_tag
+    };
+
+    let Some(node) = tree.nodes.get(&access_tag).cloned() else {
         // Best-effort: missing node means missing model metadata, not definite UB.
         return None;
     };
     let dump = if rz_tb_dump_enabled() {
-        tb_dump(tree, sb_tag, addr, size, access)
+        tb_dump(tree, access_tag, addr, size, access)
     } else {
         String::new()
     };
     if !node.alive {
         // Best-effort compromise: optimized MIR often keeps short-lived reference tags
-        // around in a way that over-approximates lifetimes. Emitting TB invalidation
-        // errors on Ref* accesses is too noisy on real crates, so keep enforcement on
-        // raw accesses while still updating TB state on writes.
-        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        // around in a way that over-approximates lifetimes. By default we suppress
+        // invalidated Ref* reports to avoid false positives on real crates; strict mode
+        // can re-enable them for conformance experiments.
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && !rz_tb_strict_invalidated_refs_enabled()
+        {
             return None;
         }
         let mut msg = format!(
             "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
             tb_access_name(access),
-            sb_tag,
+            access_tag,
             addr,
             size,
             tmeta.kind
@@ -309,13 +313,30 @@ fn tb_lite_check(
 
     match access {
         AliasAccessKind::Read => {
+            // TB-style freeze approximation: reading through a unique ancestor invalidates
+            // overlapping descendants, including raw descendants.
+            if node.kind == BorrowKind::Unique {
+                let victims: Vec<u64> = tree
+                    .nodes
+                    .values()
+                    .filter(|n| n.alive && n.tag != access_tag)
+                    .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
+                    .filter(|n| tb_is_ancestor(&tree.nodes, access_tag, n.tag))
+                    .map(|n| n.tag)
+                    .collect();
+                for victim in victims {
+                    if let Some(n) = tree.nodes.get_mut(&victim) {
+                        n.alive = false;
+                    }
+                }
+            }
             None
         }
         AliasAccessKind::Write => {
-            if node.kind != BorrowKind::Unique {
+            if !matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_NON_UNIQUE_WRITE",
-                    sb_tag, addr, size, tmeta.kind
+                    access_tag, addr, size, tmeta.kind
                 );
                 msg.push_str(&dump);
                 return Some(msg);
@@ -326,9 +347,9 @@ fn tb_lite_check(
             let victims: Vec<u64> = tree
                 .nodes
                 .values()
-                .filter(|n| n.alive && n.tag != sb_tag)
+                .filter(|n| n.alive && n.tag != access_tag)
                 .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
-                .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, sb_tag))
+                .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, access_tag))
                 .map(|n| n.tag)
                 .collect();
             for victim in victims {

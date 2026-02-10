@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Tree Borrows (lite): decoupled `tb_lite` runtime checks from SB-lite delegation, so `RZ_ALIAS_MODEL=tb_lite` now executes its own alias decisions.
+- Tree Borrows (lite): track raw tags in TB state and use original tag when available, enabling descendant invalidation checks to apply to raw accesses.
+- Tree Borrows (lite): add parent-read invalidation approximation for unique ancestors (`TB_LITE_INVALIDATED` on subsequent conflicting raw writes).
+- Tests: `scripts/run_example_tests.py` now supports model-specific expectation files (`expected.<bin>.<model>.rz`, `expected.<model>.rz`) and `EXAMPLE_FILTER`.
+- Examples: add `examples/tb_miri_micro` (Miri-inspired TB micro-suite) with per-model expectations.
 - SB-lite false-positive fix: allow parent `&mut` reactivation on reads when blocked only by newer unique descendant reborrows (best-effort NLL/liveness approximation). This addresses safe patterns like serde-style field reborrows followed by parent reads.
 - SB-lite false-positive fix: read checks now ignore unique blockers from a different root tag lineage to avoid cross-lineage conflicts when multiple independent `&mut` args share the same coarse allocation bucket.
 - SB-lite false-positive fix: when a parent `&mut` tag is missing from stack (due to reborrow truncation), read checks now reactivate it if the remaining stack contains only unique descendants of that parent.

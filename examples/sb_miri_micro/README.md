@@ -8,6 +8,9 @@ SB-lite ("Stacked Borrows lite") checking in rusteze.
 - Each file in `src/bin/*.rs` is a standalone test program.
 - Expected outcomes live in `expected.<bin>.rz` and are compared by
   `scripts/run_example_tests.py`.
+  - Model-specific overrides are supported:
+    - `expected.<bin>.tb_lite.rz`
+    - `expected.<bin>.sb_lite.rz`
   - Use `ok` if no violation should be reported.
   - Otherwise use the signature format emitted by the test runner:
     `KIND|ACCESS|POINTER_KIND|SIZE`
@@ -17,6 +20,7 @@ SB-lite ("Stacked Borrows lite") checking in rusteze.
 1. Add a new binary under `examples/sb_miri_micro/src/bin/<name>.rs`.
 2. Add `examples/sb_miri_micro/expected.<name>.rz`.
 3. Run `python3 scripts/run_example_tests.py` from the repo root.
+   - For package-scoped runs: `EXAMPLE_FILTER=sb_miri_micro python3 scripts/run_example_tests.py`
 
 ## Notes / current limitations
 
@@ -24,4 +28,3 @@ SB-lite ("Stacked Borrows lite") checking in rusteze.
   The current pointer-tagging is intentionally conservative around wide pointers
   (e.g., `&[T]`, `&str`), so tests that depend on wide-pointer lineage may need
   extra modeling work in the instrumentation pass.
-
