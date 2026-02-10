@@ -18,11 +18,20 @@ enum BorrowKind {
     RawMut,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TbPerm {
+    Reserved,
+    Active,
+    Frozen,
+    Disabled,
+}
+
 #[derive(Clone, Debug)]
 struct TbNode {
     tag: u64,
     parent: u64,
     kind: BorrowKind,
+    perm: TbPerm,
     start: usize,
     len: usize,
     alive: bool,
@@ -203,7 +212,7 @@ fn tb_lite_check_protected_dealloc(base_addr: usize) {
         };
         tree.nodes
             .values()
-            .find(|n| n.alive && n.protected)
+            .find(|n| tb_is_live_node(n) && n.protected)
             .map(|n| (n.tag, n.kind))
     };
 
@@ -275,7 +284,7 @@ fn tb_lite_validate_ref_creation(
     }
 
     for node in tree.nodes.values() {
-        if !node.alive {
+        if !tb_is_live_node(node) {
             continue;
         }
         if node.kind != BorrowKind::Unique {
@@ -329,10 +338,16 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 
     let base = tb_base_for_addr(tmeta.pointee_addr);
     let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
+    let perm = match kind {
+        BorrowKind::Unique => TbPerm::Reserved,
+        BorrowKind::RawMut => TbPerm::Active,
+        BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
+    };
     let node = TbNode {
         tag,
         parent,
         kind,
+        perm,
         start: tmeta.pointee_addr,
         len: tb_effective_len(tmeta.bounds_len),
         alive: true,
@@ -349,7 +364,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         let victim_tags: Vec<u64> = tree
             .nodes
             .values()
-            .filter(|n| n.alive && n.tag != tag)
+            .filter(|n| tb_is_live_node(n) && n.tag != tag)
             .filter(|n| tb_ranges_overlap(node.start, node.len, n.start, n.len))
             .filter(|n| {
                 !tb_is_ancestor(&tree.nodes, n.tag, tag) && !tb_is_ancestor(&tree.nodes, tag, n.tag)
@@ -358,7 +373,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
             .collect();
         for victim in victim_tags {
             if let Some(n) = tree.nodes.get_mut(&victim) {
-                n.alive = false;
+                tb_disable_node(n);
             }
         }
     }
@@ -432,7 +447,7 @@ fn tb_lite_check(
     } else {
         String::new()
     };
-    if !node.alive {
+    if !tb_is_live_node(&node) {
         // Best-effort compromise: optimized MIR often keeps short-lived reference tags
         // around in a way that over-approximates lifetimes. By default we suppress
         // invalidated Ref* reports to avoid false positives on real crates; strict mode
@@ -462,14 +477,21 @@ fn tb_lite_check(
                 let victims: Vec<u64> = tree
                     .nodes
                     .values()
-                    .filter(|n| n.alive && n.tag != access_tag)
+                    .filter(|n| tb_is_live_node(n) && n.tag != access_tag)
                     .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
                     .filter(|n| tb_is_ancestor(&tree.nodes, access_tag, n.tag))
                     .map(|n| n.tag)
                     .collect();
                 for victim in victims {
                     if let Some(n) = tree.nodes.get_mut(&victim) {
-                        n.alive = false;
+                        match n.kind {
+                            BorrowKind::Shared | BorrowKind::RawConst => {
+                                n.perm = TbPerm::Frozen;
+                            }
+                            BorrowKind::Unique | BorrowKind::RawMut => {
+                                tb_disable_node(n);
+                            }
+                        }
                     }
                 }
             }
@@ -480,7 +502,7 @@ fn tb_lite_check(
                 .nodes
                 .values()
                 .find(|n| {
-                    n.alive
+                    tb_is_live_node(n)
                         && n.protected
                         && n.tag != access_tag
                         && tb_ranges_overlap(addr, size, n.start, n.len)
@@ -495,6 +517,15 @@ fn tb_lite_check(
                 return Some(msg);
             }
 
+            if node.perm == TbPerm::Frozen {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
+                    access_tag, addr, size, tmeta.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+
             if !matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_NON_UNIQUE_WRITE",
@@ -504,19 +535,24 @@ fn tb_lite_check(
                 return Some(msg);
             }
 
+            if let Some(n) = tree.nodes.get_mut(&access_tag) {
+                n.perm = TbPerm::Active;
+                n.alive = true;
+            }
+
             // Tree-borrows-style "use": writing through this unique branch invalidates
             // overlapping nodes outside its ancestor chain.
             let victims: Vec<u64> = tree
                 .nodes
                 .values()
-                .filter(|n| n.alive && n.tag != access_tag)
+                .filter(|n| tb_is_live_node(n) && n.tag != access_tag)
                 .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
                 .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, access_tag))
                 .map(|n| n.tag)
                 .collect();
             for victim in victims {
                 if let Some(n) = tree.nodes.get_mut(&victim) {
-                    n.alive = false;
+                    tb_disable_node(n);
                 }
             }
             None
@@ -550,10 +586,11 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} kind={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} kind={:?} perm={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
             n.tag,
             n.parent,
             n.kind,
+            n.perm,
             n.alive,
             n.protected,
             n.start,
@@ -585,6 +622,17 @@ fn tb_ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize)
     let a_end = a_start.saturating_add(a_len);
     let b_end = b_start.saturating_add(b_len);
     a_start < b_end && b_start < a_end
+}
+
+#[inline]
+fn tb_is_live_node(n: &TbNode) -> bool {
+    n.alive && n.perm != TbPerm::Disabled
+}
+
+#[inline]
+fn tb_disable_node(n: &mut TbNode) {
+    n.perm = TbPerm::Disabled;
+    n.alive = false;
 }
 
 fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> Option<u64> {

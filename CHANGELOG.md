@@ -8,6 +8,11 @@
 - Tree Borrows (lite): implemented protector checks for:
   - overlapping writes through non-protected tags (`TB_LITE_PROTECTOR_CONFLICT`)
   - heap deallocation while a protected tag is still active (`TB_LITE_PROTECTOR_DEALLOC`)
+- Tree Borrows (lite): introduced explicit per-tag permission states:
+  - `Reserved`, `Active`, `Frozen`, `Disabled`
+  - state transitions now drive invalidation instead of a pure `alive` bit
+  - unique/raw-mut writes activate the writer tag; conflicting branches become `Disabled`
+  - unique reads freeze shared/raw-const descendants and disable unique/raw-mut descendants
 - Examples: added protector-focused TB micro tests:
   - `tb_miri_micro::protected_raw_write`
   - `tb_miri_micro::protected_dealloc`

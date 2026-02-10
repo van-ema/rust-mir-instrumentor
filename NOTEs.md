@@ -206,9 +206,29 @@ Checks implemented in TB-lite:
 - `TB_LITE_PROTECTOR_DEALLOC`: heap deallocation of an allocation that still has
   an active protected tag.
 
-This is intentionally a lite approximation of full Tree Borrows protectors: it
-tracks the immediate argument-child protection window, but not the full Miri
-state machine (all reserved/active transitions and protector variants).
+## Tree Borrows lite permission state machine
+
+`tb_lite` now tracks an explicit per-tag permission state:
+
+- `Reserved`
+- `Active`
+- `Frozen`
+- `Disabled`
+
+Current transitions (node-level, range-overlap based):
+
+- New `RefMut` starts `Reserved`; write through it promotes to `Active`.
+- New `RawMut` starts `Active`.
+- New shared/raw-const tags start `Frozen`.
+- Unique/raw-mut writes disable overlapping non-ancestor branches.
+- Unique reads:
+  - freeze shared/raw-const descendants
+  - disable unique/raw-mut descendants
+- `Disabled` tags are treated as invalidated.
+
+This is still intentionally lite compared to full Miri Tree Borrows: transitions
+are modeled at tag/range granularity (not per-byte location state), and some
+protector/2-phase details remain to be implemented.
 
 ## AFL++ on macOS (shared memory)
 

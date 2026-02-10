@@ -5,10 +5,10 @@ Current status
 	•	Phase 1 (call boundaries + std/core classification): completed (bytes/smallvec debug+release stable)
 	•	Phase 2 (alloc/realloc epochs): completed
 	•	Phase 3 (SB-lite): completed (micro-suite + example tests passing)
-	•	Phase 4 (Tree Borrows, runtime-first): in progress (`tb_lite` selectable, dedicated micro-suite added, call-argument protectors + dealloc/write checks implemented)
+	•	Phase 4 (Tree Borrows, runtime-first): in progress (`tb_lite` selectable, dedicated micro-suite added, call-argument protectors + initial Reserved/Active/Frozen/Disabled state machine implemented)
 	•	Phase 6 (Fuzzing + Evaluation): in progress (AFL++ harness + Docker workflow; bytes/smallvec/serde_json smoke loops stable)
 Next step
-	•	Complete Phase 4 by expanding protector/state-machine coverage (2-phase/reserved transitions, stronger state transitions)
+	•	Complete Phase 4 by expanding protector/state-machine coverage (full 2-phase semantics, stronger per-location transitions, weak/strong protector nuances)
 	•	In parallel: continue Phase 6 to turn fuzz findings into minimized, reproducible, triaged reports
 	•	Phase 7 (Wide/Fat pointers) to support slices/str/dyn Trait and reduce blind spots in real crates
 
