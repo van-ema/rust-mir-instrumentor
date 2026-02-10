@@ -42,9 +42,8 @@ fi
 
 export RUSTEZE_FAILFAST=1
 export RZ_INSTRUMENT_ALL_DEPS=1
-# Default to memory-safety checks without SB-lite to keep large-crate fuzzing stable.
-# Set `RZ_SB_LITE=1` explicitly when you want alias-model violations.
-export RZ_SB_LITE="${RZ_SB_LITE:-0}"
+# Keep SB-lite enabled by default so aliasing checks are always active.
+export RZ_SB_LITE="${RZ_SB_LITE:-1}"
 
 # We do not fuzz with ASan in this pipeline; avoid inheriting host/container
 # ASAN_* environment variables that make AFL++ enforce ASan-specific checks.

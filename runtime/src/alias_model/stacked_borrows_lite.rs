@@ -106,16 +106,27 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
         _ => return,
     };
 
-    let base = {
+    let (base, alloc_end) = {
         let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, tmeta.pointee_addr)
-            .map(|(b, _)| b)
-            .unwrap_or(tmeta.pointee_addr)
+        match find_alloc_containing(&amap, tmeta.pointee_addr) {
+            Some((b, meta)) if meta.size != 0 => (b, Some(b.saturating_add(meta.size))),
+            Some((b, _meta)) => (b, None),
+            None => (tmeta.pointee_addr, None),
+        }
     };
 
     let mut bmap = borrows().lock().unwrap();
     let stack = bmap.entry(base).or_default();
-    let (start, end) = range_from_ptr(tmeta.pointee_addr, tmeta.bounds_len);
+    let (start, end) = if tmeta.bounds_len != 0 {
+        range_from_ptr(tmeta.pointee_addr, tmeta.bounds_len)
+    } else if let Some(end) = alloc_end {
+        // For thin refs we often do not have precise type-size metadata here.
+        // Use the containing allocation tail as a conservative fallback instead
+        // of a 1-byte pseudo-range to avoid false SB conflicts on field/index accesses.
+        (tmeta.pointee_addr, end)
+    } else {
+        range_from_ptr(tmeta.pointee_addr, 1)
+    };
 
     // Retagging: if we know the parent, truncate to it (invalidate younger tags).
     // For fresh unique borrows, clear the stack to invalidate all prior aliases.
@@ -379,12 +390,13 @@ fn sb_lite_check(
             out.push_str("alloc: <none>\n");
         }
         out.push_str(&format!(
-            "tag_meta: orig_tag={} sb_tag={} kind={:?} parent={} pointee=0x{:x} alloc_epoch={} live_at_creation={} escaped={} alias_exempt={}\n",
+            "tag_meta: orig_tag={} sb_tag={} kind={:?} parent={} pointee=0x{:x} bounds_len={} alloc_epoch={} live_at_creation={} escaped={} alias_exempt={}\n",
             orig_tag,
             sb_tag,
             tmeta.kind,
             tmeta.parent,
             tmeta.pointee_addr,
+            tmeta.bounds_len,
             tmeta.alloc_epoch,
             tmeta.alloc_live_at_creation,
             tmeta.escaped,
@@ -420,12 +432,15 @@ fn sb_lite_check(
         for (i, entry) in stack.iter().enumerate() {
             if let Some(tm) = tmap.get(&entry.tag) {
                 out.push_str(&format!(
-                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} alias_exempt={}\n",
+                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} bounds_len={} range=[0x{:x},0x{:x}) alias_exempt={}\n",
                     entry.tag,
                     entry.kind,
                     tm.kind,
                     tm.parent,
                     tm.pointee_addr,
+                    tm.bounds_len,
+                    entry.start,
+                    entry.end,
                     tm.alias_exempt
                 ));
             } else {

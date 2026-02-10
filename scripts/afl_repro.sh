@@ -91,7 +91,7 @@ for f in "${files[@]}"; do
     exit 2
   fi
   echo "=== repro: $f ==="
-  sb_lite="${RZ_SB_LITE:-0}"
+  sb_lite="${RZ_SB_LITE:-1}"
   echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_SB_LITE=${sb_lite} \"$BIN_PATH\" \"$f\""
   RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_SB_LITE="${sb_lite}" "$BIN_PATH" "$f" || true
   echo

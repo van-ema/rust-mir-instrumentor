@@ -63,9 +63,8 @@ RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/deps"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
-# Build-time host tools (build scripts / proc-macros) may execute instrumented code.
-# Keep SB-lite disabled during compilation to avoid compile-time-only alias reports.
-export RZ_SB_LITE="${RZ_SB_LITE:-0}"
+# Keep SB-lite enabled by default so aliasing checks are consistently active.
+export RZ_SB_LITE="${RZ_SB_LITE:-1}"
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
 # Put temp files in the same directory that rustc writes metadata (`deps/`) to avoid EXDEV.
 export RUSTC_TMPDIR="${RUSTC_TMPDIR:-$(canonical_path "${RUNTIME_PATH}")}"
