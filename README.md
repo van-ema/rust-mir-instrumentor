@@ -56,18 +56,29 @@ make run EXAMPLE=hello PROFILE=release
 
 ## Env
 
-### Runtime
-- `RZ_LOG`: Log level for runtime output (`trace`, `info`, `warn`); default is `warn`.
-- `RZ_LOG_LOC`: If set to `1` or `true`, include caller location information in runtime violation logs.
-- `RZ_BACKTRACE_UNKNOWN_TAG`: If set to `1` or `true`, include a backtrace on `UNKNOWN_TAG` violations.
-- `RZ_BACKTRACE`: If set to `1` or `true`, include a backtrace on **any** violation.
-- `RUSTEZE_FAILFAST`: If non-zero, panic on violation; default is log-and-continue.
-- `RZ_ABORT_ON_VIOLATION`: If non-zero, abort immediately after reporting a violation.
-- `RZ_ABORT_ON_DOUBLE_FREE`: If non-zero, abort the process on `DOUBLE_FREE` after reporting.
-- `RZ_STRICT_FREE_CHECK`: If non-zero, treat frees of unknown bases as violations (and skip system dealloc).
-- `RZ_ALIAS_MODEL`: Select alias model (`tb_lite`, `sb_lite`, `none`); default is `tb_lite`.
-- `RZ_SB_LITE`: If set to `0` or `false`, disable SB-lite checks when `RZ_ALIAS_MODEL=sb_lite`.
-- `RZ_SB_DUMP`: If set to `1` or `true`, include SB-lite borrow stack + tag ancestry on SB violations.
+Project-specific environment variables are grouped below by component/script.
+
+### Runtime (`runtime/src/lib.rs`, `runtime/src/alias_model/*`)
+- `RZ_LOG`: Runtime log level (`trace`, `info`, `warn`); default `warn`.
+- `RZ_LOG_LOC`: `1/true` adds caller source location in violation output.
+- `RZ_BACKTRACE_UNKNOWN_TAG`: `1/true` adds backtrace on `UNKNOWN_TAG` reports.
+- `RZ_BACKTRACE`: `1/true` adds backtrace on every runtime violation.
+- `RUSTEZE_FAILFAST`: non-zero panics after reporting a violation.
+- `RZ_ABORT_ON_VIOLATION`: non-zero aborts process after reporting any violation.
+- `RZ_ABORT_ON_DOUBLE_FREE`: non-zero aborts on `DOUBLE_FREE`.
+- `RZ_STRICT_FREE_CHECK`: non-zero treats untracked `free/realloc` as violations.
+- `RZ_ALLOW_UNTAGGED`: non-zero allows untagged accesses instead of hard-failing.
+- `RZ_TAG0_AS_ROOT`: non-zero treats tag `0` as root in selected runtime paths.
+- `RZ_LOG_ALLOC`: non-zero emits allocation event logs.
+- `RZ_DUMP_ALLOC_ON_VIOLATION`: non-zero dumps allocation map on each violation (with `rz_alloc_dump` feature).
+- `RZ_DUMP_ALLOC_MATCH_ADDR`: non-zero narrows alloc dump to matching addresses (with `rz_alloc_dump` feature).
+- `RZ_DUMP_ALLOC_HEAP_ONLY`: non-zero limits alloc dump to heap allocations (with `rz_alloc_dump` feature).
+- `RZ_ALIAS_MODEL`: alias model selector: `tb_lite` (default), `sb_lite`, `none`.
+- `RZ_TB_LITE`: tree-borrows-lite on/off (`1` default, `0` disables checks inside `tb_lite` model).
+- `RZ_TB_DUMP`: `1/true` adds extra TB-lite diagnostic context.
+- `RZ_SB_LITE`: stacked-borrows-lite on/off (`1` default when using `sb_lite` model).
+- `RZ_SB_DUMP`: `1/true` adds SB-lite stack/ancestry details in violation output.
+- `RZ_STACK_REF_OOB_NOISE`: stack-ref OOB-noise suppression (`1` default, set `0` for strict reporting).
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a
   `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap
@@ -78,19 +89,74 @@ make run EXAMPLE=hello PROFILE=release
   The allocator wrapper uses thread-local reentrancy guards to avoid recursion
   and deadlocks when runtime hooks perform logging or internal allocations.
 
-### Instrumentation
-- `RZ_LOG`: Log level for the instrumentor pass (`trace`, `info`, `warn`); default is `warn`.
-- `RZ_INSTRUMENTED_CRATES`: Comma-separated list of dependency crate names to treat as instrumented for call-boundary tag passing.
-- `RZ_INSTRUMENT_ALL_DEPS`: If non-zero/true, treat all *non-std-like*
+### Instrumentation pass (`instrument-mir`)
+- `RZ_LOG`: Instrumentor pass log level (`trace`, `info`, `warn`); default `warn`.
+- `RZ_DEBUG_MATCH`: if set, runs `debug_classify_call_effect` for that symbol and exits.
+- `RZ_DEBUG_SYMBOL_LOOKUP`: non-zero enables verbose runtime-hook symbol lookup logs.
+- `RZ_TRACE_PASS`: non-zero enables pass-level tracing.
+- `RZ_FILTER_STDLIB_USES`: std/core/alloc coarse-use filtering (`1` default, set `0` to disable).
+- `RZ_WARN_UNKNOWN_CALLS`: unknown-call warnings (current default is off when unset; set `1` to enable).
+- `RZ_TRACE_UNKNOWN_CALLS`: extra unknown-call trace diagnostics.
+- `RZ_HEAP_ALLOCS_FROM_MIR`: `1/true` forces MIR-level heap alloc/free hooks.
+- `RZ_USE_STORAGE_DEAD`: `1/true` emits stack `live=false` on `StorageDead` (default off).
+- `RZ_INSTRUMENTED_CRATES`: comma-separated dependency allowlist treated as instrumented.
+- `RZ_INSTRUMENT_ALL_DEPS`: if non-zero/true, treat all *non-std-like*
   (non `std` / `core` / `alloc`) dependency crates as instrumented.
   Standard library crates are never treated as instrumented callees; instead,
   their effects are modeled via wrapper classification and allocator-boundary
   interception.
-- `RZ_PRINT_CRATES`: If non-zero/true, print the crate graph and show which crates are instrumented.
-- `RZ_FILTER_STDLIB_USES`: If set to `0` or `false`, do not filter out coarse pointer-use hooks from std/core/alloc; default is enabled.
-- `RZ_WARN_UNKNOWN_CALLS`: If set to `0` or `false`, suppress warnings about unknown direct calls with pointer effects; default is enabled.
-- `RZ_HEAP_ALLOCS_FROM_MIR`: If set to `1` or `true`, emit MIR-level heap alloc/free hooks (overrides allocator-wrapper default).
-- `RZ_DEBUG_SYMBOL_LOOKUP`: If set to `1` or `true`, print verbose symbol lookup logs when resolving runtime hooks.
+- `RZ_PRINT_CRATES`: non-zero/true prints crate graph + instrumented classification.
+- `RZ_TRACE_CLASSIFY`: non-zero enables call-effect classifier tracing.
+- `RZ_TRACE_CLASSIFY_FILTER`: substring filter for classify traces.
+- `RZ_TRACE_CLASSIFY_LIMIT`: max traced classify events (default `50`).
+- `RZ_TRACE_CLASSIFY_UNKNOWN_LIMIT`: max traced unknown-classify events (default `20`).
+
+### `cargo-instrument-mir` wrapper (`instrument-mir/src/bin/cargo-instrument-mir.rs`)
+- `CARGO`: cargo executable path (`cargo` by default).
+- `RZ_DEBUG_DRIVER`: non-zero prints selected `instrument-mir` driver path.
+- `RUSTFLAGS`: wrapper appends `--mir-out` / `--runtime-path` forwarding flags here.
+
+### AFL build/fuzz scripts (`scripts/afl_*.sh`)
+- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`).
+- `PROFILE`: cargo profile (`debug` or `release`; default depends on script, usually `release`).
+- `HARNESS_TARGET_DIR`: target directory for AFL harness builds.
+- `RUNTIME_FEATURES`: extra features passed when building `runtime` in `afl_build.sh`.
+- `AFL_PATH`: AFL++ checkout path (used to discover `afl-fuzz` / `afl-compiler-rt.o`).
+- `AFL_COMPILER_RT`: explicit path to `afl-compiler-rt.o`.
+- `AFL_FUZZ`: explicit `afl-fuzz` binary path.
+- `AFL_MAP_SIZE` / `AFL_MAPSIZE`: AFL map size override (Darwin default in script is `131072` when unset).
+- `TIMEOUT_MS`: fuzz-case timeout passed as `afl-fuzz -t`.
+- `OUT_DIR`: output dir override for `afl_repro.sh` (default `fuzz/out/<TARGET>`).
+- `RZ_VERIFY_HOOKS`: post-build hook-symbol verification in `afl_build.sh` (default `1`).
+- `RZ_VERIFY_HOOKS_STRICT`: strict hook verification mode in `afl_build.sh` (default `0`).
+- `RZ_ALIAS_MODEL`: alias model used by fuzz/repro scripts (default `tb_lite`).
+- `RZ_SB_LITE`: SB-lite runtime toggle passed by fuzz/repro scripts (default `1`).
+- `RZ_INSTRUMENT_ALL_DEPS`: forced to `1` by AFL scripts.
+- `RUSTFLAGS`: extended by `afl_build.sh` for sancov + `afl-compiler-rt.o` link.
+- `RUSTC_TMPDIR` / `TMPDIR`: rustc temporary directory for stable same-fs behavior.
+- `CARGO_TARGET_DIR`: set by scripts to isolate AFL build artifacts.
+- `CARGO_INCREMENTAL`: set to `0` in `afl_build.sh`.
+- `AFL_SKIP_CPUFREQ`: set to `1` by `afl_fuzz.sh`.
+- `AFL_NO_AFFINITY`: set to `1` by `afl_fuzz.sh`.
+- `ASAN_OPTIONS` / `ASAN_SYMBOLIZER_PATH`: explicitly unset in `afl_fuzz.sh`.
+- `TRACE`: `afl_build.sh` shell tracing when `TRACE=1`.
+
+### Docker AFL wrapper (`scripts/docker_afl.sh`)
+- `IMAGE`: docker image tag (default `rusteze-afl`).
+- `SHM_SIZE`: container shared-memory size (default `1g`).
+- `USE_RUST_CACHE`: mount persistent rustup/cargo volumes (`1` default).
+- `FUZZ`: if `1/true`, enables relaxed seccomp + `SYS_PTRACE`.
+- `DOCKER_CPUS`: optional container CPU limit.
+- `DOCKER_MEMORY`: optional container memory limit.
+- `TARGET`, `PROFILE`, `AFL_COMPILER_RT`, `RUNTIME_FEATURES`, `HARNESS_TARGET_DIR`, `CARGO_TARGET_DIR`, `RUSTFLAGS`, `AFL_FUZZ`, `TIMEOUT_MS`, `OUT_DIR`: forwarded into container when set.
+- All host `RZ_*`, `RUSTEZE_*`, `TRACE`, `RUST_BACKTRACE`: forwarded into container when set.
+
+### Harness / utility scripts
+- `scripts/run_harness.sh`: `CARGO`, `PROFILE` (`FAST|DEBUG`), `BUILD_PROFILE` (`debug|release`), `FLAKY_EXAMPLES`, `FLAKY_RUNS`, `REPORT_DIR`, `MEDIUM_COMMANDS_FILE`, `STOP_ON_VIOLATION`, `REINSTRUMENT`, `RZ_LOG`, `RZ_INSTRUMENT_ALL_DEPS`, `CARGO_INCREMENTAL`.
+- `scripts/run_with_trace.sh`: `EXAMPLE` (required), `PROFILE`, `OUT`, `CARGO_INCREMENTAL`, `RZ_INSTRUMENT_ALL_DEPS`.
+- `scripts/afl_setup.sh`: optional repo pin vars `REF_BYTES`, `REF_SMALLVEC`, `REF_SERDE`, `REF_SERDE_JSON`, `REF_TOML`, `REF_UUID`, `REF_QUICK_XML`, `REF_BASE64`, `REF_ITOA`; also reads `AFL_PATH`, `AFL_FUZZ`, `AFL_COMPILER_RT`.
+- `afl_harness/src/bin/afl_smallvec_driver.rs`: `AFL_MAX_STEPS`, `AFL_MAX_LEN`.
+- `instrument-mir/src/util.rs`: `HOME` is used for `~` path expansion.
 
 
 ## Standard Library Handling
