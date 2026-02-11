@@ -2,6 +2,18 @@
 
 # Notes
 
+## Current defaults
+
+- Dependency instrumentation is expected on by default (`RZ_INSTRUMENT_ALL_DEPS=1`
+  in build/fuzz scripts).
+- Active alias model default is `tb_lite` (`RZ_ALIAS_MODEL=tb_lite` unless
+  explicitly overridden).
+- Call-boundary return-tag plumbing is always enabled in instrumentation
+  (`ret_push_enabled()` / `ret_take_enabled()` both return `true`).
+- `StorageDead`-based stack-dead emission is opt-in
+  (`RZ_USE_STORAGE_DEAD=1`); default remains off to avoid optimized-MIR
+  false UAF noise.
+
 ## Access-size computation via MIR size_of
 
 To avoid `layout_of` normalization failures in generic MIR, access sizes are now
@@ -94,7 +106,10 @@ Bug pattern:
 Fix:
 
 - `RetTake` now also initializes `ref_ancestor_local(dst)` from the recovered
-  destination tag before control returns to the original call target block.
+  destination tag.
+- `RetTake` lowering is edge-local (`call -> ret_take_bb -> cont -> original_target`)
+  instead of patching the shared call target block in place. This avoids applying
+  one call-site's return-tag recovery to unrelated predecessors.
 
 Outcome:
 
@@ -140,6 +155,73 @@ Remaining limitations (best-effort):
   may still use the base address if MIR does not encode the offset in the place.
 - Projections with `from_end` or nested deref chains are not modeled yet.
 
+## Heuristics used for false-positive control
+
+The following are intentional heuristics (not full semantic modeling):
+
+1. Pointer-valued deref-read filter in MIR instrumentation
+
+- Location: `instrument-mir/src/instrumentation.rs` (`skip_pointer_value_read`).
+- Behavior: skip `PtrRead` emission when a deref-load's result type is itself a
+  pointer.
+- Reason: optimized MIR often materializes pointer metadata/provenance forwarding
+  through temporaries; treating those as data reads can produce false OOB/stale
+  reports.
+- Tradeoff: may miss some pointer-value-only flows, but preserves checks on
+  non-pointer data reads.
+
+2. Stack raw-root epoch mismatch suppression in runtime
+
+- Location: `runtime/src/lib.rs` (`rz_allow_stack_raw_root_epoch_noise`).
+- Behavior: suppress `STALE_POINTER_EPOCH_MISMATCH` only for `RawConst` tags
+  with `parent=0` when both current access and tag pointee are stack-like.
+- Reason: optimized stack-slot reuse can produce epoch churn noise for raw-root
+  const tags without actionable aliasing bugs.
+- Tradeoff: narrow by design (`RawConst` only) to avoid masking real `RawMut`/
+  write-side stale-pointer bugs.
+
+3. Stack ref OOB ambiguity suppression in runtime
+
+- Location: `runtime/src/lib.rs` (`rz_allow_stack_ref_oob_noise`).
+- Toggle: `RZ_STACK_REF_OOB_NOISE=0` disables this suppression for experiments.
+- Behavior: for `RefShared`/`RefMut` accesses on stack-like addresses, suppress
+  `OUT_OF_BOUNDS` when the selected containing stack alloc is clearly
+  inconsistent with reference metadata:
+  - reference pointee is outside that alloc, or
+  - requested access size is larger than the tracked slot size.
+  - reference is interior (`pointee > alloc_base`) and the access crosses the
+    tracked slot end.
+- Reason: optimized MIR stack-slot reuse plus partial stack-local tracking can
+  leave overlapping/coarse stack alloc metadata; strict OOB in these cases
+  produces false positives in safe dependency code (e.g. `toml` release fuzzing).
+- Tradeoff: may hide some stack-ref OOB cases in unsafe code; raw-pointer OOB
+  checks remain unchanged.
+
+Other active heuristics (brief):
+
+- `runtime/src/lib.rs` (`rz_stack_addr_hint`): stack-likeness by SP-proximity
+  window (`+/-8MiB`) to classify noisy stack-like addresses.
+- `runtime/src/lib.rs` (`rz_allow_untracked_stack_ref`,
+  `rz_allow_untracked_stack_raw_root`): suppress wild-pointer style failures
+  when stack metadata is missing but access/tag look stack-like.
+- `runtime/src/lib.rs` (epoch mismatch blocks in `__rz_ptr_read`/`__rz_ptr_write`):
+  suppress stack/ref epoch churn noise for `RefShared` (and stack `Ref*` cases).
+- `runtime/src/lib.rs` (`rz_epoch_check_relaxed` via allow-untagged wrappers):
+  temporary epoch-relaxation around coarse unknown-call hooks.
+- `instrument-mir/src/instrumentation.rs` (unknown-call policy):
+  conservatively inject pointer read/write effects for unknown direct calls.
+- `instrument-mir/src/instrumentation.rs` + `runtime/src/lib.rs`
+  (`Ptr*AllowUntagged` wrappers): avoid `UNKNOWN_TAG` on tag `0` for unknown calls.
+- `instrument-mir/src/instrumentation.rs` (`alias_exempt_for_ty`):
+  opt out alias checks for non-`Freeze` / uncertain pointee types.
+- `instrument-mir/src/instrumentation.rs` (projection offset builder):
+  unsupported nested-deref / complex index patterns fall back to base address.
+- `instrument-mir/src/instrumentation.rs` (fallback stack locals):
+  if optimized MIR omits `StorageLive/Dead`, selected locals are treated as
+  live for function lifetime.
+- `instrument-mir/src/instrumentation.rs` (defensive MIR repair):
+  insert `Unreachable` terminators for malformed blocks to avoid rustc crashes.
+
 ## Runtime parent-allocation inheritance: detached-parent fallback
 
 Runtime tag creation (`__record_ref_creation`) normally inherits allocation
@@ -159,6 +241,13 @@ Current fallback:
 - If parent does not resolve but pointee does, we refresh from pointee alloc.
 - If neither resolves and parent carried nonzero epoch metadata, we break
   lineage to avoid propagating stale allocation snapshots.
+
+Additionally for root tag creation (`parent=0` / `derived_from=0`):
+
+- If range lookup finds only a dead stack allocation at the pointee address, we
+  treat allocation metadata as unknown (epoch/live=0) instead of inheriting that
+  dead stack snapshot. This avoids false OOB/UAF from stack-slot reuse when
+  `RZ_USE_STORAGE_DEAD=1` is enabled experimentally.
 
 This keeps true OOB/UAF examples detectable while reducing false positives from
 detached ancestry.

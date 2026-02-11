@@ -694,6 +694,46 @@ fn rz_allow_stack_raw_root_epoch_noise(tmeta: &TagMeta, ameta: &AllocMeta, addr:
         && rz_stack_addr_hint(tmeta.pointee_addr)
 }
 
+#[inline]
+fn rz_stack_ref_oob_noise_enabled() -> bool {
+    std::env::var("RZ_STACK_REF_OOB_NOISE")
+        .ok()
+        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+fn rz_allow_stack_ref_oob_noise(
+    tmeta: &TagMeta,
+    ameta: &AllocMeta,
+    base: usize,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !rz_stack_ref_oob_noise_enabled() {
+        return false;
+    }
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return false;
+    }
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+        return false;
+    }
+
+    // Optimized MIR stack-lifetime imprecision can leave overlapping/coarse stack alloc metadata.
+    // If the selected containing alloc is clearly inconsistent with the reference metadata, treat
+    // this as best-effort tracking noise instead of hard OOB.
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+    let pointee_outside_alloc = tmeta.pointee_addr < base || tmeta.pointee_addr >= alloc_end;
+    let access_larger_than_slot = size > ameta.size;
+    // Interior references into stack-allocated aggregates can legitimately read/write a value
+    // that straddles a coarse tracked slot boundary when optimized MIR loses precise object
+    // boundaries for the selected alloc record.
+    let interior_crosses_slot_end =
+        tmeta.pointee_addr > base && access_end > alloc_end;
+    pointee_outside_alloc || access_larger_than_slot || interior_crosses_slot_end
+}
+
 #[inline(never)]
 fn rz_violation(kind: &str, msg: String) {
     // Always print the report. Avoid stdio re-entrancy by writing directly to fd=2.
@@ -1492,6 +1532,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
+                return;
+            }
             let msg = append_location_if_enabled(
                 format!(
                     "WRITE via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
@@ -1825,6 +1868,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
+                return;
+            }
             let msg = append_location_if_enabled(
                 format!(
                     "READ via tag={tag} addr=0x{addr:x} size={size}\naccess_end=0x{end:x} alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={:?} parent={}\npointee=0x{:x}",
@@ -2028,9 +2074,17 @@ pub extern "C" fn __record_ref_creation(
         }
     } else {
         // Root creation: snapshot from the allocation that contains this address (range lookup).
+        // If the match is a dead stack slot, treat metadata as unknown to avoid
+        // inheriting stale bounds/epoch from recycled stack storage.
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| (m.epoch, m.live, 0, 0))
+            .map(|(_base, m)| {
+                if m.is_stack && !m.live {
+                    (0, false, 0, 0)
+                } else {
+                    (m.epoch, m.live, 0, 0)
+                }
+            })
             .unwrap_or((0, false, 0, 0))
     };
     let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
@@ -2108,9 +2162,17 @@ pub extern "C" fn __record_raw_ptr_creation(
             (parent_epoch, parent_live, inherited_bounds_len)
         }
     } else {
+        // Root creation: if the match is a dead stack slot, treat metadata as unknown
+        // to avoid inheriting stale bounds/epoch from recycled stack storage.
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
-            .map(|(_base, m)| (m.epoch, m.live, 0))
+            .map(|(_base, m)| {
+                if m.is_stack && !m.live {
+                    (0, false, 0)
+                } else {
+                    (m.epoch, m.live, 0)
+                }
+            })
             .unwrap_or((0, false, 0))
     };
     let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };

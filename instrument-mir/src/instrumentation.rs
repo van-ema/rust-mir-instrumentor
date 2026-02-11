@@ -1012,6 +1012,17 @@ impl MyOptimizationPass {
         true
     }
 
+    /// Whether to emit stack-dead events on `StorageDead`.
+    ///
+    /// Default: disabled, because optimized MIR can place `StorageDead` before
+    /// a final use through outstanding references. Enable for experiments with:
+    /// `RZ_USE_STORAGE_DEAD=1`.
+    fn use_storage_dead_enabled(&self) -> bool {
+        std::env::var("RZ_USE_STORAGE_DEAD")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     /// Print an "unknown call" warning once per callee def-path to avoid spam.
     fn warn_unknown_call_once(&self, def_path: &str) {
         static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -2300,14 +2311,34 @@ impl MyOptimizationPass {
         // Stack allocation lifetime: StorageLive/StorageDead.
         match stmt.kind {
             StatementKind::StorageDead(local) => {
-                // NOTE: optimized MIR can place StorageDead before the last use
-                // through an outstanding reference. Emitting a dead event here
-                // causes false UAFs (e.g., debug_assert reads after StorageDead).
-                // We instead rely on function-return live=false for tracked locals,
-                // accepting that some intra-function UAFs are missed.
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
+                    // NOTE: optimized MIR can place StorageDead before the last use
+                    // through an outstanding reference. Emitting dead-by-default here
+                    // causes false UAFs, so this remains opt-in.
+                    if !self.use_storage_dead_enabled() {
+                        return;
+                    }
+                    let ty = body.local_decls[local].ty;
+                    if !(self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local)) {
+                        let size_op =
+                            self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span);
+                        if !matches!(size_op, SizeOperand::Const(_)) {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(local),
+                                kind: InstrKind::StackAlloc {
+                                    local,
+                                    live: false,
+                                    size_op,
+                                },
+                            });
+                        }
+                    }
                     return;
                 }
             }
@@ -2586,6 +2617,26 @@ impl MyOptimizationPass {
                             _ => None,
                         };
                         if let Some(p) = projected_ptr_place {
+                            // Pointer-value load through deref, e.g.:
+                            //   _r = &_p;        // _r: &*const T
+                            //   _dst = copy (*_r)
+                            // Recover `_p` so `_dst` inherits provenance instead of being retagged
+                            // as a fresh root. Root-retagging here is too imprecise and can attach
+                            // later accesses to the wrong stack slot.
+                            if src_local_opt.is_none()
+                                && !p.projection.is_empty()
+                                && matches!(p.projection[0], ProjectionElem::Deref)
+                            {
+                                if let Some(backtracked_local) = self.backtrack_deref_base_local(
+                                    p.local,
+                                    &block_data.statements[..stmt_idx],
+                                ) {
+                                    if self.is_pointer_ty(body.local_decls[backtracked_local].ty) {
+                                        src_local_opt = Some(backtracked_local);
+                                    }
+                                }
+                            }
+
                             // If we are extracting the data pointer from a wide pointer
                             // (e.g., `(*slice).0`), preserve the base tag.
                             if !p.projection.is_empty() {
