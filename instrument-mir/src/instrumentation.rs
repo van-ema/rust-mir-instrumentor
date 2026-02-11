@@ -2097,6 +2097,58 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Recover the pointee local for a mutable-reference local in the same block.
+    ///
+    /// Typical shape:
+    ///   _tmp = &mut _p;
+    ///   call(..., copy _tmp, ...);
+    ///
+    /// Returns `_p` for `_tmp`. We also follow trivial local forwarding
+    /// (`Use`, `CopyForDeref`, and pointer casts) to tolerate MIR temporaries.
+    fn backtrack_mut_ref_pointee_local<'tcx>(
+        &self,
+        ref_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        for (idx, stmt) in statements.iter().enumerate().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+            if place.as_local() != Some(ref_local) {
+                continue;
+            }
+
+            match rvalue {
+                Rvalue::Ref(_, BorrowKind::Mut { .. }, src_place) => {
+                    return Some(src_place.local);
+                }
+                Rvalue::Use(op) => {
+                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                Rvalue::CopyForDeref(p) => {
+                    if let Some(next_local) = p.as_local() {
+                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                Rvalue::Cast(
+                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                    op,
+                    _,
+                )
+                | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
     /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
@@ -3698,6 +3750,21 @@ impl MyOptimizationPass {
         let mut classified_derive_ptr_local: Option<Local> = None;
         let unknown_call_returns_ptr =
             unknown_call && self.is_pointer_ty(destination.ty(&body.local_decls, tcx).ty);
+        let call_target_bb: Option<BasicBlock> = match &term.kind {
+            TerminatorKind::Call { target, .. } => *target,
+            _ => None,
+        };
+        // Caller-side writeback retag set:
+        // if a callee receives `&mut P` (where `P` is itself a pointer type), it may mutate
+        // the caller's pointer local through that reference. Without a post-call retag, the
+        // caller keeps using the stale pre-call tag for `P`, which can hide aliasing UB.
+        //
+        // Example:
+        //   fn retarget(x: &mut &u32, t: &mut u32) { *x = &mut *(t as *mut _); }
+        //   retarget(&mut target_alias, target);
+        //   *target = 13;
+        //   black_box(*target_alias); // must observe updated tag lineage.
+        let mut post_call_writeback_retag_locals: HashSet<Local> = HashSet::new();
 
         // Centralized emission for direct-call effects.
         if let Some(effect) = call_effect_opt {
@@ -3970,6 +4037,20 @@ impl MyOptimizationPass {
             if !self.is_pointer_ty(ty) { continue; }
             let is_addr_exposable = self.is_addr_exposable_ptr_ty(tcx, body, ty);
 
+            // If this arg is `&mut P` (P pointer-typed), track the pointee local for
+            // post-call retagging in the caller to avoid stale tags after writeback.
+            if let TyKind::Ref(_, pointee_ty, mutbl) = ty.kind() {
+                if matches!(mutbl, Mutability::Mut) && self.is_pointer_ty(*pointee_ty) {
+                    if let Some(pointee_local) =
+                        self.backtrack_mut_ref_pointee_local(p.local, &block_data.statements)
+                    {
+                        if self.is_pointer_ty(body.local_decls[pointee_local].ty) {
+                            post_call_writeback_retag_locals.insert(pointee_local);
+                        }
+                    }
+                }
+            }
+
             let was_tagged = tagged_ptr_locals.contains(&p.local);
 
             // Ensure a tag exists before any call-boundary effects that consume it.
@@ -4074,6 +4155,43 @@ impl MyOptimizationPass {
             });
         }
 
+        // Caller-side writeback retag:
+        // At call return, re-seed tags for pointer locals that may have been rewritten through
+        // `&mut` pointer arguments. This keeps subsequent accesses tied to the updated pointer
+        // value instead of the stale pre-call tag.
+        if let Some(tgt_bb) = call_target_bb {
+            let mut writeback_locals: Vec<Local> =
+                post_call_writeback_retag_locals.into_iter().collect();
+            writeback_locals.sort_by_key(|l| l.index());
+
+            for dst_local in writeback_locals {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if !self.is_pointer_ty(dst_ty) {
+                    continue;
+                }
+                let is_mut = match dst_ty.kind() {
+                    TyKind::Ref(_, _, mutbl) => matches!(mutbl, Mutability::Mut),
+                    TyKind::RawPtr(_, mutbl) => matches!(mutbl, Mutability::Mut),
+                    _ => false,
+                };
+                let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+                ptr_locals_needing_tag.insert(dst_local);
+                tagged_ptr_locals.insert(dst_local);
+                insert_points.push(InsertPoint {
+                    bb: tgt_bb,
+                    stmt_idx: 0,
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(dst_local),
+                    kind: InstrKind::RetRoot {
+                        dst_local,
+                        is_mut,
+                        is_ref,
+                    },
+                });
+            }
+        }
+
         // Caller-side return-tag recovery for pointer returns.
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
@@ -4086,10 +4204,6 @@ impl MyOptimizationPass {
                             _ => false,
                         };
                         let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-                        let call_target_bb: Option<BasicBlock> = match &term.kind {
-                            TerminatorKind::Call { target, .. } => *target,
-                            _ => None,
-                        };
 
                         ptr_locals_needing_tag.insert(dst_local);
                         tagged_ptr_locals.insert(dst_local);
@@ -4153,10 +4267,6 @@ impl MyOptimizationPass {
                             _ => false,
                         };
                         let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-                        let call_target_bb: Option<BasicBlock> = match &term.kind {
-                            TerminatorKind::Call { target, .. } => *target,
-                            _ => None,
-                        };
 
                         ptr_locals_needing_tag.insert(dst_local);
                         if let Some(tgt_bb) = call_target_bb {

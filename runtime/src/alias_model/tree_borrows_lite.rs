@@ -30,6 +30,7 @@ enum TbPerm {
 struct TbNode {
     tag: u64,
     parent: u64,
+    alloc_epoch: u64,
     kind: BorrowKind,
     perm: TbPerm,
     start: usize,
@@ -71,20 +72,6 @@ fn rz_tb_lite_enabled() -> bool {
 #[inline]
 fn rz_tb_dump_enabled() -> bool {
     std::env::var("RZ_TB_DUMP")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-}
-
-#[inline]
-fn rz_tb_strict_creation_enabled() -> bool {
-    std::env::var("RZ_TB_STRICT_CREATE")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-}
-
-#[inline]
-fn rz_tb_strict_invalidated_refs_enabled() -> bool {
-    std::env::var("RZ_TB_STRICT_INVALIDATED_REFS")
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
@@ -244,13 +231,7 @@ fn tb_lite_validate_ref_creation(
     if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
         return None;
     }
-    // Default TB-lite mode avoids creation-time hard rejects because optimized MIR often
-    // keeps prior ref tags "alive" longer than source-level lifetimes, which can yield
-    // false positives on tight reborrow loops in real crates (e.g., serde_json parser hot paths).
-    // Access-time invalidation/checks remain active.
-    if !rz_tb_strict_creation_enabled() {
-        return None;
-    }
+    // Creation-time mutable reborrow conflicts are always checked in TB-lite.
     if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
         return None;
     }
@@ -264,11 +245,15 @@ fn tb_lite_validate_ref_creation(
     let new_len = tb_effective_len(bounds_len);
     let new_end = pointee_addr.saturating_add(new_len);
     let base = tb_base_for_addr(pointee_addr);
-    let parent_ref = if parent_tag != 0 {
+    let (parent_ref, parent_epoch) = if parent_tag != 0 {
         let tmap = tags().lock().unwrap();
-        tb_lite_find_ref_ancestor_tag(&tmap, parent_tag)
+        let pref = tb_lite_find_ref_ancestor_tag(&tmap, parent_tag);
+        let pep = pref
+            .and_then(|t| tmap.get(&t).map(|m| m.alloc_epoch))
+            .unwrap_or(0);
+        (pref, pep)
     } else {
-        None
+        (None, 0)
     };
 
     let Some(parent_ref) = parent_ref else {
@@ -297,6 +282,11 @@ fn tb_lite_validate_ref_creation(
         if !tb_ranges_overlap(pointee_addr, new_len, node.start, node.len) {
             continue;
         }
+        if parent_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != parent_epoch {
+            // Different allocation epoch at same base address (e.g. stack slot reuse).
+            // Ignore old-lifetime nodes to avoid stale-lineage conflicts.
+            continue;
+        }
 
         // Allow creation if the overlap is within the same lineage.
         let same_lineage = node.tag == parent_ref
@@ -306,11 +296,25 @@ fn tb_lite_validate_ref_creation(
             continue;
         }
 
+        // TB-lite policy:
+        // - for non-protected overlaps, defer to access-time transitions/violations;
+        // - reject at creation only when this would overlap an active protected unique.
+        //
+        // This avoids false positives in safe code paths that transiently create overlapping
+        // mutable refs but never perform an invalid protected/foreign access.
+        if !node.protected {
+            continue;
+        }
+
         return Some(format!(
-            "TB_LITE reborrow conflict: create RefMut [0x{:x},0x{:x}) overlaps active tag={} kind={:?} [0x{:x},0x{:x})",
+            "TB_LITE reborrow conflict: create RefMut [0x{:x},0x{:x}) parent_tag={} parent_ref={} parent_epoch={} overlaps active protected tag={} active_epoch={} kind={:?} [0x{:x},0x{:x})",
             pointee_addr,
             new_end,
+            parent_tag,
+            parent_ref,
+            parent_epoch,
             node.tag,
+            node.alloc_epoch,
             node.kind,
             node.start,
             node.start.saturating_add(node.len)
@@ -350,6 +354,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let node = TbNode {
         tag,
         parent,
+        alloc_epoch: tmeta.alloc_epoch,
         kind,
         perm,
         start: tmeta.pointee_addr,
@@ -446,21 +451,17 @@ fn tb_lite_check(
         // Best-effort: missing node means missing model metadata, not definite UB.
         return None;
     };
+    if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
+        // Tag metadata and TB node disagree on epoch; treat as stale model state and skip.
+        return None;
+    }
     let dump = if rz_tb_dump_enabled() {
         tb_dump(tree, access_tag, addr, size, access)
     } else {
         String::new()
     };
     if !tb_is_live_node(&node) {
-        // Best-effort compromise: optimized MIR often keeps short-lived reference tags
-        // around in a way that over-approximates lifetimes. By default we suppress
-        // invalidated Ref* reports to avoid false positives on real crates; strict mode
-        // can re-enable them for conformance experiments.
-        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
-            && !rz_tb_strict_invalidated_refs_enabled()
-        {
-            return None;
-        }
+        // Invalidated-reference accesses are always reported in TB-lite.
         let mut msg = format!(
             "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
             tb_access_name(access),
@@ -481,6 +482,12 @@ fn tb_lite_check(
         .values()
         .filter(|n| tb_is_live_node(n))
         .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
+        .filter(|n| {
+            if tmeta.alloc_epoch != 0 && n.alloc_epoch != 0 && n.alloc_epoch != tmeta.alloc_epoch {
+                return false;
+            }
+            true
+        })
         .map(|n| n.tag)
         .collect();
 
@@ -569,7 +576,14 @@ fn tb_lite_check(
         if let Some(protected) = tree
             .nodes
             .values()
-            .find(|n| tb_is_live_node(n) && n.protected && n.tag != access_tag)
+            .find(|n| {
+                tb_is_live_node(n)
+                    && n.protected
+                    && n.tag != access_tag
+                    && (tmeta.alloc_epoch == 0
+                        || n.alloc_epoch == 0
+                        || n.alloc_epoch == tmeta.alloc_epoch)
+            })
             .cloned()
         {
             let touched_protected = updates
@@ -622,9 +636,10 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} kind={:?} perm={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} epoch={} kind={:?} perm={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
             n.tag,
             n.parent,
+            n.alloc_epoch,
             n.kind,
             n.perm,
             n.alive,
