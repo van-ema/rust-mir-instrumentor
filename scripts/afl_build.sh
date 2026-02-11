@@ -120,12 +120,12 @@ find_runtime_rlib() {
 
 build_tools_and_runtime() {
   if [[ "$PROFILE" == "release" ]]; then
-    cargo build -p instrument-mir --release
+    cargo build -p instrument-mir --release --bins
     # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
     cargo build -p runtime --release ${RUNTIME_FEATURES}
     PROFILE_FLAG="--release"
   else
-    cargo build -p instrument-mir
+    cargo build -p instrument-mir --bins
     cargo build -p runtime ${RUNTIME_FEATURES}
     PROFILE_FLAG=""
   fi
@@ -140,10 +140,12 @@ rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
 
 TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
 if [[ ! -x "$TOOL" ]]; then
-  TOOL="$(command -v cargo-instrument-mir || true)"
+  echo "missing ${TOOL} after local instrument-mir build; refusing PATH fallback to avoid stale toolchain use" >&2
+  exit 2
 fi
-if [[ -z "$TOOL" || ! -x "$TOOL" ]]; then
-  echo "missing cargo-instrument-mir (instrument-mir build/install failed?)" >&2
+INSTRUMENT_BIN="${HARNESS_TARGET_DIR}/${PROFILE}/instrument-mir"
+if [[ ! -x "$INSTRUMENT_BIN" ]]; then
+  echo "missing ${INSTRUMENT_BIN} after local instrument-mir build" >&2
   exit 2
 fi
 
@@ -157,6 +159,7 @@ fi
 current_stamp="$(
   {
     echo "tool=$(hash_file "${TOOL}")"
+    echo "instrumentor=$(hash_file "${INSTRUMENT_BIN}")"
     echo "runtime=$(hash_file "${runtime_rlib}")"
     echo "profile=${PROFILE}"
     echo "runtime_features=${RUNTIME_FEATURES}"
@@ -184,10 +187,12 @@ if [[ "${clean_needed}" == "1" ]]; then
 
   TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
   if [[ ! -x "$TOOL" ]]; then
-    TOOL="$(command -v cargo-instrument-mir || true)"
+    echo "missing ${TOOL} after clean/rebuild; refusing PATH fallback to avoid stale toolchain use" >&2
+    exit 2
   fi
-  if [[ -z "$TOOL" || ! -x "$TOOL" ]]; then
-    echo "missing cargo-instrument-mir after clean/rebuild" >&2
+  INSTRUMENT_BIN="${HARNESS_TARGET_DIR}/${PROFILE}/instrument-mir"
+  if [[ ! -x "$INSTRUMENT_BIN" ]]; then
+    echo "missing ${INSTRUMENT_BIN} after clean/rebuild" >&2
     exit 2
   fi
 
@@ -200,6 +205,7 @@ if [[ "${clean_needed}" == "1" ]]; then
   current_stamp="$(
     {
       echo "tool=$(hash_file "${TOOL}")"
+      echo "instrumentor=$(hash_file "${INSTRUMENT_BIN}")"
       echo "runtime=$(hash_file "${runtime_rlib}")"
       echo "profile=${PROFILE}"
       echo "runtime_features=${RUNTIME_FEATURES}"

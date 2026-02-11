@@ -4850,9 +4850,16 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            // Caller-side: take return tag after a call returned a thin pointer into `dst_local`.
-            // This must run after the call, but we intentionally avoid rewriting the call edge.
-            // Instead, we splice the take call at the start of the existing call-target block.
+            // Caller-side: take return tag after a call returned a pointer into `dst_local`.
+            //
+            // IMPORTANT: this must be per-call-edge, not per-target-block.
+            // A single target block may have multiple call predecessors. If we patch the
+            // target block in-place, we would incorrectly run one call's RetTake logic for
+            // all predecessors and corrupt tag lineage.
+            //
+            // We therefore create:
+            //   call_bb -> ret_take_bb -> ret_take_cont_bb -> orig_target
+            // and only rewrite this call's `target` to `ret_take_bb`.
             if let InstrKind::RetTake { callee_id, dst_local } = creation_kind {
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&dst_local)
@@ -4939,16 +4946,13 @@ impl MyOptimizationPass {
                 ]
                 .into_boxed_slice();
 
-                let cont_bb = {
-                    let (orig_stmts, orig_term) = {
-                        let bd = &mut body.basic_blocks_mut()[orig_target];
-                        let stmts = std::mem::take(&mut bd.statements);
-                        let term = bd.terminator.take();
-                        (stmts, term)
-                    };
-                    let mut cont_data = BasicBlockData::new(orig_term, is_cleanup);
-                    cont_data.statements = orig_stmts;
-                    body.basic_blocks_mut().push(cont_data)
+                let ret_take_cont_bb = {
+                    let goto_term = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Goto { target: orig_target },
+                    });
+                    body.basic_blocks_mut()
+                        .push(BasicBlockData::new(goto_term, is_cleanup))
                 };
 
                 let take_term = Terminator {
@@ -4957,22 +4961,38 @@ impl MyOptimizationPass {
                         func: take_func,
                         args: args_take,
                         destination: Place::from(dst_tag),
-                        target: Some(cont_bb),
+                        target: Some(ret_take_cont_bb),
                         unwind: UnwindAction::Continue,
                         call_source,
                         fn_span,
                     },
                 };
 
-                let take_bd = &mut body.basic_blocks_mut()[orig_target];
-                if let Some(addr_stmt1) = addr_stmt1_opt {
-                    take_bd.statements.push(addr_stmt1);
+                let ret_take_bb = {
+                    let mut take_bd = BasicBlockData::new(Some(take_term), is_cleanup);
+                    if let Some(addr_stmt1) = addr_stmt1_opt {
+                        take_bd.statements.push(addr_stmt1);
+                    }
+                    take_bd.statements.push(addr_stmt2);
+                    if !bounds_len_stmts.is_empty() {
+                        take_bd.statements.append(&mut bounds_len_stmts);
+                    }
+                    body.basic_blocks_mut().push(take_bd)
+                };
+
+                // Redirect only this call edge to the RetTake trampoline block.
+                {
+                    let term = body.basic_blocks_mut()[bb]
+                        .terminator
+                        .as_mut()
+                        .expect("missing terminator while wiring RetTake");
+                    match &mut term.kind {
+                        TerminatorKind::Call { target, .. } => {
+                            *target = Some(ret_take_bb);
+                        }
+                        _ => panic!("RetTake expected a Call terminator"),
+                    }
                 }
-                take_bd.statements.push(addr_stmt2);
-                if !bounds_len_stmts.is_empty() {
-                    take_bd.statements.append(&mut bounds_len_stmts);
-                }
-                take_bd.terminator = Some(take_term);
 
                 // Keep ref-ancestor in sync for return-tag recovery.
                 // Without this, later PtrDerive on the returned pointer may pick an
@@ -4981,7 +5001,7 @@ impl MyOptimizationPass {
                 if let Some(dst_ref_ancestor_local) =
                     ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                 {
-                    body.basic_blocks_mut()[cont_bb].statements.insert(
+                    body.basic_blocks_mut()[ret_take_cont_bb].statements.insert(
                         0,
                         Statement::new(
                             source_info,
