@@ -120,7 +120,7 @@ Goal
 Approach
 	•	Runtime-first implementation in the existing pluggable alias-model layer:
 		•	add `tb_lite` as a new `AliasModel`
-		•	select with `RZ_ALIAS_MODEL=tb_lite` (keep `sb_lite` as default until stable)
+		•	select with `RZ_ALIAS_MODEL=tb_lite` (now the default; `sb_lite` remains opt-in)
 	•	Instrumentation stays unchanged in the first iteration.
 	•	If needed, add targeted instrumentation events only after measuring concrete TB gaps.
 

@@ -65,7 +65,8 @@ make run EXAMPLE=hello PROFILE=release
 - `RZ_ABORT_ON_VIOLATION`: If non-zero, abort immediately after reporting a violation.
 - `RZ_ABORT_ON_DOUBLE_FREE`: If non-zero, abort the process on `DOUBLE_FREE` after reporting.
 - `RZ_STRICT_FREE_CHECK`: If non-zero, treat frees of unknown bases as violations (and skip system dealloc).
-- `RZ_SB_LITE`: If set to `0` or `false`, disable SB-lite aliasing checks; default is enabled.
+- `RZ_ALIAS_MODEL`: Select alias model (`tb_lite`, `sb_lite`, `none`); default is `tb_lite`.
+- `RZ_SB_LITE`: If set to `0` or `false`, disable SB-lite checks when `RZ_ALIAS_MODEL=sb_lite`.
 - `RZ_SB_DUMP`: If set to `1` or `true`, include SB-lite borrow stack + tag ancestry on SB violations.
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a

@@ -75,7 +75,7 @@ def did_panic(log_path: Path) -> bool:
 
 def normalize_alias_model(raw: str | None) -> str:
     if not raw:
-        return "sb_lite"
+        return "tb_lite"
     model = raw.strip().lower()
     if model in ("", "sb", "sb_lite", "stacked_borrows"):
         return "sb_lite"
@@ -83,7 +83,7 @@ def normalize_alias_model(raw: str | None) -> str:
         return "tb_lite"
     if model in ("none", "off"):
         return "none"
-    return model
+    return "tb_lite"
 
 
 def read_expectation(pkg_dir: Path, bin_name: str, alias_model: str) -> str | None:
@@ -119,7 +119,7 @@ def read_expectation(pkg_dir: Path, bin_name: str, alias_model: str) -> str | No
 
 
 def write_expectation(pkg_dir: Path, bin_name: str, alias_model: str, value: str) -> None:
-    if alias_model == "sb_lite":
+    if alias_model == "tb_lite":
         expect_file = pkg_dir / f"expected.{bin_name}.rz"
     else:
         expect_file = pkg_dir / f"expected.{bin_name}.{alias_model}.rz"
@@ -150,6 +150,7 @@ def main() -> int:
     env.setdefault("CARGO_INCREMENTAL", "0")
     env.setdefault("RZ_LOG", "warn")
     env.setdefault("RZ_INSTRUMENT_ALL_DEPS", "1")
+    env.setdefault("RZ_ALIAS_MODEL", "tb_lite")
 
     cargo = env.get("CARGO", "cargo")
     build_profile = env.get("BUILD_PROFILE", "debug")
@@ -263,7 +264,7 @@ def main() -> int:
         if expected is None and record_expect:
             expected = observed or "ok"
             write_expectation(pkg_dir, bin_name, alias_model, expected)
-        elif record_expect and alias_model != "sb_lite":
+        elif record_expect and alias_model != "tb_lite":
             # For non-default models, allow recording only the behavioral deltas:
             # if observed differs from the default expectation, materialize a
             # model-specific expected.<bin>.<model>.rz file.

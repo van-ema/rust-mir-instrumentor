@@ -42,7 +42,9 @@ fi
 
 export RUSTEZE_FAILFAST=1
 export RZ_INSTRUMENT_ALL_DEPS=1
-# Keep SB-lite enabled by default so aliasing checks are always active.
+# Keep aliasing checks active by default with tb_lite as the model.
+export RZ_ALIAS_MODEL="${RZ_ALIAS_MODEL:-tb_lite}"
+# SB-lite knob is still honored when explicitly selecting RZ_ALIAS_MODEL=sb_lite.
 export RZ_SB_LITE="${RZ_SB_LITE:-1}"
 
 # We do not fuzz with ASan in this pipeline; avoid inheriting host/container

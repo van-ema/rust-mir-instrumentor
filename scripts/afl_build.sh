@@ -63,7 +63,9 @@ RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/deps"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
-# Keep SB-lite enabled by default so aliasing checks are consistently active.
+# Keep aliasing checks enabled by default with tb_lite as the active model.
+export RZ_ALIAS_MODEL="${RZ_ALIAS_MODEL:-tb_lite}"
+# SB-lite knob is still honored when explicitly selecting RZ_ALIAS_MODEL=sb_lite.
 export RZ_SB_LITE="${RZ_SB_LITE:-1}"
 export CARGO_TARGET_DIR="$HARNESS_TARGET_DIR"
 # Put temp files in the same directory that rustc writes metadata (`deps/`) to avoid EXDEV.

@@ -84,14 +84,14 @@ fn active_model_choice() -> ActiveModel {
     static ACTIVE: OnceLock<ActiveModel> = OnceLock::new();
     *ACTIVE.get_or_init(|| {
         let raw = std::env::var("RZ_ALIAS_MODEL")
-            .unwrap_or_else(|_| "sb_lite".to_string())
+            .unwrap_or_else(|_| "tb_lite".to_string())
             .to_ascii_lowercase();
         match raw.as_str() {
             "" | "sb" | "sb_lite" | "stacked_borrows" => ActiveModel::SbLite,
             "tb" | "tb_lite" | "tree_borrows" => ActiveModel::TbLite,
             "none" | "off" => ActiveModel::None,
             // Keep unknown values non-fatal; default to the current model.
-            _ => ActiveModel::SbLite,
+            _ => ActiveModel::TbLite,
         }
     })
 }
