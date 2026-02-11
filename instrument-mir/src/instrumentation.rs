@@ -2366,11 +2366,9 @@ impl MyOptimizationPass {
                             matches!(ptr_ty.kind(), TyKind::Ref(region, ..) if region.is_static());
                         let skip_vtable_read = self.is_vtable_like_ptr_ty(tcx, ptr_ty);
                         if !skip_static_ref_read && !skip_vtable_read && self.is_pointer_ty(ptr_ty) {
-                            // Best-effort size: use the type of the *loaded place* (after projections).
-                            // This is important for patterns where the destination is a projection
-                            // (e.g., `_tmp = (*p).field`) or when the LHS is not a plain local.
-                            let loaded_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                            let read_ty = p.ty(&body.local_decls, tcx).ty;
+                            // Best-effort size: use the type of the dereferenced/read place.
+                            let loaded_ty = p.ty(&body.local_decls, tcx).ty;
+                            let read_ty = loaded_ty;
                             // Loading function pointers or vtable-like structs should not trigger
                             // memory access checks; treat these as benign metadata reads.
                             let skip_fn_ptr_read = matches!(
@@ -2384,7 +2382,13 @@ impl MyOptimizationPass {
                                 }
                                 _ => self.is_fn_table_adt_ty(tcx, read_ty),
                             };
-                            if skip_fn_ptr_read || skip_vtable_field_read {
+                            // Optimized MIR frequently materializes pointer-valued loads that are
+                            // only metadata/provenance plumbing (e.g. forwarding `&&T` / raw ptr
+                            // values through temporaries). Instrumenting those as memory READs can
+                            // misclassify them as data accesses and produce false OOB/stale reports.
+                            // We only instrument deref reads when the loaded value is non-pointer data.
+                            let skip_pointer_value_read = self.is_pointer_ty(loaded_ty);
+                            if skip_fn_ptr_read || skip_vtable_field_read || skip_pointer_value_read {
                                 // Skip only the READ instrumentation; continue scanning this stmt.
                             } else {
                                 let size_op = self.size_operand_for_deref(

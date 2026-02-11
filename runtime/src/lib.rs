@@ -679,6 +679,21 @@ fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
         && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
 }
 
+#[inline]
+fn rz_allow_stack_raw_root_epoch_noise(tmeta: &TagMeta, ameta: &AllocMeta, addr: usize) -> bool {
+    // Best-effort suppression for optimized-stack churn:
+    // a raw-root const tag (`parent=0`) can survive while stack slots get recycled/re-tagged,
+    // yielding epoch mismatches that are not actionable aliasing bugs.
+    //
+    // Keep this narrow on purpose:
+    // - `RawConst` only (do not relax mutating raw flows),
+    // - stack-like current address + stack-like tag pointee.
+    matches!(tmeta.kind, PtrKind::RawConst)
+        && tmeta.parent == 0
+        && (ameta.is_stack || rz_stack_addr_hint(addr))
+        && rz_stack_addr_hint(tmeta.pointee_addr)
+}
+
 #[inline(never)]
 fn rz_violation(kind: &str, msg: String) {
     // Always print the report. Avoid stdio re-entrancy by writing directly to fd=2.
@@ -1370,6 +1385,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         {
             return;
         }
+        // Ignore known stack raw-root epoch churn noise (see helper for scope).
+        if rz_allow_stack_raw_root_epoch_noise(&tmeta, &ameta, addr) {
+            return;
+        }
         if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
             return;
         }
@@ -1697,6 +1716,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
             && (ameta.is_stack || rz_stack_addr_hint(addr))
         {
+            return;
+        }
+        // Ignore known stack raw-root epoch churn noise (see helper for scope).
+        if rz_allow_stack_raw_root_epoch_noise(&tmeta, &ameta, addr) {
             return;
         }
         if rz_epoch_check_relaxed() && (ameta.is_stack || rz_stack_addr_hint(addr)) {
