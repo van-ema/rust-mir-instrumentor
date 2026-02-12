@@ -2160,6 +2160,145 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Best-effort: recover a pointer-typed source local that feeds `dst_local` in the same block.
+    ///
+    /// This follows trivial forwarding/casts and ref/raw creations:
+    /// - `Use`, `CopyForDeref`
+    /// - pointer casts/coercions/transmute
+    /// - `Ref` / `RawPtr` assignments (returns their source local when pointer-typed)
+    ///
+    /// We use it to avoid falling back to `parent=0` for ref/raw creations when the immediate
+    /// source local is a temporary projection local instead of the real pointer carrier.
+    fn backtrack_pointer_source_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        dst_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        for (idx, stmt) in statements.iter().enumerate().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+            if place.as_local() != Some(dst_local) {
+                continue;
+            }
+
+            match rvalue {
+                Rvalue::Use(op) => {
+                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
+                            return Some(next_local);
+                        }
+                        return self.backtrack_pointer_source_local(
+                            body,
+                            next_local,
+                            &statements[..idx],
+                        );
+                    }
+                    return None;
+                }
+                Rvalue::CopyForDeref(p) => {
+                    if let Some(next_local) = p.as_local() {
+                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
+                            return Some(next_local);
+                        }
+                        return self.backtrack_pointer_source_local(
+                            body,
+                            next_local,
+                            &statements[..idx],
+                        );
+                    }
+                    return None;
+                }
+                Rvalue::Cast(
+                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                    op,
+                    _,
+                )
+                | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
+                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
+                            return Some(next_local);
+                        }
+                        return self.backtrack_pointer_source_local(
+                            body,
+                            next_local,
+                            &statements[..idx],
+                        );
+                    }
+                    return None;
+                }
+                Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
+                    let src_local = src_place.local;
+                    if self.is_pointer_ty(body.local_decls[src_local].ty) {
+                        return Some(src_local);
+                    }
+                    return self.backtrack_pointer_source_local(
+                        body,
+                        src_local,
+                        &statements[..idx],
+                    );
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Resolve the best parent-tag operand for ref/raw creation from `src_place`.
+    ///
+    /// We first try the nearest ref-ancestor tag local, then the normal pointer tag local.
+    /// If `src_place.local` is not pointer-typed, we backtrack same-block assignments to find
+    /// the pointer carrier that produced it.
+    ///
+    /// Example (base64 encode loop style):
+    /// Rust:
+    ///   let chunk = &mut out[out_idx..out_idx + 4];
+    ///   chunk[0] = ...
+    ///
+    /// MIR-like shape:
+    ///   _tmp = &mut (*_out_slice)[_idx.._idx+4];
+    ///   _elt = &mut (*_tmp)[0];
+    ///
+    /// The immediate `src_place.local` for `_elt` can be a projection-heavy temp with no tag local.
+    /// If we use only that local, parent becomes `0` and the new ref is treated as a root sibling.
+    /// Backtracking recovers `_out_slice` (or another pointer carrier), so parent lineage is kept.
+    fn parent_tag_operand_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        src_place: Place<'tcx>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+    ) -> Operand<'tcx> {
+        let mut candidate_local: Option<Local> = None;
+
+        let src_local = src_place.local;
+        if self.is_pointer_ty(body.local_decls[src_local].ty) {
+            candidate_local = Some(src_local);
+        } else {
+            let block_stmts = &body.basic_blocks[bb].statements;
+            let upto = stmt_idx.min(block_stmts.len());
+            candidate_local = self.backtrack_pointer_source_local(
+                body,
+                src_local,
+                &block_stmts[..upto],
+            );
+        }
+
+        if let Some(local) = candidate_local {
+            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&local) {
+                return Operand::Copy(Place::from(*tl));
+            }
+            if let Some(tl) = tag_local_for_ptr_local.get(&local) {
+                return Operand::Copy(Place::from(*tl));
+            }
+        }
+
+        self.const_u64(tcx, source_info.span, 0)
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
     /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
@@ -5890,25 +6029,17 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref { src, .. } => {
-                            let base = src.local;
-                            if let Some(tl) = tag_local_for_ptr_local.get(&base) {
-                                Operand::Copy(Place::from(*tl))
-                            } else {
-                                self.const_u64(tcx, source_info.span, 0)
-                            }
-                        }
-                        InstrKind::Raw { src, .. } => {
-                            let base = src.local;
-                            // Same policy as PtrDerive raw paths: prefer ref-ancestor lineage
-                            // to preserve alias-model parent recovery through raw-heavy code.
-                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&base) {
-                                Operand::Copy(Place::from(*tl))
-                            } else if let Some(tl) = tag_local_for_ptr_local.get(&base) {
-                                Operand::Copy(Place::from(*tl))
-                            } else {
-                                self.const_u64(tcx, source_info.span, 0)
-                            }
+                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                            self.parent_tag_operand_for_src_place(
+                                tcx,
+                                body,
+                                bb,
+                                stmt_idx,
+                                source_info,
+                                *src,
+                                tag_local_for_ptr_local,
+                                ref_ancestor_local_for_ptr_local,
+                            )
                         }
                         _ => self.const_u64(tcx, source_info.span, 0),
                     };

@@ -376,6 +376,21 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
             .filter(|n| tb_is_live_node(n) && n.tag != tag)
             .filter(|n| tb_ranges_overlap(node.start, node.len, n.start, n.len))
             .filter(|n| {
+                // Best-effort metadata can lose parent lineage on projection-heavy code paths,
+                // yielding overlapping root uniques (`parent=0`) that are still used safely.
+                // Do not eagerly invalidate root-vs-root siblings at creation; let access-time
+                // transitions decide conflicts when/if they actually occur.
+                //
+                // Example:
+                //   let chunk = &mut out[i..i+4];
+                //   chunk[0] = ...; chunk[1] = ...;
+                // With imprecise parent lowering, each per-element/per-subslice ref can appear
+                // as a fresh root unique over overlapping ranges. Eager sibling invalidation here
+                // would disable earlier roots immediately and report TB_LITE_INVALIDATED on valid
+                // subsequent writes in the same loop.
+                if node.parent == 0 && n.parent == 0 {
+                    return false;
+                }
                 !tb_is_ancestor(&tree.nodes, n.tag, tag) && !tb_is_ancestor(&tree.nodes, tag, n.tag)
             })
             .map(|n| n.tag)
