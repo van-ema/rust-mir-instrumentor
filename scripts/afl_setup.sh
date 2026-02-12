@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 THIRD_PARTY_DIR="${REPO_ROOT}/third_party"
 
 # Popular + actively maintained fuzz targets.
-DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa)
+DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv)
 
 usage() {
   cat <<'EOF'
@@ -14,7 +14,7 @@ Usage:
   ./scripts/afl_setup.sh [target ...]
 
 Targets:
-  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa
+  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv
 
 Behavior:
   1) clones missing third_party repos for selected targets
@@ -34,6 +34,7 @@ EOF
 norm_target() {
   case "$1" in
     quick-xml) echo "quick_xml" ;;
+    simd-json) echo "simd_json" ;;
     serde) echo "serde_json" ;;
     *) echo "$1" ;;
   esac
@@ -50,6 +51,9 @@ repo_url_for_target() {
     quick_xml) echo "https://github.com/tafia/quick-xml.git" ;;
     base64) echo "https://github.com/marshallpierce/rust-base64.git" ;;
     itoa) echo "https://github.com/dtolnay/itoa.git" ;;
+    simd_json) echo "https://github.com/simd-lite/simd-json.git" ;;
+    zip) echo "https://github.com/zip-rs/zip2.git" ;;
+    rkyv) echo "https://github.com/rkyv/rkyv.git" ;;
     *) return 1 ;;
   esac
 }
@@ -57,6 +61,7 @@ repo_url_for_target() {
 repo_dir_for_target() {
   case "$1" in
     quick_xml) echo "${THIRD_PARTY_DIR}/quick-xml" ;;
+    simd_json) echo "${THIRD_PARTY_DIR}/simd-json" ;;
     *) echo "${THIRD_PARTY_DIR}/$1" ;;
   esac
 }
@@ -72,13 +77,16 @@ ref_var_name_for_target() {
     quick_xml) echo "REF_QUICK_XML" ;;
     base64) echo "REF_BASE64" ;;
     itoa) echo "REF_ITOA" ;;
+    simd_json) echo "REF_SIMD_JSON" ;;
+    zip) echo "REF_ZIP" ;;
+    rkyv) echo "REF_RKYV" ;;
     *) return 1 ;;
   esac
 }
 
 validate_target() {
   case "$1" in
-    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa) ;;
+    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa|simd_json|zip|rkyv) ;;
     *) echo "error: unknown target '$1'" >&2; usage; exit 2 ;;
   esac
 }

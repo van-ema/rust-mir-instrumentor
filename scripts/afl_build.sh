@@ -16,7 +16,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
 
@@ -29,7 +29,10 @@ case "$TARGET" in
   uuid) BIN="afl_uuid_driver"; FEATURE="uuid_driver" ;;
   itoa) BIN="afl_itoa_driver"; FEATURE="itoa_driver" ;;
   quick_xml|quick-xml) BIN="afl_quick_xml_driver"; FEATURE="quick_xml_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml)" >&2; exit 2 ;;
+  simd_json|simd-json) BIN="afl_simd_json_driver"; FEATURE="simd_json_driver" ;;
+  zip) BIN="afl_zip_driver"; FEATURE="zip_driver" ;;
+  rkyv) BIN="afl_rkyv_driver"; FEATURE="rkyv_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv)" >&2; exit 2 ;;
 esac
 
 if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then

@@ -8,7 +8,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_FUZZ="${AFL_FUZZ:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv
 TIMEOUT_MS="${TIMEOUT_MS:-}" # optional, forwarded to AFL++ via -t
 
 case "$TARGET" in
@@ -20,7 +20,10 @@ case "$TARGET" in
   uuid) BIN="afl_uuid_driver" ;;
   itoa) BIN="afl_itoa_driver" ;;
   quick_xml|quick-xml) BIN="afl_quick_xml_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml)" >&2; exit 2 ;;
+  simd_json|simd-json) BIN="afl_simd_json_driver" ;;
+  zip) BIN="afl_zip_driver" ;;
+  rkyv) BIN="afl_rkyv_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv)" >&2; exit 2 ;;
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"

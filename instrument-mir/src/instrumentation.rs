@@ -985,7 +985,7 @@ impl MyOptimizationPass {
     fn warn_unknown_calls_enabled(&self) -> bool {
         std::env::var("RZ_WARN_UNKNOWN_CALLS")
             .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
     /// If true, emit MIR-based heap alloc/free hooks (`HeapAlloc` / `__rz_record_alloc`).
@@ -3544,12 +3544,8 @@ impl MyOptimizationPass {
 
             if (has_ptr_arg || returns_ptr) && !callee_instrumented {
                 // Use the centralized classifier so warning suppression matches actual handling.
-                let _ = call_effect_opt;
-                let effect = self.classify_call_effect(def_path);
-                if matches!(effect, CallEffect::Unknown) {
-                    return;
-                }
-
+                let effect =
+                    call_effect_opt.unwrap_or_else(|| self.classify_call_effect(def_path));
                 let known = !matches!(effect, CallEffect::Unknown);
                 let trace_enabled = std::env::var("RZ_TRACE_CLASSIFY")
                     .ok()
