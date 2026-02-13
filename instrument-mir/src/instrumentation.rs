@@ -1023,6 +1023,39 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    /// Print every emitted stack allocation/deallocation hook.
+    ///
+    /// Default: disabled. Enable with `RZ_TRACE_STACK_ALLOCS=1`.
+    fn trace_stack_allocs_enabled(&self) -> bool {
+        std::env::var("RZ_TRACE_STACK_ALLOCS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    fn trace_stack_alloc_emit<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+        live: bool,
+        size_op: &SizeOperand<'tcx>,
+        source: &str,
+    ) {
+        if !self.trace_stack_allocs_enabled() {
+            return;
+        }
+        let def_path = tcx.def_path_str(body.source.def_id());
+        rz_pass_warn!(
+            self,
+            "[rusteze][trace-stack] fn={} local=_{} live={} size_op={:?} source={}",
+            def_path,
+            local.index(),
+            live,
+            size_op,
+            source
+        );
+    }
+
     /// Print an "unknown call" warning once per callee def-path to avoid spam.
     fn warn_unknown_call_once(&self, def_path: &str) {
         static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -2473,9 +2506,17 @@ impl MyOptimizationPass {
                                 kind: InstrKind::StackAlloc {
                                     local,
                                     live: false,
-                                    size_op,
+                                    size_op: size_op.clone(),
                                 },
                             });
+                            self.trace_stack_alloc_emit(
+                                tcx,
+                                body,
+                                local,
+                                false,
+                                &size_op,
+                                "StorageDead",
+                            );
                         }
                     }
                     return;
@@ -2501,9 +2542,17 @@ impl MyOptimizationPass {
                                 kind: InstrKind::StackAlloc {
                                     local,
                                     live: true,
-                                    size_op,
+                                    size_op: size_op.clone(),
                                 },
                             });
+                            self.trace_stack_alloc_emit(
+                                tcx,
+                                body,
+                                local,
+                                true,
+                                &size_op,
+                                "StorageLive",
+                            );
                         }
                     }
                 }
@@ -2822,7 +2871,32 @@ impl MyOptimizationPass {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 ptr_locals_needing_tag.insert(src_local);
 
-                                if matches!(rvalue, Rvalue::BinaryOp(BinOp::Offset, _)) {
+                                let rhs_requires_retag = match rvalue {
+                                    // Pointer arithmetic and projection-heavy pointer materialization
+                                    // can change the pointee address; copying the source tag directly
+                                    // keeps stale pointee metadata. Retag derived values instead.
+                                    Rvalue::BinaryOp(op, _)
+                                        if matches!(*op, BinOp::Offset | BinOp::Add | BinOp::Sub) =>
+                                    {
+                                        true
+                                    }
+                                    Rvalue::CopyForDeref(_)
+                                    | Rvalue::Cast(
+                                        CastKind::PtrToPtr
+                                        | CastKind::PointerCoercion(_, _)
+                                        | CastKind::Transmute,
+                                        _,
+                                        _,
+                                    )
+                                    | Rvalue::Aggregate(_, _) => true,
+                                    Rvalue::Use(op) => match op {
+                                        Operand::Copy(p) | Operand::Move(p) => !p.projection.is_empty(),
+                                        _ => false,
+                                    },
+                                    _ => false,
+                                };
+
+                                if rhs_requires_retag {
                                     insert_points.push(InsertPoint {
                                         bb,
                                         stmt_idx,
@@ -4270,7 +4344,11 @@ impl MyOptimizationPass {
                     stmt_idx: block_data.statements.len(),
                     insert_before: false,
                     source_info: term.source_info,
-                    place: Place::from(p.local),
+                    // Use the full argument place (including projections), not just
+                    // the carrier local. For projected pointer arguments, using only
+                    // `p.local` retags the wrong address and desynchronizes tag pointee
+                    // from the actual call operand pointer value.
+                    place: p,
                     kind: root_kind,
                 });
             }
@@ -4284,7 +4362,7 @@ impl MyOptimizationPass {
                         stmt_idx: block_data.statements.len(),
                         insert_before: false,
                         source_info: term.source_info,
-                        place: Place::from(p.local),
+                        place: p,
                         kind: InstrKind::CallArgPush {
                             callee_id,
                             arg_index: arg_index as u64,
@@ -4313,7 +4391,7 @@ impl MyOptimizationPass {
                     stmt_idx: block_data.statements.len(),
                     insert_before: false,
                     source_info: term.source_info,
-                    place: Place::from(p.local),
+                    place: p,
                     kind: InstrKind::PtrReadAllowUntagged {
                         ptr_local: p.local,
                         size_op: size_op.clone(),
@@ -4324,7 +4402,7 @@ impl MyOptimizationPass {
                     stmt_idx: block_data.statements.len(),
                     insert_before: false,
                     source_info: term.source_info,
-                    place: Place::from(p.local),
+                    place: p,
                     kind: InstrKind::PtrWriteAllowUntagged { ptr_local: p.local, size_op },
                 });
             }
@@ -4340,7 +4418,7 @@ impl MyOptimizationPass {
                 stmt_idx: block_data.statements.len(),
                 insert_before: false,
                 source_info: term.source_info,
-                place: Place::from(p.local),
+                place: p,
                 kind: InstrKind::PtrUse { ptr_local: p.local },
             });
         }
@@ -4678,6 +4756,14 @@ impl MyOptimizationPass {
                     size_op: size_op.clone(),
                 },
             });
+            self.trace_stack_alloc_emit(
+                tcx,
+                body,
+                local,
+                true,
+                &size_op,
+                "FallbackEntry",
+            );
 
             for (ret_bb, ret_source_info, ret_stmt_idx) in return_sites.iter().copied() {
                 fallback_return_points.push(InsertPoint {
@@ -4692,6 +4778,14 @@ impl MyOptimizationPass {
                         size_op: size_op.clone(),
                     },
                 });
+                self.trace_stack_alloc_emit(
+                    tcx,
+                    body,
+                    local,
+                    false,
+                    &size_op,
+                    "FallbackReturn",
+                );
             }
         }
 
@@ -6691,6 +6785,16 @@ impl MyOptimizationPass {
                     "Skipping optimization for item in runtime crate: {:?}",
                     def_id
                 );
+            }
+            return;
+        }
+
+        if body.coroutine.is_some() {
+            // Async lowering creates coroutine state machines. Injecting locals or
+            // control-flow edits in those bodies can trigger rustc recursion/cycle
+            // errors (observed with Tokio). Skip coroutine bodies for now.
+            if trace_pass {
+                println!("Skipping optimization for coroutine body: {:?}", def_id);
             }
             return;
         }
