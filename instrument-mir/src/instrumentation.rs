@@ -2304,7 +2304,7 @@ impl MyOptimizationPass {
         src_place: Place<'tcx>,
         tag_local_for_ptr_local: &HashMap<Local, Local>,
         ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
-    ) -> Operand<'tcx> {
+        ) -> Operand<'tcx> {
         let mut candidate_local: Option<Local> = None;
 
         let src_local = src_place.local;
@@ -2321,10 +2321,13 @@ impl MyOptimizationPass {
         }
 
         if let Some(local) = candidate_local {
-            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&local) {
+            // Prefer the source local's concrete tag first.
+            // The ref-ancestor slot may hold a synthetic zero in valid flows
+            // (e.g., after RawRoot), and using it first drops provenance.
+            if let Some(tl) = tag_local_for_ptr_local.get(&local) {
                 return Operand::Copy(Place::from(*tl));
             }
-            if let Some(tl) = tag_local_for_ptr_local.get(&local) {
+            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&local) {
                 return Operand::Copy(Place::from(*tl));
             }
         }
@@ -5795,14 +5798,39 @@ impl MyOptimizationPass {
                         addr_extra_stmts = offset_stmts;
                         (opt, stmt)
                     } else {
+                        // Fallback for projection-heavy deref accesses where static offset
+                        // recovery failed (e.g., generic field layout):
+                        // materialize `&raw const <full place>` and expose that pointer.
+                        // Using only `place.local` here points at the base carrier and can
+                        // turn valid projected accesses into false OOB/WILD reports.
+                        let place_ty = place.ty(&body.local_decls, tcx).ty;
+                        let raw_ptr_ty = Ty::new_imm_ptr(tcx, place_ty);
+                        if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
+                            continue;
+                        }
+                        let tmp_ptr = body
+                            .local_decls
+                            .push(LocalDecl::new(raw_ptr_ty, source_info.span));
+                        let raw_ptr_stmt = Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(tmp_ptr),
+                                Rvalue::RawPtr(RawPtrKind::Const, place),
+                            ))),
+                        );
                         match self.addr_stmts_for_place(
                             tcx,
                             body,
                             source_info,
-                            Place::from(place.local),
+                            Place::from(tmp_ptr),
                             addr_local,
                         ) {
-                            Some(stmts) => stmts,
+                            Some((opt_stmt, addr_stmt)) => {
+                                if let Some(s) = opt_stmt {
+                                    addr_extra_stmts.push(s);
+                                }
+                                (Some(raw_ptr_stmt), addr_stmt)
+                            }
                             None => continue,
                         }
                     }
@@ -6049,30 +6077,21 @@ impl MyOptimizationPass {
                         .get(&dst)
                         .expect("missing tag local for PtrDerive dst");
 
+                    let parent_from_src: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*tl))
+                    } else if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
                     let parent_tag_op: Operand<'tcx> = match &creation_kind {
-                        // For ref derivations (e.g., from_raw_parts_mut), pass the nearest
-                        // tracked ref-ancestor if available. This avoids runtime parent recovery
-                        // heuristics on raw-heavy code paths.
-                        InstrKind::PtrDerive { is_ref: true, .. } => {
-                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
-                                Operand::Copy(Place::from(*tl))
-                            } else if let Some(tl) = tag_local_for_ptr_local.get(&src) {
-                                Operand::Copy(Place::from(*tl))
-                            } else {
-                                self.const_u64(tcx, source_info.span, 0)
-                            }
-                        }
+                        // For derivations, use the source local's current tag when available.
+                        // Falling back to ref-ancestor is only a backup path.
+                        InstrKind::PtrDerive { is_ref: true, .. } => parent_from_src,
                         _ => {
-                            // Keep raw-derivation lineage anchored to the nearest ref ancestor
-                            // when available; this avoids raw-only parent chains that trigger
-                            // conservative SB-lite fallback checks in safe code.
-                            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
-                                Operand::Copy(Place::from(*tl))
-                            } else if let Some(tl) = tag_local_for_ptr_local.get(&src) {
-                                Operand::Copy(Place::from(*tl))
-                            } else {
-                                self.const_u64(tcx, source_info.span, 0)
-                            }
+                            // Keep raw derivations connected to source provenance.
+                            parent_from_src
                         }
                     };
 

@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 THIRD_PARTY_DIR="${REPO_ROOT}/third_party"
 
 # Popular + actively maintained fuzz targets.
-DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv)
+DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper)
 
 usage() {
   cat <<'EOF'
@@ -14,7 +14,7 @@ Usage:
   ./scripts/afl_setup.sh [target ...]
 
 Targets:
-  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv
+  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper
 
 Behavior:
   1) clones missing third_party repos for selected targets
@@ -54,6 +54,7 @@ repo_url_for_target() {
     simd_json) echo "https://github.com/simd-lite/simd-json.git" ;;
     zip) echo "https://github.com/zip-rs/zip2.git" ;;
     rkyv) echo "https://github.com/rkyv/rkyv.git" ;;
+    hyper) echo "https://github.com/hyperium/hyper.git" ;;
     *) return 1 ;;
   esac
 }
@@ -62,6 +63,7 @@ repo_dir_for_target() {
   case "$1" in
     quick_xml) echo "${THIRD_PARTY_DIR}/quick-xml" ;;
     simd_json) echo "${THIRD_PARTY_DIR}/simd-json" ;;
+    hyper) echo "${THIRD_PARTY_DIR}/hyper" ;;
     *) echo "${THIRD_PARTY_DIR}/$1" ;;
   esac
 }
@@ -80,13 +82,14 @@ ref_var_name_for_target() {
     simd_json) echo "REF_SIMD_JSON" ;;
     zip) echo "REF_ZIP" ;;
     rkyv) echo "REF_RKYV" ;;
+    hyper) echo "REF_HYPER" ;;
     *) return 1 ;;
   esac
 }
 
 validate_target() {
   case "$1" in
-    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa|simd_json|zip|rkyv) ;;
+    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa|simd_json|zip|rkyv|hyper) ;;
     *) echo "error: unknown target '$1'" >&2; usage; exit 2 ;;
   esac
 }

@@ -45,6 +45,7 @@ members = [
     "examples/ret_ptr_local_uad_interior",
     "examples/simple_raw_write",
     "examples/stack_reuse",
+    "examples/stack_slot_reuse_vec_len",
     "examples/tag0_call_arg_offset_add_sub",
     "examples/tag0_call_arg_wrapping_offset",
     "examples/tag0_cast_then_call",

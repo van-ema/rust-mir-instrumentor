@@ -14,6 +14,19 @@
   (`RZ_USE_STORAGE_DEAD=1`); default remains off to avoid optimized-MIR
   false UAF noise.
 
+## Unknown tags vs untracked regions
+
+- `UNKNOWN_TAG` is still reported by default for reads/writes when a tag is not
+  present in runtime metadata (`__rz_ptr_read` / `__rz_ptr_write`).
+- Stack/TLS suppression does **not** bypass `UNKNOWN_TAG`; it only applies in
+  the later "no containing allocation" path for known tags.
+- `runtime/src/lib.rs` now has a dedicated untracked-region path for TLS
+  (`rz_handle_untracked_region`) so uncertain TLS accesses can be treated
+  separately from generic `WILD_POINTER`.
+- Strict mode for this path: set `RZ_STRICT_UNTRACKED_REGION=1` to emit
+  `UNTRACKED_REGION_ACCESS` instead of silently accepting untracked TLS region
+  accesses.
+
 ## Access-size computation via MIR size_of
 
 To avoid `layout_of` normalization failures in generic MIR, access sizes are now

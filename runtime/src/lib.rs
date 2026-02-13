@@ -117,6 +117,93 @@ fn rz_stack_addr_hint(addr: usize) -> bool {
     addr >= lo && addr <= hi
 }
 
+#[inline]
+fn rz_tls_addr_hint(addr: usize) -> bool {
+    // Heuristic: treat addresses near our thread-local guard as TLS.
+    // This suppresses WILD_POINTER reports for thread-local data (e.g., Tokio budget)
+    // that is not tracked by stack/heap alloc metadata.
+    RZ_IN_RUNTIME_HOOK.with(|c| {
+        let tls = c as *const _ as usize;
+        let lo = tls.saturating_sub(8 * 1024 * 1024);
+        let hi = tls.saturating_add(8 * 1024 * 1024);
+        addr >= lo && addr <= hi
+    })
+}
+
+#[derive(Copy, Clone, Debug)]
+enum UntrackedRegionKind {
+    Tls,
+}
+
+#[inline]
+fn rz_untracked_region_strict() -> bool {
+    std::env::var("RZ_STRICT_UNTRACKED_REGION")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+fn rz_tls_pseudo_range() -> (usize, usize) {
+    RZ_IN_RUNTIME_HOOK.with(|c| {
+        let tls = c as *const _ as usize;
+        (
+            tls.saturating_sub(8 * 1024 * 1024),
+            tls.saturating_add(8 * 1024 * 1024),
+        )
+    })
+}
+
+#[inline]
+fn rz_untracked_region_for_access(addr: usize, size: usize) -> Option<UntrackedRegionKind> {
+    let (start, end) = rz_tls_pseudo_range();
+    let access_end = addr.saturating_add(size.max(1));
+    let stack_like = rz_stack_addr_hint(addr)
+        || rz_stack_addr_hint(access_end.saturating_sub(1));
+    if addr >= start && access_end <= end && !stack_like {
+        return Some(UntrackedRegionKind::Tls);
+    }
+    None
+}
+
+#[inline]
+fn rz_handle_untracked_region(
+    access_kind: &str,
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> bool {
+    let Some(region) = rz_untracked_region_for_access(addr, size) else {
+        return false;
+    };
+
+    // Keep TLS suppression narrow: only for tags with unknown allocation provenance
+    // that also look TLS-originated. This avoids masking real heap/stack OOB accesses
+    // that happen to land inside the coarse TLS pseudo-window.
+    if tmeta.alloc_epoch != 0
+        || !(rz_tls_addr_hint(tmeta.pointee_addr) || rz_tls_addr_hint(addr))
+    {
+        return false;
+    }
+
+    if rz_untracked_region_strict() {
+        let region_name = match region {
+            UntrackedRegionKind::Tls => "TLS",
+        };
+        let msg = append_location_if_enabled(
+            format!(
+                "{access_kind} via tag={tag} addr=0x{addr:x} size={size}\n(untracked region: {region_name}) kind={:?} parent={} pointee=0x{:x}",
+                tmeta.kind,
+                tmeta.parent,
+                tmeta.pointee_addr
+            ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("UNTRACKED_REGION_ACCESS", msg);
+    }
+    true
+}
+
 fn rz_static_ranges() -> &'static Vec<StaticRange> {
     static RANGES: OnceLock<Vec<StaticRange>> = OnceLock::new();
     RANGES.get_or_init(static_image::collect_static_ranges)
@@ -668,15 +755,55 @@ fn find_alloc_containing<'a>(
 fn rz_allow_untracked_stack_ref(tmeta: &TagMeta, addr: usize) -> bool {
     matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
         && tmeta.alloc_epoch == 0
-        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
+        && (rz_stack_addr_hint(addr)
+            || rz_stack_addr_hint(tmeta.pointee_addr)
+            || rz_tls_addr_hint(addr)
+            || rz_tls_addr_hint(tmeta.pointee_addr))
 }
 
 #[inline]
 fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
-    matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
-        && tmeta.parent == 0
-        && tmeta.alloc_epoch == 0
-        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
+    if tmeta.alloc_epoch != 0 {
+        return false;
+    }
+    let is_stack = rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr);
+    let is_tls = rz_tls_addr_hint(addr) || rz_tls_addr_hint(tmeta.pointee_addr);
+    if !(is_stack || is_tls) {
+        return false;
+    }
+
+    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        return false;
+    }
+
+    // Root untracked stack/TLS raws are low-confidence by construction.
+    if tmeta.parent == 0 {
+        return true;
+    }
+
+    // Optimized MIR often threads pointer values through short derived chains
+    // (`Ref -> Raw -> Raw`) while stack-slot metadata is absent. Keep this
+    // suppression narrow: only for untracked stack/TLS chains and shallow depth.
+    let tmap = tags().lock().unwrap();
+    let mut cur = tmeta.parent;
+    let mut depth = 0usize;
+    while cur != 0 && depth < 4 {
+        let Some(pm) = tmap.get(&cur) else {
+            break;
+        };
+        if pm.alloc_epoch == 0
+            && (rz_stack_addr_hint(pm.pointee_addr) || rz_tls_addr_hint(pm.pointee_addr))
+            && matches!(
+                pm.kind,
+                PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
+            )
+        {
+            return true;
+        }
+        cur = pm.parent;
+        depth += 1;
+    }
+    false
 }
 
 #[inline]
@@ -729,9 +856,37 @@ fn rz_allow_stack_ref_oob_noise(
     // Interior references into stack-allocated aggregates can legitimately read/write a value
     // that straddles a coarse tracked slot boundary when optimized MIR loses precise object
     // boundaries for the selected alloc record.
-    let interior_crosses_slot_end =
-        tmeta.pointee_addr > base && access_end > alloc_end;
-    pointee_outside_alloc || access_larger_than_slot || interior_crosses_slot_end
+    let crosses_coarse_slot_end = tmeta.parent != 0
+        && tmeta.pointee_addr >= base
+        && tmeta.pointee_addr < alloc_end
+        && access_end > alloc_end;
+    pointee_outside_alloc || access_larger_than_slot || crosses_coarse_slot_end
+}
+
+#[inline]
+fn rz_allow_stack_raw_root_oob_noise(
+    tmeta: &TagMeta,
+    ameta: &AllocMeta,
+    base: usize,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        return false;
+    }
+    if tmeta.parent != 0 {
+        return false;
+    }
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+        return false;
+    }
+
+    // Root-tagged stack raws are low-confidence when lineage is missing:
+    // coarse stack-slot selection can make near-boundary reads/writes look OOB.
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+    let near_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= 16;
+    near_boundary && size <= 16 && access_end > alloc_end
 }
 
 #[inline(never)]
@@ -1281,6 +1436,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     let Some((base, ameta)) = alloc_opt else {
+        if rz_handle_untracked_region("WRITE", tag, &tmeta, addr, size) {
+            return;
+        }
+
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
@@ -1302,6 +1461,12 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 
                 // If the access overlaps beyond the end of the origin allocation, it's OOB.
                 if addr >= obase && access_end > alloc_end {
+                    if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
+                    if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
                     let msg = append_location_if_enabled(
                         format!(
                             "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
@@ -1532,7 +1697,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size)
+                || rz_allow_stack_raw_root_oob_noise(&tmeta, &ameta, base, addr, size)
+            {
                 return;
             }
             let msg = append_location_if_enabled(
@@ -1651,6 +1818,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let alloc_opt = find_alloc_containing(&amap, addr);
 
     let Some((base, ameta)) = alloc_opt else {
+        if rz_handle_untracked_region("READ", tag, &tmeta, addr, size) {
+            return;
+        }
+
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
@@ -1668,6 +1839,12 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 if addr >= obase && access_end > alloc_end {
+                    if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
+                    if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
                     let msg = append_location_if_enabled(
                         format!(
                             "READ via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
@@ -1868,7 +2045,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size)
+                || rz_allow_stack_raw_root_oob_noise(&tmeta, &ameta, base, addr, size)
+            {
                 return;
             }
             let msg = append_location_if_enabled(

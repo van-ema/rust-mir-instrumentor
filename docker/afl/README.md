@@ -67,6 +67,7 @@ TARGET=itoa PROFILE=debug ./scripts/afl_build.sh
 TARGET=simd_json PROFILE=debug ./scripts/afl_build.sh
 TARGET=zip PROFILE=debug ./scripts/afl_build.sh
 TARGET=rkyv PROFILE=debug ./scripts/afl_build.sh
+TARGET=hyper PROFILE=debug ./scripts/afl_build.sh
 ```
 
 Then you can run/minimize with `afl-tmin` / `afl-cmin` without doing any fuzzing.
@@ -74,7 +75,7 @@ Then you can run/minimize with `afl-tmin` / `afl-cmin` without doing any fuzzing
 Available `TARGET` values:
 
 ```text
-bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv
+bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper
 ```
 
 ## Fuzzing (optional)
