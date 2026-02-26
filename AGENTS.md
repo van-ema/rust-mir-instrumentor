@@ -51,6 +51,7 @@ The project has two main components:
 
 5. **Fuzzing objective and crash policy**
 - Primary objective: implement and improve `rusteze` in this repository, and use it to fuzz real-world Rust targets to find bugs/vulnerabilities.
+- Quality objective: minimize false positives and avoid breaking target-program behavior due to instrumentation, while keeping detection of real memory-safety and aliasing-rule violations high.
 - During fuzzing, keep violation-as-crash behavior enabled to make findings visible to AFL:
   use `RUSTEZE_FAILFAST=1` and `RZ_ABORT_ON_VIOLATION=1` by default.
 - Do not silently suppress violations just to keep fuzzing running; prefer fixing root-cause
