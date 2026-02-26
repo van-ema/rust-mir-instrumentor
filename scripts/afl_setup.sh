@@ -216,7 +216,14 @@ for target in "${select_targets[@]}"; do
   in_dir="${REPO_ROOT}/fuzz/corpus/${target}"
   mkdir -p "${in_dir}"
   if ! find "${in_dir}" -maxdepth 1 -type f -print -quit | grep -q .; then
-    printf '\x00' > "${in_dir}/seed0"
+    case "${target}" in
+      hyper)
+        printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${in_dir}/seed0"
+        ;;
+      *)
+        printf '\x00' > "${in_dir}/seed0"
+        ;;
+    esac
     echo "seed created: ${in_dir}/seed0"
   else
     echo "seed exists: ${in_dir}"

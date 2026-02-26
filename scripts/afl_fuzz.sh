@@ -41,10 +41,34 @@ fi
 
 # AFL++ requires at least one seed file.
 if ! find "$IN_DIR" -maxdepth 1 -type f -print -quit | grep -q .; then
-  printf '\x00' > "${IN_DIR}/seed0"
+  case "$TARGET" in
+    hyper)
+      # Use a minimally valid HTTP/1.1 request so AFL dry-run has at least
+      # one non-trivial, non-crashing seed for async network parsing.
+      printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${IN_DIR}/seed0"
+      ;;
+    *)
+      printf '\x00' > "${IN_DIR}/seed0"
+      ;;
+  esac
 fi
 
-export RUSTEZE_FAILFAST=1
+# Backward compatibility: older setups created `fuzz/corpus/hyper/seed0` as a
+# single NUL byte. That seed often crashes in dry-run and prevents AFL startup.
+if [[ "$TARGET" == "hyper" && -f "${IN_DIR}/seed0" ]]; then
+  seed0_size="$(wc -c < "${IN_DIR}/seed0" | tr -d '[:space:]')"
+  if [[ "$seed0_size" == "1" ]]; then
+    first_byte="$(od -An -tx1 -N1 "${IN_DIR}/seed0" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$first_byte" == "00" ]]; then
+      printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${IN_DIR}/seed0"
+      echo "updated ${IN_DIR}/seed0 to a valid HTTP seed for TARGET=hyper"
+    fi
+  fi
+fi
+
+# Keep fail-fast by default, but allow callers to disable it for noisy targets
+# (e.g., async-heavy crates) so AFL can start and keep mutating inputs.
+export RUSTEZE_FAILFAST="${RUSTEZE_FAILFAST:-1}"
 export RZ_INSTRUMENT_ALL_DEPS=1
 # Keep aliasing checks active by default with tb_lite as the model.
 export RZ_ALIAS_MODEL="${RZ_ALIAS_MODEL:-tb_lite}"

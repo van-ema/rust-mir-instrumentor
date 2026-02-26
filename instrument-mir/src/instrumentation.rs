@@ -291,6 +291,9 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // Volatile intrinsics.
     EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_load", CallEffect::Load),
     EffectRule::one(MatchKind::Contains, "::intrinsics::volatile_store", CallEffect::Store),
+    // Core intrinsics used by mem::replace and similar wrappers.
+    EffectRule::one(MatchKind::Contains, "::intrinsics::read_via_copy", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::intrinsics::write_via_move", CallEffect::Store),
 
     // Memset-like.
     EffectRule::one(MatchKind::Contains, "::intrinsics::write_bytes", CallEffect::MemSet),
@@ -3068,11 +3071,10 @@ impl MyOptimizationPass {
             }
         }
 
-        //  std/alloc pattern where a thin pointer is produced by `Transmute` from
-        // `NonNull<T>`/`Unique<T>` (ADT). TagProp does not apply because the source is not a thin
-        // pointer local, so we synthesize a *root* raw-pointer tag for the destination.
-        //
-        // TODO: recover the parent tag from the pointer stored inside the ADT and propagate it.
+        // std/alloc pattern where a thin pointer is produced by `Transmute` from
+        // `NonNull<T>`/`Unique<T>` (ADT). TagProp does not apply because the source is not
+        // necessarily a thin pointer local. Prefer deriving from a recovered pointer source
+        // local (to keep lineage), and fall back to RawRoot only when recovery fails.
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
@@ -3097,17 +3099,49 @@ impl MyOptimizationPass {
                                 TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
                                 _ => false,
                             };
+                            let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+                            let src_local_opt = self
+                                .place_from_operand(op)
+                                .and_then(|p| p.as_local())
+                                .and_then(|src_local| {
+                                    if self.is_pointer_ty(body.local_decls[src_local].ty) {
+                                        Some(src_local)
+                                    } else {
+                                        self.backtrack_pointer_source_local(
+                                            body,
+                                            src_local,
+                                            &block_data.statements[..stmt_idx],
+                                        )
+                                    }
+                                });
 
                             ptr_locals_needing_tag.insert(dst_local);
                             tagged_ptr_locals.insert(dst_local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx,
-                                insert_before: false,
-                                source_info: stmt.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
-                            });
+                            if let Some(src_local) = src_local_opt {
+                                ptr_locals_needing_tag.insert(src_local);
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::PtrDerive {
+                                        dst: dst_local,
+                                        src: src_local,
+                                        is_mut,
+                                        is_ref,
+                                    },
+                                });
+                            } else {
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                                });
+                            }
                         }
                     }
                 }
@@ -3431,6 +3465,31 @@ impl MyOptimizationPass {
         }
 
         def_id_opt.map(|def_id| (def_id, self.callee_id_u64(tcx, def_id)))
+    }
+
+    /// Best-effort: recover the pointer source local from call arg0.
+    ///
+    /// For wrappers like `read_via_copy` and pointer arithmetic helpers, arg0 carries the
+    /// provenance source for a returned pointer value.
+    fn call_arg0_pointer_source_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        block_data: &BasicBlockData<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+    ) -> Option<Local> {
+        let first = args.get(0)?;
+        let arg_place = self.place_from_operand(&first.node)?;
+        let arg_local = arg_place.local;
+        let arg_ty = body.local_decls[arg_local].ty;
+        if self.is_pointer_ty(arg_ty) {
+            return Some(arg_local);
+        }
+        let base_local = self.backtrack_unsize_base_local(arg_local, &block_data.statements)?;
+        if self.is_pointer_ty(body.local_decls[base_local].ty) {
+            Some(base_local)
+        } else {
+            None
+        }
     }
 
     fn push_ptr_derive_call<'tcx>(
@@ -4223,26 +4282,9 @@ impl MyOptimizationPass {
                             let dst_ty = body.local_decls[dst_local].ty;
                             // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
                             if self.is_pointer_ty(dst_ty) {
-                                // Find base pointer local in arg0 (thin ptr) or backtrack an unsize cast.
-                                let mut src_local_opt: Option<Local> = None;
-                                if let Some(first) = args.get(0) {
-                                    if let Some(arg_place) = self.place_from_operand(&first.node) {
-                                        let arg_local = arg_place.local;
-                                        let arg_ty = body.local_decls[arg_local].ty;
-                                        if self.is_pointer_ty(arg_ty) {
-                                            src_local_opt = Some(arg_local);
-                                        } else if let Some(base_local) =
-                                            self.backtrack_unsize_base_local(arg_local, &block_data.statements)
-                                        {
-                                            let base_ty = body.local_decls[base_local].ty;
-                                            if self.is_pointer_ty(base_ty) {
-                                                src_local_opt = Some(base_local);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(src_local) = src_local_opt {
+                                if let Some(src_local) =
+                                    self.call_arg0_pointer_source_local(body, block_data, args)
+                                {
                                     ptr_locals_needing_tag.insert(dst_local);
                                     ptr_locals_needing_tag.insert(src_local);
                                     Self::push_ptr_derive_call(
@@ -4526,10 +4568,35 @@ impl MyOptimizationPass {
                             AllocShimKind::Alloc | AllocShimKind::AllocZeroed | AllocShimKind::Realloc
                         ))
                     );
-                    let return_tagged_by_effect = matches!(
+                    let mut return_tagged_by_effect = matches!(
                         call_effect_opt,
                         Some(CallEffect::PtrDerive | CallEffect::BoxIntoRaw)
                     ) || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
+
+                    // `core::intrinsics::read_via_copy` is classified as `Load`: when it returns
+                    // a pointer value, that return is derived from arg0's pointer provenance.
+                    if !return_tagged_by_effect
+                        && matches!(call_effect_opt, Some(CallEffect::Load))
+                    {
+                        if let Some(src_local) =
+                            self.call_arg0_pointer_source_local(body, block_data, args)
+                        {
+                            ptr_locals_needing_tag.insert(dst_local);
+                            ptr_locals_needing_tag.insert(src_local);
+                            Self::push_ptr_derive_call(
+                                bb,
+                                block_data,
+                                term,
+                                dst_local,
+                                dst_ty,
+                                src_local,
+                                insert_points,
+                                tagged_ptr_locals,
+                                &mut classified_derive_ptr_local,
+                            );
+                            return_tagged_by_effect = true;
+                        }
+                    }
 
                     if !return_tagged_by_effect {
                         let is_mut = match dst_ty.kind() {
@@ -4565,7 +4632,10 @@ impl MyOptimizationPass {
                                     is_mut,
                                     is_ref,
                                 },
-                });
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -4578,9 +4648,6 @@ impl MyOptimizationPass {
             insert_points.retain(|ip| {
                 !(ip.bb == bb && matches!(ip.kind, InstrKind::HeapAlloc { live: false, .. }))
             });
-        }
-    }
-            }
         }
     }
 
@@ -6168,7 +6235,31 @@ impl MyOptimizationPass {
                         }
                         _ => false,
                     };
-                    let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
+                    // `alias_exempt` argument is a bitfield:
+                    // - bit0: alias-exempt pointee classification (existing behavior)
+                    // - bit1: projected-source raw creation hint (used by runtime lineage repair)
+                    let alias_flags: u8 = match &creation_kind {
+                        InstrKind::Raw { src, .. } => {
+                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            // Raw creation can still lose lineage when source-tag plumbing is
+                            // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
+                            // raw creations as eligible for runtime best-effort repair.
+                            let _ = src;
+                            flags |= 0b10;
+                            flags
+                        }
+                        // RawRoot is emitted exactly in cases where provenance source recovery
+                        // failed at instrumentation time. Mark for runtime best-effort repair.
+                        InstrKind::RawRoot { .. } => {
+                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            flags |= 0b10;
+                            flags
+                        }
+                        _ => {
+                            if alias_exempt { 1 } else { 0 }
+                        }
+                    };
+                    let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
 
                     let bounds_ptr_local = match &creation_kind {
                         InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
@@ -7142,6 +7233,14 @@ mod tests {
         assert_eq!(
             effect_for("core::intrinsics::arith_offset"),
             CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::intrinsics::read_via_copy"),
+            CallEffect::Load
+        );
+        assert_eq!(
+            effect_for("core::intrinsics::write_via_move"),
+            CallEffect::Store
         );
         assert_eq!(
             effect_for("<alloc::vec::Vec<T, A> as core::ops::Index<I>>::index"),

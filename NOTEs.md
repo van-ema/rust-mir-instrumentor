@@ -129,6 +129,41 @@ Outcome:
 - OOB examples like one-past-end deref through returned pointers now keep
   lineage and classify as `OUT_OF_BOUNDS` instead of `WILD_POINTER`.
 
+## Pin/project_replace raw-root lineage drop (tokio/hyper)
+
+Real-world false-positive path seen while fuzzing `hyper`:
+
+- In `tokio::future::maybe_done::MaybeDone::take_output`, `pin-project-lite`
+  expands `project_replace` and creates raw pointers from `Pin<&mut T>` internals.
+- In optimized MIR, this can lower to:
+  - `_14 = move (_1.0: &mut MaybeDone<Fut>)`
+  - `_3 = &raw mut (*_14)`
+  - `__record_raw_ptr_creation(..., derived_from=0, ...)`
+  even though the pointer semantically descends from an existing tagged `&mut`.
+
+Why this is a problem:
+
+- The new raw tag becomes a synthetic root (`parent=0`) and snapshots allocation
+  metadata independently.
+- Later accesses can be checked against this detached snapshot and raise false
+  `OUT_OF_BOUNDS`/`WILD_POINTER` in safe async code.
+
+Current fix:
+
+- Instrumentation now marks projected-source raw creations with a hint bit in
+  the raw-creation call (`alias_exempt` bit1). Runtime uses this to keep repair
+  targeted.
+- Runtime raw-tag creation performs best-effort lineage repair for this
+  pattern only when all hold:
+  - `derived_from=0`
+  - projected-source hint present
+  - stack allocation with known epoch
+  - containing stack slot larger than one pointer word
+  It then reattaches to the newest same-address non-root tag in the same
+  allocation epoch.
+- This keeps checks enabled while preserving provenance for wrapper-heavy
+  optimized async MIR paths.
+
 ### Instrumentation priority order
 
 When multiple hooks target the same basic block and statement index, we order
@@ -217,6 +252,9 @@ Other active heuristics (brief):
 - `runtime/src/lib.rs` (`rz_allow_untracked_stack_ref`,
   `rz_allow_untracked_stack_raw_root`): suppress wild-pointer style failures
   when stack metadata is missing but access/tag look stack-like.
+- `runtime/src/lib.rs` (`rz_allow_stack_raw_root_oob_noise`): suppress low-
+  confidence root-raw stack OOB reports for near-boundary and interior
+  coarse-slot-crossing accesses (optimized MIR stack-slot ambiguity).
 - `runtime/src/lib.rs` (epoch mismatch blocks in `__rz_ptr_read`/`__rz_ptr_write`):
   suppress stack/ref epoch churn noise for `RefShared` (and stack `Ref*` cases).
 - `runtime/src/lib.rs` (`rz_epoch_check_relaxed` via allow-untagged wrappers):
