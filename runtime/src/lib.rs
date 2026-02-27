@@ -932,40 +932,18 @@ fn rz_allow_stack_ref_oob_noise(
     if !rz_stack_ref_oob_noise_enabled() {
         return false;
     }
-    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return false;
     }
-
-    let alloc_end = base.saturating_add(ameta.size);
-    let access_end = addr.saturating_add(size);
-
-    // Coarse stack-slot fallback: optimized MIR can bind a pointer tag to an 8/16-byte
-    // stack carrier slot while the pointer's own bounds describe a larger pointee.
-    // If the access is in-bounds for the tag and only violates the coarse alloc slot,
-    // treat this as low-confidence stack metadata noise.
-    if ameta.size <= (2 * std::mem::size_of::<usize>())
-        && tmeta.bounds_len != 0
-        && matches!(
-            tmeta.kind,
-            PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
-        )
-    {
-        if let Some(bounds_end) = tmeta.pointee_addr.checked_add(tmeta.bounds_len) {
-            let in_bounds = addr >= tmeta.pointee_addr && access_end <= bounds_end;
-            let crosses_alloc = addr < base || access_end > alloc_end;
-            if in_bounds && crosses_alloc {
-                return true;
-            }
-        }
-    }
-
-    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
         return false;
     }
 
     // Optimized MIR stack-lifetime imprecision can leave overlapping/coarse stack alloc metadata.
     // If the selected containing alloc is clearly inconsistent with the reference metadata, treat
     // this as best-effort tracking noise instead of hard OOB.
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
     let pointee_outside_alloc = tmeta.pointee_addr < base || tmeta.pointee_addr >= alloc_end;
     let access_larger_than_slot = size > ameta.size;
     // Interior references into stack-allocated aggregates can legitimately read/write a value

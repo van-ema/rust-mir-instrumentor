@@ -1379,9 +1379,8 @@ impl MyOptimizationPass {
         }
     }
 
-    /// Best-effort pointee bounds length in bytes.
-    /// For wide pointers (slice/str), derive from metadata. For thin pointers to sized types,
-    /// use `size_of::<Pointee>()`. Returns 0 when metadata/size cannot be derived.
+    /// Best-effort bounds length for wide pointers (slice/str), in bytes.
+    /// Returns 0 for thin pointers or unknown metadata.
     fn bounds_len_operand_for_ptr_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1401,7 +1400,6 @@ impl MyOptimizationPass {
                 elem_ty: *elem_ty,
             },
             TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
-            _ if pointee.is_sized(tcx, body.typing_env(tcx)) => SizeOperand::SizeOf(pointee),
             _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
         }
     }
@@ -2094,56 +2092,67 @@ impl MyOptimizationPass {
         ptr_local: Local,
         statements: &[Statement<'tcx>],
     ) -> Option<Local> {
-        for (idx, stmt) in statements.iter().enumerate().rev() {
-            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
-            if place.as_local() != Some(ptr_local) {
-                continue;
+        let mut current_local = ptr_local;
+        let mut search_end = statements.len();
+
+        'outer: loop {
+            for (idx, stmt) in statements[..search_end].iter().enumerate().rev() {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+                if place.as_local() != Some(current_local) {
+                    continue;
+                }
+
+                match rvalue {
+                    Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
+                        let is_deref_src = src_place
+                            .projection
+                            .iter()
+                            .next()
+                            .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+                        if is_deref_src {
+                            return None;
+                        }
+                        return Some(src_place.local);
+                    }
+                    Rvalue::Use(op) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::CopyForDeref(p) => {
+                        let Some(next_local) = p.as_local() else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                        op,
+                        _to_ty,
+                    )
+                    | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _to_ty) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    _ => return None,
+                }
             }
 
-            match rvalue {
-                Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
-                    let is_deref_src = src_place
-                        .projection
-                        .iter()
-                        .next()
-                        .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
-                    if is_deref_src {
-                        return None;
-                    }
-                    return Some(src_place.local);
-                }
-                Rvalue::Use(op) => {
-                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                Rvalue::CopyForDeref(p) => {
-                    if let Some(p_local) = p.as_local() {
-                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                Rvalue::Cast(
-                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
-                    op,
-                    _to_ty,
-                ) => {
-                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _to_ty) => {
-                    if let Some(p_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        return self.backtrack_deref_base_local(p_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                _ => return None,
-            }
+            return None;
         }
-        None
     }
 
     /// Recover the pointee local for a mutable-reference local in the same block.
@@ -2159,43 +2168,59 @@ impl MyOptimizationPass {
         ref_local: Local,
         statements: &[Statement<'tcx>],
     ) -> Option<Local> {
-        for (idx, stmt) in statements.iter().enumerate().rev() {
-            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
-            if place.as_local() != Some(ref_local) {
-                continue;
+        let mut current_local = ref_local;
+        let mut search_end = statements.len();
+
+        'outer: loop {
+            for (idx, stmt) in statements[..search_end].iter().enumerate().rev() {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+                if place.as_local() != Some(current_local) {
+                    continue;
+                }
+
+                match rvalue {
+                    Rvalue::Ref(_, BorrowKind::Mut { .. }, src_place) => {
+                        return Some(src_place.local);
+                    }
+                    Rvalue::Use(op) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::CopyForDeref(p) => {
+                        let Some(next_local) = p.as_local() else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                        op,
+                        _,
+                    )
+                    | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    _ => return None,
+                }
             }
 
-            match rvalue {
-                Rvalue::Ref(_, BorrowKind::Mut { .. }, src_place) => {
-                    return Some(src_place.local);
-                }
-                Rvalue::Use(op) => {
-                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                Rvalue::CopyForDeref(p) => {
-                    if let Some(next_local) = p.as_local() {
-                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                Rvalue::Cast(
-                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
-                    op,
-                    _,
-                )
-                | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
-                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        return self.backtrack_mut_ref_pointee_local(next_local, &statements[..idx]);
-                    }
-                    return None;
-                }
-                _ => return None,
-            }
+            return None;
         }
-        None
     }
 
     /// Best-effort: recover a pointer-typed source local that feeds `dst_local` in the same block.
@@ -2213,72 +2238,46 @@ impl MyOptimizationPass {
         dst_local: Local,
         statements: &[Statement<'tcx>],
     ) -> Option<Local> {
-        for (idx, stmt) in statements.iter().enumerate().rev() {
-            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
-            if place.as_local() != Some(dst_local) {
-                continue;
+        let mut current_local = dst_local;
+        let mut search_end = statements.len();
+
+        'outer: loop {
+            for (idx, stmt) in statements[..search_end].iter().enumerate().rev() {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+                if place.as_local() != Some(current_local) {
+                    continue;
+                }
+
+                let next_local = match rvalue {
+                    Rvalue::Use(op) => self.place_from_operand(op).and_then(|p| p.as_local()),
+                    Rvalue::CopyForDeref(p) => p.as_local(),
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                        op,
+                        _,
+                    )
+                    | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                        self.place_from_operand(op).and_then(|p| p.as_local())
+                    }
+                    Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
+                        Some(src_place.local)
+                    }
+                    _ => return None,
+                };
+
+                let Some(next_local) = next_local else { return None };
+
+                if self.is_pointer_ty(body.local_decls[next_local].ty) {
+                    return Some(next_local);
+                }
+
+                current_local = next_local;
+                search_end = idx;
+                continue 'outer;
             }
 
-            match rvalue {
-                Rvalue::Use(op) => {
-                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
-                            return Some(next_local);
-                        }
-                        return self.backtrack_pointer_source_local(
-                            body,
-                            next_local,
-                            &statements[..idx],
-                        );
-                    }
-                    return None;
-                }
-                Rvalue::CopyForDeref(p) => {
-                    if let Some(next_local) = p.as_local() {
-                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
-                            return Some(next_local);
-                        }
-                        return self.backtrack_pointer_source_local(
-                            body,
-                            next_local,
-                            &statements[..idx],
-                        );
-                    }
-                    return None;
-                }
-                Rvalue::Cast(
-                    CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
-                    op,
-                    _,
-                )
-                | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
-                    if let Some(next_local) = self.place_from_operand(op).and_then(|p| p.as_local()) {
-                        if self.is_pointer_ty(body.local_decls[next_local].ty) {
-                            return Some(next_local);
-                        }
-                        return self.backtrack_pointer_source_local(
-                            body,
-                            next_local,
-                            &statements[..idx],
-                        );
-                    }
-                    return None;
-                }
-                Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
-                    let src_local = src_place.local;
-                    if self.is_pointer_ty(body.local_decls[src_local].ty) {
-                        return Some(src_local);
-                    }
-                    return self.backtrack_pointer_source_local(
-                        body,
-                        src_local,
-                        &statements[..idx],
-                    );
-                }
-                _ => return None,
-            }
+            return None;
         }
-        None
     }
 
     /// Resolve the best parent-tag operand for ref/raw creation from `src_place`.
@@ -6268,65 +6267,34 @@ impl MyOptimizationPass {
                         }
                         _ => false,
                     };
-                    const ALIAS_FLAG_EXEMPT: u8 = 0b0000_0001;
-                    const ALIAS_FLAG_REPAIR_HINT_BASIC: u8 = 0b0000_0010;
-                    const ALIAS_FLAG_REPAIR_HINT_STRONG: u8 = 0b0000_0100;
                     // `alias_exempt` argument is a bitfield:
                     // - bit0: alias-exempt pointee classification (existing behavior)
-                    // - bit1: lineage repair hint (projection/wrapper-heavy lowering)
-                    // - bit2: stronger root-origin hint (call-boundary/root-synthesized value)
+                    // - bit1: projected-source raw creation hint (used by runtime lineage repair)
                     let alias_flags: u8 = match &creation_kind {
-                        InstrKind::Ref { .. } => {
-                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
-                            // Optimized MIR can lower reborrows through wrappers/projections and
-                            // drop parent provenance, effectively turning a reborrow into a root.
-                            // Mark references so runtime can attempt targeted stack lineage repair
-                            // when parent resolution falls back to 0.
-                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
-                            flags
-                        }
                         InstrKind::Raw { src, .. } => {
-                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
+                            let mut flags = if alias_exempt { 1 } else { 0 };
                             // Raw creation can still lose lineage when source-tag plumbing is
                             // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
                             // raw creations as eligible for runtime best-effort repair.
                             let _ = src;
-                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
+                            flags |= 0b10;
                             flags
                         }
                         // RawRoot is emitted exactly in cases where provenance source recovery
-                        // failed at instrumentation time. Mark as strong root-origin hint so
-                        // runtime can use broader (still bounded) parent recovery.
+                        // failed at instrumentation time. Mark for runtime best-effort repair.
                         InstrKind::RawRoot { .. } => {
-                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
-                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
-                            flags
-                        }
-                        InstrKind::RetRoot { .. } => {
-                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
-                            // RetRoot is introduced when caller-side provenance is unavailable.
-                            // Mark as strong root-origin hint so runtime can attempt broader
-                            // stack-lineage recovery instead of always treating it as a hard root.
-                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
+                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            flags |= 0b10;
                             flags
                         }
                         _ => {
-                            if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 }
+                            if alias_exempt { 1 } else { 0 }
                         }
                     };
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
 
                     let bounds_ptr_local = match &creation_kind {
-                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
-                            place.as_local().or_else(|| {
-                                let src_local = src.local;
-                                if self.is_pointer_ty(body.local_decls[src_local].ty) {
-                                    Some(src_local)
-                                } else {
-                                    None
-                                }
-                            })
-                        }
+                        InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
                         InstrKind::RawRoot { ptr_local, .. } => Some(*ptr_local),
                         InstrKind::RetRoot { dst_local, .. } => Some(*dst_local),
                         _ => None,
