@@ -671,6 +671,8 @@ pub struct TagMeta {
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
+    /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
+    pub lineage_hint: u8,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
@@ -957,6 +959,38 @@ fn rz_allow_stack_ref_oob_noise(
 }
 
 #[inline]
+fn rz_allow_stack_ref_root_boundary_oob_noise(
+    tmeta: &TagMeta,
+    ameta: &AllocMeta,
+    base: usize,
+    addr: usize,
+    size: usize,
+) -> bool {
+    // Narrow fallback for root refs created after lineage loss: a valid field read/write can
+    // start at the end of a tiny stack carrier slot (typically pointer-sized pair).
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return false;
+    }
+    if tmeta.parent != 0 || tmeta.bounds_len != 0 {
+        return false;
+    }
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+        return false;
+    }
+
+    let usize_sz = std::mem::size_of::<usize>();
+    if ameta.size > 2 * usize_sz {
+        return false;
+    }
+
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+    let starts_at_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= usize_sz;
+    let small_access = size > 0 && size <= usize_sz;
+    starts_at_boundary && small_access && access_end > alloc_end
+}
+
+#[inline]
 fn rz_allow_stack_raw_root_oob_noise(
     tmeta: &TagMeta,
     ameta: &AllocMeta,
@@ -984,6 +1018,55 @@ fn rz_allow_stack_raw_root_oob_noise(
         && access_end > alloc_end;
     (near_boundary && size <= 16 && access_end > alloc_end)
         || interior_crosses_coarse_slot_end
+}
+
+#[inline]
+fn rz_allow_projected_raw_stack_slot_oob_noise(
+    tmeta: &TagMeta,
+    ameta: &AllocMeta,
+    base: usize,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        return false;
+    }
+    // Strong projected-source hint only; keep this path narrowly targeted.
+    if (tmeta.lineage_hint & 0b0000_0100) == 0 || tmeta.parent == 0 {
+        return false;
+    }
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+        return false;
+    }
+
+    let usize_sz = std::mem::size_of::<usize>();
+    if ameta.size > 2 * usize_sz || size <= 8 * usize_sz {
+        return false;
+    }
+
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+    if access_end <= alloc_end {
+        return false;
+    }
+    if tmeta.pointee_addr < base || tmeta.pointee_addr >= alloc_end {
+        return false;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut cur = tmeta.parent;
+    let mut depth = 0usize;
+    while cur != 0 && depth < 8 {
+        let Some(parent) = tmap.get(&cur) else {
+            break;
+        };
+        if parent.pointee_addr >= base && parent.pointee_addr < alloc_end {
+            return true;
+        }
+        cur = parent.parent;
+        depth += 1;
+    }
+    false
 }
 
 #[inline(never)]
@@ -1561,7 +1644,16 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
                         return;
                     }
+                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, ometa, obase, addr, size)
+                    {
+                        return;
+                    }
                     if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
+                    if rz_allow_projected_raw_stack_slot_oob_noise(
+                        &tmeta, ometa, obase, addr, size,
+                    ) {
                         return;
                     }
                     let msg = append_location_if_enabled(
@@ -1796,6 +1888,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if end > alloc_end {
             if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size)
                 || rz_allow_stack_raw_root_oob_noise(&tmeta, &ameta, base, addr, size)
+                || rz_allow_projected_raw_stack_slot_oob_noise(&tmeta, &ameta, base, addr, size)
             {
                 return;
             }
@@ -1937,6 +2030,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
 
                 if addr >= obase && access_end > alloc_end {
                     if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
+                        return;
+                    }
+                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, ometa, obase, addr, size)
+                    {
                         return;
                     }
                     if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
@@ -2434,6 +2531,7 @@ pub extern "C" fn __record_ref_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
+        lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
@@ -2617,7 +2715,7 @@ pub extern "C" fn __record_raw_ptr_creation(
             alloc_epoch,
             true,
             requested_bounds,
-            false,
+            projected_raw_strong_hint,
             matches!(kind, PtrKind::RawMut),
         );
         if repaired_parent != 0 && repaired_parent != resolved_parent {
@@ -2654,6 +2752,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
+        lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());

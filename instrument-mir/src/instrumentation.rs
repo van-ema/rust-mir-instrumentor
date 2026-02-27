@@ -2308,15 +2308,36 @@ impl MyOptimizationPass {
         src_place: Place<'tcx>,
         tag_local_for_ptr_local: &HashMap<Local, Local>,
         ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
-        ) -> Operand<'tcx> {
+        is_raw_creation: bool,
+    ) -> Operand<'tcx> {
         let mut candidate_local: Option<Local> = None;
+        let block_stmts = &body.basic_blocks[bb].statements;
+        let upto = stmt_idx.min(block_stmts.len());
 
         let src_local = src_place.local;
         if self.is_pointer_ty(body.local_decls[src_local].ty) {
-            candidate_local = Some(src_local);
+            // For raw creation from projected pointer-field loads (`(*ref_to_struct).ptr_field`),
+            // using `src_place.local` as parent incorrectly picks the container-ref tag.
+            // That ties the raw pointer to the stack slot of the wrapper object instead of the
+            // real pointee carried in the field.
+            let projected_raw_field_load = is_raw_creation
+                && !src_place.projection.is_empty()
+                && matches!(
+                    src_place.projection.first(),
+                    Some(ProjectionElem::Deref)
+                )
+                && src_place
+                    .projection
+                    .iter()
+                    .skip(1)
+                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
+            if projected_raw_field_load {
+                candidate_local =
+                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto]);
+            } else {
+                candidate_local = Some(src_local);
+            }
         } else {
-            let block_stmts = &body.basic_blocks[bb].statements;
-            let upto = stmt_idx.min(block_stmts.len());
             candidate_local = self.backtrack_pointer_source_local(
                 body,
                 src_local,
@@ -6171,7 +6192,7 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::PtrDerive { dst, src, is_mut, .. } => {
+                InstrKind::PtrDerive { dst, src, is_mut, is_ref } => {
                     let dst_tag = *tag_local_for_ptr_local
                         .get(&dst)
                         .expect("missing tag local for PtrDerive dst");
@@ -6197,7 +6218,15 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let dst_ty = body.local_decls[dst].ty;
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                    let arg_alias = self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
+                    // Bitfield semantics match __record_* hooks:
+                    // bit0=alias_exempt, bit1=basic lineage-repair hint, bit2=strong hint.
+                    // Raw PtrDerive in optimized MIR often comes from projection-heavy lowering
+                    // and benefits from runtime parent repair when stack metadata is coarse.
+                    let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
+                    if !is_ref {
+                        alias_flags |= 0b10 | 0b100;
+                    }
+                    let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
                     let bounds_len_op = self.bounds_len_operand_for_ptr_local(
                         tcx,
                         body,
@@ -6237,7 +6266,7 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                        InstrKind::Ref { src, .. } => {
                             self.parent_tag_operand_for_src_place(
                                 tcx,
                                 body,
@@ -6247,6 +6276,20 @@ impl MyOptimizationPass {
                                 *src,
                                 tag_local_for_ptr_local,
                                 ref_ancestor_local_for_ptr_local,
+                                false,
+                            )
+                        }
+                        InstrKind::Raw { src, .. } => {
+                            self.parent_tag_operand_for_src_place(
+                                tcx,
+                                body,
+                                bb,
+                                stmt_idx,
+                                source_info,
+                                *src,
+                                tag_local_for_ptr_local,
+                                ref_ancestor_local_for_ptr_local,
+                                true,
                             )
                         }
                         _ => self.const_u64(tcx, source_info.span, 0),
@@ -6269,15 +6312,30 @@ impl MyOptimizationPass {
                     };
                     // `alias_exempt` argument is a bitfield:
                     // - bit0: alias-exempt pointee classification (existing behavior)
-                    // - bit1: projected-source raw creation hint (used by runtime lineage repair)
+                    // - bit1: projected-source creation hint (used by runtime lineage repair)
+                    // - bit2: stronger root-origin repair hint (bounded overlap recovery)
                     let alias_flags: u8 = match &creation_kind {
+                        InstrKind::Ref { src, .. } => {
+                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            // Projection-heavy reference lowering can lose parent lineage and
+                            // synthesize parent=0 at runtime. Hint repair only for projected
+                            // sources to avoid changing simple local-ref behavior.
+                            if !src.projection.is_empty() {
+                                flags |= 0b10 | 0b100;
+                            }
+                            flags
+                        }
                         InstrKind::Raw { src, .. } => {
                             let mut flags = if alias_exempt { 1 } else { 0 };
                             // Raw creation can still lose lineage when source-tag plumbing is
                             // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
                             // raw creations as eligible for runtime best-effort repair.
-                            let _ = src;
                             flags |= 0b10;
+                            // For projected raw sources (`(*p).field`, etc.) also allow strong
+                            // bounded-overlap parent recovery in the runtime repair path.
+                            if !src.projection.is_empty() {
+                                flags |= 0b100;
+                            }
                             flags
                         }
                         // RawRoot is emitted exactly in cases where provenance source recovery
