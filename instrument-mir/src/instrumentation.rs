@@ -1379,8 +1379,9 @@ impl MyOptimizationPass {
         }
     }
 
-    /// Best-effort bounds length for wide pointers (slice/str), in bytes.
-    /// Returns 0 for thin pointers or unknown metadata.
+    /// Best-effort pointee bounds length in bytes.
+    /// For wide pointers (slice/str), derive from metadata. For thin pointers to sized types,
+    /// use `size_of::<Pointee>()`. Returns 0 when metadata/size cannot be derived.
     fn bounds_len_operand_for_ptr_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1400,6 +1401,7 @@ impl MyOptimizationPass {
                 elem_ty: *elem_ty,
             },
             TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            _ if pointee.is_sized(tcx, body.typing_env(tcx)) => SizeOperand::SizeOf(pointee),
             _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
         }
     }
@@ -4369,33 +4371,58 @@ impl MyOptimizationPass {
                     TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
                     _ => false,
                 };
+                let is_ref = matches!(ty.kind(), TyKind::Ref(..));
                 tagged_ptr_locals.insert(p.local);
                 ptr_locals_needing_tag.insert(p.local);
-                let root_kind = if matches!(ty.kind(), TyKind::Ref(..)) {
-                    // For reference-typed args, preserve ref semantics at the root.
-                    // Emitting RawRoot here loses that information and can produce
-                    // spurious stack wild-pointer reports when call-boundary tags
-                    // are missing for optimized/indirect calls.
-                    InstrKind::RetRoot {
-                        dst_local: p.local,
-                        is_mut,
-                        is_ref: true,
-                    }
+                let derive_src = self
+                    .backtrack_pointer_source_local(body, p.local, &block_data.statements)
+                    .filter(|src_local| *src_local != p.local && tagged_ptr_locals.contains(src_local));
+                if let Some(src_local) = derive_src {
+                    ptr_locals_needing_tag.insert(src_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        // Use the full argument place (including projections), not just
+                        // the carrier local. For projected pointer arguments, using only
+                        // `p.local` retags the wrong address and desynchronizes tag pointee
+                        // from the actual call operand pointer value.
+                        place: p,
+                        kind: InstrKind::PtrDerive {
+                            dst: p.local,
+                            src: src_local,
+                            is_mut,
+                            is_ref,
+                        },
+                    });
                 } else {
-                    InstrKind::RawRoot { ptr_local: p.local, is_mut }
-                };
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx: block_data.statements.len(),
-                    insert_before: false,
-                    source_info: term.source_info,
-                    // Use the full argument place (including projections), not just
-                    // the carrier local. For projected pointer arguments, using only
-                    // `p.local` retags the wrong address and desynchronizes tag pointee
-                    // from the actual call operand pointer value.
-                    place: p,
-                    kind: root_kind,
-                });
+                    let root_kind = if is_ref {
+                        // For reference-typed args, preserve ref semantics at the root.
+                        // Emitting RawRoot here loses that information and can produce
+                        // spurious stack wild-pointer reports when call-boundary tags
+                        // are missing for optimized/indirect calls.
+                        InstrKind::RetRoot {
+                            dst_local: p.local,
+                            is_mut,
+                            is_ref: true,
+                        }
+                    } else {
+                        InstrKind::RawRoot { ptr_local: p.local, is_mut }
+                    };
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        // Use the full argument place (including projections), not just
+                        // the carrier local. For projected pointer arguments, using only
+                        // `p.local` retags the wrong address and desynchronizes tag pointee
+                        // from the actual call operand pointer value.
+                        place: p,
+                        kind: root_kind,
+                    });
+                }
             }
         
             // Inter-procedural: push argument tag to callee if instrumented.
@@ -4424,6 +4451,7 @@ impl MyOptimizationPass {
                 && !unknown_call_returns_ptr
                 && matches!(ty.kind(), TyKind::Ref(..))
             {
+                let is_mut_ref = matches!(ty.kind(), TyKind::Ref(_, _, Mutability::Mut));
                 let size_op = match ty.kind() {
                     TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
                         self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
@@ -4442,14 +4470,19 @@ impl MyOptimizationPass {
                         size_op: size_op.clone(),
                     },
                 });
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx: block_data.statements.len(),
-                    insert_before: false,
-                    source_info: term.source_info,
-                    place: p,
-                    kind: InstrKind::PtrWriteAllowUntagged { ptr_local: p.local, size_op },
-                });
+                // Shared refs (`&T`) are read-only at the type level. Emitting unknown-call
+                // write checks for them causes false positives in std/core helper paths
+                // (e.g., compare/equality intrinsics over static data).
+                if is_mut_ref {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind: InstrKind::PtrWriteAllowUntagged { ptr_local: p.local, size_op },
+                    });
+                }
             }
         
             // Always record a coarse escape event for pointer arguments at call boundaries,
@@ -6235,34 +6268,65 @@ impl MyOptimizationPass {
                         }
                         _ => false,
                     };
+                    const ALIAS_FLAG_EXEMPT: u8 = 0b0000_0001;
+                    const ALIAS_FLAG_REPAIR_HINT_BASIC: u8 = 0b0000_0010;
+                    const ALIAS_FLAG_REPAIR_HINT_STRONG: u8 = 0b0000_0100;
                     // `alias_exempt` argument is a bitfield:
                     // - bit0: alias-exempt pointee classification (existing behavior)
-                    // - bit1: projected-source raw creation hint (used by runtime lineage repair)
+                    // - bit1: lineage repair hint (projection/wrapper-heavy lowering)
+                    // - bit2: stronger root-origin hint (call-boundary/root-synthesized value)
                     let alias_flags: u8 = match &creation_kind {
+                        InstrKind::Ref { .. } => {
+                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
+                            // Optimized MIR can lower reborrows through wrappers/projections and
+                            // drop parent provenance, effectively turning a reborrow into a root.
+                            // Mark references so runtime can attempt targeted stack lineage repair
+                            // when parent resolution falls back to 0.
+                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
+                            flags
+                        }
                         InstrKind::Raw { src, .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
                             // Raw creation can still lose lineage when source-tag plumbing is
                             // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
                             // raw creations as eligible for runtime best-effort repair.
                             let _ = src;
-                            flags |= 0b10;
+                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
                             flags
                         }
                         // RawRoot is emitted exactly in cases where provenance source recovery
-                        // failed at instrumentation time. Mark for runtime best-effort repair.
+                        // failed at instrumentation time. Mark as strong root-origin hint so
+                        // runtime can use broader (still bounded) parent recovery.
                         InstrKind::RawRoot { .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
-                            flags |= 0b10;
+                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
+                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
+                            flags
+                        }
+                        InstrKind::RetRoot { .. } => {
+                            let mut flags = if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 };
+                            // RetRoot is introduced when caller-side provenance is unavailable.
+                            // Mark as strong root-origin hint so runtime can attempt broader
+                            // stack-lineage recovery instead of always treating it as a hard root.
+                            flags |= ALIAS_FLAG_REPAIR_HINT_BASIC | ALIAS_FLAG_REPAIR_HINT_STRONG;
                             flags
                         }
                         _ => {
-                            if alias_exempt { 1 } else { 0 }
+                            if alias_exempt { ALIAS_FLAG_EXEMPT } else { 0 }
                         }
                     };
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
 
                     let bounds_ptr_local = match &creation_kind {
-                        InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
+                        InstrKind::Ref { src, .. } | InstrKind::Raw { src, .. } => {
+                            place.as_local().or_else(|| {
+                                let src_local = src.local;
+                                if self.is_pointer_ty(body.local_decls[src_local].ty) {
+                                    Some(src_local)
+                                } else {
+                                    None
+                                }
+                            })
+                        }
                         InstrKind::RawRoot { ptr_local, .. } => Some(*ptr_local),
                         InstrKind::RetRoot { dst_local, .. } => Some(*dst_local),
                         _ => None,

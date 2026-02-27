@@ -551,22 +551,32 @@ fn tb_lite_check(
                 TbPerm::Reserved { conflicted: true },
                 true,
             ) => {
-                let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
-                    access_tag, addr, size, tmeta.kind, n.tag
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                if n.tag == access_tag {
+                    let mut msg = format!(
+                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
+                        access_tag, addr, size, tmeta.kind, n.tag
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
+                // Descendant writes can represent normal activation through a reborrow chain.
+                // Keep direct conflicted-tag writes as violations, but avoid flagging every
+                // protected conflicted ancestor on descendant activation.
+                TbPerm::Active
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
+                if matches!(n.kind, BorrowKind::RawMut) && !n.protected {
+                    TbPerm::Active
+                } else {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
                     access_tag, addr, size, tmeta.kind
                 );
                 msg.push_str(&dump);
                 return Some(msg);
+                }
             }
             (AliasAccessKind::Write, true, TbPerm::Disabled, _) => {
                 let mut msg = format!(

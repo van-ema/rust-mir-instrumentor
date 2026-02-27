@@ -754,30 +754,94 @@ fn find_alloc_containing<'a>(
 /// Best-effort lineage repair for stack roots:
 /// when instrumentation emits a root raw tag (`parent=0`) for an address that already has
 /// same-address non-root tags in the same allocation epoch, attach to the newest one.
+/// With a strong hint, also allow bounded overlap-based recovery within the same stack alloc.
 #[inline]
-fn recover_parent_for_stack_root(pointee_addr: usize, alloc_epoch: u64, is_stack: bool) -> u64 {
+fn recover_parent_for_stack_root(
+    pointee_addr: usize,
+    alloc_epoch: u64,
+    is_stack: bool,
+    requested_bounds_len: usize,
+    strong_hint: bool,
+    require_mut_parent: bool,
+) -> u64 {
     if !is_stack || alloc_epoch == 0 || pointee_addr == 0 {
         return 0;
     }
 
-    tags()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|(&tag, meta)| {
-            if meta.pointee_addr != pointee_addr {
-                return None;
+    let requested_span = if requested_bounds_len == 0 {
+        std::mem::size_of::<usize>()
+    } else {
+        requested_bounds_len
+    };
+    let requested_end = pointee_addr.saturating_add(requested_span);
+
+    let amap = allocs().lock().unwrap();
+    let root_base = find_alloc_containing(&amap, pointee_addr).map(|(base, _)| base);
+    let tmap = tags().lock().unwrap();
+    let mut exact_parent = 0u64;
+    let mut overlap_parent: Option<(usize, u64)> = None;
+
+    for (&tag, meta) in tmap.iter() {
+        if meta.parent == 0 {
+            continue;
+        }
+        if meta.alloc_epoch != 0 && meta.alloc_epoch != alloc_epoch {
+            continue;
+        }
+        if require_mut_parent && !matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
+            continue;
+        }
+        if let Some(base) = root_base {
+            let Some((cand_base, _)) = find_alloc_containing(&amap, meta.pointee_addr) else {
+                continue;
+            };
+            if cand_base != base {
+                continue;
             }
-            if meta.parent == 0 {
-                return None;
+        }
+
+        if meta.pointee_addr == pointee_addr {
+            if tag > exact_parent {
+                exact_parent = tag;
             }
-            if meta.alloc_epoch != 0 && meta.alloc_epoch != alloc_epoch {
-                return None;
+            continue;
+        }
+
+        if !strong_hint {
+            continue;
+        }
+
+        let cand_span = if meta.bounds_len == 0 {
+            std::mem::size_of::<usize>()
+        } else {
+            meta.bounds_len
+        };
+        let cand_end = meta.pointee_addr.saturating_add(cand_span);
+        let overlaps = pointee_addr < cand_end && meta.pointee_addr < requested_end;
+        if !overlaps {
+            continue;
+        }
+
+        let distance = if meta.pointee_addr >= pointee_addr {
+            meta.pointee_addr - pointee_addr
+        } else {
+            pointee_addr - meta.pointee_addr
+        };
+        match overlap_parent {
+            None => overlap_parent = Some((distance, tag)),
+            Some((best_distance, best_tag)) => {
+                if distance < best_distance || (distance == best_distance && tag > best_tag) {
+                    overlap_parent = Some((distance, tag));
+                }
             }
-            Some(tag)
-        })
-        .max()
-        .unwrap_or(0)
+        }
+    }
+
+    if exact_parent != 0 {
+        exact_parent
+    } else {
+        overlap_parent.map(|(_, tag)| tag).unwrap_or(0)
+    }
 }
 
 #[inline]
@@ -868,18 +932,40 @@ fn rz_allow_stack_ref_oob_noise(
     if !rz_stack_ref_oob_noise_enabled() {
         return false;
     }
-    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
         return false;
     }
-    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+
+    // Coarse stack-slot fallback: optimized MIR can bind a pointer tag to an 8/16-byte
+    // stack carrier slot while the pointer's own bounds describe a larger pointee.
+    // If the access is in-bounds for the tag and only violates the coarse alloc slot,
+    // treat this as low-confidence stack metadata noise.
+    if ameta.size <= (2 * std::mem::size_of::<usize>())
+        && tmeta.bounds_len != 0
+        && matches!(
+            tmeta.kind,
+            PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
+        )
+    {
+        if let Some(bounds_end) = tmeta.pointee_addr.checked_add(tmeta.bounds_len) {
+            let in_bounds = addr >= tmeta.pointee_addr && access_end <= bounds_end;
+            let crosses_alloc = addr < base || access_end > alloc_end;
+            if in_bounds && crosses_alloc {
+                return true;
+            }
+        }
+    }
+
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return false;
     }
 
     // Optimized MIR stack-lifetime imprecision can leave overlapping/coarse stack alloc metadata.
     // If the selected containing alloc is clearly inconsistent with the reference metadata, treat
     // this as best-effort tracking noise instead of hard OOB.
-    let alloc_end = base.saturating_add(ameta.size);
-    let access_end = addr.saturating_add(size);
     let pointee_outside_alloc = tmeta.pointee_addr < base || tmeta.pointee_addr >= alloc_end;
     let access_larger_than_slot = size > ameta.size;
     // Interior references into stack-allocated aggregates can legitimately read/write a value
@@ -2212,12 +2298,19 @@ pub extern "C" fn __record_ref_creation(
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
+    // `alias_exempt` is a bitfield emitted by instrumentation:
+    // - bit0: alias-exempt classification
+    // - bit1: basic lineage-repair hint
+    // - bit2: strong root-origin repair hint
+    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let projected_ref_hint = (alias_exempt & 0b0000_0010) != 0;
+    let projected_ref_strong_hint = (alias_exempt & 0b0000_0100) != 0;
 
     if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
         kind,
         parent_tag,
-        alias_exempt != 0,
+        alias_exempt_flag,
         bounds_len,
     ) {
         rz_violation(
@@ -2230,7 +2323,10 @@ pub extern "C" fn __record_ref_creation(
     // allocation snapshot to keep stack-slot reuse detectable.
     // Exception: if the new ref clearly points into a different allocation than the parent
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
-    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len, resolved_parent_tag) = if parent_tag != 0 {
+    let mut alloc_is_stack = false;
+    let mut alloc_size = 0usize;
+    let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len, mut resolved_parent_tag) =
+        if parent_tag != 0 {
         let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
             .lock()
             .unwrap()
@@ -2244,6 +2340,8 @@ pub extern "C" fn __record_ref_creation(
             let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
             match (parent_alloc, pointee_alloc) {
                 (Some((parent_base, _parent_meta)), Some((pointee_base, pointee_meta))) => {
+                    alloc_is_stack = pointee_meta.is_stack;
+                    alloc_size = pointee_meta.size;
                     if parent_base != pointee_base
                         || (parent_epoch != 0
                             && pointee_meta.epoch != 0
@@ -2269,6 +2367,8 @@ pub extern "C" fn __record_ref_creation(
                     }
                 }
                 (None, Some((_pointee_base, pointee_meta))) => {
+                    alloc_is_stack = pointee_meta.is_stack;
+                    alloc_size = pointee_meta.size;
                     (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
                 }
                 (None, None) => {
@@ -2291,6 +2391,8 @@ pub extern "C" fn __record_ref_creation(
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, pointee_addr)
             .map(|(_base, m)| {
+                alloc_is_stack = m.is_stack;
+                alloc_size = m.size;
                 if m.is_stack && !m.live {
                     (0, false, 0, 0)
                 } else {
@@ -2299,6 +2401,51 @@ pub extern "C" fn __record_ref_creation(
             })
             .unwrap_or((0, false, 0, 0))
     };
+
+    // Optimized MIR can emit root reference creations in wrapper/projection-heavy paths where
+    // caller-side provenance is lost. For stack pointers only, try to reconnect to the newest
+    // same-address non-root tag in the same allocation epoch.
+    if resolved_parent_tag == 0
+        && projected_ref_hint
+        && alloc_is_stack
+        && alloc_epoch != 0
+        && alloc_size >= std::mem::size_of::<usize>()
+    {
+        let requested_bounds = if bounds_len != 0 {
+            bounds_len
+        } else {
+            inherited_bounds_len
+        };
+        let repaired_parent = recover_parent_for_stack_root(
+            pointee_addr,
+            alloc_epoch,
+            true,
+            requested_bounds,
+            projected_ref_strong_hint,
+            matches!(kind, PtrKind::RefMut),
+        );
+        if repaired_parent != 0 {
+            resolved_parent_tag = repaired_parent;
+            if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent_tag).cloned() {
+                if inherited_bounds_len == 0 {
+                    inherited_bounds_len = parent_meta.bounds_len;
+                }
+                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
+                    alloc_epoch = parent_meta.alloc_epoch;
+                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
+                }
+            }
+            rz_trace!(
+                "__record_ref_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
+                pointee_addr,
+                parent_tag,
+                resolved_parent_tag,
+                alloc_epoch,
+                alloc_size
+            );
+        }
+    }
+
     let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
@@ -2308,7 +2455,7 @@ pub extern "C" fn __record_ref_creation(
         escaped: false,
         alloc_epoch,
         alloc_live_at_creation,
-        alias_exempt: alias_exempt != 0,
+        alias_exempt: alias_exempt_flag,
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
@@ -2343,12 +2490,17 @@ pub extern "C" fn __record_raw_ptr_creation(
     let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
     // `alias_exempt` is a bitfield emitted by instrumentation:
     // - bit0: alias-exempt classification
-    // - bit1: projected-source raw creation hint (for targeted lineage repair)
+    // - bit1: basic lineage-repair hint
+    // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
+    let projected_raw_strong_hint = (alias_exempt & 0b0000_0100) != 0;
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
+    let mut parent_alloc_mismatch = false;
+    let mut parent_is_root = false;
+    let mut parent_pointee_addr: Option<usize> = None;
 
     // IMPORTANT: On retagging/derived pointers (derived_from != 0), prefer inheriting the
     // parent's alloc_epoch to keep the original allocation-instance snapshot and make
@@ -2356,26 +2508,47 @@ pub extern "C" fn __record_raw_ptr_creation(
     // clearly points into a different allocation than the parent, refresh to the pointee's
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
     let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) = if derived_from != 0 {
-        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) = tags()
             .lock()
             .unwrap()
             .get(&derived_from)
-            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
-            .unwrap_or((0, false, None, 0));
+            .map(|p| {
+                (
+                    p.alloc_epoch,
+                    p.alloc_live_at_creation,
+                    Some(p.pointee_addr),
+                    p.bounds_len,
+                    p.parent,
+                )
+            })
+            .unwrap_or((0, false, None, 0, 0));
+        parent_is_root = parent_parent == 0;
+        parent_pointee_addr = parent_pointee;
 
         if let Some(parent_pointee) = parent_pointee {
             let amap = allocs().lock().unwrap();
             let parent_alloc = find_alloc_containing(&amap, parent_pointee);
             let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
-            if let (Some((parent_base, _)), Some((pointee_base, pointee_meta))) =
-                (parent_alloc, pointee_alloc)
-            {
+            if let Some((pointee_base, pointee_meta)) = pointee_alloc {
                 alloc_is_stack = pointee_meta.is_stack;
                 alloc_size = pointee_meta.size;
-                if parent_base != pointee_base {
-                    (pointee_meta.epoch, pointee_meta.live, 0)
-                } else {
-                    (parent_epoch, parent_live, inherited_bounds_len)
+                match parent_alloc {
+                    Some((parent_base, _)) if parent_base == pointee_base => {
+                        (parent_epoch, parent_live, inherited_bounds_len)
+                    }
+                    Some((_parent_base, _)) => {
+                        parent_alloc_mismatch = true;
+                        (pointee_meta.epoch, pointee_meta.live, 0)
+                    }
+                    None => {
+                        // Parent alloc metadata can be missing in optimized lowering
+                        // even when the child pointee alloc is known. Prefer the child
+                        // alloc snapshot and allow exact-address lineage recovery below.
+                        if parent_pointee != pointee_addr {
+                            parent_alloc_mismatch = true;
+                        }
+                        (pointee_meta.epoch, pointee_meta.live, 0)
+                    }
                 }
             } else {
                 (parent_epoch, parent_live, inherited_bounds_len)
@@ -2408,9 +2581,21 @@ pub extern "C" fn __record_raw_ptr_creation(
         && projected_raw_hint
         && alloc_is_stack
         && alloc_epoch != 0
-        && alloc_size > std::mem::size_of::<usize>()
+        && alloc_size >= std::mem::size_of::<usize>()
     {
-        let repaired_parent = recover_parent_for_stack_root(pointee_addr, alloc_epoch, true);
+        let requested_bounds = if bounds_len != 0 {
+            bounds_len
+        } else {
+            inherited_bounds_len
+        };
+        let repaired_parent = recover_parent_for_stack_root(
+            pointee_addr,
+            alloc_epoch,
+            true,
+            requested_bounds,
+            projected_raw_strong_hint,
+            matches!(kind, PtrKind::RawMut),
+        );
         if repaired_parent != 0 {
             resolved_parent = repaired_parent;
             if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent).cloned() {
@@ -2426,6 +2611,54 @@ pub extern "C" fn __record_raw_ptr_creation(
                 "__record_raw_ptr_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
                 pointee_addr,
                 derived_from,
+                resolved_parent,
+                alloc_epoch,
+                alloc_size
+            );
+        }
+    }
+
+    // Derived pointer creation can still lose effective lineage in optimized async lowering:
+    // a raw pointer may be emitted as "derived" from a freshly synthesized root that points to
+    // a different stack slot than the raw pointee. In that shape we prefer exact same-address
+    // non-root recovery over keeping the mismatched root parent.
+    if resolved_parent != 0
+        && parent_is_root
+        && (parent_alloc_mismatch || parent_pointee_addr.map_or(false, |pp| pp != pointee_addr))
+        && alloc_is_stack
+        && alloc_epoch != 0
+        && alloc_size >= std::mem::size_of::<usize>()
+    {
+        let requested_bounds = if bounds_len != 0 {
+            bounds_len
+        } else {
+            inherited_bounds_len
+        };
+        let repaired_parent = recover_parent_for_stack_root(
+            pointee_addr,
+            alloc_epoch,
+            true,
+            requested_bounds,
+            false,
+            matches!(kind, PtrKind::RawMut),
+        );
+        if repaired_parent != 0 && repaired_parent != resolved_parent {
+            let previous_parent = resolved_parent;
+            resolved_parent = repaired_parent;
+            if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent).cloned() {
+                if inherited_bounds_len == 0 {
+                    inherited_bounds_len = parent_meta.bounds_len;
+                }
+                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
+                    alloc_epoch = parent_meta.alloc_epoch;
+                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
+                }
+            }
+            rz_trace!(
+                "__record_raw_ptr_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
+                pointee_addr,
+                derived_from,
+                previous_parent,
                 resolved_parent,
                 alloc_epoch,
                 alloc_size
@@ -2454,12 +2687,13 @@ pub extern "C" fn __record_raw_ptr_creation(
         _ => "?",
     };
     rz_trace!(
-        "__record_raw_ptr_creation called: tag={}, from={} (resolved={}), pointee=0x{:x}, kind={}",
+        "__record_raw_ptr_creation called: tag={}, from={} (resolved={}), pointee=0x{:x}, kind={}, bounds={}",
         tag,
         derived_from,
         resolved_parent,
         pointee_addr,
-        kind_str
+        kind_str,
+        bounds_len
     );
     tag
 }

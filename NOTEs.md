@@ -153,14 +153,20 @@ Current fix:
 - Instrumentation now marks projected-source raw creations with a hint bit in
   the raw-creation call (`alias_exempt` bit1). Runtime uses this to keep repair
   targeted.
-- Runtime raw-tag creation performs best-effort lineage repair for this
-  pattern only when all hold:
-  - `derived_from=0`
-  - projected-source hint present
-  - stack allocation with known epoch
-  - containing stack slot larger than one pointer word
-  It then reattaches to the newest same-address non-root tag in the same
-  allocation epoch.
+- Runtime raw-tag creation performs best-effort lineage repair in two cases:
+  - root-raw creation (`derived_from=0`) with projected-source hint;
+  - derived-raw creation where the resolved parent is a root-like mismatch
+    (parent points to a different stack pointee / alloc snapshot).
+  In both cases, repair is exact-address and epoch-scoped: reattach to the
+  newest same-address non-root tag in the same allocation epoch.
+- Runtime now prefers child-pointee alloc metadata when parent alloc metadata is
+  missing in optimized lowering. This keeps stack/epoch context available for
+  the lineage repair above.
+- Bounds propagation for raw/ref creation was tightened:
+  - if destination is a projected place (no destination local), bounds lookup
+    falls back to the source pointer local;
+  - thin pointers now carry `size_of::<Pointee>()` as `bounds_len` (wide ptrs
+    still use metadata-derived length).
 - This keeps checks enabled while preserving provenance for wrapper-heavy
   optimized async MIR paths.
 
@@ -267,6 +273,8 @@ Other active heuristics (brief):
   opt out alias checks for non-`Freeze` / uncertain pointee types.
 - `instrument-mir/src/instrumentation.rs` (projection offset builder):
   unsupported nested-deref / complex index patterns fall back to base address.
+- `instrument-mir/src/instrumentation.rs` (`bounds_len_operand_for_ptr_local`):
+  thin pointers use `size_of::<Pointee>()` as best-effort bounds (was `0`).
 - `instrument-mir/src/instrumentation.rs` (fallback stack locals):
   if optimized MIR omits `StorageLive/Dead`, selected locals are treated as
   live for function lifetime.
@@ -363,9 +371,10 @@ Current transitions (node-level, range-overlap based):
 - Unique/raw-mut writes disable overlapping non-ancestor branches.
 - Foreign reads over protected `Reserved(conflicted=false)` set
   `Reserved(conflicted=true)`.
-- Child writes through protected `Reserved(conflicted=true)` are rejected
-  (`TB_LITE_2PHASE_CONFLICT`).
+- Direct writes through protected `Reserved(conflicted=true)` are rejected
+  (`TB_LITE_2PHASE_CONFLICT`); descendant activation writes are allowed.
 - Foreign reads over `Active` degrade to `Frozen` (or `Disabled` if protected).
+- Descendant writes may reactivate a frozen, non-protected `RawMut` ancestor.
 - Foreign writes disable the overlapping node.
 - `Disabled` tags are treated as invalidated.
 
