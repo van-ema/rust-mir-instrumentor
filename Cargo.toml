@@ -75,6 +75,7 @@ members = [
     "examples/tb_miri_micro",
     "examples/wide_ptr_raw_slice_cast_ok",
     "examples/wide_ptr_raw_str_cast_ok",
+    "examples/maybeuninit_array_assume_init_ok",
     "examples/wide_ptr_slice_uaf_write",
     "examples/wide_ptr_slice_uaf_read",
     "examples/wide_ptr_dyn_trait_cast_ok",

@@ -672,6 +672,7 @@ pub struct TagMeta {
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
     /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
+    /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source.
     pub lineage_hint: u8,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
@@ -2568,9 +2569,11 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit0: alias-exempt classification
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
+    // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let projected_raw_strong_hint = (alias_exempt & 0b0000_0100) != 0;
+    let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
@@ -2661,8 +2664,10 @@ pub extern "C" fn __record_raw_ptr_creation(
     {
         let requested_bounds = if bounds_len != 0 {
             bounds_len
-        } else {
+        } else if carry_bounds_from_source {
             inherited_bounds_len
+        } else {
+            0
         };
         let repaired_parent = recover_parent_for_stack_root(
             pointee_addr,
@@ -2707,8 +2712,10 @@ pub extern "C" fn __record_raw_ptr_creation(
     {
         let requested_bounds = if bounds_len != 0 {
             bounds_len
-        } else {
+        } else if carry_bounds_from_source {
             inherited_bounds_len
+        } else {
+            0
         };
         let repaired_parent = recover_parent_for_stack_root(
             pointee_addr,
@@ -2742,7 +2749,13 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
 
-    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
+    let bounds_len = if bounds_len != 0 {
+        bounds_len
+    } else if carry_bounds_from_source {
+        inherited_bounds_len
+    } else {
+        0
+    };
 
     let tmeta = TagMeta {
         pointee_addr,

@@ -831,6 +831,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "maybeuninit_array_assume_init_ok"
+version = "0.1.0"
+
+[[package]]
 name = "medium_bytes_driver"
 version = "0.1.0"
 dependencies = [

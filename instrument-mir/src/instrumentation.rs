@@ -1404,6 +1404,27 @@ impl MyOptimizationPass {
         }
     }
 
+    fn ptr_ty_has_precise_wide_bounds<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                matches!(pointee.kind(), TyKind::Slice(..) | TyKind::Str)
+            }
+            _ => false,
+        }
+    }
+
+    fn should_forward_bounds_from_src_ptr_derive<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src: Local,
+        dst: Local,
+    ) -> bool {
+        let src_ty = body.local_decls[src].ty;
+        let dst_ty = body.local_decls[dst].ty;
+        self.ptr_ty_has_precise_wide_bounds(src_ty) && self.is_thin_ptr_ty(tcx, body, dst_ty)
+    }
+
     fn field_offset_bytes<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -6219,12 +6240,16 @@ impl MyOptimizationPass {
                     let dst_ty = body.local_decls[dst].ty;
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
                     // Bitfield semantics match __record_* hooks:
-                    // bit0=alias_exempt, bit1=basic lineage-repair hint, bit2=strong hint.
+                    // bit0=alias_exempt, bit1=basic lineage-repair hint, bit2=strong hint,
+                    // bit3=carry wide bounds from src when derivation drops metadata.
                     // Raw PtrDerive in optimized MIR often comes from projection-heavy lowering
                     // and benefits from runtime parent repair when stack metadata is coarse.
                     let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
                     if !is_ref {
                         alias_flags |= 0b10 | 0b100;
+                        if self.should_forward_bounds_from_src_ptr_derive(tcx, body, src, dst) {
+                            alias_flags |= 0b1000;
+                        }
                     }
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
                     let bounds_len_op = self.bounds_len_operand_for_ptr_local(
