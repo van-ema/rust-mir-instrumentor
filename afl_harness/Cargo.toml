@@ -16,6 +16,7 @@ quick_xml_driver = ["dep:quick-xml"]
 simd_json_driver = ["dep:simd-json"]
 zip_driver = ["dep:zip"]
 rkyv_driver = ["dep:rkyv"]
+hyper_driver = ["dep:hyper", "dep:tokio", "dep:http-body-util"]
 
 [dependencies]
 bytes = { path = "../third_party/bytes", optional = true }
@@ -30,6 +31,9 @@ itoa = { version = "1.0", optional = true }
 simd-json = { version = "0.14", features = ["serde_impl"], optional = true }
 zip = { version = "2.2", default-features = false, features = ["deflate"], optional = true }
 rkyv = { version = "0.8", default-features = false, features = ["std", "alloc", "bytecheck"], optional = true }
+hyper = { path = "../third_party/hyper", features = ["full"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"], optional = true }
 
 [[bin]]
 name = "afl_bytes_driver"
@@ -85,3 +89,8 @@ required-features = ["zip_driver"]
 name = "afl_rkyv_driver"
 path = "src/bin/afl_rkyv_driver.rs"
 required-features = ["rkyv_driver"]
+
+[[bin]]
+name = "afl_hyper_driver"
+path = "src/bin/afl_hyper_driver.rs"
+required-features = ["hyper_driver"]

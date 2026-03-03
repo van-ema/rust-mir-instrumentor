@@ -16,7 +16,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
 
@@ -32,13 +32,21 @@ case "$TARGET" in
   simd_json|simd-json) BIN="afl_simd_json_driver"; FEATURE="simd_json_driver" ;;
   zip) BIN="afl_zip_driver"; FEATURE="zip_driver" ;;
   rkyv) BIN="afl_rkyv_driver"; FEATURE="rkyv_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv)" >&2; exit 2 ;;
+  hyper) BIN="afl_hyper_driver"; FEATURE="hyper_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper)" >&2; exit 2 ;;
 esac
 
 if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then
   if [[ ! -f "third_party/serde/serde/Cargo.toml" ]]; then
     echo "missing third_party/serde checkout (needed by third_party/serde_json path dependency)." >&2
     echo "run: git clone https://github.com/serde-rs/serde.git third_party/serde" >&2
+    exit 2
+  fi
+fi
+if [[ "$TARGET" == "hyper" ]]; then
+  if [[ ! -f "third_party/hyper/Cargo.toml" ]]; then
+    echo "missing third_party/hyper checkout." >&2
+    echo "run: git clone https://github.com/hyperium/hyper.git third_party/hyper" >&2
     exit 2
   fi
 fi
@@ -166,6 +174,8 @@ current_stamp="$(
     echo "runtime=$(hash_file "${runtime_rlib}")"
     echo "profile=${PROFILE}"
     echo "runtime_features=${RUNTIME_FEATURES}"
+    echo "instrument_all_deps=${RZ_INSTRUMENT_ALL_DEPS:-}"
+    echo "instrumented_crates=${RZ_INSTRUMENTED_CRATES:-}"
   } | tr '\n' ';'
 )"
 clean_needed=0

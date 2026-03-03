@@ -14,6 +14,19 @@
   (`RZ_USE_STORAGE_DEAD=1`); default remains off to avoid optimized-MIR
   false UAF noise.
 
+## Unknown tags vs untracked regions
+
+- `UNKNOWN_TAG` is still reported by default for reads/writes when a tag is not
+  present in runtime metadata (`__rz_ptr_read` / `__rz_ptr_write`).
+- Stack/TLS suppression does **not** bypass `UNKNOWN_TAG`; it only applies in
+  the later "no containing allocation" path for known tags.
+- `runtime/src/lib.rs` now has a dedicated untracked-region path for TLS
+  (`rz_handle_untracked_region`) so uncertain TLS accesses can be treated
+  separately from generic `WILD_POINTER`.
+- Strict mode for this path: set `RZ_STRICT_UNTRACKED_REGION=1` to emit
+  `UNTRACKED_REGION_ACCESS` instead of silently accepting untracked TLS region
+  accesses.
+
 ## Access-size computation via MIR size_of
 
 To avoid `layout_of` normalization failures in generic MIR, access sizes are now
@@ -116,6 +129,47 @@ Outcome:
 - OOB examples like one-past-end deref through returned pointers now keep
   lineage and classify as `OUT_OF_BOUNDS` instead of `WILD_POINTER`.
 
+## Pin/project_replace raw-root lineage drop (tokio/hyper)
+
+Real-world false-positive path seen while fuzzing `hyper`:
+
+- In `tokio::future::maybe_done::MaybeDone::take_output`, `pin-project-lite`
+  expands `project_replace` and creates raw pointers from `Pin<&mut T>` internals.
+- In optimized MIR, this can lower to:
+  - `_14 = move (_1.0: &mut MaybeDone<Fut>)`
+  - `_3 = &raw mut (*_14)`
+  - `__record_raw_ptr_creation(..., derived_from=0, ...)`
+  even though the pointer semantically descends from an existing tagged `&mut`.
+
+Why this is a problem:
+
+- The new raw tag becomes a synthetic root (`parent=0`) and snapshots allocation
+  metadata independently.
+- Later accesses can be checked against this detached snapshot and raise false
+  `OUT_OF_BOUNDS`/`WILD_POINTER` in safe async code.
+
+Current fix:
+
+- Instrumentation now marks projected-source raw creations with a hint bit in
+  the raw-creation call (`alias_exempt` bit1). Runtime uses this to keep repair
+  targeted.
+- Runtime raw-tag creation performs best-effort lineage repair in two cases:
+  - root-raw creation (`derived_from=0`) with projected-source hint;
+  - derived-raw creation where the resolved parent is a root-like mismatch
+    (parent points to a different stack pointee / alloc snapshot).
+  In both cases, repair is exact-address and epoch-scoped: reattach to the
+  newest same-address non-root tag in the same allocation epoch.
+- Runtime now prefers child-pointee alloc metadata when parent alloc metadata is
+  missing in optimized lowering. This keeps stack/epoch context available for
+  the lineage repair above.
+- Bounds propagation for raw/ref creation was tightened:
+  - if destination is a projected place (no destination local), bounds lookup
+    falls back to the source pointer local;
+  - thin pointers now carry `size_of::<Pointee>()` as `bounds_len` (wide ptrs
+    still use metadata-derived length).
+- This keeps checks enabled while preserving provenance for wrapper-heavy
+  optimized async MIR paths.
+
 ### Instrumentation priority order
 
 When multiple hooks target the same basic block and statement index, we order
@@ -204,6 +258,9 @@ Other active heuristics (brief):
 - `runtime/src/lib.rs` (`rz_allow_untracked_stack_ref`,
   `rz_allow_untracked_stack_raw_root`): suppress wild-pointer style failures
   when stack metadata is missing but access/tag look stack-like.
+- `runtime/src/lib.rs` (`rz_allow_stack_raw_root_oob_noise`): suppress low-
+  confidence root-raw stack OOB reports for near-boundary and interior
+  coarse-slot-crossing accesses (optimized MIR stack-slot ambiguity).
 - `runtime/src/lib.rs` (epoch mismatch blocks in `__rz_ptr_read`/`__rz_ptr_write`):
   suppress stack/ref epoch churn noise for `RefShared` (and stack `Ref*` cases).
 - `runtime/src/lib.rs` (`rz_epoch_check_relaxed` via allow-untagged wrappers):
@@ -216,6 +273,8 @@ Other active heuristics (brief):
   opt out alias checks for non-`Freeze` / uncertain pointee types.
 - `instrument-mir/src/instrumentation.rs` (projection offset builder):
   unsupported nested-deref / complex index patterns fall back to base address.
+- `instrument-mir/src/instrumentation.rs` (`bounds_len_operand_for_ptr_local`):
+  thin pointers use `size_of::<Pointee>()` as best-effort bounds (was `0`).
 - `instrument-mir/src/instrumentation.rs` (fallback stack locals):
   if optimized MIR omits `StorageLive/Dead`, selected locals are treated as
   live for function lifetime.
@@ -312,9 +371,10 @@ Current transitions (node-level, range-overlap based):
 - Unique/raw-mut writes disable overlapping non-ancestor branches.
 - Foreign reads over protected `Reserved(conflicted=false)` set
   `Reserved(conflicted=true)`.
-- Child writes through protected `Reserved(conflicted=true)` are rejected
-  (`TB_LITE_2PHASE_CONFLICT`).
+- Direct writes through protected `Reserved(conflicted=true)` are rejected
+  (`TB_LITE_2PHASE_CONFLICT`); descendant activation writes are allowed.
 - Foreign reads over `Active` degrade to `Frozen` (or `Disabled` if protected).
+- Descendant writes may reactivate a frozen, non-protected `RawMut` ancestor.
 - Foreign writes disable the overlapping node.
 - `Disabled` tags are treated as invalidated.
 

@@ -117,7 +117,7 @@ Project-specific environment variables are grouped below by component/script.
 - `RUSTFLAGS`: wrapper appends `--mir-out` / `--runtime-path` forwarding flags here.
 
 ### AFL build/fuzz scripts (`scripts/afl_*.sh`)
-- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `zip`, `rkyv`).
+- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `zip`, `rkyv`, `hyper`).
 - `PROFILE`: cargo profile (`debug` or `release`; default depends on script, usually `release`).
 - `HARNESS_TARGET_DIR`: target directory for AFL harness builds.
 - `RUNTIME_FEATURES`: extra features passed when building `runtime` in `afl_build.sh`.
@@ -132,6 +132,8 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_ALIAS_MODEL`: alias model used by fuzz/repro scripts (default `tb_lite`).
 - `RZ_SB_LITE`: SB-lite runtime toggle passed by fuzz/repro scripts (default `1`).
 - `RZ_INSTRUMENT_ALL_DEPS`: forced to `1` by AFL scripts.
+- `RZ_INSTRUMENTED_CRATES`: optional allowlist used only when
+  `RZ_INSTRUMENT_ALL_DEPS=0`.
 - `RUSTFLAGS`: extended by `afl_build.sh` for sancov + `afl-compiler-rt.o` link.
 - `RUSTC_TMPDIR` / `TMPDIR`: rustc temporary directory for stable same-fs behavior.
 - `CARGO_TARGET_DIR`: set by scripts to isolate AFL build artifacts.
@@ -154,7 +156,7 @@ Project-specific environment variables are grouped below by component/script.
 ### Harness / utility scripts
 - `scripts/run_harness.sh`: `CARGO`, `PROFILE` (`FAST|DEBUG`), `BUILD_PROFILE` (`debug|release`), `FLAKY_EXAMPLES`, `FLAKY_RUNS`, `REPORT_DIR`, `MEDIUM_COMMANDS_FILE`, `STOP_ON_VIOLATION`, `REINSTRUMENT`, `RZ_LOG`, `RZ_INSTRUMENT_ALL_DEPS`, `CARGO_INCREMENTAL`.
 - `scripts/run_with_trace.sh`: `EXAMPLE` (required), `PROFILE`, `OUT`, `CARGO_INCREMENTAL`, `RZ_INSTRUMENT_ALL_DEPS`.
-- `scripts/afl_setup.sh`: optional repo pin vars `REF_BYTES`, `REF_SMALLVEC`, `REF_SERDE`, `REF_SERDE_JSON`, `REF_TOML`, `REF_UUID`, `REF_QUICK_XML`, `REF_BASE64`, `REF_ITOA`, `REF_SIMD_JSON`, `REF_ZIP`, `REF_RKYV`; also reads `AFL_PATH`, `AFL_FUZZ`, `AFL_COMPILER_RT`.
+- `scripts/afl_setup.sh`: optional repo pin vars `REF_BYTES`, `REF_SMALLVEC`, `REF_SERDE`, `REF_SERDE_JSON`, `REF_TOML`, `REF_UUID`, `REF_QUICK_XML`, `REF_BASE64`, `REF_ITOA`, `REF_SIMD_JSON`, `REF_ZIP`, `REF_RKYV`, `REF_HYPER`; also reads `AFL_PATH`, `AFL_FUZZ`, `AFL_COMPILER_RT`.
 - `afl_harness/src/bin/afl_smallvec_driver.rs`: `AFL_MAX_STEPS`, `AFL_MAX_LEN`.
 - `instrument-mir/src/util.rs`: `HOME` is used for `~` path expansion.
 
@@ -336,7 +338,7 @@ The repo includes an AFL++ harness crate with drivers:
 `afl_bytes_driver`, `afl_smallvec_driver`, `afl_serde_json_driver`,
 `afl_toml_driver`, `afl_base64_driver`, `afl_uuid_driver`,
 `afl_itoa_driver`, `afl_quick_xml_driver`, `afl_simd_json_driver`,
-`afl_zip_driver`, and `afl_rkyv_driver`.
+`afl_zip_driver`, `afl_rkyv_driver`, and `afl_hyper_driver`.
 
 Bootstrap third-party checkouts and env hints first:
 
@@ -357,16 +359,19 @@ TARGET=serde_json PROFILE=release ./scripts/afl_build.sh
 TARGET=simd_json PROFILE=release ./scripts/afl_build.sh
 TARGET=zip PROFILE=release ./scripts/afl_build.sh
 TARGET=rkyv PROFILE=release ./scripts/afl_build.sh
+TARGET=hyper PROFILE=release ./scripts/afl_build.sh
 
 # Run AFL++
 TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
 TARGET=serde_json PROFILE=release ./scripts/afl_fuzz.sh
 TARGET=simd_json PROFILE=release ./scripts/afl_fuzz.sh
+TARGET=hyper PROFILE=release ./scripts/afl_fuzz.sh
 
 # Reproduce a single crash
 TARGET=bytes PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/bytes/default/crashes/id:...
 TARGET=serde_json PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/serde_json/default/crashes/id:...
 TARGET=simd_json PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/simd_json/default/crashes/id:...
+TARGET=hyper PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/hyper/default/crashes/id:...
 ```
 
 `scripts/afl_build.sh` includes a post-build hook check and prints:

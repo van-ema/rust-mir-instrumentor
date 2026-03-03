@@ -38,10 +38,21 @@ The project has two main components:
 
 3. **Code reference**
 
-- File /Users/emanuelevannacci/dynBorrowProposal/dynBorrowProposal/main.tex contains the project details.
-- If you need to verify rust compiler struct or further detauls, you can find the rust compiler code in ~/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/rustc-src/rust/compiler
+- Project design/details: `/Users/emanuelevannacci/dynBorrowProposal/dynBorrowProposal/main.tex`
+- MIR instrumentation pass entry point: `instrument-mir/src/instrumentation.rs`
+- Runtime checks entry point: `runtime/src/lib.rs`
+- Aliasing model implementations (pluggable): `runtime/src/alias_model/`
+- Rust compiler source (for rustc internals/structs): `~/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/rustc-src/rust/compiler`
 
 4. **Contraints**
 - Build policy: always use `RZ_INSTRUMENT_ALL_DEPS=1`. Only `std`/`core` are treated
   as non-instrumented for unknown-call warnings and classification heuristics.
 - Compile with CARGO_INCREMENTAL=0 to force building the crates.
+
+5. **Fuzzing objective and crash policy**
+- Primary objective: implement and improve `rusteze` in this repository, and use it to fuzz real-world Rust targets to find bugs/vulnerabilities.
+- Quality objective: minimize false positives and avoid breaking target-program behavior due to instrumentation, while keeping detection of real memory-safety and aliasing-rule violations high.
+- During fuzzing, keep violation-as-crash behavior enabled to make findings visible to AFL:
+  use `RUSTEZE_FAILFAST=1` and `RZ_ABORT_ON_VIOLATION=1` by default.
+- Do not silently suppress violations just to keep fuzzing running; prefer fixing root-cause
+  false positives in instrumentation/runtime and keep high-confidence crashes actionable.
