@@ -903,6 +903,35 @@ fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
 }
 
 #[inline]
+fn rz_allow_bounded_stack_ref_no_alloc_noise(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return false;
+    }
+    if tmeta.bounds_len == 0 || size == 0 {
+        return false;
+    }
+    if !(rz_stack_addr_hint(addr)
+        || rz_stack_addr_hint(tmeta.pointee_addr)
+        || rz_tls_addr_hint(addr)
+        || rz_tls_addr_hint(tmeta.pointee_addr))
+    {
+        return false;
+    }
+
+    let access_end = match addr.checked_add(size) {
+        Some(end) => end,
+        None => return false,
+    };
+    let bounds_end = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
+
+    // Prefer explicit ref bounds over coarse/missing stack alloc metadata. This catches
+    // optimized tail-buffer patterns like `tmpbuf: [u8; 64]` -> `&tmpbuf[..]` -> SIMD lane
+    // reads, where the reference metadata is precise but stack-slot tracking only retained a
+    // tiny carrier alloc or no alloc at all for later lanes.
+    addr >= tmeta.pointee_addr && access_end <= bounds_end
+}
+
+#[inline]
 fn rz_allow_stack_raw_root_epoch_noise(tmeta: &TagMeta, ameta: &AllocMeta, addr: usize) -> bool {
     // Best-effort suppression for optimized-stack churn:
     // a raw-root const tag (`parent=0`) can survive while stack slots get recycled/re-tagged,
@@ -969,6 +998,9 @@ fn rz_allow_stack_ref_root_boundary_oob_noise(
 ) -> bool {
     // Narrow fallback for root refs created after lineage loss: a valid field read/write can
     // start at the end of a tiny stack carrier slot (typically pointer-sized pair).
+    // On AArch64/NEON this also shows up as 16-byte vector lane reads from a 64-byte temporary
+    // (e.g. simd-json stage1's local tmpbuf), where coarse stack-slot tracking records only the
+    // first 16-byte lane as the containing alloc.
     if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return false;
     }
@@ -987,7 +1019,8 @@ fn rz_allow_stack_ref_root_boundary_oob_noise(
     let alloc_end = base.saturating_add(ameta.size);
     let access_end = addr.saturating_add(size);
     let starts_at_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= usize_sz;
-    let small_access = size > 0 && size <= usize_sz;
+    let vector_lane = 2 * usize_sz;
+    let small_access = size > 0 && size <= vector_lane;
     starts_at_boundary && small_access && access_end > alloc_end
 }
 
@@ -1625,6 +1658,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+            || rz_allow_bounded_stack_ref_no_alloc_noise(&tmeta, addr, size)
         {
             return;
         }
@@ -2017,6 +2051,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+            || rz_allow_bounded_stack_ref_no_alloc_noise(&tmeta, addr, size)
         {
             return;
         }
@@ -2478,11 +2513,10 @@ pub extern "C" fn __record_ref_creation(
             .unwrap_or((0, false, 0, 0))
     };
 
-    // Optimized MIR can emit root reference creations in wrapper/projection-heavy paths where
-    // caller-side provenance is lost. For stack pointers only, try to reconnect to the newest
-    // same-address non-root tag in the same allocation epoch.
+    // Optimized MIR frequently loses parent tags for stack refs at call boundaries and in
+    // projection-heavy lowering. Exact same-address recovery is low-risk for refs, so allow it
+    // for all stack roots; the stronger bounded-overlap recovery remains gated by the hint bit.
     if resolved_parent_tag == 0
-        && projected_ref_hint
         && alloc_is_stack
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()

@@ -1404,6 +1404,38 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Bounds length for direct reference creation.
+    ///
+    /// Unlike raw derives, an `Rvalue::Ref` still names the concrete pointee object, so for sized
+    /// pointees we can safely use `size_of::<T>()` as the dynamic bounds. This preserves array /
+    /// aggregate extents across later unsizing or vectorized loads (e.g. `&[u8; 64]` feeding SIMD
+    /// lane reads) without constraining subsequent raw-pointer arithmetic.
+    fn ref_creation_bounds_len_operand_for_ptr_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        let pointee = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) => *pointee,
+            _ => return self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, span),
+        };
+
+        match pointee.kind() {
+            TyKind::Slice(elem_ty) => SizeOperand::PtrMetadataSlice {
+                ptr_local,
+                elem_ty: *elem_ty,
+            },
+            TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            _ if pointee.is_sized(tcx, body.typing_env(tcx)) => {
+                self.size_operand_for_ty(tcx, body, pointee, span)
+            }
+            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        }
+    }
+
     fn ptr_ty_has_precise_wide_bounds<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
@@ -3878,7 +3910,6 @@ impl MyOptimizationPass {
         }
     }
 
-
     fn push_alloc_shim_effects<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -5338,12 +5369,26 @@ impl MyOptimizationPass {
                     _ => false,
                 };
                 let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
-                    tcx,
-                    body,
-                    dst_local,
-                    source_info.span,
-                );
+                let alias_flags = {
+                    let mut flags = if alias_exempt { 1 } else { 0 };
+                    if matches!(dst_ty.kind(), TyKind::Ref(..)) {
+                        // Call-return ref retagging can lose the caller-side parent tag and
+                        // materialize a fresh root at the same stack address. Mark these for
+                        // runtime same-address lineage repair.
+                        flags |= 0b10;
+                    }
+                    flags
+                };
+                let bounds_len_op = if matches!(dst_ty.kind(), TyKind::Ref(..)) {
+                    self.ref_creation_bounds_len_operand_for_ptr_local(
+                        tcx,
+                        body,
+                        dst_local,
+                        source_info.span,
+                    )
+                } else {
+                    self.bounds_len_operand_for_ptr_local(tcx, body, dst_local, source_info.span)
+                };
                 let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
                     tcx,
                     body,
@@ -5364,7 +5409,11 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        node: self.const_u8(
+                            tcx,
+                            source_info.span,
+                            alias_flags,
+                        ),
                         span: source_info.span,
                     },
                     Spanned {
@@ -5604,6 +5653,16 @@ impl MyOptimizationPass {
                     body,
                     body.local_decls[ptr_local].ty,
                 );
+                let alias_flags = {
+                    let mut flags = if alias_exempt { 1 } else { 0 };
+                    if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
+                        // Argument retagging often introduces short-lived receiver borrows at
+                        // call boundaries. If source-tag plumbing drops the parent, allow runtime
+                        // same-address repair instead of creating a sibling root.
+                        flags |= 0b10;
+                    }
+                    flags
+                };
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
                 let addr_local = body
@@ -5658,7 +5717,11 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        node: self.const_u8(
+                            tcx,
+                            source_info.span,
+                            alias_flags,
+                        ),
                         span: source_info.span,
                     },
                     Spanned {
@@ -6342,11 +6405,14 @@ impl MyOptimizationPass {
                     let alias_flags: u8 = match &creation_kind {
                         InstrKind::Ref { src, .. } => {
                             let mut flags = if alias_exempt { 1 } else { 0 };
-                            // Projection-heavy reference lowering can lose parent lineage and
-                            // synthesize parent=0 at runtime. Hint repair only for projected
-                            // sources to avoid changing simple local-ref behavior.
+                            // Even simple reference reborrows can lose their parent tag in
+                            // optimized MIR/call-boundary lowering and show up as fresh roots at
+                            // the same stack address. Always allow exact same-address repair for
+                            // refs; keep the stronger bounded-overlap recovery limited to
+                            // projection-heavy sources.
+                            flags |= 0b10;
                             if !src.projection.is_empty() {
-                                flags |= 0b10 | 0b100;
+                                flags |= 0b100;
                             }
                             flags
                         }
@@ -6370,21 +6436,58 @@ impl MyOptimizationPass {
                             flags |= 0b10;
                             flags
                         }
+                        InstrKind::RetRoot { dst_local, .. } => {
+                            let mut flags = if alias_exempt { 1 } else { 0 };
+                            if matches!(body.local_decls[*dst_local].ty.kind(), TyKind::Ref(..)) {
+                                // Return-root ref creation has the same failure mode as call
+                                // arg/ret retagging: optimized MIR can lose the parent and emit a
+                                // fresh stack root at an address that already has live lineage.
+                                flags |= 0b10;
+                            }
+                            flags
+                        }
                         _ => {
                             if alias_exempt { 1 } else { 0 }
                         }
                     };
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
 
-                    let bounds_ptr_local = match &creation_kind {
+                let bounds_ptr_local = match &creation_kind {
                         InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
                         InstrKind::RawRoot { ptr_local, .. } => Some(*ptr_local),
                         InstrKind::RetRoot { dst_local, .. } => Some(*dst_local),
                         _ => None,
                     };
                     let bounds_len_op = bounds_ptr_local
-                        .map(|pl| self.bounds_len_operand_for_ptr_local(tcx, body, pl, source_info.span))
-                        .unwrap_or_else(|| SizeOperand::Const(self.const_usize(tcx, source_info.span, 0)));
+                        .map(|pl| match &creation_kind {
+                            InstrKind::Ref { .. } => {
+                                self.ref_creation_bounds_len_operand_for_ptr_local(
+                                    tcx,
+                                    body,
+                                    pl,
+                                    source_info.span,
+                                )
+                            }
+                            InstrKind::RetRoot { .. }
+                                if matches!(body.local_decls[pl].ty.kind(), TyKind::Ref(..)) =>
+                            {
+                                self.ref_creation_bounds_len_operand_for_ptr_local(
+                                    tcx,
+                                    body,
+                                    pl,
+                                    source_info.span,
+                                )
+                            }
+                            _ => self.bounds_len_operand_for_ptr_local(
+                                tcx,
+                                body,
+                                pl,
+                                source_info.span,
+                            ),
+                        })
+                        .unwrap_or_else(|| {
+                            SizeOperand::Const(self.const_usize(tcx, source_info.span, 0))
+                        });
                     let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
                         tcx,
                         body,
@@ -6459,7 +6562,11 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        node: self.const_u8(
+                            tcx,
+                            source_info.span,
+                            if alias_exempt { 1 } else { 0 },
+                        ),
                         span: source_info.span,
                     },
                     Spanned {
@@ -6690,6 +6797,13 @@ impl MyOptimizationPass {
                     body,
                     body.local_decls[ptr_local].ty,
                 );
+                let alias_flags = {
+                    let mut flags = if alias_exempt { 1 } else { 0 };
+                    if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
+                        flags |= 0b10;
+                    }
+                    flags
+                };
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
                 let addr_local = body
@@ -6709,12 +6823,17 @@ impl MyOptimizationPass {
                     )
                     .expect("ArgRetag on non-pointer local");
 
-                let bounds_len_op = self.bounds_len_operand_for_ptr_local(
-                    tcx,
-                    body,
-                    ptr_local,
-                    source_info.span,
-                );
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                let bounds_len_op = if matches!(ptr_ty.kind(), TyKind::Ref(..)) {
+                    self.ref_creation_bounds_len_operand_for_ptr_local(
+                        tcx,
+                        body,
+                        ptr_local,
+                        source_info.span,
+                    )
+                } else {
+                    self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, source_info.span)
+                };
                 let (arg_bounds_len, mut bounds_len_stmts) = self.materialize_size_operand(
                     tcx,
                     body,
@@ -6744,7 +6863,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 }),
+                        node: self.const_u8(tcx, source_info.span, alias_flags),
                         span: source_info.span,
                     },
                     Spanned {
