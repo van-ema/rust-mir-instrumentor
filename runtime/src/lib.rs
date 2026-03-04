@@ -157,8 +157,7 @@ fn rz_tls_pseudo_range() -> (usize, usize) {
 fn rz_untracked_region_for_access(addr: usize, size: usize) -> Option<UntrackedRegionKind> {
     let (start, end) = rz_tls_pseudo_range();
     let access_end = addr.saturating_add(size.max(1));
-    let stack_like = rz_stack_addr_hint(addr)
-        || rz_stack_addr_hint(access_end.saturating_sub(1));
+    let stack_like = rz_stack_addr_hint(addr) || rz_stack_addr_hint(access_end.saturating_sub(1));
     if addr >= start && access_end <= end && !stack_like {
         return Some(UntrackedRegionKind::Tls);
     }
@@ -180,9 +179,7 @@ fn rz_handle_untracked_region(
     // Keep TLS suppression narrow: only for tags with unknown allocation provenance
     // that also look TLS-originated. This avoids masking real heap/stack OOB accesses
     // that happen to land inside the coarse TLS pseudo-window.
-    if tmeta.alloc_epoch != 0
-        || !(rz_tls_addr_hint(tmeta.pointee_addr) || rz_tls_addr_hint(addr))
-    {
+    if tmeta.alloc_epoch != 0 || !(rz_tls_addr_hint(tmeta.pointee_addr) || rz_tls_addr_hint(addr)) {
         return false;
     }
 
@@ -215,7 +212,6 @@ fn rz_static_range_for_addr(addr: usize) -> Option<&'static StaticRange> {
         .iter()
         .find(|r| addr >= r.start && addr < r.end)
 }
-
 
 #[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
@@ -378,7 +374,10 @@ struct RzStackBuf {
 impl RzStackBuf {
     #[inline]
     fn new() -> Self {
-        Self { buf: [0u8; 1024], len: 0 }
+        Self {
+            buf: [0u8; 1024],
+            len: 0,
+        }
     }
 
     #[inline]
@@ -432,7 +431,6 @@ fn rz_emit_str(s: &str) {
         eprint!("{}", s);
     }
 }
-
 
 #[cfg(feature = "rz_log")]
 macro_rules! rz_log {
@@ -491,7 +489,6 @@ macro_rules! rz_trace {
         rz_log!(LogLevel::Trace, $($arg)*)
     };
 }
-
 
 /// Pre-free validation to avoid process abort on double-free/invalid-free.
 /// Returns `true` if it is safe to call the underlying system deallocator.
@@ -622,7 +619,6 @@ fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
     }
 }
 
-
 static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
 
 /// Metadata for a tracked allocation (stack or heap).
@@ -696,7 +692,7 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
+pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -733,7 +729,11 @@ fn find_alloc_containing<'a>(
         };
 
         if addr < end {
-            let slot = if meta.live { &mut best_live } else { &mut best_dead };
+            let slot = if meta.live {
+                &mut best_live
+            } else {
+                &mut best_dead
+            };
             match slot {
                 None => *slot = Some((*base, meta, end)),
                 Some((_b, _m, best_end)) => {
@@ -1004,11 +1004,9 @@ fn rz_allow_stack_raw_root_oob_noise(
     let alloc_end = base.saturating_add(ameta.size);
     let access_end = addr.saturating_add(size);
     let near_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= 16;
-    let interior_crosses_coarse_slot_end = tmeta.pointee_addr > base
-        && tmeta.pointee_addr < alloc_end
-        && access_end > alloc_end;
-    (near_boundary && size <= 16 && access_end > alloc_end)
-        || interior_crosses_coarse_slot_end
+    let interior_crosses_coarse_slot_end =
+        tmeta.pointee_addr > base && tmeta.pointee_addr < alloc_end && access_end > alloc_end;
+    (near_boundary && size <= 16 && access_end > alloc_end) || interior_crosses_coarse_slot_end
 }
 
 #[inline]
@@ -1081,7 +1079,9 @@ fn rz_violation(kind: &str, msg: String) {
     }
 
     // Fail-fast only if requested
-    let failfast = std::env::var("RUSTEZE_FAILFAST").ok().map_or(false, |v| v != "0");
+    let failfast = std::env::var("RUSTEZE_FAILFAST")
+        .ok()
+        .map_or(false, |v| v != "0");
     if failfast {
         // Enable backtraces with `RUST_BACKTRACE=1`
         panic!("rusteze violation: {kind}");
@@ -1230,10 +1230,7 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         let is_stack = (live & 0x2) != 0;
         rz_emit_alloc(format_args!(
             "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
-            base_addr,
-            size,
-            new_live,
-            is_stack
+            base_addr, size, new_live, is_stack
         ));
     } else if rz_log_enabled(LogLevel::Trace) {
         // `live` bit 0: live/dead. bit 1: stack marker.
@@ -1316,7 +1313,12 @@ struct AllocLogEntry {
 #[cfg(feature = "rz_alloc_dump")]
 impl AllocLogEntry {
     const fn empty() -> Self {
-        Self { seq: 0, base: 0, size: 0, live: 0 }
+        Self {
+            seq: 0,
+            base: 0,
+            size: 0,
+            live: 0,
+        }
     }
 }
 
@@ -1340,14 +1342,24 @@ fn alloc_log_record(base_addr: usize, size: usize, live: u8) {
     let idx = ALLOC_LOG_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_SIZE;
     let seq = ALLOC_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
     unsafe {
-        ALLOC_LOG[idx] = AllocLogEntry { seq, base: base_addr, size, live };
+        ALLOC_LOG[idx] = AllocLogEntry {
+            seq,
+            base: base_addr,
+            size,
+            live,
+        };
     }
     // Also keep a heap-only ring buffer to avoid stack noise.
     if (live & 0x2) == 0 {
         let hidx = ALLOC_LOG_HEAP_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_HEAP_SIZE;
         let hseq = ALLOC_LOG_HEAP_SEQ.fetch_add(1, Ordering::Relaxed);
         unsafe {
-            ALLOC_LOG_HEAP[hidx] = AllocLogEntry { seq: hseq, base: base_addr, size, live };
+            ALLOC_LOG_HEAP[hidx] = AllocLogEntry {
+                seq: hseq,
+                base: base_addr,
+                size,
+                live,
+            };
         }
     }
 }
@@ -1366,7 +1378,10 @@ fn alloc_log_dump() {
     impl LocalBuf {
         #[inline]
         fn new() -> Self {
-            Self { buf: [0u8; 256], len: 0 }
+            Self {
+                buf: [0u8; 256],
+                len: 0,
+            }
         }
         #[inline]
         fn as_bytes(&self) -> &[u8] {
@@ -1401,13 +1416,13 @@ fn alloc_log_dump() {
         (
             ALLOC_LOG_HEAP_IDX.load(Ordering::Relaxed),
             ALLOC_LOG_HEAP_SIZE,
-            unsafe { &raw const ALLOC_LOG_HEAP as *const [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] }
+            unsafe { &raw const ALLOC_LOG_HEAP as *const [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] },
         )
     } else {
         (
             ALLOC_LOG_IDX.load(Ordering::Relaxed),
             ALLOC_LOG_SIZE,
-            unsafe { &raw const ALLOC_LOG as *const [AllocLogEntry; ALLOC_LOG_SIZE] }
+            unsafe { &raw const ALLOC_LOG as *const [AllocLogEntry; ALLOC_LOG_SIZE] },
         )
     };
 
@@ -1453,7 +1468,10 @@ fn alloc_log_dump_contains(addr: usize) {
     impl LocalBuf {
         #[inline]
         fn new() -> Self {
-            Self { buf: [0u8; 256], len: 0 }
+            Self {
+                buf: [0u8; 256],
+                len: 0,
+            }
         }
         #[inline]
         fn as_bytes(&self) -> &[u8] {
@@ -1560,10 +1578,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
                 "RZ_LOG_LOC",
             );
-            rz_violation(
-                "UNKNOWN_TAG",
-                msg,
-            );
+            rz_violation("UNKNOWN_TAG", msg);
             return;
         };
         let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
@@ -1595,13 +1610,27 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let amap = allocs().lock().unwrap();
     let alloc_opt = find_alloc_containing(&amap, addr);
     if rz_log_enabled(LogLevel::Trace) {
-        rz_trace!("[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}", addr, size, tag);
+        rz_trace!(
+            "[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}",
+            addr,
+            size,
+            tag
+        );
         // Print up to 8 nearest bases <= addr for debugging.
         let mut shown = 0usize;
         for (b, m) in amap.range(..=addr).rev() {
-            if shown >= 8 { break; }
+            if shown >= 8 {
+                break;
+            }
             let end = b.saturating_add(m.size);
-            rz_trace!("  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}", b, m.size, m.live, m.epoch, end);
+            rz_trace!(
+                "  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}",
+                b,
+                m.size,
+                m.live,
+                m.epoch,
+                end
+            );
             shown += 1;
         }
     }
@@ -1643,9 +1672,8 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
                         return;
                     }
-                    if rz_allow_projected_raw_stack_slot_oob_noise(
-                        &tmeta, ometa, obase, addr, size,
-                    ) {
+                    if rz_allow_projected_raw_stack_slot_oob_noise(&tmeta, ometa, obase, addr, size)
+                    {
                         return;
                     }
                     let msg = append_location_if_enabled(
@@ -1663,10 +1691,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     if rz_dump_alloc_match_addr_enabled() {
                         alloc_log_dump_contains(addr);
                     }
-                    rz_violation(
-                        "OUT_OF_BOUNDS",
-                        msg,
-                    );
+                    rz_violation("OUT_OF_BOUNDS", msg);
                     return;
                 }
             }
@@ -1688,10 +1713,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation(
-                    "WRITE_TO_READONLY_STATIC",
-                    msg,
-                );
+                rz_violation("WRITE_TO_READONLY_STATIC", msg);
                 return;
             }
         }
@@ -1708,10 +1730,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "WILD_POINTER",
-            msg,
-        );
+        rz_violation("WILD_POINTER", msg);
         return;
     };
 
@@ -1751,10 +1770,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "USE_AFTER_DEAD",
-            msg,
-        );
+        rz_violation("USE_AFTER_DEAD", msg);
         return;
     }
 
@@ -1793,10 +1809,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "STALE_POINTER_EPOCH_MISMATCH",
-            msg,
-        );
+        rz_violation("STALE_POINTER_EPOCH_MISMATCH", msg);
         return;
     }
 
@@ -1817,10 +1830,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation(
-                    "OUT_OF_BOUNDS",
-                    msg,
-                );
+                rz_violation("OUT_OF_BOUNDS", msg);
                 return;
             }
         };
@@ -1838,10 +1848,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
-            rz_violation(
-                "OUT_OF_BOUNDS",
-                msg,
-            );
+            rz_violation("OUT_OF_BOUNDS", msg);
             return;
         }
     }
@@ -1864,10 +1871,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 if rz_dump_alloc_match_addr_enabled() {
                     alloc_log_dump_contains(addr);
                 }
-                rz_violation(
-                    "OUT_OF_BOUNDS",
-                    msg,
-                );
+                rz_violation("OUT_OF_BOUNDS", msg);
                 return;
             }
         };
@@ -1897,10 +1901,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             if rz_dump_alloc_match_addr_enabled() {
                 alloc_log_dump_contains(addr);
             }
-            rz_violation(
-                "OUT_OF_BOUNDS",
-                msg,
-            );
+            rz_violation("OUT_OF_BOUNDS", msg);
             return;
         }
     }
@@ -1964,10 +1965,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
                 "RZ_LOG_LOC",
             );
-            rz_violation(
-                "UNKNOWN_TAG",
-                msg,
-            );
+            rz_violation("UNKNOWN_TAG", msg);
             return;
         };
         let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
@@ -2047,10 +2045,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     if rz_dump_alloc_match_addr_enabled() {
                         alloc_log_dump_contains(addr);
                     }
-                    rz_violation(
-                        "OUT_OF_BOUNDS",
-                        msg,
-                    );
+                    rz_violation("OUT_OF_BOUNDS", msg);
                     return;
                 }
             }
@@ -2074,10 +2069,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "WILD_POINTER",
-            msg,
-        );
+        rz_violation("WILD_POINTER", msg);
         return;
     };
 
@@ -2105,10 +2097,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "USE_AFTER_DEAD",
-            msg,
-        );
+        rz_violation("USE_AFTER_DEAD", msg);
         return;
     }
 
@@ -2147,10 +2136,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation(
-            "STALE_POINTER_EPOCH_MISMATCH",
-            msg,
-        );
+        rz_violation("STALE_POINTER_EPOCH_MISMATCH", msg);
         return;
     }
 
@@ -2171,10 +2157,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation(
-                    "OUT_OF_BOUNDS",
-                    msg,
-                );
+                rz_violation("OUT_OF_BOUNDS", msg);
                 return;
             }
         };
@@ -2192,10 +2175,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
-            rz_violation(
-                "OUT_OF_BOUNDS",
-                msg,
-            );
+            rz_violation("OUT_OF_BOUNDS", msg);
             return;
         }
     }
@@ -2218,10 +2198,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 if rz_dump_alloc_match_addr_enabled() {
                     alloc_log_dump_contains(addr);
                 }
-                rz_violation(
-                    "OUT_OF_BOUNDS",
-                    msg,
-                );
+                rz_violation("OUT_OF_BOUNDS", msg);
                 return;
             }
         };
@@ -2250,10 +2227,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             if rz_dump_alloc_match_addr_enabled() {
                 alloc_log_dump_contains(addr);
             }
-            rz_violation(
-                "OUT_OF_BOUNDS",
-                msg,
-            );
+            rz_violation("OUT_OF_BOUNDS", msg);
             return;
         }
     }
@@ -2315,7 +2289,11 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0)
+    ret_tags()
+        .lock()
+        .unwrap()
+        .remove(&(callee_id, addr))
+        .unwrap_or(0)
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -2331,7 +2309,13 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     bounds_len: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    let tag = { ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0) };
+    let tag = {
+        ret_tags()
+            .lock()
+            .unwrap()
+            .remove(&(callee_id, addr))
+            .unwrap_or(0)
+    };
     if tag != 0 {
         return tag;
     }
@@ -2365,7 +2349,11 @@ pub extern "C" fn __record_ref_creation(
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
+    let kind = if is_mut != 0 {
+        PtrKind::RefMut
+    } else {
+        PtrKind::RefShared
+    };
     // `alias_exempt` is a bitfield emitted by instrumentation:
     // - bit0: alias-exempt classification
     // - bit1: basic lineage-repair hint
@@ -2391,13 +2379,24 @@ pub extern "C" fn __record_ref_creation(
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
-    let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len, mut resolved_parent_tag) =
-        if parent_tag != 0 {
+    let (
+        mut alloc_epoch,
+        mut alloc_live_at_creation,
+        mut inherited_bounds_len,
+        mut resolved_parent_tag,
+    ) = if parent_tag != 0 {
         let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
             .lock()
             .unwrap()
             .get(&parent_tag)
-            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
+            .map(|p| {
+                (
+                    p.alloc_epoch,
+                    p.alloc_live_at_creation,
+                    Some(p.pointee_addr),
+                    p.bounds_len,
+                )
+            })
             .unwrap_or((0, false, None, 0));
 
         if let Some(parent_pointee) = parent_pointee {
@@ -2474,10 +2473,7 @@ pub extern "C" fn __record_ref_creation(
     //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
     // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
     // that repair even when we reject broader overlap-based guessing.
-    if resolved_parent_tag == 0
-        && alloc_epoch != 0
-        && alloc_size >= std::mem::size_of::<usize>()
-    {
+    if resolved_parent_tag == 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
@@ -2505,7 +2501,11 @@ pub extern "C" fn __record_ref_creation(
         }
     }
 
-    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
+    let bounds_len = if bounds_len != 0 {
+        bounds_len
+    } else {
+        inherited_bounds_len
+    };
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -2547,7 +2547,11 @@ pub extern "C" fn __record_raw_ptr_creation(
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
+    let kind = if is_mut != 0 {
+        PtrKind::RawMut
+    } else {
+        PtrKind::RawConst
+    };
     // `alias_exempt` is a bitfield emitted by instrumentation:
     // - bit0: alias-exempt classification
     // - bit1: basic lineage-repair hint
@@ -2568,72 +2572,74 @@ pub extern "C" fn __record_raw_ptr_creation(
     // stack-slot reuse detectable as stale pointers. Exception: if the derived pointer
     // clearly points into a different allocation than the parent, refresh to the pointee's
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
-    let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) = if derived_from != 0 {
-        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) = tags()
-            .lock()
-            .unwrap()
-            .get(&derived_from)
-            .map(|p| {
-                (
-                    p.alloc_epoch,
-                    p.alloc_live_at_creation,
-                    Some(p.pointee_addr),
-                    p.bounds_len,
-                    p.parent,
-                )
-            })
-            .unwrap_or((0, false, None, 0, 0));
-        parent_is_root = parent_parent == 0;
-        parent_pointee_addr = parent_pointee;
+    let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) =
+        if derived_from != 0 {
+            let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) =
+                tags()
+                    .lock()
+                    .unwrap()
+                    .get(&derived_from)
+                    .map(|p| {
+                        (
+                            p.alloc_epoch,
+                            p.alloc_live_at_creation,
+                            Some(p.pointee_addr),
+                            p.bounds_len,
+                            p.parent,
+                        )
+                    })
+                    .unwrap_or((0, false, None, 0, 0));
+            parent_is_root = parent_parent == 0;
+            parent_pointee_addr = parent_pointee;
 
-        if let Some(parent_pointee) = parent_pointee {
-            let amap = allocs().lock().unwrap();
-            let parent_alloc = find_alloc_containing(&amap, parent_pointee);
-            let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
-            if let Some((pointee_base, pointee_meta)) = pointee_alloc {
-                alloc_is_stack = pointee_meta.is_stack;
-                alloc_size = pointee_meta.size;
-                match parent_alloc {
-                    Some((parent_base, _)) if parent_base == pointee_base => {
-                        (parent_epoch, parent_live, inherited_bounds_len)
-                    }
-                    Some((_parent_base, _)) => {
-                        parent_alloc_mismatch = true;
-                        (pointee_meta.epoch, pointee_meta.live, 0)
-                    }
-                    None => {
-                        // Parent alloc metadata can be missing in optimized lowering
-                        // even when the child pointee alloc is known. Prefer the child
-                        // alloc snapshot and allow exact-address lineage recovery below.
-                        if parent_pointee != pointee_addr {
-                            parent_alloc_mismatch = true;
+            if let Some(parent_pointee) = parent_pointee {
+                let amap = allocs().lock().unwrap();
+                let parent_alloc = find_alloc_containing(&amap, parent_pointee);
+                let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+                if let Some((pointee_base, pointee_meta)) = pointee_alloc {
+                    alloc_is_stack = pointee_meta.is_stack;
+                    alloc_size = pointee_meta.size;
+                    match parent_alloc {
+                        Some((parent_base, _)) if parent_base == pointee_base => {
+                            (parent_epoch, parent_live, inherited_bounds_len)
                         }
-                        (pointee_meta.epoch, pointee_meta.live, 0)
+                        Some((_parent_base, _)) => {
+                            parent_alloc_mismatch = true;
+                            (pointee_meta.epoch, pointee_meta.live, 0)
+                        }
+                        None => {
+                            // Parent alloc metadata can be missing in optimized lowering
+                            // even when the child pointee alloc is known. Prefer the child
+                            // alloc snapshot and allow exact-address lineage recovery below.
+                            if parent_pointee != pointee_addr {
+                                parent_alloc_mismatch = true;
+                            }
+                            (pointee_meta.epoch, pointee_meta.live, 0)
+                        }
                     }
+                } else {
+                    (parent_epoch, parent_live, inherited_bounds_len)
                 }
             } else {
                 (parent_epoch, parent_live, inherited_bounds_len)
             }
         } else {
-            (parent_epoch, parent_live, inherited_bounds_len)
-        }
-    } else {
-        // Root creation: if the match is a dead stack slot, treat metadata as unknown
-        // to avoid inheriting stale bounds/epoch from recycled stack storage.
-        let amap = allocs().lock().unwrap();
-        match find_alloc_containing(&amap, pointee_addr) {
-            Some((_base, m)) => {
-                alloc_is_stack = m.is_stack;
-                alloc_size = m.size;
-                if m.is_stack && !m.live {
-                    (0, false, 0)
-                } else {
-                    (m.epoch, m.live, 0)
+            // Root creation: if the match is a dead stack slot, treat metadata as unknown
+            // to avoid inheriting stale bounds/epoch from recycled stack storage.
+            let amap = allocs().lock().unwrap();
+            match find_alloc_containing(&amap, pointee_addr) {
+                Some((_base, m)) => {
+                    alloc_is_stack = m.is_stack;
+                    alloc_size = m.size;
+                    if m.is_stack && !m.live {
+                        (0, false, 0)
+                    } else {
+                        (m.epoch, m.live, 0)
+                    }
                 }
+                None => (0, false, 0),
             }
-            None => (0, false, 0),
-        }
-    };
+        };
 
     // Optimized MIR can materialize `&raw mut` from projected wrappers (e.g. Pin field access)
     // without a recoverable source local and emit `derived_from=0`. When this happens on stack
@@ -2779,6 +2785,10 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
             tmeta.escaped
         );
     } else {
-        rz_trace!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);
+        rz_trace!(
+            "[rusteze-runtime] USE: unknown tag={} addr=0x{:x}",
+            tag,
+            addr
+        );
     }
 }
