@@ -337,20 +337,32 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         _ => return,
     };
 
-    let parent = if tmeta.parent == 0 {
-        0
-    } else {
-        let tmap = tags().lock().unwrap();
-        tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(tmeta.parent)
-    };
-
     let base = tb_base_for_addr(tmeta.pointee_addr);
-    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let perm = match kind {
         BorrowKind::Unique => TbPerm::Reserved { conflicted: false },
         BorrowKind::RawMut => TbPerm::Active,
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
+    let mut all = tb_state().lock().unwrap();
+    let tree = all.entry(base).or_default();
+    let parent = if tmeta.parent == 0 {
+        0
+    } else {
+        let tmap = tags().lock().unwrap();
+        match kind {
+            BorrowKind::Shared | BorrowKind::Unique => tb_lite_find_materialized_ref_ancestor_tag(
+                &tmap,
+                &tree.nodes,
+                tmeta.parent,
+            )
+            .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent))
+            .unwrap_or(tmeta.parent),
+            BorrowKind::RawConst | BorrowKind::RawMut => {
+                tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(tmeta.parent)
+            }
+        }
+    };
+    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let node = TbNode {
         tag,
         parent,
@@ -362,9 +374,6 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         alive: true,
         protected,
     };
-
-    let mut all = tb_state().lock().unwrap();
-    let tree = all.entry(base).or_default();
     tree.nodes.insert(tag, node.clone());
 
     // Eager invalidation for mutable-reference creation keeps the tree state monotonic and
@@ -705,6 +714,24 @@ fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> 
     for _ in 0..32 {
         let t = tmap.get(&tag)?;
         if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+            return Some(tag);
+        }
+        if t.parent == 0 {
+            return None;
+        }
+        tag = t.parent;
+    }
+    None
+}
+
+fn tb_lite_find_materialized_ref_ancestor_tag(
+    tmap: &HashMap<u64, TagMeta>,
+    nodes: &HashMap<u64, TbNode>,
+    mut tag: u64,
+) -> Option<u64> {
+    for _ in 0..32 {
+        let t = tmap.get(&tag)?;
+        if nodes.contains_key(&tag) && matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
             return Some(tag);
         }
         if t.parent == 0 {

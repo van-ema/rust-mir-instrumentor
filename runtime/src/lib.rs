@@ -759,15 +759,14 @@ fn find_alloc_containing<'a>(
 /// same-address non-root tags in the same allocation epoch, attach to the newest one.
 /// With a strong hint, also allow bounded overlap-based recovery within the same stack alloc.
 #[inline]
-fn recover_parent_for_stack_root(
+fn recover_parent_for_alloc_root(
     pointee_addr: usize,
     alloc_epoch: u64,
-    is_stack: bool,
+    allow_overlap: bool,
     requested_bounds_len: usize,
-    strong_hint: bool,
     require_mut_parent: bool,
 ) -> u64 {
-    if !is_stack || alloc_epoch == 0 || pointee_addr == 0 {
+    if alloc_epoch == 0 || pointee_addr == 0 {
         return 0;
     }
 
@@ -810,7 +809,7 @@ fn recover_parent_for_stack_root(
             continue;
         }
 
-        if !strong_hint {
+        if !allow_overlap {
             continue;
         }
 
@@ -2513,11 +2512,13 @@ pub extern "C" fn __record_ref_creation(
             .unwrap_or((0, false, 0, 0))
     };
 
-    // Optimized MIR frequently loses parent tags for stack refs at call boundaries and in
-    // projection-heavy lowering. Exact same-address recovery is low-risk for refs, so allow it
-    // for all stack roots; the stronger bounded-overlap recovery remains gated by the hint bit.
+    // Optimized MIR can lose parent tags for same-address ref reborrows on both stack and heap
+    // objects. Example:
+    //   let kind = self.kind();   // emits `&self` on a `BytesMut`
+    //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
+    // Exact same-address recovery is low-risk for refs across any tracked allocation. Keep the
+    // stronger bounded-overlap recovery restricted to stack/projected cases via the hint bit.
     if resolved_parent_tag == 0
-        && alloc_is_stack
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {
@@ -2526,12 +2527,11 @@ pub extern "C" fn __record_ref_creation(
         } else {
             inherited_bounds_len
         };
-        let repaired_parent = recover_parent_for_stack_root(
+        let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            true,
+            alloc_is_stack && projected_ref_strong_hint,
             requested_bounds,
-            projected_ref_strong_hint,
             matches!(kind, PtrKind::RefMut),
         );
         if repaired_parent != 0 {
@@ -2703,12 +2703,11 @@ pub extern "C" fn __record_raw_ptr_creation(
         } else {
             0
         };
-        let repaired_parent = recover_parent_for_stack_root(
+        let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            true,
-            requested_bounds,
             projected_raw_strong_hint,
+            requested_bounds,
             matches!(kind, PtrKind::RawMut),
         );
         if repaired_parent != 0 {
@@ -2751,12 +2750,11 @@ pub extern "C" fn __record_raw_ptr_creation(
         } else {
             0
         };
-        let repaired_parent = recover_parent_for_stack_root(
+        let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            true,
-            requested_bounds,
             projected_raw_strong_hint,
+            requested_bounds,
             matches!(kind, PtrKind::RawMut),
         );
         if repaired_parent != 0 && repaired_parent != resolved_parent {
