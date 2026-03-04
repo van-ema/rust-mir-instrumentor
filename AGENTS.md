@@ -56,3 +56,10 @@ The project has two main components:
   use `RUSTEZE_FAILFAST=1` and `RZ_ABORT_ON_VIOLATION=1` by default.
 - Do not silently suppress violations just to keep fuzzing running; prefer fixing root-cause
   false positives in instrumentation/runtime and keep high-confidence crashes actionable.
+
+6. **Testing and commit gate**
+- Before every commit, run the relevant test coverage for the touched code.
+- Do not commit while any targeted test is failing.
+- Before every commit, run the full example test suite, not only examples related to the touched
+  code.
+- Do not commit while any example is failing: all examples must pass before committing.

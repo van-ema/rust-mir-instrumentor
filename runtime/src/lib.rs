@@ -754,6 +754,48 @@ fn find_alloc_containing<'a>(
     best_unknown
 }
 
+/// Best-effort origin lookup for provenance-aware OOB classification.
+///
+/// Unlike direct access lookup, this also accepts the exact one-past-end address of a tracked
+/// allocation. Example:
+///   let p = v.as_ptr().add(v.len()); // legal to compute, illegal to dereference
+/// A later read through `p` should be classified as OUT_OF_BOUNDS relative to `v`'s allocation,
+/// not as a generic WILD_POINTER.
+#[inline]
+fn find_alloc_origin_candidate<'a>(
+    amap: &'a BTreeMap<usize, AllocMeta>,
+    addr: usize,
+) -> Option<(usize, &'a AllocMeta)> {
+    if let Some(found) = find_alloc_containing(amap, addr) {
+        return Some(found);
+    }
+
+    let mut best_live: Option<(usize, &'a AllocMeta)> = None;
+    let mut best_dead: Option<(usize, &'a AllocMeta)> = None;
+
+    for (base, meta) in amap.range(..addr).rev() {
+        if meta.size == 0 {
+            continue;
+        }
+        let Some(end) = base.checked_add(meta.size) else {
+            continue;
+        };
+        if end != addr {
+            continue;
+        }
+
+        if meta.live {
+            best_live = Some((*base, meta));
+            break;
+        }
+        if best_dead.is_none() {
+            best_dead = Some((*base, meta));
+        }
+    }
+
+    best_live.or(best_dead)
+}
+
 /// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
 /// If instrumentation emits a root tag (`parent=0`) for an address that already has
 /// same-address non-root tags in the same allocation epoch, attach to the newest one.
@@ -999,14 +1041,17 @@ fn rz_allow_stack_raw_root_oob_noise(
         return false;
     }
 
-    // Root-tagged stack raws are low-confidence when lineage is missing:
-    // coarse stack-slot selection can make boundary and interior-slot reads/writes look OOB.
+    // Root-tagged stack raws are low-confidence when lineage is missing, but keep this
+    // suppression narrow: tolerate only small near-boundary overhangs. Broad interior-slot
+    // suppression masked real OOB writes such as:
+    //   let q = (p as *mut u8).add(size_of::<S>() - 1);
+    //   ptr::write_unaligned(q.add(8) as *mut u64, ...)
+    // where `q` lands inside a tracked stack slot and the 8-byte write truly crosses the
+    // containing allocation boundary.
     let alloc_end = base.saturating_add(ameta.size);
     let access_end = addr.saturating_add(size);
     let near_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= 16;
-    let interior_crosses_coarse_slot_end =
-        tmeta.pointee_addr > base && tmeta.pointee_addr < alloc_end && access_end > alloc_end;
-    (near_boundary && size <= 16 && access_end > alloc_end) || interior_crosses_coarse_slot_end
+    near_boundary && size <= 16 && access_end > alloc_end
 }
 
 #[inline]
@@ -1198,7 +1243,7 @@ fn origin_alloc_for_tag<'a>(
     for _ in 0..32 {
         let t: &TagMeta = tmap.get(&tag)?;
 
-        if let Some((base, ameta)) = find_alloc_containing(amap, t.pointee_addr) {
+        if let Some((base, ameta)) = find_alloc_origin_candidate(amap, t.pointee_addr) {
             // If both sides have epochs, require a match.
             if t.alloc_epoch != 0 && ameta.epoch != 0 && t.alloc_epoch != ameta.epoch {
                 // Epoch mismatch: treat as unrelated (likely address reuse / stale).
