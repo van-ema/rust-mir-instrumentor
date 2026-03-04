@@ -754,34 +754,26 @@ fn find_alloc_containing<'a>(
     best_unknown
 }
 
-/// Best-effort lineage repair for stack roots:
-/// when instrumentation emits a root raw tag (`parent=0`) for an address that already has
+/// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
+/// If instrumentation emits a root tag (`parent=0`) for an address that already has
 /// same-address non-root tags in the same allocation epoch, attach to the newest one.
-/// With a strong hint, also allow bounded overlap-based recovery within the same stack alloc.
+///
+/// We intentionally do not guess based on overlapping ranges here. Exact same-address repair
+/// covers the real "parent tag was lost" case without introducing range-overlap heuristics.
 #[inline]
 fn recover_parent_for_alloc_root(
     pointee_addr: usize,
     alloc_epoch: u64,
-    allow_overlap: bool,
-    requested_bounds_len: usize,
     require_mut_parent: bool,
 ) -> u64 {
     if alloc_epoch == 0 || pointee_addr == 0 {
         return 0;
     }
 
-    let requested_span = if requested_bounds_len == 0 {
-        std::mem::size_of::<usize>()
-    } else {
-        requested_bounds_len
-    };
-    let requested_end = pointee_addr.saturating_add(requested_span);
-
     let amap = allocs().lock().unwrap();
     let root_base = find_alloc_containing(&amap, pointee_addr).map(|(base, _)| base);
     let tmap = tags().lock().unwrap();
     let mut exact_parent = 0u64;
-    let mut overlap_parent: Option<(usize, u64)> = None;
 
     for (&tag, meta) in tmap.iter() {
         if meta.parent == 0 {
@@ -806,44 +798,10 @@ fn recover_parent_for_alloc_root(
             if tag > exact_parent {
                 exact_parent = tag;
             }
-            continue;
-        }
-
-        if !allow_overlap {
-            continue;
-        }
-
-        let cand_span = if meta.bounds_len == 0 {
-            std::mem::size_of::<usize>()
-        } else {
-            meta.bounds_len
-        };
-        let cand_end = meta.pointee_addr.saturating_add(cand_span);
-        let overlaps = pointee_addr < cand_end && meta.pointee_addr < requested_end;
-        if !overlaps {
-            continue;
-        }
-
-        let distance = if meta.pointee_addr >= pointee_addr {
-            meta.pointee_addr - pointee_addr
-        } else {
-            pointee_addr - meta.pointee_addr
-        };
-        match overlap_parent {
-            None => overlap_parent = Some((distance, tag)),
-            Some((best_distance, best_tag)) => {
-                if distance < best_distance || (distance == best_distance && tag > best_tag) {
-                    overlap_parent = Some((distance, tag));
-                }
-            }
         }
     }
 
-    if exact_parent != 0 {
-        exact_parent
-    } else {
-        overlap_parent.map(|(_, tag)| tag).unwrap_or(0)
-    }
+    exact_parent
 }
 
 #[inline]
@@ -2413,8 +2371,6 @@ pub extern "C" fn __record_ref_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    let projected_ref_hint = (alias_exempt & 0b0000_0010) != 0;
-    let projected_ref_strong_hint = (alias_exempt & 0b0000_0100) != 0;
 
     if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
@@ -2516,22 +2472,15 @@ pub extern "C" fn __record_ref_creation(
     // objects. Example:
     //   let kind = self.kind();   // emits `&self` on a `BytesMut`
     //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
-    // Exact same-address recovery is low-risk for refs across any tracked allocation. Keep the
-    // stronger bounded-overlap recovery restricted to stack/projected cases via the hint bit.
+    // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
+    // that repair even when we reject broader overlap-based guessing.
     if resolved_parent_tag == 0
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {
-        let requested_bounds = if bounds_len != 0 {
-            bounds_len
-        } else {
-            inherited_bounds_len
-        };
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            alloc_is_stack && projected_ref_strong_hint,
-            requested_bounds,
             matches!(kind, PtrKind::RefMut),
         );
         if repaired_parent != 0 {
@@ -2606,7 +2555,6 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
-    let projected_raw_strong_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
@@ -2696,18 +2644,9 @@ pub extern "C" fn __record_raw_ptr_creation(
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {
-        let requested_bounds = if bounds_len != 0 {
-            bounds_len
-        } else if carry_bounds_from_source {
-            inherited_bounds_len
-        } else {
-            0
-        };
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            projected_raw_strong_hint,
-            requested_bounds,
             matches!(kind, PtrKind::RawMut),
         );
         if repaired_parent != 0 {
@@ -2743,18 +2682,9 @@ pub extern "C" fn __record_raw_ptr_creation(
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {
-        let requested_bounds = if bounds_len != 0 {
-            bounds_len
-        } else if carry_bounds_from_source {
-            inherited_bounds_len
-        } else {
-            0
-        };
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
-            projected_raw_strong_hint,
-            requested_bounds,
             matches!(kind, PtrKind::RawMut),
         );
         if repaired_parent != 0 && repaired_parent != resolved_parent {
