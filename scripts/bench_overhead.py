@@ -40,6 +40,7 @@ class Target:
     pkg: str
     bin: str
     pkg_dir: Path
+    required_features: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -68,7 +69,14 @@ def load_targets(cargo: str, env: dict[str, str], suite: str) -> list[Target]:
         pkg_dir = Path(manifest_path).parent
         for tgt in pkg.get("targets", []):
             if "bin" in tgt.get("kind", []):
-                targets.append(Target(pkg=pkg["name"], bin=tgt["name"], pkg_dir=pkg_dir))
+                targets.append(
+                    Target(
+                        pkg=pkg["name"],
+                        bin=tgt["name"],
+                        pkg_dir=pkg_dir,
+                        required_features=tuple(tgt.get("required-features", [])),
+                    )
+                )
 
     return sorted(targets, key=lambda t: t.label)
 
@@ -92,9 +100,19 @@ def parse_target_spec(spec: str, repo_root: Path, cargo: str, env: dict[str, str
         pkg_dir = Path(pkg_meta["manifest_path"]).parent
         for tgt in pkg_meta.get("targets", []):
             if "bin" in tgt.get("kind", []) and tgt.get("name") == bin_name:
-                return Target(pkg=pkg, bin=bin_name, pkg_dir=pkg_dir)
+                return Target(
+                    pkg=pkg,
+                    bin=bin_name,
+                    pkg_dir=pkg_dir,
+                    required_features=tuple(tgt.get("required-features", [])),
+                )
         die(f"package {pkg} has no bin target {bin_name}")
     die(f"unknown package {pkg}")
+
+
+def add_required_features(cmd: list[str], target: Target) -> None:
+    if target.required_features:
+        cmd.extend(["--features", ",".join(target.required_features)])
 
 
 def cargo_build_runtime(cargo: str, env: dict[str, str], profile: str, target_dir: Path) -> Path:
@@ -120,6 +138,7 @@ def cargo_build_baseline(
     env["CARGO_TARGET_DIR"] = str(target_dir)
 
     cmd = [cargo, "build", "-p", target.pkg, "--bin", target.bin]
+    add_required_features(cmd, target)
     if profile == "release":
         cmd.append("--release")
     subprocess.run(cmd, env=env, check=True)
@@ -137,13 +156,17 @@ def cargo_build_asan(
     target_dir: Path,
     target: Target,
     rustflags: str,
+    asan_dylib: Path | None,
 ) -> Path:
     env = strip_rz_env(env)
     env = env.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["RUSTFLAGS"] = rustflags if not env.get("RUSTFLAGS") else f"{env['RUSTFLAGS']} {rustflags}"
+    if asan_dylib is not None:
+        env.setdefault("DYLD_INSERT_LIBRARIES", str(asan_dylib))
 
     cmd = [cargo, "+nightly", "build", "-p", target.pkg, "--bin", target.bin]
+    add_required_features(cmd, target)
     if profile == "release":
         cmd.append("--release")
     subprocess.run(cmd, env=env, check=True)
@@ -162,20 +185,46 @@ def cargo_miri_available(cargo: str, env: dict[str, str]) -> bool:
         return False
 
 
+def resolve_macos_asan_dylib(env: dict[str, str]) -> Path | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        libdir = subprocess.check_output(
+            ["rustc", "+nightly", "--print", "target-libdir"],
+            text=True,
+            env=env,
+        ).strip()
+    except Exception:
+        return None
+
+    libdir_path = Path(libdir)
+    direct = libdir_path / "librustc-nightly_rt.asan.dylib"
+    if direct.exists():
+        return direct
+
+    matches = sorted(libdir_path.glob("librustc*_rt.asan.dylib"))
+    return matches[0] if matches else None
+
+
 def run_miri(
     cargo: str,
     env: dict[str, str],
     target: Target,
     runs: int,
     timeout_s: float | None,
+    bin_args: list[str] | None = None,
 ) -> tuple[list[float], list[int]]:
     times: list[float] = []
     codes: list[int] = []
     env = strip_rz_env(env)
+    cmd = [cargo, "+nightly", "miri", "run", "-p", target.pkg, "--bin", target.bin]
+    add_required_features(cmd, target)
+    if bin_args:
+        cmd += ["--", *bin_args]
     for _ in range(runs):
         start = time.perf_counter()
         proc = subprocess.run(
-            [cargo, "+nightly", "miri", "run", "-p", target.pkg, "--bin", target.bin],
+            cmd,
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -208,6 +257,7 @@ def cargo_build_rusteze(
         "--bin",
         target.bin,
     ]
+    add_required_features(cmd, target)
     if mir_out is not None:
         cmd.insert(3, f"--mir-out={mir_out}")
     if profile == "release":
@@ -227,14 +277,18 @@ def run_timed(
     runs: int,
     warmup: int,
     timeout_s: float | None,
+    bin_args: list[str] | None = None,
 ) -> tuple[list[float], list[int]]:
     times: list[float] = []
     exit_codes: list[int] = []
+    cmd = [str(bin_path)]
+    if bin_args:
+        cmd.extend(bin_args)
 
     def one_run() -> tuple[float, int]:
         start = time.perf_counter()
         proc = subprocess.run(
-            [str(bin_path)],
+            cmd,
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -290,6 +344,11 @@ def main() -> int:
     ap.add_argument("--no-timeout", action="store_true")
     ap.add_argument("--report-dir", default="reports/overhead")
     ap.add_argument("--emit-mir", action="store_true", help="Write MIR output per target (debugging)")
+    ap.add_argument(
+        "--input-file",
+        default="",
+        help="Optional input file path passed as argv[1] to each benchmark binary.",
+    )
     ap.add_argument("--include-asan", action="store_true", help="Also build+run AddressSanitizer (nightly)")
     ap.add_argument(
         "--asan-rustflags",
@@ -328,6 +387,7 @@ def main() -> int:
     if args.include_asan:
         # Quick sanity check early so we fail fast with a clear message.
         subprocess.run([cargo, "+nightly", "--version"], env=env, check=True, stdout=subprocess.DEVNULL)
+    asan_dylib = resolve_macos_asan_dylib(env) if args.include_asan else None
 
     if args.include_miri:
         if not cargo_miri_available(cargo, env):
@@ -350,6 +410,14 @@ def main() -> int:
     results: list[dict] = []
 
     timeout_s = None if args.no_timeout else args.timeout_s
+    bin_args: list[str] = []
+    if args.input_file:
+        input_path = Path(args.input_file)
+        if not input_path.is_absolute():
+            input_path = (repo_root / input_path).resolve()
+        if not input_path.exists():
+            die(f"input file does not exist: {input_path}")
+        bin_args = [str(input_path)]
 
     for t in targets:
         base_bin = cargo_build_baseline(cargo, env, args.profile, base_target_dir, t)
@@ -362,6 +430,7 @@ def main() -> int:
                 asan_target_dir,
                 t,
                 rustflags=args.asan_rustflags,
+                asan_dylib=asan_dylib,
             )
 
         mir_out = None
@@ -383,6 +452,7 @@ def main() -> int:
             runs=args.runs,
             warmup=args.warmup,
             timeout_s=timeout_s,
+            bin_args=bin_args,
         )
         rz_env = env.copy()
         # Reduce logging overhead during benchmarks.
@@ -393,6 +463,7 @@ def main() -> int:
             runs=args.runs,
             warmup=args.warmup,
             timeout_s=timeout_s,
+            bin_args=bin_args,
         )
         asan_times: list[float] = []
         asan_codes: list[int] = []
@@ -400,12 +471,15 @@ def main() -> int:
             asan_env = strip_rz_env(env)
             # Reduce ASan overhead variance/noise (especially on macOS).
             asan_env.setdefault("ASAN_OPTIONS", "detect_leaks=0")
+            if asan_dylib is not None:
+                asan_env.setdefault("DYLD_INSERT_LIBRARIES", str(asan_dylib))
             asan_times, asan_codes = run_timed(
                 asan_bin,
                 env=asan_env,
                 runs=args.runs,
                 warmup=args.warmup,
                 timeout_s=timeout_s,
+                bin_args=bin_args,
             )
 
         miri_times: list[float] = []
@@ -413,7 +487,14 @@ def main() -> int:
         if args.include_miri:
             # Miri does not have a meaningful "release" mode; it interprets MIR and is orders of
             # magnitude slower. Include it for completeness, but do not interpret as overhead.
-            miri_times, miri_codes = run_miri(cargo, env, t, runs=args.miri_runs, timeout_s=timeout_s)
+            miri_times, miri_codes = run_miri(
+                cargo,
+                env,
+                t,
+                runs=args.miri_runs,
+                timeout_s=timeout_s,
+                bin_args=bin_args,
+            )
 
         base_sum = summarize(base_times)
         rz_sum = summarize(rz_times)
@@ -435,6 +516,7 @@ def main() -> int:
                 "pkg": t.pkg,
                 "bin": t.bin,
                 "profile": args.profile,
+                "input_file": bin_args[0] if bin_args else None,
                 "baseline": {"bin": str(base_bin), "times_s": base_times, "exit_codes": base_codes, "summary": base_sum},
                 "rusteze": {"bin": str(rz_bin), "times_s": rz_times, "exit_codes": rz_codes, "summary": rz_sum},
                 "asan": (
