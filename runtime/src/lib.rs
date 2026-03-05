@@ -12,6 +12,7 @@ mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
 mod live_alloc_cache;
 mod tag_lookup_cache;
+mod tag_store;
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -1789,9 +1790,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(tmeta) =
-        tag_lookup_cache::get_cached(tag, || tags().lock().unwrap().get(&tag).copied())
-    else {
+    let Some(tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
             "RZ_LOG_LOC",
@@ -2198,9 +2197,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(tmeta) =
-        tag_lookup_cache::get_cached(tag, || tags().lock().unwrap().get(&tag).copied())
-    else {
+    let Some(tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
             "RZ_LOG_LOC",
@@ -2644,19 +2641,18 @@ pub extern "C" fn __record_ref_creation(
         mut inherited_bounds_len,
         mut resolved_parent_tag,
     ) = if parent_tag != 0 {
-        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
-            .lock()
-            .unwrap()
-            .get(&parent_tag)
-            .map(|p| {
-                (
-                    p.alloc_epoch,
-                    p.alloc_live_at_creation,
-                    Some(p.pointee_addr),
-                    p.bounds_len,
-                )
-            })
-            .unwrap_or((0, false, None, 0));
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) =
+            tag_store::get(parent_tag)
+                .as_ref()
+                .map(|p| {
+                    (
+                        p.alloc_epoch,
+                        p.alloc_live_at_creation,
+                        Some(p.pointee_addr),
+                        p.bounds_len,
+                    )
+                })
+                .unwrap_or((0, false, None, 0));
 
         if let Some(parent_pointee) = parent_pointee {
             let amap = allocs().lock().unwrap();
@@ -2740,7 +2736,7 @@ pub extern "C" fn __record_ref_creation(
         );
         if repaired_parent != 0 {
             resolved_parent_tag = repaired_parent;
-            if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent_tag).cloned() {
+            if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
                 if inherited_bounds_len == 0 {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
@@ -2777,8 +2773,7 @@ pub extern "C" fn __record_ref_creation(
         lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
     };
-    tags().lock().unwrap().insert(tag, tmeta.clone());
-    tag_lookup_cache::invalidate();
+    tag_store::insert(tag, tmeta.clone());
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -2835,10 +2830,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) =
         if derived_from != 0 {
             let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) =
-                tags()
-                    .lock()
-                    .unwrap()
-                    .get(&derived_from)
+                tag_store::get(derived_from)
+                    .as_ref()
                     .map(|p| {
                         (
                             p.alloc_epoch,
@@ -2917,7 +2910,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         );
         if repaired_parent != 0 {
             resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent).cloned() {
+            if let Some(parent_meta) = tag_store::get(resolved_parent) {
                 if inherited_bounds_len == 0 {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
@@ -2956,7 +2949,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         if repaired_parent != 0 && repaired_parent != resolved_parent {
             let previous_parent = resolved_parent;
             resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tags().lock().unwrap().get(&resolved_parent).cloned() {
+            if let Some(parent_meta) = tag_store::get(resolved_parent) {
                 if inherited_bounds_len == 0 {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
@@ -2996,8 +2989,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
     };
-    tags().lock().unwrap().insert(tag, tmeta.clone());
-    tag_lookup_cache::invalidate();
+    tag_store::insert(tag, tmeta.clone());
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -3033,10 +3025,7 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
         return;
     }
 
-    let mut tmap = tags().lock().unwrap();
-    if let Some(tmeta) = tmap.get_mut(&tag) {
-        tmeta.escaped = true;
-        tag_lookup_cache::invalidate();
+    if let Some(tmeta) = tag_store::mark_escaped(tag) {
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,

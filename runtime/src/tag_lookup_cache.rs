@@ -1,5 +1,4 @@
 use crate::TagMeta;
-use core::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
 
 const TAG_CACHE_SLOTS: usize = 256;
@@ -30,8 +29,6 @@ const EMPTY_TAG_LOOKUP_CACHE_ENTRY: TagLookupCacheEntry = TagLookupCacheEntry {
     has_tag: false,
     meta: EMPTY_TAG_META,
 };
-
-static TAG_LOOKUP_GEN: AtomicU64 = AtomicU64::new(1);
 
 ::std::thread_local! {
     static RZ_TAG_LOOKUP_CACHE: RefCell<[TagLookupCacheEntry; TAG_CACHE_SLOTS]> =
@@ -87,18 +84,13 @@ pub(crate) fn get_cached<F>(tag: u64, load: F) -> Option<TagMeta>
 where
     F: FnOnce() -> Option<TagMeta>,
 {
-    let gen = TAG_LOOKUP_GEN.load(Ordering::Relaxed);
+    let gen = crate::tag_store::gen_for_tag(tag);
     if let Some(found) = tag_cache_get(tag, gen) {
         return found;
     }
 
     let found = load();
-    let gen_now = TAG_LOOKUP_GEN.load(Ordering::Relaxed);
+    let gen_now = crate::tag_store::gen_for_tag(tag);
     tag_cache_put(tag, gen_now, found);
     found
-}
-
-#[inline]
-pub(crate) fn invalidate() {
-    TAG_LOOKUP_GEN.fetch_add(1, Ordering::Relaxed);
 }
