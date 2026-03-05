@@ -15,6 +15,7 @@ extern crate rustc_target;
 
 mod driver;
 mod instrumentation;
+mod unsafe_dataflow;
 mod util;
 
 use rustc_errors::{emitter::HumanReadableErrorType, ColorConfig};

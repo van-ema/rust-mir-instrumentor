@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
+use crate::unsafe_dataflow::{self, UnsafeInfluence};
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
@@ -1033,6 +1034,61 @@ impl MyOptimizationPass {
         std::env::var("RZ_TRACE_STACK_ALLOCS")
             .ok()
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    /// Enable crate-local unsafe-influence dataflow gating for pointer access hooks.
+    ///
+    /// Default: disabled.
+    /// Set `RZ_UNSAFE_DATAFLOW=1` to keep heavy pointer access hooks only for locals that
+    /// are conservatively tainted by unsafe influence (raw pointers / unknown-call boundaries).
+    fn unsafe_dataflow_selective_enabled(&self) -> bool {
+        unsafe_dataflow::unsafe_dataflow_enabled()
+    }
+
+    fn trace_unsafe_dataflow_enabled(&self) -> bool {
+        std::env::var("RZ_TRACE_UNSAFE_DATAFLOW")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    fn filter_insert_points_by_unsafe_dataflow<'tcx>(
+        &self,
+        _body: &Body<'tcx>,
+        mut insert_points: Vec<InsertPoint<'tcx>>,
+        unsafe_influence: &UnsafeInfluence,
+    ) -> Vec<InsertPoint<'tcx>> {
+        if !unsafe_influence.enabled() {
+            return insert_points;
+        }
+
+        let before = insert_points.len();
+        insert_points.retain(|ip| {
+            let ptr_local_opt = match ip.kind {
+                InstrKind::PtrRead { ptr_local, .. }
+                | InstrKind::PtrWrite { ptr_local, .. }
+                | InstrKind::PtrReadAllowUntagged { ptr_local, .. }
+                | InstrKind::PtrWriteAllowUntagged { ptr_local, .. }
+                | InstrKind::PtrUse { ptr_local } => Some(ptr_local),
+                _ => None,
+            };
+            ptr_local_opt
+                .map(|l| unsafe_influence.should_instrument_ptr_local(l))
+                .unwrap_or(true)
+        });
+
+        if self.trace_unsafe_dataflow_enabled() {
+            let dropped = before.saturating_sub(insert_points.len());
+            rz_pass_warn!(
+                self,
+                "[rusteze][unsafe-dflow] filtered {} access hooks (kept {} / tainted_ptrs={} total_ptrs={})",
+                dropped,
+                insert_points.len(),
+                unsafe_influence.tainted_ptr_count(),
+                unsafe_influence.total_ptr_count()
+            );
+        }
+
+        insert_points
     }
 
     fn trace_stack_alloc_emit<'tcx>(
@@ -4756,7 +4812,12 @@ impl MyOptimizationPass {
         }
     }
 
-    fn scan_body<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> ScanResult<'tcx> {
+    fn scan_body<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) -> ScanResult<'tcx> {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
         let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
@@ -4968,6 +5029,12 @@ impl MyOptimizationPass {
         insert_points.splice(0..0, fallback_entry_points);
         // Append return points normally; they stay associated with return blocks.
         insert_points.extend(fallback_return_points);
+
+        let insert_points = self.filter_insert_points_by_unsafe_dataflow(
+            body,
+            insert_points,
+            unsafe_influence,
+        );
 
         ScanResult { insert_points, ptr_locals_needing_tag }
     }
@@ -7234,7 +7301,22 @@ impl MyOptimizationPass {
             def_id_exit_fn,
         };
 
-        let scan = self.scan_body(tcx, body);
+        let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(
+            tcx,
+            body,
+            self.unsafe_dataflow_selective_enabled(),
+        );
+        if self.trace_unsafe_dataflow_enabled() && unsafe_influence.enabled() {
+            rz_pass_warn!(
+                self,
+                "[rusteze][unsafe-dflow] fn={} tainted_ptrs={} total_ptrs={}",
+                def_path,
+                unsafe_influence.tainted_ptr_count(),
+                unsafe_influence.total_ptr_count()
+            );
+        }
+
+        let scan = self.scan_body(tcx, body, &unsafe_influence);
         let tag_local_for_ptr_local =
             self.allocate_tag_locals(tcx, body, scan.ptr_locals_needing_tag.clone());
         // Per-pointer local "nearest reference ancestor" tag.
