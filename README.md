@@ -275,9 +275,16 @@ Key knobs:
 - `--suite`: `examples` | `medium` | `fuzz`
 - `--targets`: optional list of `pkg` or `pkg::bin`
 - `--profile`: `release` recommended for steady-state
+- `--input-file`: optional file path passed as `argv[1]` to the benchmark binary
 - `--include-asan`: adds an ASan build+run column (requires `cargo +nightly`)
 - `--include-miri`: adds a Miri timing column (very slow; not comparable to native runtime)
 - `--runs` / `--warmup`: sampling controls
+
+Notes:
+- For `afl_harness` bins (`afl_harness::afl_*_driver`), required feature flags are
+  resolved automatically from Cargo metadata.
+- Driver targets that read input files should be benchmarked with `--input-file`
+  (for example, corpus `seed0` files under `fuzz/corpus/<target>/`).
 
 ```bash
 # Examples suite (release)
@@ -291,6 +298,20 @@ python3 scripts/bench_overhead.py --suite medium --profile release --include-asa
 
 # Optional: include Miri timings (not comparable to native runtime)
 python3 scripts/bench_overhead.py --suite medium --profile release --include-asan --include-miri --miri-runs 1
+
+# Single AFL harness target with corpus input (4-way comparison)
+python3 scripts/bench_overhead.py \
+  --profile release \
+  --targets afl_harness::afl_toml_driver \
+  --input-file fuzz/corpus/toml/seed0 \
+  --include-asan \
+  --include-miri --miri-runs 1
+
+# Multiple maintained crates (repeatable, release profile)
+python3 scripts/bench_overhead.py --profile release --targets afl_harness::afl_base64_driver --input-file fuzz/corpus/base64/seed0 --include-asan --include-miri --miri-runs 1
+python3 scripts/bench_overhead.py --profile release --targets afl_harness::afl_uuid_driver --input-file fuzz/corpus/uuid/seed0 --include-asan --include-miri --miri-runs 1
+python3 scripts/bench_overhead.py --profile release --targets afl_harness::afl_itoa_driver --input-file fuzz/corpus/itoa/seed0 --include-asan --include-miri --miri-runs 1
+python3 scripts/bench_overhead.py --profile release --targets afl_harness::afl_quick_xml_driver --input-file fuzz/corpus/quick_xml/seed0 --include-asan --include-miri --miri-runs 1
 ```
 
 ### Criterion microbenches (bytes/smallvec workloads)
