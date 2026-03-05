@@ -333,8 +333,16 @@ def fmt_s(x: float | None) -> str:
     return f"{x:.6f}"
 
 
+def ratio(num: float | None, den: float | None) -> float | None:
+    if num is None or den is None or num <= 0.0 or den <= 0.0:
+        return None
+    return num / den
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Measure runtime overhead (baseline vs rusteze).")
+    ap = argparse.ArgumentParser(
+        description="Measure runtime overhead (baseline vs rusteze with/without alias model)."
+    )
     ap.add_argument("--profile", choices=["debug", "release"], default="release")
     ap.add_argument("--suite", choices=["examples", "medium", "fuzz"], default="examples")
     ap.add_argument("--targets", nargs="*", default=[], help="Explicit targets as pkg or pkg::bin")
@@ -357,6 +365,11 @@ def main() -> int:
     )
     ap.add_argument("--include-miri", action="store_true", help="Also run under Miri (nightly; very slow)")
     ap.add_argument("--miri-runs", type=int, default=1, help="Number of Miri runs per target (default: 1)")
+    ap.add_argument(
+        "--rusteze-alias-model",
+        default="tb_lite",
+        help="Alias model for the primary rusteze run (default: tb_lite); a second run uses RZ_ALIAS_MODEL=none",
+    )
     args = ap.parse_args()
 
     env = os.environ.copy()
@@ -454,17 +467,31 @@ def main() -> int:
             timeout_s=timeout_s,
             bin_args=bin_args,
         )
-        rz_env = env.copy()
+        rz_alias_env = env.copy()
         # Reduce logging overhead during benchmarks.
-        rz_env.setdefault("RZ_LOG", "error")
-        rz_times, rz_codes = run_timed(
+        rz_alias_env.setdefault("RZ_LOG", "error")
+        rz_alias_env["RZ_ALIAS_MODEL"] = args.rusteze_alias_model
+        rz_alias_times, rz_alias_codes = run_timed(
             rz_bin,
-            env=rz_env,
+            env=rz_alias_env,
             runs=args.runs,
             warmup=args.warmup,
             timeout_s=timeout_s,
             bin_args=bin_args,
         )
+
+        rz_no_alias_env = env.copy()
+        rz_no_alias_env.setdefault("RZ_LOG", "error")
+        rz_no_alias_env["RZ_ALIAS_MODEL"] = "none"
+        rz_no_alias_times, rz_no_alias_codes = run_timed(
+            rz_bin,
+            env=rz_no_alias_env,
+            runs=args.runs,
+            warmup=args.warmup,
+            timeout_s=timeout_s,
+            bin_args=bin_args,
+        )
+
         asan_times: list[float] = []
         asan_codes: list[int] = []
         if asan_bin is not None:
@@ -497,18 +524,21 @@ def main() -> int:
             )
 
         base_sum = summarize(base_times)
-        rz_sum = summarize(rz_times)
+        rz_alias_sum = summarize(rz_alias_times)
+        rz_no_alias_sum = summarize(rz_no_alias_times)
         asan_sum = summarize(asan_times) if asan_bin is not None else None
         miri_sum = summarize(miri_times) if args.include_miri else None
-        overhead = None
-        if base_sum.get("mean_s", 0.0) > 0.0 and rz_sum.get("mean_s", 0.0) > 0.0:
-            overhead = rz_sum["mean_s"] / base_sum["mean_s"]
-        asan_overhead = None
-        if asan_sum is not None and base_sum.get("mean_s", 0.0) > 0.0 and asan_sum.get("mean_s", 0.0) > 0.0:
-            asan_overhead = asan_sum["mean_s"] / base_sum["mean_s"]
-        rz_vs_asan = None
-        if asan_sum is not None and asan_sum.get("mean_s", 0.0) > 0.0 and rz_sum.get("mean_s", 0.0) > 0.0:
-            rz_vs_asan = rz_sum["mean_s"] / asan_sum["mean_s"]
+        base_mean = base_sum.get("mean_s")
+        rz_alias_mean = rz_alias_sum.get("mean_s")
+        rz_no_alias_mean = rz_no_alias_sum.get("mean_s")
+        asan_mean = None if asan_sum is None else asan_sum.get("mean_s")
+
+        rz_alias_over_base = ratio(rz_alias_mean, base_mean)
+        rz_no_alias_over_base = ratio(rz_no_alias_mean, base_mean)
+        asan_over_base = ratio(asan_mean, base_mean)
+        rz_alias_over_asan = ratio(rz_alias_mean, asan_mean)
+        rz_no_alias_over_asan = ratio(rz_no_alias_mean, asan_mean)
+        rz_alias_over_no_alias = ratio(rz_alias_mean, rz_no_alias_mean)
 
         results.append(
             {
@@ -518,7 +548,25 @@ def main() -> int:
                 "profile": args.profile,
                 "input_file": bin_args[0] if bin_args else None,
                 "baseline": {"bin": str(base_bin), "times_s": base_times, "exit_codes": base_codes, "summary": base_sum},
-                "rusteze": {"bin": str(rz_bin), "times_s": rz_times, "exit_codes": rz_codes, "summary": rz_sum},
+                "rusteze_alias_model": args.rusteze_alias_model,
+                "rusteze": {
+                    "bin": str(rz_bin),
+                    "times_s": rz_alias_times,
+                    "exit_codes": rz_alias_codes,
+                    "summary": rz_alias_sum,
+                },
+                "rusteze_alias": {
+                    "bin": str(rz_bin),
+                    "times_s": rz_alias_times,
+                    "exit_codes": rz_alias_codes,
+                    "summary": rz_alias_sum,
+                },
+                "rusteze_no_alias": {
+                    "bin": str(rz_bin),
+                    "times_s": rz_no_alias_times,
+                    "exit_codes": rz_no_alias_codes,
+                    "summary": rz_no_alias_sum,
+                },
                 "asan": (
                     None
                     if asan_bin is None
@@ -529,38 +577,65 @@ def main() -> int:
                     if not args.include_miri
                     else {"times_s": miri_times, "exit_codes": miri_codes, "summary": miri_sum}
                 ),
-                "overhead_mean_ratio_rusteze_over_baseline": overhead,
-                "overhead_mean_ratio_asan_over_baseline": asan_overhead,
-                "overhead_mean_ratio_rusteze_over_asan": rz_vs_asan,
+                # Backward-compatible keys keep using the alias-model run.
+                "overhead_mean_ratio_rusteze_over_baseline": rz_alias_over_base,
+                "overhead_mean_ratio_asan_over_baseline": asan_over_base,
+                "overhead_mean_ratio_rusteze_over_asan": rz_alias_over_asan,
+                "overhead_mean_ratio_rusteze_alias_over_baseline": rz_alias_over_base,
+                "overhead_mean_ratio_rusteze_no_alias_over_baseline": rz_no_alias_over_base,
+                "overhead_mean_ratio_rusteze_alias_over_asan": rz_alias_over_asan,
+                "overhead_mean_ratio_rusteze_no_alias_over_asan": rz_no_alias_over_asan,
+                "overhead_mean_ratio_rusteze_alias_over_no_alias": rz_alias_over_no_alias,
             }
         )
 
     (report_dir / "results.json").write_text(json.dumps(results, indent=2))
 
-    header = ["target", "base_mean_s", "rz_mean_s"]
+    header = [
+        "target",
+        "base_mean_s",
+        "rz_alias_mean_s",
+        "rz_no_alias_mean_s",
+        "rz_alias_over_base",
+        "rz_no_alias_over_base",
+        "rz_alias_over_no_alias",
+    ]
     if args.include_asan:
-        header += ["asan_mean_s", "rz_over_base", "asan_over_base", "rz_over_asan"]
-    else:
-        header += ["rz_over_base"]
+        header += ["asan_mean_s", "asan_over_base", "rz_alias_over_asan", "rz_no_alias_over_asan"]
     if args.include_miri:
         header += ["miri_mean_s"]
     lines = ["\t".join(header)]
 
     for r in results:
         base_mean = r["baseline"]["summary"].get("mean_s", 0.0)
-        rz_mean = r["rusteze"]["summary"].get("mean_s", 0.0)
-        rz_over_base = r.get("overhead_mean_ratio_rusteze_over_baseline")
-        rz_over_base_s = "-" if rz_over_base is None else f"{rz_over_base:.3f}"
+        rz_alias_mean = r["rusteze_alias"]["summary"].get("mean_s", 0.0)
+        rz_no_alias_mean = r["rusteze_no_alias"]["summary"].get("mean_s", 0.0)
+        rz_alias_over_base = r.get("overhead_mean_ratio_rusteze_alias_over_baseline")
+        rz_no_alias_over_base = r.get("overhead_mean_ratio_rusteze_no_alias_over_baseline")
+        rz_alias_over_no_alias = r.get("overhead_mean_ratio_rusteze_alias_over_no_alias")
+        row = [
+            r["target"],
+            f"{base_mean:.6f}",
+            f"{rz_alias_mean:.6f}",
+            f"{rz_no_alias_mean:.6f}",
+            "-" if rz_alias_over_base is None else f"{rz_alias_over_base:.3f}",
+            "-" if rz_no_alias_over_base is None else f"{rz_no_alias_over_base:.3f}",
+            "-" if rz_alias_over_no_alias is None else f"{rz_alias_over_no_alias:.3f}",
+        ]
+
         if args.include_asan:
             asan = r.get("asan")
             asan_mean = 0.0 if asan is None else asan["summary"].get("mean_s", 0.0)
             asan_over_base = r.get("overhead_mean_ratio_asan_over_baseline")
             asan_over_base_s = "-" if asan_over_base is None else f"{asan_over_base:.3f}"
-            rz_over_asan = r.get("overhead_mean_ratio_rusteze_over_asan")
-            rz_over_asan_s = "-" if rz_over_asan is None else f"{rz_over_asan:.3f}"
-            row = [r["target"], f"{base_mean:.6f}", f"{rz_mean:.6f}", f"{asan_mean:.6f}", rz_over_base_s, asan_over_base_s, rz_over_asan_s]
-        else:
-            row = [r["target"], f"{base_mean:.6f}", f"{rz_mean:.6f}", rz_over_base_s]
+            rz_alias_over_asan = r.get("overhead_mean_ratio_rusteze_alias_over_asan")
+            rz_no_alias_over_asan = r.get("overhead_mean_ratio_rusteze_no_alias_over_asan")
+            row += [
+                f"{asan_mean:.6f}",
+                asan_over_base_s,
+                "-" if rz_alias_over_asan is None else f"{rz_alias_over_asan:.3f}",
+                "-" if rz_no_alias_over_asan is None else f"{rz_no_alias_over_asan:.3f}",
+            ]
 
         if args.include_miri:
             miri = r.get("miri")
@@ -577,22 +652,23 @@ def main() -> int:
         f"- suite: `{args.suite}`",
         f"- runs: `{args.runs}`",
         f"- warmup: `{args.warmup}`",
+        f"- rusteze alias model: `{args.rusteze_alias_model}`",
     ]
     if args.include_miri:
         md.append("- miri: included (not comparable to native runtime)")
     md.append("")
 
     if args.include_asan:
-        header = "| target | baseline mean (s) | rusteze mean (s) | ASan mean (s) | rusteze/baseline (x) | ASan/baseline (x) | rusteze/ASan (x) |"
-        sep = "|---|---:|---:|---:|---:|---:|---:|"
+        header = "| target | baseline mean (s) | rusteze(alias) mean (s) | rusteze(no-alias) mean (s) | ASan mean (s) | rz(alias)/base (x) | rz(no-alias)/base (x) | rz(alias)/rz(no-alias) (x) | ASan/base (x) | rz(alias)/ASan (x) | rz(no-alias)/ASan (x) |"
+        sep = "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
         if args.include_miri:
             header = header[:-1] + " Miri mean (s) |"
             sep = sep[:-1] + "---:|"
         md.append(header)
         md.append(sep)
     else:
-        header = "| target | baseline mean (s) | rusteze mean (s) | rusteze/baseline (x) |"
-        sep = "|---|---:|---:|---:|"
+        header = "| target | baseline mean (s) | rusteze(alias) mean (s) | rusteze(no-alias) mean (s) | rz(alias)/base (x) | rz(no-alias)/base (x) | rz(alias)/rz(no-alias) (x) |"
+        sep = "|---|---:|---:|---:|---:|---:|---:|"
         if args.include_miri:
             header = header[:-1] + " Miri mean (s) |"
             sep = sep[:-1] + "---:|"
@@ -600,21 +676,33 @@ def main() -> int:
         md.append(sep)
     for r in results:
         base_mean = r["baseline"]["summary"].get("mean_s")
-        rz_mean = r["rusteze"]["summary"].get("mean_s")
-        rz_over_base = r.get("overhead_mean_ratio_rusteze_over_baseline")
+        rz_alias_mean = r["rusteze_alias"]["summary"].get("mean_s")
+        rz_no_alias_mean = r["rusteze_no_alias"]["summary"].get("mean_s")
+        rz_alias_over_base = r.get("overhead_mean_ratio_rusteze_alias_over_baseline")
+        rz_no_alias_over_base = r.get("overhead_mean_ratio_rusteze_no_alias_over_baseline")
+        rz_alias_over_no_alias = r.get("overhead_mean_ratio_rusteze_alias_over_no_alias")
         if args.include_asan:
             asan = r.get("asan")
             asan_mean = None if asan is None else asan["summary"].get("mean_s")
             asan_over_base = r.get("overhead_mean_ratio_asan_over_baseline")
-            rz_over_asan = r.get("overhead_mean_ratio_rusteze_over_asan")
+            rz_alias_over_asan = r.get("overhead_mean_ratio_rusteze_alias_over_asan")
+            rz_no_alias_over_asan = r.get("overhead_mean_ratio_rusteze_no_alias_over_asan")
             row = (
-                f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_mean)} | {fmt_s(asan_mean)} | "
-                f"{'-' if rz_over_base is None else f'{rz_over_base:.3f}'} | "
+                f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_alias_mean)} | {fmt_s(rz_no_alias_mean)} | {fmt_s(asan_mean)} | "
+                f"{'-' if rz_alias_over_base is None else f'{rz_alias_over_base:.3f}'} | "
+                f"{'-' if rz_no_alias_over_base is None else f'{rz_no_alias_over_base:.3f}'} | "
+                f"{'-' if rz_alias_over_no_alias is None else f'{rz_alias_over_no_alias:.3f}'} | "
                 f"{'-' if asan_over_base is None else f'{asan_over_base:.3f}'} | "
-                f"{'-' if rz_over_asan is None else f'{rz_over_asan:.3f}'} |"
+                f"{'-' if rz_alias_over_asan is None else f'{rz_alias_over_asan:.3f}'} | "
+                f"{'-' if rz_no_alias_over_asan is None else f'{rz_no_alias_over_asan:.3f}'} |"
             )
         else:
-            row = f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_mean)} | {'-' if rz_over_base is None else f'{rz_over_base:.3f}'} |"
+            row = (
+                f"| `{r['target']}` | {fmt_s(base_mean)} | {fmt_s(rz_alias_mean)} | {fmt_s(rz_no_alias_mean)} | "
+                f"{'-' if rz_alias_over_base is None else f'{rz_alias_over_base:.3f}'} | "
+                f"{'-' if rz_no_alias_over_base is None else f'{rz_no_alias_over_base:.3f}'} | "
+                f"{'-' if rz_alias_over_no_alias is None else f'{rz_alias_over_no_alias:.3f}'} |"
+            )
 
         if args.include_miri:
             miri = r.get("miri")

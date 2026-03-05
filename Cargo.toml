@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "afl_harness",
+    "benchmarks/eco_bench",
     "benchmarks/rz_bench",
     "dynamic_loader",
     "examples/call_arg_offset",

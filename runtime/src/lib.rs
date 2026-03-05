@@ -4,11 +4,13 @@
 #![allow(internal_features)]
 use core::ptr;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 mod static_image;
 use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
+mod live_alloc_cache;
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -74,6 +76,113 @@ impl Drop for RelaxEpochGuard {
     #[inline]
     fn drop(&mut self) {
         RZ_RELAX_EPOCH_CHECK.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+struct HookProfileCounters {
+    write_calls: AtomicU64,
+    write_total_ns: AtomicU64,
+    write_tag_lookup_ns: AtomicU64,
+    write_alias_check_ns: AtomicU64,
+    write_alloc_lookup_ns: AtomicU64,
+    read_calls: AtomicU64,
+    read_total_ns: AtomicU64,
+    read_tag_lookup_ns: AtomicU64,
+    read_alias_check_ns: AtomicU64,
+    read_alloc_lookup_ns: AtomicU64,
+}
+
+impl HookProfileCounters {
+    const fn new() -> Self {
+        Self {
+            write_calls: AtomicU64::new(0),
+            write_total_ns: AtomicU64::new(0),
+            write_tag_lookup_ns: AtomicU64::new(0),
+            write_alias_check_ns: AtomicU64::new(0),
+            write_alloc_lookup_ns: AtomicU64::new(0),
+            read_calls: AtomicU64::new(0),
+            read_total_ns: AtomicU64::new(0),
+            read_tag_lookup_ns: AtomicU64::new(0),
+            read_alias_check_ns: AtomicU64::new(0),
+            read_alloc_lookup_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+static RZ_HOOK_PROFILE: OnceLock<HookProfileCounters> = OnceLock::new();
+
+#[inline]
+fn rz_hook_profile() -> &'static HookProfileCounters {
+    RZ_HOOK_PROFILE.get_or_init(HookProfileCounters::new)
+}
+
+#[inline]
+fn rz_profile_hooks_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RZ_PROFILE_HOOKS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    })
+}
+
+#[inline]
+fn rz_elapsed_ns(start: Instant) -> u64 {
+    let ns = start.elapsed().as_nanos();
+    core::cmp::min(ns, u64::MAX as u128) as u64
+}
+
+#[inline]
+fn rz_profile_add(counter: &AtomicU64, start: Option<Instant>) {
+    if let Some(t0) = start {
+        counter.fetch_add(rz_elapsed_ns(t0), Ordering::Relaxed);
+    }
+}
+
+struct HookProfileGuard {
+    start: Option<Instant>,
+    total_counter: Option<&'static AtomicU64>,
+}
+
+impl HookProfileGuard {
+    #[inline]
+    fn write(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.write_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.write_total_ns),
+        }
+    }
+
+    #[inline]
+    fn read(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.read_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.read_total_ns),
+        }
+    }
+}
+
+impl Drop for HookProfileGuard {
+    #[inline]
+    fn drop(&mut self) {
+        let (Some(t0), Some(total)) = (self.start.as_ref(), self.total_counter) else {
+            return;
+        };
+        total.fetch_add(rz_elapsed_ns(*t0), Ordering::Relaxed);
     }
 }
 
@@ -622,7 +731,7 @@ fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
 static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
 
 /// Metadata for a tracked allocation (stack or heap).
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct AllocMeta {
     /// Whether the allocation is currently live.
     pub live: bool,
@@ -1335,7 +1444,9 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         entry.size = entry.size.max(size);
     }
 
+    let entry_snapshot = *entry;
     drop(m);
+    live_alloc_cache::update_alloc(base_addr, entry_snapshot);
     active_alias_model().on_alloc_state_change(base_addr, new_live);
 }
 
@@ -1585,6 +1696,63 @@ pub extern "C" fn __rz_dump_state() {
     rz_info!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
 }
 
+#[no_mangle]
+pub extern "C" fn __rz_reset_hook_profile() {
+    let Some(p) = RZ_HOOK_PROFILE.get() else {
+        return;
+    };
+    p.write_calls.store(0, Ordering::Relaxed);
+    p.write_total_ns.store(0, Ordering::Relaxed);
+    p.write_tag_lookup_ns.store(0, Ordering::Relaxed);
+    p.write_alias_check_ns.store(0, Ordering::Relaxed);
+    p.write_alloc_lookup_ns.store(0, Ordering::Relaxed);
+    p.read_calls.store(0, Ordering::Relaxed);
+    p.read_total_ns.store(0, Ordering::Relaxed);
+    p.read_tag_lookup_ns.store(0, Ordering::Relaxed);
+    p.read_alias_check_ns.store(0, Ordering::Relaxed);
+    p.read_alloc_lookup_ns.store(0, Ordering::Relaxed);
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_dump_hook_profile() {
+    if !rz_profile_hooks_enabled() {
+        eprintln!("[rusteze-runtime] hook profile: disabled (set RZ_PROFILE_HOOKS=1)");
+        return;
+    }
+    let p = rz_hook_profile();
+    let write_calls = p.write_calls.load(Ordering::Relaxed);
+    let read_calls = p.read_calls.load(Ordering::Relaxed);
+    let write_total_ns = p.write_total_ns.load(Ordering::Relaxed);
+    let read_total_ns = p.read_total_ns.load(Ordering::Relaxed);
+    let write_tag_ns = p.write_tag_lookup_ns.load(Ordering::Relaxed);
+    let read_tag_ns = p.read_tag_lookup_ns.load(Ordering::Relaxed);
+    let write_alias_ns = p.write_alias_check_ns.load(Ordering::Relaxed);
+    let read_alias_ns = p.read_alias_check_ns.load(Ordering::Relaxed);
+    let write_alloc_ns = p.write_alloc_lookup_ns.load(Ordering::Relaxed);
+    let read_alloc_ns = p.read_alloc_lookup_ns.load(Ordering::Relaxed);
+
+    let write_avg_ns = if write_calls == 0 {
+        0.0
+    } else {
+        write_total_ns as f64 / write_calls as f64
+    };
+    let read_avg_ns = if read_calls == 0 {
+        0.0
+    } else {
+        read_total_ns as f64 / read_calls as f64
+    };
+
+    eprintln!("[rusteze-runtime] hook profile (ns):");
+    eprintln!(
+        "  write: calls={} total={} avg_per_call={:.1} tag_lookup={} alias_check={} alloc_lookup={}",
+        write_calls, write_total_ns, write_avg_ns, write_tag_ns, write_alias_ns, write_alloc_ns
+    );
+    eprintln!(
+        "  read:  calls={} total={} avg_per_call={:.1} tag_lookup={} alias_check={} alloc_lookup={}",
+        read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
+    );
+}
+
 /// Record/validate a write through a tracked pointer tag.
 /// For now this performs only best-effort checks:
 ///  - tag must exist
@@ -1593,6 +1761,9 @@ pub extern "C" fn __rz_dump_state() {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::write(profile);
+
     let tag = if tag == 0 {
         if rz_allow_untagged() {
             return;
@@ -1616,6 +1787,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         return;
     }
     let _g = RzRuntimeGuard::enter();
+    let tag_lookup_start = profile.map(|_| Instant::now());
     let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
         let Some(tmeta) = tmap.get(&tag) else {
@@ -1633,16 +1805,24 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         };
         (tmeta.clone(), sb_tag)
     };
+    if let Some(p) = profile {
+        rz_profile_add(&p.write_tag_lookup_ns, tag_lookup_start);
+    }
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = active_alias_model().check_access(
+        let alias_check_start = profile.map(|_| Instant::now());
+        let alias_violation = active_alias_model().check_access(
             sb_tag,
             tag,
             &tmeta,
             addr,
             size,
             AliasAccessKind::Write,
-        ) {
+        );
+        if let Some(p) = profile {
+            rz_profile_add(&p.write_alias_check_ns, alias_check_start);
+        }
+        if let Some(msg) = alias_violation {
             rz_violation(
                 active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -1652,9 +1832,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
 
     // Range-based allocation lookup.
-    let amap = allocs().lock().unwrap();
-    let alloc_opt = find_alloc_containing(&amap, addr);
-    if rz_log_enabled(LogLevel::Trace) {
+    let alloc_lookup_start = profile.map(|_| Instant::now());
+    let trace_enabled = rz_log_enabled(LogLevel::Trace);
+    let alloc_opt: Option<(usize, AllocMeta)> = if trace_enabled {
+        let amap = allocs().lock().unwrap();
         rz_trace!(
             "[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}",
             addr,
@@ -1678,6 +1859,15 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             );
             shown += 1;
         }
+        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+    } else {
+        live_alloc_cache::lookup_containing(addr).or_else(|| {
+            let amap = allocs().lock().unwrap();
+            find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+        })
+    };
+    if let Some(p) = profile {
+        rz_profile_add(&p.write_alloc_lookup_ns, alloc_lookup_start);
     }
 
     let Some((base, ameta)) = alloc_opt else {
@@ -1699,6 +1889,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
         // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        let amap = allocs().lock().unwrap();
         let tmap = tags().lock().unwrap();
         if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
@@ -1980,6 +2171,9 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 #[no_mangle]
 #[track_caller]
 pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::read(profile);
+
     let tag = if tag == 0 {
         if rz_allow_untagged() {
             return;
@@ -2003,6 +2197,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         return;
     }
     let _g = RzRuntimeGuard::enter();
+    let tag_lookup_start = profile.map(|_| Instant::now());
     let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
         let Some(tmeta) = tmap.get(&tag) else {
@@ -2020,16 +2215,24 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         };
         (tmeta.clone(), sb_tag)
     };
+    if let Some(p) = profile {
+        rz_profile_add(&p.read_tag_lookup_ns, tag_lookup_start);
+    }
 
     if let Some(sb_tag) = sb_tag_opt {
-        if let Some(msg) = active_alias_model().check_access(
+        let alias_check_start = profile.map(|_| Instant::now());
+        let alias_violation = active_alias_model().check_access(
             sb_tag,
             tag,
             &tmeta,
             addr,
             size,
             AliasAccessKind::Read,
-        ) {
+        );
+        if let Some(p) = profile {
+            rz_profile_add(&p.read_alias_check_ns, alias_check_start);
+        }
+        if let Some(msg) = alias_violation {
             rz_violation(
                 active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -2039,8 +2242,19 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
 
     // Range-based allocation lookup.
-    let amap = allocs().lock().unwrap();
-    let alloc_opt = find_alloc_containing(&amap, addr);
+    let alloc_lookup_start = profile.map(|_| Instant::now());
+    let alloc_opt: Option<(usize, AllocMeta)> = if rz_log_enabled(LogLevel::Trace) {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+    } else {
+        live_alloc_cache::lookup_containing(addr).or_else(|| {
+            let amap = allocs().lock().unwrap();
+            find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+        })
+    };
+    if let Some(p) = profile {
+        rz_profile_add(&p.read_alloc_lookup_ns, alloc_lookup_start);
+    }
 
     let Some((base, ameta)) = alloc_opt else {
         if rz_handle_untracked_region("READ", tag, &tmeta, addr, size) {
@@ -2058,6 +2272,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
 
         // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
+        let amap = allocs().lock().unwrap();
         let tmap = tags().lock().unwrap();
         if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
