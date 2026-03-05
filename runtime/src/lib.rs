@@ -11,6 +11,7 @@ use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
 mod live_alloc_cache;
+mod tag_lookup_cache;
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -753,7 +754,7 @@ pub enum PtrKind {
 }
 
 /// Metadata associated with a borrow tag.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct TagMeta {
     /// Address of the pointee (exposed provenance / numeric address).
     pub pointee_addr: usize,
@@ -1788,22 +1789,21 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let (tmeta, sb_tag_opt) = {
+    let Some(tmeta) =
+        tag_lookup_cache::get_cached(tag, || tags().lock().unwrap().get(&tag).copied())
+    else {
+        let msg = append_location_if_enabled(
+            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("UNKNOWN_TAG", msg);
+        return;
+    };
+    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
-        let Some(tmeta) = tmap.get(&tag) else {
-            let msg = append_location_if_enabled(
-                format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
-                "RZ_LOG_LOC",
-            );
-            rz_violation("UNKNOWN_TAG", msg);
-            return;
-        };
-        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-        } else {
-            Some(tag)
-        };
-        (tmeta.clone(), sb_tag)
+        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+    } else {
+        Some(tag)
     };
     if let Some(p) = profile {
         rz_profile_add(&p.write_tag_lookup_ns, tag_lookup_start);
@@ -2198,22 +2198,21 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let (tmeta, sb_tag_opt) = {
+    let Some(tmeta) =
+        tag_lookup_cache::get_cached(tag, || tags().lock().unwrap().get(&tag).copied())
+    else {
+        let msg = append_location_if_enabled(
+            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("UNKNOWN_TAG", msg);
+        return;
+    };
+    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
-        let Some(tmeta) = tmap.get(&tag) else {
-            let msg = append_location_if_enabled(
-                format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
-                "RZ_LOG_LOC",
-            );
-            rz_violation("UNKNOWN_TAG", msg);
-            return;
-        };
-        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-        } else {
-            Some(tag)
-        };
-        (tmeta.clone(), sb_tag)
+        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+    } else {
+        Some(tag)
     };
     if let Some(p) = profile {
         rz_profile_add(&p.read_tag_lookup_ns, tag_lookup_start);
@@ -2779,6 +2778,7 @@ pub extern "C" fn __record_ref_creation(
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
+    tag_lookup_cache::invalidate();
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -2997,6 +2997,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         bounds_len,
     };
     tags().lock().unwrap().insert(tag, tmeta.clone());
+    tag_lookup_cache::invalidate();
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -3035,6 +3036,7 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
     let mut tmap = tags().lock().unwrap();
     if let Some(tmeta) = tmap.get_mut(&tag) {
         tmeta.escaped = true;
+        tag_lookup_cache::invalidate();
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,

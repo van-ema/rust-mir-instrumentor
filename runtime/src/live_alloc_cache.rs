@@ -8,13 +8,18 @@ static LIVE_ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new(
 static LIVE_ALLOC_LOOKUP_GEN: AtomicU64 = AtomicU64::new(1);
 
 const LIVE_ALLOC_CACHE_SLOTS: usize = 64;
+const CACHE_KIND_EMPTY: u8 = 0;
+const CACHE_KIND_MISS_EXACT: u8 = 1;
+const CACHE_KIND_HIT_RANGE: u8 = 2;
+const CACHE_KIND_HIT_EXACT: u8 = 3;
 
 #[derive(Copy, Clone)]
 struct LiveAllocCacheEntry {
     gen: u64,
-    addr: usize,
-    has_alloc: bool,
+    kind: u8,
+    query_addr: usize,
     base: usize,
+    end: usize,
     meta: AllocMeta,
 }
 
@@ -27,9 +32,10 @@ const EMPTY_ALLOC_META: AllocMeta = AllocMeta {
 
 const EMPTY_LIVE_ALLOC_CACHE_ENTRY: LiveAllocCacheEntry = LiveAllocCacheEntry {
     gen: 0,
-    addr: 0,
-    has_alloc: false,
+    kind: CACHE_KIND_EMPTY,
+    query_addr: 0,
     base: 0,
+    end: 0,
     meta: EMPTY_ALLOC_META,
 };
 
@@ -99,13 +105,32 @@ fn live_alloc_cache_get(addr: usize, gen: u64) -> Option<Option<(usize, AllocMet
     RZ_LIVE_ALLOC_LOOKUP_CACHE.with(|cache| {
         let cache = cache.borrow();
         let entry = cache[live_alloc_cache_index(addr)];
-        if entry.gen != gen || entry.addr != addr {
+        if entry.gen != gen {
             return None;
         }
-        if entry.has_alloc {
-            Some(Some((entry.base, entry.meta)))
-        } else {
-            Some(None)
+        match entry.kind {
+            CACHE_KIND_MISS_EXACT => {
+                if entry.query_addr == addr {
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+            CACHE_KIND_HIT_RANGE => {
+                if addr >= entry.base && addr < entry.end {
+                    Some(Some((entry.base, entry.meta)))
+                } else {
+                    None
+                }
+            }
+            CACHE_KIND_HIT_EXACT => {
+                if addr == entry.base {
+                    Some(Some((entry.base, entry.meta)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     })
 }
@@ -116,16 +141,32 @@ fn live_alloc_cache_put(addr: usize, gen: u64, found: Option<(usize, AllocMeta)>
         let mut cache = cache.borrow_mut();
         let slot = &mut cache[live_alloc_cache_index(addr)];
         slot.gen = gen;
-        slot.addr = addr;
         match found {
             Some((base, meta)) => {
-                slot.has_alloc = true;
                 slot.base = base;
+                slot.query_addr = addr;
                 slot.meta = meta;
+                if meta.size == 0 {
+                    slot.kind = CACHE_KIND_HIT_EXACT;
+                    slot.end = base;
+                } else {
+                    match base.checked_add(meta.size) {
+                        Some(end) => {
+                            slot.kind = CACHE_KIND_HIT_RANGE;
+                            slot.end = end;
+                        }
+                        None => {
+                            slot.kind = CACHE_KIND_HIT_EXACT;
+                            slot.end = base;
+                        }
+                    }
+                }
             }
             None => {
-                slot.has_alloc = false;
+                slot.kind = CACHE_KIND_MISS_EXACT;
+                slot.query_addr = addr;
                 slot.base = 0;
+                slot.end = 0;
                 slot.meta = EMPTY_ALLOC_META;
             }
         }
