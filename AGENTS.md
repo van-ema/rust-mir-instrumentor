@@ -63,3 +63,5 @@ The project has two main components:
 - Before every commit, run the full example test suite, not only examples related to the touched
   code.
 - Do not commit while any example is failing: all examples must pass before committing.
+- After each commit, re-run the full example test suite (`python3 scripts/run_example_tests.py`)
+  and verify it is still fully green on the committed revision.
