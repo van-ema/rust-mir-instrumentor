@@ -843,13 +843,8 @@ pub struct TagMeta {
     /// Whether the pointer has escaped its original scope (e.g., passed across a call boundary).
     pub escaped: bool,
     /// Allocation epoch observed at creation time (0 if unknown).
-    /// TODO: This is a best-effort snapshot used to disambiguate
-    /// address reuse (e.g., stack slots or freed heap memory). Currently,
-    /// epochs are matched only when the pointer equals the allocation base
-    /// address exactly. This should be extended to:
-    ///   - map interior pointers to their base allocation
-    ///   - use allocation ranges instead of exact address equality
-    ///   - reject accesses when tag.alloc_epoch != alloc.epoch
+    /// Best-effort snapshot used to disambiguate address reuse
+    /// (e.g., stack slots or freed heap memory).
     pub alloc_epoch: u64,
     /// Whether the tag was created while the containing allocation was live.
     pub alloc_live_at_creation: bool,
@@ -861,6 +856,13 @@ pub struct TagMeta {
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
+    /// Whether we captured an allocation-origin snapshot for this tag.
+    pub origin_known: bool,
+    /// Base address of the allocation that originated this tag.
+    pub origin_base: usize,
+    /// End address of the allocation that originated this tag (half-open).
+    /// For unknown-size allocations this is equal to `origin_base`.
+    pub origin_end: usize,
 }
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
@@ -1460,6 +1462,88 @@ fn origin_alloc_for_tag<'a>(
     None
 }
 
+#[inline]
+fn origin_end_from_alloc(base: usize, ameta: &AllocMeta) -> usize {
+    if ameta.size == 0 {
+        base
+    } else {
+        base.saturating_add(ameta.size)
+    }
+}
+
+#[inline]
+fn tag_origin_contains_access(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
+    if !tmeta.origin_known || size == 0 {
+        return false;
+    }
+
+    let access_end = match addr.checked_add(size) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    if tmeta.origin_end > tmeta.origin_base {
+        addr >= tmeta.origin_base && access_end <= tmeta.origin_end
+    } else {
+        // Unknown-size alloc snapshot: only exact-base accesses are trusted.
+        addr == tmeta.origin_base
+    }
+}
+
+#[inline]
+fn tag_origin_oob_cached(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
+    if !tmeta.origin_known || size == 0 || tmeta.origin_end <= tmeta.origin_base {
+        return false;
+    }
+    let access_end = match addr.checked_add(size) {
+        Some(e) => e,
+        None => return true,
+    };
+    addr < tmeta.origin_base || access_end > tmeta.origin_end
+}
+
+#[inline]
+fn alloc_from_origin_base(tmeta: &TagMeta) -> Option<(usize, AllocMeta)> {
+    if !tmeta.origin_known {
+        return None;
+    }
+    let amap = allocs().lock().unwrap();
+    amap.get(&tmeta.origin_base)
+        .copied()
+        .map(|ameta| (tmeta.origin_base, ameta))
+}
+
+#[inline]
+fn refresh_tag_origin_cache(tag: u64, tmeta: &mut TagMeta, base: usize, ameta: &AllocMeta) {
+    let origin_end = origin_end_from_alloc(base, ameta);
+    if tmeta.origin_known && tmeta.origin_base == base && tmeta.origin_end == origin_end {
+        return;
+    }
+
+    tmeta.origin_known = true;
+    tmeta.origin_base = base;
+    tmeta.origin_end = origin_end;
+    tag_store::update(tag, *tmeta);
+}
+
+#[inline]
+fn snapshot_tag_origin(pointee_addr: usize, parent_tag: u64) -> (bool, usize, usize) {
+    let amap = allocs().lock().unwrap();
+    if let Some((base, ameta)) = find_alloc_origin_candidate(&amap, pointee_addr) {
+        return (true, base, origin_end_from_alloc(base, ameta));
+    }
+    drop(amap);
+
+    if parent_tag != 0 {
+        if let Some(parent_meta) = tag_store::get(parent_tag) {
+            if parent_meta.origin_known {
+                return (true, parent_meta.origin_base, parent_meta.origin_end);
+            }
+        }
+    }
+    (false, 0, 0)
+}
+
 /// Record (or update) allocation metadata. The key is the base address.
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
@@ -1903,9 +1987,10 @@ pub extern "C" fn __rz_dump_hook_profile() {
 }
 
 /// Record/validate a write through a tracked pointer tag.
-/// For now this performs only best-effort checks:
+/// Best-effort checks:
 ///  - tag must exist
-///  - if an allocation record exists at exactly `addr`, it must be live
+///  - fast path uses tag-cached origin bounds + exact-base alloc lookup
+///  - slow path falls back to range lookup when cache is missing/invalid
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
@@ -1937,7 +2022,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
+    let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
             "RZ_LOG_LOC",
@@ -1977,41 +2062,63 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    // Range-based allocation lookup.
+    // Fast path: tag-cached origin bounds + exact-base alloc lookup.
+    // Slow path falls back to range lookup only when cache is missing/invalid.
     let alloc_lookup_start = profile.map(|_| Instant::now());
     let trace_enabled = rz_log_enabled(LogLevel::Trace);
-    let alloc_opt: Option<(usize, AllocMeta)> = if trace_enabled {
-        let amap = allocs().lock().unwrap();
-        rz_trace!(
-            "[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}",
-            addr,
-            size,
-            tag
-        );
-        // Print up to 8 nearest bases <= addr for debugging.
-        let mut shown = 0usize;
-        for (b, m) in amap.range(..=addr).rev() {
-            if shown >= 8 {
-                break;
-            }
-            let end = b.saturating_add(m.size);
-            rz_trace!(
-                "  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}",
-                b,
-                m.size,
-                m.live,
-                m.epoch,
-                end
-            );
-            shown += 1;
+    let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
+    let origin_base_alloc = alloc_from_origin_base(&tmeta);
+    let mut alloc_opt: Option<(usize, AllocMeta)> = None;
+
+    if !cached_origin_oob {
+        if tag_origin_contains_access(&tmeta, addr, size) {
+            alloc_opt = origin_base_alloc;
         }
-        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-    } else {
-        live_alloc_cache::lookup_containing(addr).or_else(|| {
+
+        if alloc_opt.is_none() {
+            alloc_opt = if trace_enabled {
+                let amap = allocs().lock().unwrap();
+                rz_trace!(
+                    "[rusteze-runtime] WRITE lookup (slow): addr=0x{:x} size={} tag={}",
+                    addr,
+                    size,
+                    tag
+                );
+                let mut shown = 0usize;
+                for (b, m) in amap.range(..=addr).rev() {
+                    if shown >= 8 {
+                        break;
+                    }
+                    let end = b.saturating_add(m.size);
+                    rz_trace!(
+                        "  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}",
+                        b,
+                        m.size,
+                        m.live,
+                        m.epoch,
+                        end
+                    );
+                    shown += 1;
+                }
+                find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+            } else {
+                live_alloc_cache::lookup_containing(addr).or_else(|| {
+                    let amap = allocs().lock().unwrap();
+                    find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+                })
+            };
+        }
+    } else if origin_base_alloc.is_none() {
+        // Cached origin exists but exact-base entry disappeared; revalidate via slow path.
+        alloc_opt = live_alloc_cache::lookup_containing(addr).or_else(|| {
             let amap = allocs().lock().unwrap();
             find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-        })
-    };
+        });
+    }
+
+    if let Some((base, ameta)) = alloc_opt {
+        refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
+    }
     if let Some(p) = profile {
         rz_profile_add(&p.write_alloc_lookup_ns, alloc_lookup_start);
     }
@@ -2033,29 +2140,40 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!("[rusteze-runtime] WRITE lookup result: no containing allocation");
         }
-        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
+        // If we can prove (via tag-cached origin + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
-        let amap = allocs().lock().unwrap();
-        let tmap = tags().lock().unwrap();
-        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
+        let cached_origin_alloc = if tmeta.origin_known {
+            origin_base_alloc
+        } else {
+            None
+        };
+        let fallback_origin_alloc = if cached_origin_alloc.is_none() {
+            let amap = allocs().lock().unwrap();
+            let tmap = tags().lock().unwrap();
+            origin_alloc_for_tag(&tmap, &amap, tag).map(|(base, meta)| (base, *meta))
+        } else {
+            None
+        };
+        if let Some((obase, ometa)) = cached_origin_alloc.or(fallback_origin_alloc) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 // If the access overlaps beyond the end of the origin allocation, it's OOB.
                 if addr >= obase && access_end > alloc_end {
-                    if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
+                    if rz_allow_stack_ref_oob_noise(&tmeta, &ometa, obase, addr, size) {
                         return;
                     }
-                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, ometa, obase, addr, size)
+                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, &ometa, obase, addr, size)
                     {
                         return;
                     }
-                    if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
+                    if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
                         return;
                     }
-                    if rz_allow_projected_raw_stack_slot_oob_noise(&tmeta, ometa, obase, addr, size)
-                    {
+                    if rz_allow_projected_raw_stack_slot_oob_noise(
+                        &tmeta, &ometa, obase, addr, size,
+                    ) {
                         return;
                     }
                     let msg = append_location_if_enabled(
@@ -2310,9 +2428,10 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 }
 
 /// Record/validate a read through a tracked pointer tag.
-/// For now this performs only best-effort checks:
+/// Best-effort checks:
 ///  - tag must exist
-///  - if an allocation record exists at exactly `addr`, it must be live
+///  - fast path uses tag-cached origin bounds + exact-base alloc lookup
+///  - slow path falls back to range lookup when cache is missing/invalid
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
@@ -2344,7 +2463,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     }
     let _g = RzRuntimeGuard::enter();
     let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
+    let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
             "RZ_LOG_LOC",
@@ -2384,17 +2503,41 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    // Range-based allocation lookup.
+    // Fast path: tag-cached origin bounds + exact-base alloc lookup.
+    // Slow path falls back to range lookup only when cache is missing/invalid.
     let alloc_lookup_start = profile.map(|_| Instant::now());
-    let alloc_opt: Option<(usize, AllocMeta)> = if rz_log_enabled(LogLevel::Trace) {
-        let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-    } else {
-        live_alloc_cache::lookup_containing(addr).or_else(|| {
+    let trace_enabled = rz_log_enabled(LogLevel::Trace);
+    let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
+    let origin_base_alloc = alloc_from_origin_base(&tmeta);
+    let mut alloc_opt: Option<(usize, AllocMeta)> = None;
+
+    if !cached_origin_oob {
+        if tag_origin_contains_access(&tmeta, addr, size) {
+            alloc_opt = origin_base_alloc;
+        }
+
+        if alloc_opt.is_none() {
+            alloc_opt = if trace_enabled {
+                let amap = allocs().lock().unwrap();
+                find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+            } else {
+                live_alloc_cache::lookup_containing(addr).or_else(|| {
+                    let amap = allocs().lock().unwrap();
+                    find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+                })
+            };
+        }
+    } else if origin_base_alloc.is_none() {
+        // Cached origin exists but exact-base entry disappeared; revalidate via slow path.
+        alloc_opt = live_alloc_cache::lookup_containing(addr).or_else(|| {
             let amap = allocs().lock().unwrap();
             find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-        })
-    };
+        });
+    }
+
+    if let Some((base, ameta)) = alloc_opt {
+        refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
+    }
     if let Some(p) = profile {
         rz_profile_add(&p.read_alloc_lookup_ns, alloc_lookup_start);
     }
@@ -2413,24 +2556,34 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             return;
         }
 
-        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
+        // If we can prove (via tag-cached origin + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
-        let amap = allocs().lock().unwrap();
-        let tmap = tags().lock().unwrap();
-        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
+        let cached_origin_alloc = if tmeta.origin_known {
+            origin_base_alloc
+        } else {
+            None
+        };
+        let fallback_origin_alloc = if cached_origin_alloc.is_none() {
+            let amap = allocs().lock().unwrap();
+            let tmap = tags().lock().unwrap();
+            origin_alloc_for_tag(&tmap, &amap, tag).map(|(base, meta)| (base, *meta))
+        } else {
+            None
+        };
+        if let Some((obase, ometa)) = cached_origin_alloc.or(fallback_origin_alloc) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 if addr >= obase && access_end > alloc_end {
-                    if rz_allow_stack_ref_oob_noise(&tmeta, ometa, obase, addr, size) {
+                    if rz_allow_stack_ref_oob_noise(&tmeta, &ometa, obase, addr, size) {
                         return;
                     }
-                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, ometa, obase, addr, size)
+                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, &ometa, obase, addr, size)
                     {
                         return;
                     }
-                    if rz_allow_stack_raw_root_oob_noise(&tmeta, ometa, obase, addr, size) {
+                    if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
                         return;
                     }
                     let msg = append_location_if_enabled(
@@ -2910,6 +3063,8 @@ pub extern "C" fn __record_ref_creation(
     } else {
         inherited_bounds_len
     };
+    let (origin_known, origin_base, origin_end) =
+        snapshot_tag_origin(pointee_addr, resolved_parent_tag);
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -2921,6 +3076,9 @@ pub extern "C" fn __record_ref_creation(
         alias_exempt: alias_exempt_flag,
         lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
+        origin_known,
+        origin_base,
+        origin_end,
     };
     tag_store::insert(tag, tmeta.clone());
     lineage_cache::remember_non_root_tag(tag, &tmeta);
@@ -3129,6 +3287,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     } else {
         0
     };
+    let (origin_known, origin_base, origin_end) =
+        snapshot_tag_origin(pointee_addr, resolved_parent);
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -3140,6 +3300,9 @@ pub extern "C" fn __record_raw_ptr_creation(
         alias_exempt: alias_exempt_flag,
         lineage_hint: alias_exempt & 0b0000_1110,
         bounds_len,
+        origin_known,
+        origin_base,
+        origin_end,
     };
     tag_store::insert(tag, tmeta.clone());
     lineage_cache::remember_non_root_tag(tag, &tmeta);

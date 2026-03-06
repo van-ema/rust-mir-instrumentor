@@ -117,7 +117,7 @@ Project-specific environment variables are grouped below by component/script.
 - `RUSTFLAGS`: wrapper appends `--mir-out` / `--runtime-path` forwarding flags here.
 
 ### AFL build/fuzz scripts (`scripts/afl_*.sh`)
-- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `zip`, `rkyv`, `hyper`).
+- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `simd_json_borrowed`/`simd-json-borrowed`, `simd_json_tape`/`simd-json-tape`, `zip`, `rkyv`, `hyper`).
 - `PROFILE`: cargo profile (`debug` or `release`; default depends on script, usually `release`).
 - `HARNESS_TARGET_DIR`: target directory for AFL harness builds.
 - `RUNTIME_FEATURES`: extra features passed when building `runtime` in `afl_build.sh`.
@@ -186,6 +186,23 @@ use-after-free via raw pointers) are detected at the application boundary.
 ### Call-argument tag buffering
 
 To prevent unbounded memory growth when pointer-argument tags are pushed but never taken (for example, calls into uninstrumented external crates), the runtime employs a bounded ring buffer. Each pushed entry is stored in a fixed-size circular buffer, while a small hashmap maps `(callee_id, arg_index, addr)` to the buffer slot for efficient O(1) lookup on tag retrieval. When the ring buffer wraps around, overwritten entries are evicted from the hashmap, ensuring memory usage remains bounded. This design achieves O(1) push and take operations in the common case and remains robust under fuzzing and partial instrumentation.
+
+### Runtime hot-path cache model
+
+`__rz_ptr_read` / `__rz_ptr_write` use a tag-origin cache to avoid repeated range scans:
+
+- At tag creation (`__record_ref_creation` / `__record_raw_ptr_creation`), the runtime snapshots:
+  - `origin_base`
+  - `origin_end`
+  - `alloc_epoch` (existing field)
+- On each access, fast path does:
+  - bounds check against cached tag origin range
+  - exact-base allocation lookup (`allocs.get(origin_base)`) for live/epoch checks
+- Slow path is used only when cached origin is missing/invalid:
+  - range lookup to find containing allocation
+  - cache refresh on successful resolution
+
+This keeps correctness fallbacks while shifting common accesses away from per-access range scans.
 
 ### Example
 
@@ -436,6 +453,6 @@ We can force loading extern crate with
 --extern=force:runtime={runtime_path}/libruntime.rlib
 ```
 
-- Performance:For best performance, disable tracing (`RZ_LOG=warn` or unset). Future
-  work includes lock sharding, TLS fast paths,
-  and optional native runtime backends for hot paths.
+- Performance: For best performance, disable tracing (`RZ_LOG=warn` or unset). Future
+  work includes further cache tuning, reducing hot-path hook density in MIR, and
+  optional native runtime backends for hot paths.

@@ -76,16 +76,21 @@ Exit criteria:
 Goal:
 - Reduce runtime overhead on parser-heavy ecosystem crates while preserving dynamic-checking behavior.
 
+Completed recently:
+1. Added runtime hook profiling split for `__rz_ptr_read` / `__rz_ptr_write`.
+2. Added sharded tag store + TLS lookup caches for hot metadata paths.
+3. Added tag-origin alloc cache in tag metadata:
+- Snapshot `origin_base`/`origin_end` at tag creation.
+- Use fast-path bounds + exact-base liveness/epoch checks per access.
+- Keep range-lookup fallback and cache refresh on misses.
+
 Open tasks:
-1. Add profiling instrumentation to runtime hooks.
-- Measure `__rz_ptr_read` and `__rz_ptr_write` time split (tag lookup, alias check, alloc lookup, total).
-- Expose reset/dump entrypoints for repeated benchmark runs.
-2. Remove hot-path lock contention.
-- Prototype sharded metadata maps and/or thread-local fast-path caches for recent tag/alloc lookups.
-- Keep correctness-first fallback to the global authoritative state.
-3. Reduce hook density in MIR pass where safe.
+1. Tune remaining high-overhead targets.
+- Focus on `toml`, `zip`, and other parser-heavy outliers.
+- Use profiling split to separate alias-model vs alloc-check costs.
+2. Reduce hook density in MIR pass where safe.
 - Skip or coalesce checks for provably in-bounds non-escaping stack accesses.
 - Keep conservative behavior when proof is unavailable.
-4. Validate and regressions.
+3. Validate and regressions.
 - Benchmark with and without alias model (`tb_lite` and `none`) using `scripts/bench_overhead.py`.
 - Ensure functional tests/fuzz smoke still pass after each optimization step.

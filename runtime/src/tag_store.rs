@@ -65,6 +65,11 @@ pub(crate) fn insert(tag: u64, tmeta: TagMeta) {
 }
 
 #[inline]
+pub(crate) fn update(tag: u64, tmeta: TagMeta) {
+    insert(tag, tmeta);
+}
+
+#[inline]
 pub(crate) fn mark_escaped(tag: u64) -> Option<TagMeta> {
     let updated = {
         let mut tmap = tags().lock().unwrap();

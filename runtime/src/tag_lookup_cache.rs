@@ -13,6 +13,9 @@ const EMPTY_TAG_META: TagMeta = TagMeta {
     alias_exempt: false,
     lineage_hint: 0,
     bounds_len: 0,
+    origin_known: false,
+    origin_base: 0,
+    origin_end: 0,
 };
 
 #[derive(Copy, Clone)]
