@@ -17,5 +17,6 @@ fn main() {
     }
 
     black_box(total);
+    eco_bench::maybe_dump_rusteze_hook_profile();
     println!("{total}");
 }

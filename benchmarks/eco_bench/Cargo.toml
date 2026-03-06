@@ -3,6 +3,9 @@ name = "eco_bench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+rusteze-profile = []
+
 [dependencies]
 base64 = "0.22"
 itoa = "1"

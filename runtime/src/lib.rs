@@ -10,6 +10,7 @@ mod static_image;
 use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
+mod lineage_cache;
 mod live_alloc_cache;
 mod tag_lookup_cache;
 mod tag_store;
@@ -92,6 +93,14 @@ struct HookProfileCounters {
     read_tag_lookup_ns: AtomicU64,
     read_alias_check_ns: AtomicU64,
     read_alloc_lookup_ns: AtomicU64,
+    ref_create_calls: AtomicU64,
+    ref_create_total_ns: AtomicU64,
+    raw_create_calls: AtomicU64,
+    raw_create_total_ns: AtomicU64,
+    ptr_use_calls: AtomicU64,
+    ptr_use_total_ns: AtomicU64,
+    record_alloc_calls: AtomicU64,
+    record_alloc_total_ns: AtomicU64,
 }
 
 impl HookProfileCounters {
@@ -107,6 +116,14 @@ impl HookProfileCounters {
             read_tag_lookup_ns: AtomicU64::new(0),
             read_alias_check_ns: AtomicU64::new(0),
             read_alloc_lookup_ns: AtomicU64::new(0),
+            ref_create_calls: AtomicU64::new(0),
+            ref_create_total_ns: AtomicU64::new(0),
+            raw_create_calls: AtomicU64::new(0),
+            raw_create_total_ns: AtomicU64::new(0),
+            ptr_use_calls: AtomicU64::new(0),
+            ptr_use_total_ns: AtomicU64::new(0),
+            record_alloc_calls: AtomicU64::new(0),
+            record_alloc_total_ns: AtomicU64::new(0),
         }
     }
 }
@@ -174,6 +191,66 @@ impl HookProfileGuard {
         Self {
             start: Some(Instant::now()),
             total_counter: Some(&p.read_total_ns),
+        }
+    }
+
+    #[inline]
+    fn ref_create(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.ref_create_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.ref_create_total_ns),
+        }
+    }
+
+    #[inline]
+    fn raw_create(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.raw_create_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.raw_create_total_ns),
+        }
+    }
+
+    #[inline]
+    fn ptr_use(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.ptr_use_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.ptr_use_total_ns),
+        }
+    }
+
+    #[inline]
+    fn record_alloc(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.record_alloc_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.record_alloc_total_ns),
         }
     }
 }
@@ -923,6 +1000,12 @@ fn recover_parent_for_alloc_root(
         return 0;
     }
 
+    if let Some(tag) =
+        lineage_cache::lookup_repaired_parent(pointee_addr, alloc_epoch, require_mut_parent)
+    {
+        return tag;
+    }
+
     let amap = allocs().lock().unwrap();
     let root_base = find_alloc_containing(&amap, pointee_addr).map(|(base, _)| base);
     let tmap = tags().lock().unwrap();
@@ -951,6 +1034,12 @@ fn recover_parent_for_alloc_root(
             if tag > exact_parent {
                 exact_parent = tag;
             }
+        }
+    }
+
+    if exact_parent != 0 {
+        if let Some(meta) = tmap.get(&exact_parent).copied() {
+            lineage_cache::remember_non_root_tag(exact_parent, &meta);
         }
     }
 
@@ -1375,6 +1464,8 @@ fn origin_alloc_for_tag<'a>(
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::record_alloc(profile);
     let _g = RzRuntimeGuard::enter();
 
     // Record allocation events into a fixed-size ring buffer for post-mortem dumps.
@@ -1713,6 +1804,14 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.read_tag_lookup_ns.store(0, Ordering::Relaxed);
     p.read_alias_check_ns.store(0, Ordering::Relaxed);
     p.read_alloc_lookup_ns.store(0, Ordering::Relaxed);
+    p.ref_create_calls.store(0, Ordering::Relaxed);
+    p.ref_create_total_ns.store(0, Ordering::Relaxed);
+    p.raw_create_calls.store(0, Ordering::Relaxed);
+    p.raw_create_total_ns.store(0, Ordering::Relaxed);
+    p.ptr_use_calls.store(0, Ordering::Relaxed);
+    p.ptr_use_total_ns.store(0, Ordering::Relaxed);
+    p.record_alloc_calls.store(0, Ordering::Relaxed);
+    p.record_alloc_total_ns.store(0, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -1732,6 +1831,14 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let read_alias_ns = p.read_alias_check_ns.load(Ordering::Relaxed);
     let write_alloc_ns = p.write_alloc_lookup_ns.load(Ordering::Relaxed);
     let read_alloc_ns = p.read_alloc_lookup_ns.load(Ordering::Relaxed);
+    let ref_create_calls = p.ref_create_calls.load(Ordering::Relaxed);
+    let ref_create_total_ns = p.ref_create_total_ns.load(Ordering::Relaxed);
+    let raw_create_calls = p.raw_create_calls.load(Ordering::Relaxed);
+    let raw_create_total_ns = p.raw_create_total_ns.load(Ordering::Relaxed);
+    let ptr_use_calls = p.ptr_use_calls.load(Ordering::Relaxed);
+    let ptr_use_total_ns = p.ptr_use_total_ns.load(Ordering::Relaxed);
+    let record_alloc_calls = p.record_alloc_calls.load(Ordering::Relaxed);
+    let record_alloc_total_ns = p.record_alloc_total_ns.load(Ordering::Relaxed);
 
     let write_avg_ns = if write_calls == 0 {
         0.0
@@ -1752,6 +1859,46 @@ pub extern "C" fn __rz_dump_hook_profile() {
     eprintln!(
         "  read:  calls={} total={} avg_per_call={:.1} tag_lookup={} alias_check={} alloc_lookup={}",
         read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
+    );
+    eprintln!(
+        "  ref_create:  calls={} total={} avg_per_call={:.1}",
+        ref_create_calls,
+        ref_create_total_ns,
+        if ref_create_calls == 0 {
+            0.0
+        } else {
+            ref_create_total_ns as f64 / ref_create_calls as f64
+        }
+    );
+    eprintln!(
+        "  raw_create:  calls={} total={} avg_per_call={:.1}",
+        raw_create_calls,
+        raw_create_total_ns,
+        if raw_create_calls == 0 {
+            0.0
+        } else {
+            raw_create_total_ns as f64 / raw_create_calls as f64
+        }
+    );
+    eprintln!(
+        "  ptr_use:     calls={} total={} avg_per_call={:.1}",
+        ptr_use_calls,
+        ptr_use_total_ns,
+        if ptr_use_calls == 0 {
+            0.0
+        } else {
+            ptr_use_total_ns as f64 / ptr_use_calls as f64
+        }
+    );
+    eprintln!(
+        "  record_alloc:calls={} total={} avg_per_call={:.1}",
+        record_alloc_calls,
+        record_alloc_total_ns,
+        if record_alloc_calls == 0 {
+            0.0
+        } else {
+            record_alloc_total_ns as f64 / record_alloc_calls as f64
+        }
     );
 }
 
@@ -2603,6 +2750,8 @@ pub extern "C" fn __record_ref_creation(
     alias_exempt: u8,
     bounds_len: usize,
 ) -> u64 {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::ref_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 {
@@ -2774,6 +2923,7 @@ pub extern "C" fn __record_ref_creation(
         bounds_len,
     };
     tag_store::insert(tag, tmeta.clone());
+    lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -2800,6 +2950,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     alias_exempt: u8,
     bounds_len: usize,
 ) -> u64 {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 {
@@ -2990,6 +3142,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         bounds_len,
     };
     tag_store::insert(tag, tmeta.clone());
+    lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -3016,6 +3169,8 @@ pub extern "C" fn __record_raw_ptr_creation(
 /// `addr` is the pointer value (exposed provenance), not an interior offset.
 #[no_mangle]
 pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
+    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
+    let _profile_guard = HookProfileGuard::ptr_use(profile);
     let _g = RzRuntimeGuard::enter();
     if tag == 0 {
         rz_trace!(
