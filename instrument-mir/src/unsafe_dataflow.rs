@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::{
-    BasicBlockData, Body, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
-    StatementKind, Terminator, TerminatorKind,
+    BasicBlockData, Body, Local, Operand, Place, ProjectionElem, Rvalue, Statement, StatementKind,
+    Terminator, TerminatorKind,
 };
 use rustc_middle::ty::{TyCtxt, TyKind};
 
@@ -75,10 +76,7 @@ fn taint_local(local: Local, tainted_ptr_locals: &mut HashSet<Local>) -> bool {
     tainted_ptr_locals.insert(local)
 }
 
-fn operand_tainted<'tcx>(
-    op: &Operand<'tcx>,
-    tainted_ptr_locals: &HashSet<Local>,
-) -> bool {
+fn operand_tainted<'tcx>(op: &Operand<'tcx>, tainted_ptr_locals: &HashSet<Local>) -> bool {
     place_from_operand(op)
         .map(|p| tainted_ptr_locals.contains(&p.local))
         .unwrap_or(false)
@@ -99,19 +97,77 @@ fn rvalue_tainted<'tcx>(
         Rvalue::Ref(_, _, p) | Rvalue::CopyForDeref(p) => tainted_ptr_locals.contains(&p.local),
         Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => operand_tainted(op, tainted_ptr_locals),
         Rvalue::BinaryOp(_, ops) => {
-            operand_tainted(&ops.0, tainted_ptr_locals) || operand_tainted(&ops.1, tainted_ptr_locals)
+            operand_tainted(&ops.0, tainted_ptr_locals)
+                || operand_tainted(&ops.1, tainted_ptr_locals)
         }
         Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_tainted(op, tainted_ptr_locals)),
         _ => false,
     }
 }
 
-fn direct_local_callee<'tcx>(
+fn parse_instrumented_crates_env() -> Option<HashSet<String>> {
+    let raw = std::env::var("RZ_INSTRUMENTED_CRATES").ok()?;
+    let mut set = HashSet::new();
+    for part in raw.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        // Allow either '-' or '_' in names; rustc uses '_' for crate_name().
+        set.insert(p.replace('-', "_"));
+    }
+    Some(set)
+}
+
+fn instrument_all_deps_enabled() -> bool {
+    std::env::var("RZ_INSTRUMENT_ALL_DEPS")
+        .ok()
+        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+fn is_std_like_crate_name(name: &str) -> bool {
+    matches!(name, "core" | "std")
+}
+
+fn instrumented_crates_cached<'tcx>(tcx: TyCtxt<'tcx>) -> &'static HashSet<String> {
+    static INSTRUMENTED: OnceLock<HashSet<String>> = OnceLock::new();
+
+    INSTRUMENTED.get_or_init(|| {
+        // Priority 1: explicit allowlist
+        if let Some(env_set) = parse_instrumented_crates_env() {
+            return env_set;
+        }
+
+        // Priority 2: instrument all non-runtime dependencies
+        if !instrument_all_deps_enabled() {
+            return HashSet::new();
+        }
+
+        let mut set = HashSet::new();
+        for &cnum in tcx.crates(()).iter() {
+            let name = tcx.crate_name(cnum).as_str().to_string();
+            if name == "runtime" {
+                continue;
+            }
+
+            // Even in "instrument all deps" mode, do NOT treat std/core as instrumented
+            // callees. We rely on wrapper classification there.
+            if is_std_like_crate_name(&name) {
+                continue;
+            }
+
+            set.insert(name);
+        }
+        set
+    })
+}
+
+fn resolve_callee_def_id<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     func: &Operand<'tcx>,
-) -> bool {
-    let def_id_opt = match func {
+) -> Option<rustc_hir::def_id::DefId> {
+    match func {
         Operand::Constant(c) => match c.const_.ty().kind() {
             TyKind::FnDef(def_id, _) => Some(*def_id),
             _ => None,
@@ -121,8 +177,29 @@ fn direct_local_callee<'tcx>(
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn instrumented_call_boundary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> bool {
+    let Some(did) = resolve_callee_def_id(tcx, body, func) else {
+        // Callee could not be resolved (fn ptr / vtable / etc.): conservatively unknown.
+        return false;
     };
-    def_id_opt.map_or(false, |did| did.krate == LOCAL_CRATE)
+
+    if did.krate == LOCAL_CRATE {
+        return true;
+    }
+
+    let crate_name = tcx.crate_name(did.krate).as_str();
+    if crate_name == "runtime" || is_std_like_crate_name(crate_name) {
+        return false;
+    }
+
+    instrumented_crates_cached(tcx).contains(crate_name)
 }
 
 fn apply_statement<'tcx>(
@@ -177,8 +254,15 @@ fn apply_terminator<'tcx>(
 ) -> bool {
     let mut changed = false;
 
-    if let TerminatorKind::Call { func, args, destination, .. } = &term.kind {
+    if let TerminatorKind::Call {
+        func,
+        args,
+        destination,
+        ..
+    } = &term.kind
+    {
         let mut ptr_arg_locals: Vec<Local> = Vec::new();
+        let mut raw_ptr_arg_locals: Vec<Local> = Vec::new();
         let mut any_raw_arg = false;
         let mut any_tainted_arg = false;
 
@@ -188,17 +272,29 @@ fn apply_terminator<'tcx>(
                 let local_ty = body.local_decls[local].ty;
                 if is_pointer_ty(local_ty) {
                     ptr_arg_locals.push(local);
-                    any_raw_arg |= is_raw_pointer_ty(local_ty);
+                    let is_raw = is_raw_pointer_ty(local_ty);
+                    if is_raw {
+                        raw_ptr_arg_locals.push(local);
+                    }
+                    any_raw_arg |= is_raw;
                     any_tainted_arg |= tainted_ptr_locals.contains(&local);
                 }
             }
         }
 
-        // Crate-level conservative boundary: if callee is not a direct local fn, treat as unknown.
-        let unknown_boundary = !direct_local_callee(tcx, body, func);
+        // Conservative boundary: treat only unresolved or intentionally-uninstrumented callees
+        // (std/core/runtime/uninstrumented deps) as unknown. Cross-crate calls to instrumented
+        // dependencies should not taint by default.
+        let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
 
-        if unknown_boundary || any_raw_arg {
+        if unknown_boundary {
             for local in ptr_arg_locals.iter().copied() {
+                changed |= taint_local(local, tainted_ptr_locals);
+            }
+        } else if any_raw_arg {
+            // For known instrumented callees, keep raw-pointer conservativeness but avoid
+            // blanket-tainting unrelated shared/reference pointer operands.
+            for local in raw_ptr_arg_locals.iter().copied() {
                 changed |= taint_local(local, tainted_ptr_locals);
             }
         }
