@@ -1,0 +1,3 @@
+[submodule "dynBorrowProposal"]
+	path = dynBorrowProposal
+	url = git@github.com:van-ema/rusteze-proposal.git
