@@ -15,7 +15,7 @@ dependencies = [
  "base64",
  "bytes 1.11.0",
  "http-body-util",
- "hyper",
+ "hyper 1.8.1",
  "itoa",
  "quick-xml 0.38.4",
  "rkyv",
@@ -414,9 +414,12 @@ name = "eco_bench"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes 1.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hyper 1.8.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "itoa",
  "quick-xml 0.37.5",
  "serde_json 1.0.149 (registry+https://github.com/rust-lang/crates.io-index)",
+ "smallvec 1.15.1",
  "toml",
  "uuid",
 ]
@@ -717,6 +720,27 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "want",
+]
+
+[[package]]
+name = "hyper"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ab2d4f250c3d7b1c9fcdff1cece94ea4e2dfbec68614f7b87cb205f24ca9d11"
+dependencies = [
+ "atomic-waker",
+ "bytes 1.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "futures-channel",
+ "futures-core",
+ "http",
+ "http-body",
+ "httparse",
+ "itoa",
+ "pin-project-lite",
+ "pin-utils",
+ "smallvec 1.15.1",
+ "tokio",
  "want",
 ]
 

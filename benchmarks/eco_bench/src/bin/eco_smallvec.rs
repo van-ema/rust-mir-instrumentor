@@ -6,7 +6,7 @@ fn main() {
     let mut acc = 0usize;
 
     for i in 0..iters {
-        let mut v: SmallVec<u32, 16> = SmallVec::new();
+        let mut v: SmallVec<[u32; 16]> = SmallVec::new();
         for j in 0..32u32 {
             v.push(j.wrapping_add(i as u32));
         }

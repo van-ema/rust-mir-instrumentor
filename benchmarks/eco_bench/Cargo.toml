@@ -8,8 +8,11 @@ rusteze-profile = []
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
+hyper = { version = "1.7.0", default-features = false, features = ["http1", "client"] }
 itoa = "1"
 quick-xml = "0.37"
 serde_json = "1"
+smallvec = "1"
 toml = "0.9.11"
 uuid = "1"
