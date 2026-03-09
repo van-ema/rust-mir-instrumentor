@@ -194,7 +194,8 @@ fn instrumented_call_boundary<'tcx>(
         return true;
     }
 
-    let crate_name = tcx.crate_name(did.krate).as_str();
+    let crate_name_sym = tcx.crate_name(did.krate);
+    let crate_name = crate_name_sym.as_str();
     if crate_name == "runtime" || is_std_like_crate_name(crate_name) {
         return false;
     }
