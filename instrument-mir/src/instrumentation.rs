@@ -5157,7 +5157,6 @@ impl MyOptimizationPass {
         );
         let provenance_overrides = provenance_dataflow::apply_provenance_dataflow(
             self,
-            tcx,
             body,
             &mut insert_points,
         );

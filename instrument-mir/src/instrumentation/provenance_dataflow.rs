@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use rustc_middle::mir::{
     BasicBlock, Body, BorrowKind, Local, Operand, Place, RawPtrKind, Rvalue, StatementKind,
@@ -9,7 +9,7 @@ use super::{InsertPoint, InstrKind, MyOptimizationPass, PassLogLevel};
 
 // This pass is intentionally narrow:
 // - it only reasons about pointer-local provenance equivalence
-// - it only rewrites metadata consumers or removes dead TagProp copies
+// - it only rewrites metadata-propagation hooks (`TagProp`, `PtrDerive`)
 // - it does not suppress semantic hooks such as ref/raw creation or ptr reads/writes
 //
 // The guiding invariant is:
@@ -66,7 +66,6 @@ pub(super) fn apply_provenance_dataflow<'tcx>(
         .count();
 
     let mut override_by_old_idx: HashMap<usize, Local> = HashMap::new();
-    let mut drop_old_indices: HashSet<usize> = HashSet::new();
 
     for (idx, ip) in insert_points.iter().enumerate() {
         if let Some(input_local) = natural_provenance_input_local(ip) {
@@ -79,45 +78,10 @@ pub(super) fn apply_provenance_dataflow<'tcx>(
         }
     }
 
-    for (idx, ip) in insert_points.iter().enumerate() {
-        let InstrKind::TagProp { dst, .. } = ip.kind else {
-            continue;
-        };
-
-        let dst_value = analysis.point_value(ip, dst);
-        let ProvenanceValue::Symbol(dst_symbol) = dst_value else {
-            continue;
-        };
-
-        let mut can_drop = true;
-        for (consumer_idx, consumer) in insert_points.iter().enumerate() {
-            if natural_provenance_input_local(consumer) != Some(dst) {
-                continue;
-            }
-            if analysis.point_value(consumer, dst) != ProvenanceValue::Symbol(dst_symbol) {
-                continue;
-            }
-
-            let rep = override_by_old_idx.get(&consumer_idx).copied().unwrap_or(dst);
-            if rep == dst {
-                can_drop = false;
-                break;
-            }
-        }
-
-        if can_drop {
-            drop_old_indices.insert(idx);
-        }
-    }
-
     let mut remapped_overrides: HashMap<usize, Local> = HashMap::new();
     let mut new_points: Vec<InsertPoint<'tcx>> = Vec::with_capacity(insert_points.len());
 
     for (old_idx, ip) in std::mem::take(insert_points).into_iter().enumerate() {
-        if drop_old_indices.contains(&old_idx) {
-            continue;
-        }
-
         let new_idx = new_points.len();
         if let Some(rep_local) = override_by_old_idx.get(&old_idx).copied() {
             remapped_overrides.insert(new_idx, rep_local);
@@ -149,9 +113,11 @@ pub(super) fn apply_provenance_dataflow<'tcx>(
 }
 
 fn provenance_dataflow_enabled() -> bool {
+    // Experimental: pointer-value provenance equivalence alone is not enough to rewrite tag-local
+    // consumers soundly. Keep the pass opt-in until it reasons about tag materialization directly.
     std::env::var("RZ_PROVENANCE_DATAFLOW")
         .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
 fn provenance_dataflow_stats_enabled() -> bool {
@@ -169,13 +135,6 @@ fn place_from_operand<'tcx>(op: &Operand<'tcx>) -> Option<Place<'tcx>> {
 
 fn natural_provenance_input_local<'tcx>(ip: &InsertPoint<'tcx>) -> Option<Local> {
     match ip.kind {
-        InstrKind::PtrRead { ptr_local, .. }
-        | InstrKind::PtrWrite { ptr_local, .. }
-        | InstrKind::PtrReadAllowUntagged { ptr_local, .. }
-        | InstrKind::PtrWriteAllowUntagged { ptr_local, .. }
-        | InstrKind::PtrUse { ptr_local }
-        | InstrKind::CallArgPush { ptr_local, .. }
-        | InstrKind::RetPush { ptr_local, .. } => Some(ptr_local),
         InstrKind::TagProp { src, .. } | InstrKind::PtrDerive { src, .. } => Some(src),
         _ => None,
     }
