@@ -94,6 +94,11 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_DEBUG_MATCH`: if set, runs `debug_classify_call_effect` for that symbol and exits.
 - `RZ_DEBUG_SYMBOL_LOOKUP`: non-zero enables verbose runtime-hook symbol lookup logs.
 - `RZ_TRACE_PASS`: non-zero enables pass-level tracing.
+- `RZ_METADATA_DATAFLOW`: enables the metadata-local dataflow optimization pass (`1` default, set
+  `0` to disable). This pass only prunes redundant metadata propagation such as `TagProp`; it does
+  not rewrite semantic hooks like `PtrRead` / `PtrWrite`.
+- `RZ_METADATA_DATAFLOW_STATS`: non-zero prints metadata-dataflow pruning stats during
+  instrumentation.
 - `RZ_FILTER_STDLIB_USES`: std/core/alloc coarse-use filtering (`1` default, set `0` to disable).
 - `RZ_WARN_UNKNOWN_CALLS`: unknown-call warnings (default on; set `0` to disable).
 - `RZ_TRACE_UNKNOWN_CALLS`: extra unknown-call trace diagnostics.
