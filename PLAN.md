@@ -76,21 +76,21 @@ Exit criteria:
 Goal:
 - Reduce runtime overhead on parser-heavy ecosystem crates while preserving dynamic-checking behavior.
 
-Completed recently:
-1. Added runtime hook profiling split for `__rz_ptr_read` / `__rz_ptr_write`.
-2. Added sharded tag store + TLS lookup caches for hot metadata paths.
-3. Added tag-origin alloc cache in tag metadata:
-- Snapshot `origin_base`/`origin_end` at tag creation.
-- Use fast-path bounds + exact-base liveness/epoch checks per access.
-- Keep range-lookup fallback and cache refresh on misses.
-
 Open tasks:
 1. Tune remaining high-overhead targets.
 - Focus on `toml`, `zip`, and other parser-heavy outliers.
 - Use profiling split to separate alias-model vs alloc-check costs.
-2. Reduce hook density in MIR pass where safe.
-- Skip or coalesce checks for provably in-bounds non-escaping stack accesses.
-- Keep conservative behavior when proof is unavailable.
-3. Validate and regressions.
+2. Rework MIR-side dataflow optimization on a sound basis.
+- Replace the current experimental pointer-provenance rewrite idea with a metadata-local analysis.
+- Analyze emitted tag/ref-ancestor state, not pointer-value equivalence.
+- Keep any new optimization opt-in until soundness is established on examples and smoke fuzzing.
+3. Metadata-dataflow implementation plan.
+- Build the analysis after instrumentation planning, over the metadata program we actually emit.
+- Track abstract tag/ref-ancestor state (`Unknown`, concrete source local, fresh assignment, join).
+- Remove only propagation hooks proven redundant at the metadata-local level.
+- Optimize only metadata propagation (`TagProp`, ref-ancestor propagation, dead metadata stores).
+- Do not rewrite semantic consumers (`PtrRead`, `PtrWrite`, `PtrUse`, `CallArgPush`, `RetPush`).
+- Add stats for metadata hooks before/after optimization; semantic-hook rewrites should remain zero.
+4. Validate and regressions.
 - Benchmark with and without alias model (`tb_lite` and `none`) using `scripts/bench_overhead.py`.
 - Ensure functional tests/fuzz smoke still pass after each optimization step.

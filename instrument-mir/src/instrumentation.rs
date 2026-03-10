@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Mutex, OnceLock};
 
-mod provenance_dataflow;
+mod metadata_dataflow;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
@@ -557,7 +557,6 @@ struct InsertPoint<'tcx> {
 struct ScanResult<'tcx> {
     insert_points: Vec<InsertPoint<'tcx>>,
     ptr_locals_needing_tag: HashSet<Local>,
-    provenance_overrides: HashMap<usize, Local>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -5155,16 +5154,11 @@ impl MyOptimizationPass {
             insert_points,
             unsafe_influence,
         );
-        let provenance_overrides = provenance_dataflow::apply_provenance_dataflow(
-            self,
-            body,
-            &mut insert_points,
-        );
+        metadata_dataflow::apply_metadata_dataflow(self, body, &mut insert_points);
 
         ScanResult {
             insert_points,
             ptr_locals_needing_tag,
-            provenance_overrides,
         }
     }
 
@@ -5282,7 +5276,6 @@ impl MyOptimizationPass {
         tcx: TyCtxt<'tcx>,
         body: &mut Body<'tcx>,
         insert_points: Vec<InsertPoint<'tcx>>,
-        provenance_overrides: &HashMap<usize, Local>,
         tag_local_for_ptr_local: &HashMap<Local, Local>,
         ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
         hooks: Hooks,
@@ -5333,31 +5326,11 @@ impl MyOptimizationPass {
         sort_points(&mut arg_retag_points);
 
         for (_idx, ip) in other_points.into_iter().rev() {
-            let provenance_override = provenance_overrides.get(&_idx).copied();
             let bb = ip.bb;
             let stmt_idx = ip.stmt_idx;
             let source_info = ip.source_info;
             let place = ip.place;
-            let creation_kind = match ip.kind {
-                InstrKind::TagProp { dst, .. } if provenance_override.is_some() => {
-                    InstrKind::TagProp {
-                        dst,
-                        src: provenance_override.unwrap(),
-                    }
-                }
-                InstrKind::PtrDerive {
-                    dst,
-                    src: _,
-                    is_mut,
-                    is_ref,
-                } if provenance_override.is_some() => InstrKind::PtrDerive {
-                    dst,
-                    src: provenance_override.unwrap(),
-                    is_mut,
-                    is_ref,
-                },
-                other => other,
-            };
+            let creation_kind = ip.kind;
 
             // Avoid emitting allow-untagged READ/WRITE for raw-pointer args from unknown calls.
             // These are a common source of false positives (e.g., pointer casts).
@@ -5712,9 +5685,8 @@ impl MyOptimizationPass {
 
             // Callee-side: push the return tag immediately before the `Return` terminator.
             if let InstrKind::RetPush { callee_id, ptr_local } = creation_kind {
-                let provenance_local = provenance_override.unwrap_or(ptr_local);
                 let tag_local = *tag_local_for_ptr_local
-                    .get(&provenance_local)
+                    .get(&ptr_local)
                     .expect("missing tag local for RetPush");
 
                 // Use the data pointer for wide return values so tag passing stays consistent.
@@ -6322,8 +6294,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let provenance_local = provenance_override.unwrap_or(ptr_local);
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&provenance_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
@@ -6422,8 +6393,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let provenance_local = provenance_override.unwrap_or(ptr_local);
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&provenance_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
@@ -6456,8 +6426,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let provenance_local = provenance_override.unwrap_or(ptr_local);
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&provenance_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
@@ -6482,8 +6451,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let provenance_local = provenance_override.unwrap_or(ptr_local);
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&provenance_local) {
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
@@ -7520,7 +7488,6 @@ impl MyOptimizationPass {
             tcx,
             body,
             insert_points,
-            &scan.provenance_overrides,
             &tag_local_for_ptr_local,
             &ref_ancestor_local_for_ptr_local,
             hooks,
