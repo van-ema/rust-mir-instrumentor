@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 mod metadata_dataflow;
@@ -54,6 +57,17 @@ struct UnsafeDflowStats {
     hooks_total_after: usize,
     access_hooks_before: usize,
     access_hooks_after: usize,
+}
+
+#[derive(Default)]
+struct UnsafeSummaryStats {
+    functions_seen: usize,
+    functions_with_direct_sink: usize,
+    functions_calling_unknown_boundary: usize,
+    ptr_args_total: usize,
+    ptr_args_with_direct_sink: usize,
+    ptr_args_escaping_unknown: usize,
+    ptr_args_forwarded_to_return: usize,
 }
 
 
@@ -1070,6 +1084,18 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    fn unsafe_dataflow_summary_stats_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_STATS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    fn unsafe_dataflow_summary_dump_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn trace_unsafe_dataflow_enabled(&self) -> bool {
         std::env::var("RZ_TRACE_UNSAFE_DATAFLOW")
             .ok()
@@ -1148,6 +1174,189 @@ impl MyOptimizationPass {
             stats.hooks_total_after,
             stats.hooks_total_before.saturating_sub(stats.hooks_total_after)
         );
+    }
+
+    fn log_unsafe_dataflow_summary_stats<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) {
+        if !self.unsafe_dataflow_summary_stats_enabled() {
+            return;
+        }
+
+        let fn_name = tcx.def_path_str(body.source.def_id());
+        let summary = unsafe_influence.summary();
+        let ptr_args_total = summary.ptr_args().len();
+        let ptr_args_with_direct_sink = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.reaches_direct_sink())
+            .count();
+        let ptr_args_escaping_unknown = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_unknown_boundary())
+            .count();
+        let ptr_args_forwarded_to_return = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.forwarded_to_return())
+            .count();
+
+        eprintln!(
+            "[rusteze][unsafe-summary][fn] fn={} direct_sink={} calls_unknown_boundary={} ptr_args={} direct_sink_args={} escape_unknown={} to_return={}",
+            fn_name,
+            summary.has_direct_sink(),
+            summary.calls_unknown_boundary(),
+            ptr_args_total,
+            ptr_args_with_direct_sink,
+            ptr_args_escaping_unknown,
+            ptr_args_forwarded_to_return
+        );
+
+        for arg in summary.ptr_args() {
+            eprintln!(
+                "[rusteze][unsafe-summary][arg] fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} to_return={}",
+                fn_name,
+                arg.arg_index,
+                arg.direct_sink_mask,
+                arg.propagation_mask,
+                arg.reaches_direct_sink(),
+                arg.escapes_to_unknown_boundary(),
+                arg.forwarded_to_return()
+            );
+        }
+
+        static STATS: OnceLock<Mutex<UnsafeSummaryStats>> = OnceLock::new();
+        let mut stats = STATS
+            .get_or_init(|| Mutex::new(UnsafeSummaryStats::default()))
+            .lock()
+            .unwrap();
+
+        stats.functions_seen += 1;
+        stats.functions_with_direct_sink += usize::from(summary.has_direct_sink());
+        stats.functions_calling_unknown_boundary += usize::from(summary.calls_unknown_boundary());
+        stats.ptr_args_total += ptr_args_total;
+        stats.ptr_args_with_direct_sink += ptr_args_with_direct_sink;
+        stats.ptr_args_escaping_unknown += ptr_args_escaping_unknown;
+        stats.ptr_args_forwarded_to_return += ptr_args_forwarded_to_return;
+
+        eprintln!(
+            "[rusteze][unsafe-summary][totals] fns={} direct_sink_fns={} calls_unknown_boundary_fns={} ptr_args={} direct_sink_args={} escape_unknown={} to_return={}",
+            stats.functions_seen,
+            stats.functions_with_direct_sink,
+            stats.functions_calling_unknown_boundary,
+            stats.ptr_args_total,
+            stats.ptr_args_with_direct_sink,
+            stats.ptr_args_escaping_unknown,
+            stats.ptr_args_forwarded_to_return
+        );
+    }
+
+    fn json_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 8);
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    fn unsafe_summary_dump_path<'tcx>(&self, tcx: TyCtxt<'tcx>) -> PathBuf {
+        let crate_name = tcx.crate_name(LOCAL_CRATE).as_str().replace('-', "_");
+        if let Ok(path) = std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP_PATH") {
+            return PathBuf::from(path);
+        }
+        let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+        PathBuf::from(target_dir)
+            .join("rusteze-unsafe-summaries")
+            .join(format!("{crate_name}.jsonl"))
+    }
+
+    fn dump_unsafe_dataflow_summary<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) {
+        if !self.unsafe_dataflow_summary_dump_enabled() {
+            return;
+        }
+
+        let path = self.unsafe_summary_dump_path(tcx);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][unsafe-summary] failed to create dump dir {}: {}",
+                    parent.display(),
+                    err
+                );
+                return;
+            }
+        }
+
+        let fn_name = tcx.def_path_str(body.source.def_id());
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
+        let summary = unsafe_influence.summary();
+        let mut line = String::new();
+        line.push('{');
+        line.push_str(&format!(
+            "\"crate\":\"{}\",\"function\":\"{}\",\"has_direct_sink\":{},\"calls_unknown_boundary\":{},\"ptr_args\":[",
+            Self::json_escape(crate_name),
+            Self::json_escape(&fn_name),
+            summary.has_direct_sink(),
+            summary.calls_unknown_boundary(),
+        ));
+        for (i, arg) in summary.ptr_args().iter().enumerate() {
+            if i != 0 {
+                line.push(',');
+            }
+            line.push_str(&format!(
+                "{{\"arg_index\":{},\"direct_sink_mask\":{},\"propagation_mask\":{},\"reaches_direct_sink\":{},\"escapes_to_unknown_boundary\":{},\"forwarded_to_return\":{}}}",
+                arg.arg_index(),
+                arg.direct_sink_mask(),
+                arg.propagation_mask(),
+                arg.reaches_direct_sink(),
+                arg.escapes_to_unknown_boundary(),
+                arg.forwarded_to_return()
+            ));
+        }
+        line.push_str("]}\n");
+
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()) {
+                    rz_pass_warn!(
+                        self,
+                        "[rusteze][unsafe-summary] failed to write {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][unsafe-summary] failed to open {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
     }
 
     fn filter_insert_points_by_unsafe_dataflow<'tcx>(
@@ -7459,6 +7668,8 @@ impl MyOptimizationPass {
             body,
             self.unsafe_dataflow_selective_enabled(),
         );
+        self.log_unsafe_dataflow_summary_stats(tcx, body, &unsafe_influence);
+        self.dump_unsafe_dataflow_summary(tcx, body, &unsafe_influence);
         if self.trace_unsafe_dataflow_enabled() && unsafe_influence.enabled() {
             rz_pass_warn!(
                 self,
