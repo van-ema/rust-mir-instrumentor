@@ -88,6 +88,9 @@ Open tasks:
 - Build the analysis after instrumentation planning, over the metadata program we actually emit.
 - Track abstract tag/ref-ancestor state (`Unknown`, concrete source local, fresh assignment, join).
 - Remove only propagation hooks proven redundant at the metadata-local level.
+- Add backward metadata liveness so dead overwritten metadata stores can be pruned.
+- Treat tag and ref-ancestor propagation independently so a `TagProp` can keep only the
+  still-live half when the other copy is redundant.
 - Optimize only metadata propagation (`TagProp`, ref-ancestor propagation, dead metadata stores).
 - Do not rewrite semantic consumers (`PtrRead`, `PtrWrite`, `PtrUse`, `CallArgPush`, `RetPush`).
 - Add stats for metadata hooks before/after optimization; semantic-hook rewrites should remain zero.

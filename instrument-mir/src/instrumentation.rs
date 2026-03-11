@@ -525,7 +525,12 @@ enum InstrKind<'tcx> {
     PtrUse { ptr_local: Local },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
-    TagProp { dst: Local, src: Local },
+    TagProp {
+        dst: Local,
+        src: Local,
+        copy_tag: bool,
+        copy_ref_ancestor: bool,
+    },
     /// Fresh tag for a derived pointer value (pointer arithmetic like add/sub/offset).
     /// Emits either ref/raw creation based on destination kind, with `parent=tag(src)`.
     PtrDerive { dst: Local, src: Local, is_mut: bool, is_ref: bool },
@@ -3172,7 +3177,12 @@ impl MyOptimizationPass {
                                         insert_before: false,
                                         source_info: stmt.source_info,
                                         place: Place::from(dst_local),
-                                        kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                        kind: InstrKind::TagProp {
+                                            dst: dst_local,
+                                            src: src_local,
+                                            copy_tag: true,
+                                            copy_ref_ancestor: true,
+                                        },
                                     });
                                 }
                                 tagged_ptr_locals.insert(dst_local);
@@ -5764,46 +5774,60 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::TagProp { dst, src } = creation_kind {
+            if let InstrKind::TagProp {
+                dst,
+                src,
+                copy_tag,
+                copy_ref_ancestor,
+            } = creation_kind
+            {
                 // println!(
                 //     "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
                 //     dst,
                 //     src
                 // );
-                let dst_tag = *tag_local_for_ptr_local
-                    .get(&dst)
-                    .expect("missing tag local for TagProp dst");
+                let prop_stmt = if copy_tag {
+                    let dst_tag = *tag_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing tag local for TagProp dst");
 
-                let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
-                    Operand::Copy(Place::from(*src_tag))
-                } else {
-                    self.const_u64(tcx, source_info.span, 0)
-                };
-
-                let prop_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(dst_tag),
-                        Rvalue::Use(src_op),
-                    ))),
-                );
-
-                let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
-                    .get(&dst)
-                    .expect("missing ref-ancestor local for TagProp dst");
-                let src_ref_ancestor_op: Operand<'tcx> =
-                    if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
-                        Operand::Copy(Place::from(*src_ref_ancestor))
+                    let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*src_tag))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
                     };
-                let prop_ref_ancestor_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(dst_ref_ancestor),
-                        Rvalue::Use(src_ref_ancestor_op),
-                    ))),
-                );
+
+                    Some(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(dst_tag),
+                            Rvalue::Use(src_op),
+                        ))),
+                    ))
+                } else {
+                    None
+                };
+
+                let prop_ref_ancestor_stmt = if copy_ref_ancestor {
+                    let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing ref-ancestor local for TagProp dst");
+                    let src_ref_ancestor_op: Operand<'tcx> =
+                        if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
+                            Operand::Copy(Place::from(*src_ref_ancestor))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        };
+                    Some(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(dst_ref_ancestor),
+                            Rvalue::Use(src_ref_ancestor_op),
+                        ))),
+                    ))
+                } else {
+                    None
+                };
 
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let insert_at = if stmt_idx >= bd.statements.len() {
@@ -5811,8 +5835,14 @@ impl MyOptimizationPass {
                 } else {
                     stmt_idx + 1
                 };
-                bd.statements.insert(insert_at, prop_stmt);
-                bd.statements.insert(insert_at + 1, prop_ref_ancestor_stmt);
+                let mut next_insert = insert_at;
+                if let Some(prop_stmt) = prop_stmt {
+                    bd.statements.insert(next_insert, prop_stmt);
+                    next_insert += 1;
+                }
+                if let Some(prop_ref_ancestor_stmt) = prop_ref_ancestor_stmt {
+                    bd.statements.insert(next_insert, prop_ref_ancestor_stmt);
+                }
                 continue;
             }
 
