@@ -79,6 +79,10 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_SB_LITE`: stacked-borrows-lite on/off (`1` default when using `sb_lite` model).
 - `RZ_SB_DUMP`: `1/true` adds SB-lite stack/ancestry details in violation output.
 - `RZ_STACK_REF_OOB_NOISE`: stack-ref OOB-noise suppression (`1` default, set `0` for strict reporting).
+- `RZ_PROFILE_HOOKS`: `1/true` enables runtime hook profiling counters for `read`, `write`,
+  `ref_create`, `raw_create`, `ptr_use`, and `record_alloc`.
+- `RZ_DUMP_HOOK_PROFILE_AT_EXIT`: `1/true` dumps the aggregated runtime hook profile to stderr at
+  process exit. Use this with `RZ_PROFILE_HOOKS=1` for one-shot repro/benchmark runs.
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a
   `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap

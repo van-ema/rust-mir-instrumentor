@@ -6,6 +6,11 @@ use core::ptr;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn atexit(cb: extern "C" fn()) -> i32;
+}
+
 mod static_image;
 use static_image::StaticRange;
 mod alias_model;
@@ -132,6 +137,7 @@ static RZ_HOOK_PROFILE: OnceLock<HookProfileCounters> = OnceLock::new();
 
 #[inline]
 fn rz_hook_profile() -> &'static HookProfileCounters {
+    rz_maybe_register_hook_profile_atexit();
     RZ_HOOK_PROFILE.get_or_init(HookProfileCounters::new)
 }
 
@@ -143,6 +149,37 @@ fn rz_profile_hooks_enabled() -> bool {
             .ok()
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     })
+}
+
+#[inline]
+fn rz_dump_hook_profile_at_exit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RZ_DUMP_HOOK_PROFILE_AT_EXIT")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    })
+}
+
+#[cfg(unix)]
+extern "C" fn rz_dump_hook_profile_atexit() {
+    __rz_dump_hook_profile();
+}
+
+#[inline]
+fn rz_maybe_register_hook_profile_atexit() {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    if !rz_profile_hooks_enabled() || !rz_dump_hook_profile_at_exit_enabled() {
+        return;
+    }
+    let _ = REGISTERED.get_or_init(|| {
+        #[cfg(unix)]
+        unsafe {
+            // Register once so repro/benchmark runs can dump aggregate runtime hook costs
+            // without modifying individual harness binaries.
+            let _ = atexit(rz_dump_hook_profile_atexit);
+        }
+    });
 }
 
 #[inline]
