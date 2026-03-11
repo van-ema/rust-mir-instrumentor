@@ -162,6 +162,176 @@ Do not use the whole-program index to rewrite or suppress:
 Those hooks are where the runtime actually checks behavior. They should continue to observe the
 original local's metadata unless we later prove equivalence at the metadata-local level.
 
+## Unsafe-sensitive reachability plan
+
+The pruning criterion must not be ``textually inside an `unsafe {}` block''.
+That boundary is too weak: safe-looking code may call dependencies or standard-library APIs that
+execute unsafe internals, and the final semantic hook may occur outside the block that introduced
+the problematic provenance.
+
+The right property is:
+
+- a pointer/reference and its aliases may be pruned only if they can be proven never to reach any
+  **unsafe-sensitive sink**
+
+Initial sink set:
+- raw-pointer creation/derivation
+- raw dereference
+- ref-from-raw / raw-from-ref sensitive paths
+- pointer escape to unknown or uninstrumented calls
+- FFI/intrinsics
+- call/return boundaries whose summaries are unknown
+
+This definition is conservative by construction: if we are unsure whether a sink is
+unsafe-sensitive, we classify it as relevant and keep instrumentation.
+
+## Staged implementation plan
+
+The implementation should proceed in small, validated steps.
+
+### Step 1: tighten the existing intra-procedural analysis
+
+Extend `instrument-mir/src/unsafe_dataflow.rs` so it computes a stronger local notion of
+unsafe-sensitive influence:
+
+- identify unsafe-sensitive roots
+- propagate through pointer copies, reborrows, and pointer casts
+- model escapes to calls and returns conservatively
+- treat unknown calls as sinks, not as pruning opportunities
+
+This stage remains purely intra-procedural and should only affect hook placement, not hook
+retargeting.
+
+### Step 2: add per-function summaries
+
+For each function, compute a compact summary such as:
+
+- whether it is directly unsafe-sensitive
+- which pointer arguments reach unsafe-sensitive sinks
+- which arguments escape
+- whether the return value is fresh, derived from an argument, or unknown
+- whether the function calls unknown or already-unsafe-sensitive callees
+
+The first version can stay crate-local and need not serialize summaries yet.
+
+### Step 3: add intra-crate interprocedural propagation
+
+Build a conservative crate-local call graph and propagate the summaries:
+
+- if callee argument `i` is unsafe-sensitive, the corresponding caller argument becomes relevant
+- if the callee return derives from argument `i`, propagate relevance back to the caller
+- if the callee is unknown or incomplete, fall back to keeping instrumentation
+
+This stage should already strengthen pruning over helper-heavy code without requiring a two-pass
+whole-program build.
+
+### Step 4: use summaries only for pruning, not semantic-hook rewrites
+
+Initially, summary results should only drive:
+
+- pruning of `PtrRead` / `PtrWrite` on values proven outside the unsafe-sensitive slice
+- maybe later, pruning of obviously irrelevant `Ref` / `Raw` creation hooks
+
+They must not be used to:
+
+- retarget semantic hooks to different locals
+- assume pointer-equivalence implies tag-local equivalence
+
+### Step 5: move to cross-crate/two-pass summaries
+
+Once the intra-crate summary model is stable and validated:
+
+1. emit per-crate summaries in an analyze-only build
+2. merge them into a whole-program index
+3. rerun compilation with the merged index guiding instrumentation
+
+Only at this point should cross-crate pruning become aggressive.
+
+## Validation order
+
+Each stage must clear the same gates before proceeding:
+
+1. full example suite stays green
+2. representative AFL smoke targets build and start fuzzing without immediate tool aborts
+3. differential comparison against the full-instrumentation mode shows no regressions on known UB
+   examples
+
+This ensures every pruning step is justified by evidence rather than by intuition.
+
+## Progress
+
+### Step 1 implemented: stronger intra-procedural unsafe-sensitive analysis
+
+The first step of the plan is now implemented in
+`instrument-mir/src/unsafe_dataflow.rs`.
+
+Current improvements:
+
+- track **tainted value carriers** in addition to tainted pointer locals
+  - this preserves unsafe-sensitive influence when a pointer flows through a local wrapper or
+    aggregate before being extracted again
+- treat **provenance-sensitive pointer roots** as unsafe-sensitive roots
+  - `Rvalue::RawPtr(..)`
+  - `CastKind::PointerWithExposedProvenance` to a pointer type
+  - pointer-producing `Transmute` from integral sources, conservatively
+- propagate taint through **aggregate/projection storage**
+  - storing a tainted pointer into `base.field` taints the base local as a carrier
+- keep **unknown or uninstrumented call boundaries** as sinks
+  - destinations of such calls become tainted when fed by tainted inputs or raw arguments
+
+This remains a hook-placement analysis only. It does not retarget semantic hooks and does not
+rewrite tag/ref-ancestor consumers.
+
+### Practical examples
+
+Example: wrapper local keeps unsafe-sensitive influence
+
+```rust
+let p: *mut u8 = ...;
+let w = Wrapper { p };
+let q = w.p;
+unsafe { *q = 1; }
+```
+
+The old analysis could lose the connection at `w`. The current version taints `w` as a value
+carrier, so `q` remains unsafe-relevant.
+
+Example: provenance-sensitive cast is treated as a root
+
+```rust
+let addr: usize = ...;
+let p = addr as *const u8;
+unsafe { *p };
+```
+
+This is now conservatively treated as unsafe-sensitive from the cast onward.
+
+Example: projected storage preserves relevance
+
+```rust
+holder.ptr = raw_ptr;
+let q = holder.ptr;
+unsafe { *q };
+```
+
+The base local `holder` is tainted as a carrier, so extracting `q` keeps the unsafe-sensitive
+slice intact.
+
+### Validation status
+
+The current Step 1 implementation has been validated with:
+
+- `cargo build -p instrument-mir`
+- `cargo build -p runtime`
+- full example suite:
+  - `reports/example_tests/20260311_120700/summary.tsv`
+
+Further work still required:
+
+- add per-function summaries
+- propagate those summaries across the crate-local call graph
+- measure pruning impact with better aggregated stats than the current per-build log sampling
+
 ## Why this differs from the failed provenance-dataflow experiment
 
 The failed local experiment reasoned about:

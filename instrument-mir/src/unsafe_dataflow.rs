@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::mir::{
-    BasicBlockData, Body, Local, Operand, Place, ProjectionElem, Rvalue, Statement, StatementKind,
-    Terminator, TerminatorKind,
+    BasicBlockData, Body, CastKind, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
+    StatementKind, Terminator, TerminatorKind,
 };
 use rustc_middle::ty::{TyCtxt, TyKind};
 
@@ -76,9 +76,13 @@ fn taint_local(local: Local, tainted_ptr_locals: &mut HashSet<Local>) -> bool {
     tainted_ptr_locals.insert(local)
 }
 
-fn operand_tainted<'tcx>(op: &Operand<'tcx>, tainted_ptr_locals: &HashSet<Local>) -> bool {
+fn taint_value_local(local: Local, tainted_value_locals: &mut HashSet<Local>) -> bool {
+    tainted_value_locals.insert(local)
+}
+
+fn operand_tainted<'tcx>(op: &Operand<'tcx>, tainted_value_locals: &HashSet<Local>) -> bool {
     place_from_operand(op)
-        .map(|p| tainted_ptr_locals.contains(&p.local))
+        .map(|p| tainted_value_locals.contains(&p.local))
         .unwrap_or(false)
 }
 
@@ -86,21 +90,40 @@ fn rvalue_tainted<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     rv: &Rvalue<'tcx>,
-    tainted_ptr_locals: &HashSet<Local>,
+    tainted_value_locals: &HashSet<Local>,
 ) -> bool {
     match rv {
-        Rvalue::Use(op) | Rvalue::Repeat(op, _) => operand_tainted(op, tainted_ptr_locals),
+        Rvalue::Use(op) | Rvalue::Repeat(op, _) => operand_tainted(op, tainted_value_locals),
         Rvalue::RawPtr(_, p) => {
             // Raw pointer construction is an unsafe-influence root.
-            tainted_ptr_locals.contains(&p.local) || is_pointer_ty(p.ty(&body.local_decls, tcx).ty)
+            tainted_value_locals.contains(&p.local) || is_pointer_ty(p.ty(&body.local_decls, tcx).ty)
         }
-        Rvalue::Ref(_, _, p) | Rvalue::CopyForDeref(p) => tainted_ptr_locals.contains(&p.local),
-        Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => operand_tainted(op, tainted_ptr_locals),
+        Rvalue::Ref(_, _, p) | Rvalue::CopyForDeref(p) => tainted_value_locals.contains(&p.local),
+        Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => operand_tainted(op, tainted_value_locals),
         Rvalue::BinaryOp(_, ops) => {
-            operand_tainted(&ops.0, tainted_ptr_locals)
-                || operand_tainted(&ops.1, tainted_ptr_locals)
+            operand_tainted(&ops.0, tainted_value_locals)
+                || operand_tainted(&ops.1, tainted_value_locals)
         }
-        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_tainted(op, tainted_ptr_locals)),
+        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_tainted(op, tainted_value_locals)),
+        _ => false,
+    }
+}
+
+fn rvalue_is_unsafe_root<'tcx>(
+    body: &Body<'tcx>,
+    rv: &Rvalue<'tcx>,
+) -> bool {
+    match rv {
+        Rvalue::RawPtr(..) => true,
+        Rvalue::Cast(CastKind::PointerWithExposedProvenance, _, to_ty) => is_pointer_ty(*to_ty),
+        Rvalue::Cast(CastKind::Transmute, op, to_ty) => {
+            if !is_pointer_ty(*to_ty) {
+                return false;
+            }
+            place_from_operand(op)
+                .map(|p| body.local_decls[p.local].ty.is_integral())
+                .unwrap_or(true)
+        }
         _ => false,
     }
 }
@@ -207,6 +230,7 @@ fn apply_statement<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     stmt: &Statement<'tcx>,
+    tainted_value_locals: &mut HashSet<Local>,
     tainted_ptr_locals: &mut HashSet<Local>,
 ) -> bool {
     let mut changed = false;
@@ -217,6 +241,7 @@ fn apply_statement<'tcx>(
             let ptr_local = lhs_place.local;
             let ptr_ty = body.local_decls[ptr_local].ty;
             if is_raw_pointer_ty(ptr_ty) {
+                changed |= taint_value_local(ptr_local, tainted_value_locals);
                 changed |= taint_local(ptr_local, tainted_ptr_locals);
             }
         }
@@ -226,20 +251,24 @@ fn apply_statement<'tcx>(
                     let ptr_local = p.local;
                     let ptr_ty = body.local_decls[ptr_local].ty;
                     if is_raw_pointer_ty(ptr_ty) {
+                        changed |= taint_value_local(ptr_local, tainted_value_locals);
                         changed |= taint_local(ptr_local, tainted_ptr_locals);
                     }
                 }
             }
         }
 
+        let rhs_is_tainted = rvalue_tainted(tcx, body, rhs, tainted_value_locals);
+        let rhs_is_unsafe_root = rvalue_is_unsafe_root(body, rhs);
+
+        if rhs_is_tainted || rhs_is_unsafe_root {
+            changed |= taint_value_local(lhs_place.local, tainted_value_locals);
+        }
+
         if let Some(dst_local) = lhs_place.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
-            if is_pointer_ty(dst_ty) {
-                let rhs_is_tainted = rvalue_tainted(tcx, body, rhs, tainted_ptr_locals);
-                let rhs_is_unsafe_root = matches!(rhs, Rvalue::RawPtr(..));
-                if rhs_is_tainted || rhs_is_unsafe_root {
-                    changed |= taint_local(dst_local, tainted_ptr_locals);
-                }
+            if (rhs_is_tainted || rhs_is_unsafe_root) && is_pointer_ty(dst_ty) {
+                changed |= taint_local(dst_local, tainted_ptr_locals);
             }
         }
     }
@@ -251,6 +280,7 @@ fn apply_terminator<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     term: &Terminator<'tcx>,
+    tainted_value_locals: &mut HashSet<Local>,
     tainted_ptr_locals: &mut HashSet<Local>,
 ) -> bool {
     let mut changed = false;
@@ -278,7 +308,7 @@ fn apply_terminator<'tcx>(
                         raw_ptr_arg_locals.push(local);
                     }
                     any_raw_arg |= is_raw;
-                    any_tainted_arg |= tainted_ptr_locals.contains(&local);
+                    any_tainted_arg |= tainted_value_locals.contains(&local);
                 }
             }
         }
@@ -290,12 +320,14 @@ fn apply_terminator<'tcx>(
 
         if unknown_boundary {
             for local in ptr_arg_locals.iter().copied() {
+                changed |= taint_value_local(local, tainted_value_locals);
                 changed |= taint_local(local, tainted_ptr_locals);
             }
         } else if any_raw_arg {
             // For known instrumented callees, keep raw-pointer conservativeness but avoid
             // blanket-tainting unrelated shared/reference pointer operands.
             for local in raw_ptr_arg_locals.iter().copied() {
+                changed |= taint_value_local(local, tainted_value_locals);
                 changed |= taint_local(local, tainted_ptr_locals);
             }
         }
@@ -303,6 +335,7 @@ fn apply_terminator<'tcx>(
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
             if is_pointer_ty(dst_ty) && (unknown_boundary || any_raw_arg || any_tainted_arg) {
+                changed |= taint_value_local(dst_local, tainted_value_locals);
                 changed |= taint_local(dst_local, tainted_ptr_locals);
             }
         }
@@ -321,6 +354,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
     }
 
     let mut tainted_ptr_locals: HashSet<Local> = HashSet::new();
+    let mut tainted_value_locals: HashSet<Local> = HashSet::new();
     let mut total_ptr_locals = 0usize;
 
     for local in body.local_decls.indices() {
@@ -330,6 +364,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
             // Raw pointers are unsafe-influence roots by default.
             if is_raw_pointer_ty(ty) {
                 tainted_ptr_locals.insert(local);
+                tainted_value_locals.insert(local);
             }
         }
     }
@@ -339,6 +374,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         let arg_ty = body.local_decls[arg_local].ty;
         if is_pointer_ty(arg_ty) {
             tainted_ptr_locals.insert(arg_local);
+            tainted_value_locals.insert(arg_local);
         }
     }
 
@@ -347,7 +383,13 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
     while changed {
         changed = false;
         for block_data in body.basic_blocks.iter() {
-            changed |= apply_block(tcx, body, block_data, &mut tainted_ptr_locals);
+            changed |= apply_block(
+                tcx,
+                body,
+                block_data,
+                &mut tainted_value_locals,
+                &mut tainted_ptr_locals,
+            );
         }
     }
 
@@ -362,14 +404,15 @@ fn apply_block<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     block_data: &BasicBlockData<'tcx>,
+    tainted_value_locals: &mut HashSet<Local>,
     tainted_ptr_locals: &mut HashSet<Local>,
 ) -> bool {
     let mut changed = false;
     for stmt in block_data.statements.iter() {
-        changed |= apply_statement(tcx, body, stmt, tainted_ptr_locals);
+        changed |= apply_statement(tcx, body, stmt, tainted_value_locals, tainted_ptr_locals);
     }
     if let Some(term) = block_data.terminator.as_ref() {
-        changed |= apply_terminator(tcx, body, term, tainted_ptr_locals);
+        changed |= apply_terminator(tcx, body, term, tainted_value_locals, tainted_ptr_locals);
     }
     changed
 }
