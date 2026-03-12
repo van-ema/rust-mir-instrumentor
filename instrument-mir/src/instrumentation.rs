@@ -1112,13 +1112,20 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
-    fn ptr_access_local_from_instr_kind<'tcx>(kind: &InstrKind<'tcx>) -> Option<Local> {
+    fn unsafe_dataflow_gated_local<'tcx>(
+        kind: &InstrKind<'tcx>,
+        place: &Place<'tcx>,
+    ) -> Option<Local> {
         match kind {
             InstrKind::PtrRead { ptr_local, .. }
             | InstrKind::PtrWrite { ptr_local, .. }
             | InstrKind::PtrReadAllowUntagged { ptr_local, .. }
             | InstrKind::PtrWriteAllowUntagged { ptr_local, .. }
-            | InstrKind::PtrUse { ptr_local } => Some(*ptr_local),
+            | InstrKind::PtrUse { ptr_local }
+            | InstrKind::RawRoot { ptr_local, .. }
+            | InstrKind::RetRoot { dst_local: ptr_local, .. }
+            | InstrKind::PtrDerive { dst: ptr_local, .. } => Some(*ptr_local),
+            InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
             _ => None,
         }
     }
@@ -1377,7 +1384,16 @@ impl MyOptimizationPass {
         let before_total = insert_points.len();
         let before_access = insert_points
             .iter()
-            .filter(|ip| Self::ptr_access_local_from_instr_kind(&ip.kind).is_some())
+            .filter(|ip| {
+                matches!(
+                    ip.kind,
+                    InstrKind::PtrRead { .. }
+                        | InstrKind::PtrWrite { .. }
+                        | InstrKind::PtrReadAllowUntagged { .. }
+                        | InstrKind::PtrWriteAllowUntagged { .. }
+                        | InstrKind::PtrUse { .. }
+                )
+            })
             .count();
 
         if !unsafe_influence.enabled() {
@@ -1394,7 +1410,7 @@ impl MyOptimizationPass {
         }
 
         insert_points.retain(|ip| {
-            let ptr_local_opt = Self::ptr_access_local_from_instr_kind(&ip.kind);
+            let ptr_local_opt = Self::unsafe_dataflow_gated_local(&ip.kind, &ip.place);
             ptr_local_opt
                 .map(|l| unsafe_influence.should_instrument_ptr_local(l))
                 .unwrap_or(true)
@@ -1403,7 +1419,16 @@ impl MyOptimizationPass {
         let after_total = insert_points.len();
         let after_access = insert_points
             .iter()
-            .filter(|ip| Self::ptr_access_local_from_instr_kind(&ip.kind).is_some())
+            .filter(|ip| {
+                matches!(
+                    ip.kind,
+                    InstrKind::PtrRead { .. }
+                        | InstrKind::PtrWrite { .. }
+                        | InstrKind::PtrReadAllowUntagged { .. }
+                        | InstrKind::PtrWriteAllowUntagged { .. }
+                        | InstrKind::PtrUse { .. }
+                )
+            })
             .count();
 
         if self.trace_unsafe_dataflow_enabled() {

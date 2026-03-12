@@ -796,7 +796,7 @@ fn summarize_arg_effects<'tcx>(
                 if unknown_boundary && any_tainted_ptr_arg {
                     propagation_mask |= UnsafeArgSummary::PROP_ESCAPE_UNKNOWN;
                 }
-                if any_tainted_raw_arg {
+                if any_tainted_raw_arg && (unknown_boundary || callee_summary.is_none()) {
                     direct_sink_mask |= UnsafeArgSummary::DIRECT_RAW_ARG_TO_CALL;
                 }
                 if let Some(summary) = &callee_summary {
@@ -856,13 +856,14 @@ fn compute_function_summary<'tcx>(
                         && callee_summary
                             .as_ref()
                             .is_some_and(|callee| callee.calls_unknown_boundary()));
-                summary.has_direct_sink |= args.iter().any(|arg| {
-                    place_from_operand(&arg.node).is_some_and(|p| {
-                        let local = p.local;
-                        is_raw_pointer_ty(body.local_decls[local].ty)
-                            && tainted_value_locals.contains(&local)
-                    })
-                });
+                summary.has_direct_sink |= (unknown_boundary || callee_summary.is_none())
+                    && args.iter().any(|arg| {
+                        place_from_operand(&arg.node).is_some_and(|p| {
+                            let local = p.local;
+                            is_raw_pointer_ty(body.local_decls[local].ty)
+                                && tainted_value_locals.contains(&local)
+                        })
+                    });
                 if let Some(callee) = &callee_summary {
                     summary.has_direct_sink |= args.iter().enumerate().any(|(arg_index, arg)| {
                         place_from_operand(&arg.node).is_some_and(|p| {
@@ -1198,15 +1199,19 @@ fn seed_terminator_sink_relevance<'tcx>(
             continue;
         }
         let is_raw = is_raw_pointer_ty(ty);
-        let sink_relevant = unknown_boundary
-            || local_summary_missing
-            || is_raw
-            || callee_summary.as_ref().is_some_and(|summary| {
-                summary.ptr_args().iter().any(|entry| {
-                    entry.arg_index() == arg_index
-                        && (entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary())
-                })
-            });
+        let sink_relevant = if unknown_boundary || local_summary_missing {
+            true
+        } else if let Some(summary) = callee_summary.as_ref() {
+            summary.ptr_args().iter().any(|entry| {
+                entry.arg_index() == arg_index
+                    && (entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary())
+            })
+        } else {
+            // If an instrumented non-local callee has no summary available, keep raw-pointer
+            // arguments conservative. Once a summary exists, only actual sink/escape effects
+            // should keep the caller local relevant.
+            is_raw
+        };
         if sink_relevant {
             mark_value_local(local, relevant_value_locals);
             mark_ptr_local(local, relevant_ptr_locals);
