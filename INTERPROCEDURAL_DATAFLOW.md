@@ -328,9 +328,64 @@ The current Step 1 implementation has been validated with:
 
 Further work still required:
 
-- add per-function summaries
 - propagate those summaries across the crate-local call graph
 - measure pruning impact with better aggregated stats than the current per-build log sampling
+
+### Step 2 implemented: per-function summaries and dumpable artifacts
+
+The next stage is now implemented conservatively:
+
+- each analyzed function computes a crate-local `UnsafeFunctionSummary`
+- summaries distinguish:
+  - direct unsafe-sensitive sinks
+  - unknown-boundary effects
+  - per-argument direct-sink vs propagation effects
+- summaries can be inspected through:
+  - `RZ_UNSAFE_DATAFLOW_SUMMARY_STATS=1`
+  - `RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP=1`
+
+Current dump format:
+
+- one JSONL record per function
+- default location:
+  - `${CARGO_TARGET_DIR:-target}/rusteze-unsafe-summaries/<crate>.jsonl`
+
+The summary model is intentionally coarse but now separates:
+
+- `has_direct_sink`
+- `calls_unknown_boundary`
+- per-pointer-arg:
+  - `direct_sink_mask`
+  - `propagation_mask`
+
+This makes it possible to inspect real builds before using summaries for optimization.
+
+### Step 3 blocked for now: local same-session propagation needs a different implementation
+
+A first attempt at same-session crate-local propagation was made, but it ran into rustc query-model
+constraints:
+
+- querying other local bodies through `optimized_mir` from inside the pass created query cycles
+- precomputing summaries from `optimized_mir` in `after_analysis` stole MIR bodies before the
+  custom pass could use them
+- precomputing from `mir_for_ctfe` is invalid for non-const functions
+- borrowing earlier `Steal<Body>`-based MIR in `after_analysis` is also not generally available,
+  because some bodies are already stolen by that point
+
+So crate-local interprocedural propagation is **not enabled** in the current implementation.
+
+Current status:
+
+- intra-procedural unsafe-sensitive analysis is active
+- per-function summaries are active
+- std/core/alloc external summary classification is active for selected APIs
+- same-session crate-local propagation is deferred until we implement a summary pipeline that does
+  not violate rustc's MIR query ownership model
+
+The likely direction is still:
+
+- a true two-stage local pipeline over a precomputed body cache, or
+- the broader two-build summary/index design described earlier in this document
 
 ## Why this differs from the failed provenance-dataflow experiment
 

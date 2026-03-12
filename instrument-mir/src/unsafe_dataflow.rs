@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::mir::{
     BasicBlockData, Body, CastKind, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
     StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
@@ -16,19 +16,20 @@ pub(crate) struct UnsafeInfluence {
     summary: UnsafeFunctionSummary,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnsafeFunctionSummary {
     has_direct_sink: bool,
     calls_unknown_boundary: bool,
     ptr_args: Vec<UnsafeArgSummary>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnsafeArgSummary {
     pub(crate) arg_index: usize,
     pub(crate) direct_sink_mask: u32,
     pub(crate) propagation_mask: u32,
 }
+
 
 impl UnsafeInfluence {
     pub(crate) fn disabled() -> Self {
@@ -271,6 +272,131 @@ fn resolve_callee_def_id<'tcx>(
     }
 }
 
+fn make_pointer_arg_summary(
+    arg_index: usize,
+    direct_sink_mask: u32,
+    propagation_mask: u32,
+) -> UnsafeArgSummary {
+    UnsafeArgSummary {
+        arg_index,
+        direct_sink_mask,
+        propagation_mask,
+    }
+}
+
+fn known_external_summary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_hir::def_id::DefId,
+) -> Option<UnsafeFunctionSummary> {
+    let crate_name_sym = tcx.crate_name(did.krate);
+    let crate_name = crate_name_sym.as_str();
+    if !matches!(crate_name, "core" | "std" | "alloc") {
+        return None;
+    }
+
+    let path = tcx.def_path_str(did);
+    let sig = tcx.fn_sig(did).instantiate_identity().skip_binder();
+    let ptr_arg_indices: Vec<usize> = sig
+        .inputs()
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, ty)| is_pointer_ty(*ty).then_some(idx))
+        .collect();
+
+    let arg0_ptr = ptr_arg_indices.first().copied();
+    let mut summary = UnsafeFunctionSummary::default();
+
+    // Pure forwarding helpers on refs/slices/containers.
+    if matches!(
+        path.as_str(),
+        p if p.ends_with("::as_ref")
+            || p.ends_with("::as_mut")
+            || p.ends_with("::as_slice")
+            || p.ends_with("::as_mut_slice")
+            || p.ends_with("::deref")
+            || p.ends_with("::deref_mut")
+    ) {
+        if let Some(arg_index) = arg0_ptr {
+            summary.ptr_args.push(make_pointer_arg_summary(
+                arg_index,
+                0,
+                UnsafeArgSummary::PROP_FORWARD_TO_RETURN,
+            ));
+        }
+        return Some(summary);
+    }
+
+    // Pointer/view creators that return a raw pointer derived from arg0.
+    if matches!(
+        path.as_str(),
+        p if p.ends_with("::as_ptr")
+            || p.ends_with("::as_mut_ptr")
+            || p.ends_with("::as_non_null")
+            || p.ends_with("::as_ptr_range")
+            || p.ends_with("::as_mut_ptr_range")
+            || p.ends_with("::add")
+            || p.ends_with("::sub")
+            || p.ends_with("::byte_add")
+            || p.ends_with("::byte_sub")
+            || p.ends_with("::wrapping_add")
+            || p.ends_with("::wrapping_sub")
+            || p.ends_with("::offset")
+            || p.ends_with("::wrapping_offset")
+    ) {
+        if let Some(arg_index) = arg0_ptr {
+            summary.has_direct_sink = true;
+            summary.ptr_args.push(make_pointer_arg_summary(
+                arg_index,
+                UnsafeArgSummary::DIRECT_RAW_CREATION,
+                UnsafeArgSummary::PROP_FORWARD_TO_RETURN,
+            ));
+        }
+        return Some(summary);
+    }
+
+    // core::ptr / std::ptr direct raw sinks.
+    if (path.contains("core::ptr::") || path.contains("std::ptr::"))
+        && matches!(
+            path.as_str(),
+            p if p.ends_with("::read")
+                || p.ends_with("::read_unaligned")
+                || p.ends_with("::read_volatile")
+                || p.ends_with("::write")
+                || p.ends_with("::write_unaligned")
+                || p.ends_with("::write_volatile")
+                || p.ends_with("::copy")
+                || p.ends_with("::copy_nonoverlapping")
+                || p.ends_with("::swap")
+                || p.ends_with("::replace")
+        )
+    {
+        summary.has_direct_sink = true;
+        for arg_index in ptr_arg_indices {
+            summary.ptr_args.push(make_pointer_arg_summary(
+                arg_index,
+                UnsafeArgSummary::DIRECT_RAW_ARG_TO_CALL,
+                0,
+            ));
+        }
+        return Some(summary);
+    }
+
+    None
+}
+
+fn callee_summary<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> Option<UnsafeFunctionSummary> {
+    let did = resolve_callee_def_id(tcx, body, func)?;
+    if did.krate == LOCAL_CRATE {
+        None
+    } else {
+        known_external_summary(tcx, did)
+    }
+}
+
 fn instrumented_call_boundary<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -360,17 +486,17 @@ fn apply_terminator<'tcx>(
         ..
     } = &term.kind
     {
-        let mut ptr_arg_locals: Vec<Local> = Vec::new();
+        let mut ptr_arg_locals: Vec<(usize, Local)> = Vec::new();
         let mut raw_ptr_arg_locals: Vec<Local> = Vec::new();
         let mut any_raw_arg = false;
         let mut any_tainted_arg = false;
 
-        for arg in args.iter() {
+        for (arg_index, arg) in args.iter().enumerate() {
             if let Some(p) = place_from_operand(&arg.node) {
                 let local = p.local;
                 let local_ty = body.local_decls[local].ty;
                 if is_pointer_ty(local_ty) {
-                    ptr_arg_locals.push(local);
+                    ptr_arg_locals.push((arg_index, local));
                     let is_raw = is_raw_pointer_ty(local_ty);
                     if is_raw {
                         raw_ptr_arg_locals.push(local);
@@ -385,11 +511,30 @@ fn apply_terminator<'tcx>(
         // (std/core/runtime/uninstrumented deps) as unknown. Cross-crate calls to instrumented
         // dependencies should not taint by default.
         let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
+        let callee_summary = callee_summary(tcx, body, func);
+        let conservative_local_fallback = !unknown_boundary
+            && resolve_callee_def_id(tcx, body, func)
+                .is_some_and(|did| did.krate == LOCAL_CRATE)
+            && callee_summary.is_none();
 
         if unknown_boundary {
-            for local in ptr_arg_locals.iter().copied() {
+            for (_, local) in ptr_arg_locals.iter().copied() {
                 changed |= taint_value_local(local, tainted_value_locals);
                 changed |= taint_local(local, tainted_ptr_locals);
+            }
+        } else if let Some(summary) = &callee_summary {
+            for (arg_index, local) in ptr_arg_locals.iter().copied() {
+                if let Some(arg_summary) = summary
+                    .ptr_args()
+                    .iter()
+                    .find(|entry| entry.arg_index() == arg_index)
+                {
+                    if arg_summary.reaches_direct_sink() || arg_summary.escapes_to_unknown_boundary()
+                    {
+                        changed |= taint_value_local(local, tainted_value_locals);
+                        changed |= taint_local(local, tainted_ptr_locals);
+                    }
+                }
             }
         } else if any_raw_arg {
             // For known instrumented callees, keep raw-pointer conservativeness but avoid
@@ -398,13 +543,35 @@ fn apply_terminator<'tcx>(
                 changed |= taint_value_local(local, tainted_value_locals);
                 changed |= taint_local(local, tainted_ptr_locals);
             }
+        } else if conservative_local_fallback {
+            for (_, local) in ptr_arg_locals.iter().copied() {
+                changed |= taint_value_local(local, tainted_value_locals);
+                changed |= taint_local(local, tainted_ptr_locals);
+            }
         }
 
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
-            if is_pointer_ty(dst_ty) && (unknown_boundary || any_raw_arg || any_tainted_arg) {
-                changed |= taint_value_local(dst_local, tainted_value_locals);
-                changed |= taint_local(dst_local, tainted_ptr_locals);
+            if is_pointer_ty(dst_ty) {
+                let local_returned_from_arg = callee_summary.as_ref().is_some_and(|summary| {
+                    ptr_arg_locals.iter().any(|(arg_index, _)| {
+                        summary
+                            .ptr_args()
+                            .iter()
+                            .any(|entry| {
+                                entry.arg_index() == *arg_index && entry.forwarded_to_return()
+                            })
+                    })
+                });
+                if unknown_boundary
+                    || any_raw_arg
+                    || any_tainted_arg
+                    || local_returned_from_arg
+                    || conservative_local_fallback
+                {
+                    changed |= taint_value_local(dst_local, tainted_value_locals);
+                    changed |= taint_local(dst_local, tainted_ptr_locals);
+                }
             }
         }
     }
@@ -496,11 +663,35 @@ fn summarize_arg_effects<'tcx>(
                     }
                 }
                 let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
+                let callee_summary = callee_summary(tcx, body, func);
                 if unknown_boundary && any_tainted_ptr_arg {
                     propagation_mask |= UnsafeArgSummary::PROP_ESCAPE_UNKNOWN;
                 }
                 if any_tainted_raw_arg {
                     direct_sink_mask |= UnsafeArgSummary::DIRECT_RAW_ARG_TO_CALL;
+                }
+                if let Some(summary) = &callee_summary {
+                    for (call_arg_index, arg) in args.iter().enumerate() {
+                        if let Some(p) = place_from_operand(&arg.node) {
+                            let local = p.local;
+                            if tainted_value_locals.contains(&local) {
+                                if let Some(callee_arg) = summary
+                                    .ptr_args()
+                                    .iter()
+                                    .find(|entry| entry.arg_index() == call_arg_index)
+                                {
+                                    direct_sink_mask |= callee_arg.direct_sink_mask();
+                                    propagation_mask |= callee_arg.propagation_mask()
+                                        & UnsafeArgSummary::PROP_ESCAPE_UNKNOWN;
+                                }
+                            }
+                        }
+                    }
+                } else if resolve_callee_def_id(tcx, body, func)
+                    .is_some_and(|did| did.krate == LOCAL_CRATE)
+                    && any_tainted_ptr_arg
+                {
+                    propagation_mask |= UnsafeArgSummary::PROP_ESCAPE_UNKNOWN;
                 }
             }
         }
@@ -533,7 +724,13 @@ fn compute_function_summary<'tcx>(
         if let Some(term) = block_data.terminator.as_ref() {
             if let TerminatorKind::Call { func, args, .. } = &term.kind {
                 let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
-                summary.calls_unknown_boundary |= unknown_boundary;
+                let callee_summary = callee_summary(tcx, body, func);
+                summary.calls_unknown_boundary |= unknown_boundary
+                    || (resolve_callee_def_id(tcx, body, func)
+                        .is_some_and(|did| did.krate == LOCAL_CRATE)
+                        && callee_summary
+                            .as_ref()
+                            .is_some_and(|callee| callee.calls_unknown_boundary()));
                 summary.has_direct_sink |= args.iter().any(|arg| {
                     place_from_operand(&arg.node).is_some_and(|p| {
                         let local = p.local;
@@ -541,6 +738,21 @@ fn compute_function_summary<'tcx>(
                             && tainted_value_locals.contains(&local)
                     })
                 });
+                if let Some(callee) = &callee_summary {
+                    summary.has_direct_sink |= args.iter().enumerate().any(|(arg_index, arg)| {
+                        place_from_operand(&arg.node).is_some_and(|p| {
+                            let local = p.local;
+                            tainted_value_locals.contains(&local)
+                                && callee
+                                    .ptr_args()
+                                    .iter()
+                                    .any(|entry| {
+                                        entry.arg_index() == arg_index
+                                            && entry.reaches_direct_sink()
+                                    })
+                        })
+                    });
+                }
             }
         }
     }
@@ -549,7 +761,12 @@ fn compute_function_summary<'tcx>(
         if is_pointer_ty(body.local_decls[arg_local].ty) {
             summary
                 .ptr_args
-                .push(summarize_arg_effects(tcx, body, arg_local, arg_index));
+                .push(summarize_arg_effects(
+                    tcx,
+                    body,
+                    arg_local,
+                    arg_index,
+                ));
         }
     }
 
@@ -565,6 +782,21 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         return UnsafeInfluence::disabled();
     }
 
+    let (tainted_ptr_locals, tainted_value_locals, total_ptr_locals) =
+        compute_tainted_state(tcx, body);
+
+    UnsafeInfluence {
+        enabled: true,
+        tainted_ptr_locals,
+        total_ptr_locals,
+        summary: compute_function_summary(tcx, body, &tainted_value_locals),
+    }
+}
+
+fn compute_tainted_state<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+) -> (HashSet<Local>, HashSet<Local>, usize) {
     let mut tainted_ptr_locals: HashSet<Local> = HashSet::new();
     let mut tainted_value_locals: HashSet<Local> = HashSet::new();
     let mut total_ptr_locals = 0usize;
@@ -605,12 +837,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         }
     }
 
-    UnsafeInfluence {
-        enabled: true,
-        tainted_ptr_locals,
-        total_ptr_locals,
-        summary: compute_function_summary(tcx, body, &tainted_value_locals),
-    }
+    (tainted_ptr_locals, tainted_value_locals, total_ptr_locals)
 }
 
 fn apply_block<'tcx>(
@@ -625,7 +852,13 @@ fn apply_block<'tcx>(
         changed |= apply_statement(tcx, body, stmt, tainted_value_locals, tainted_ptr_locals);
     }
     if let Some(term) = block_data.terminator.as_ref() {
-        changed |= apply_terminator(tcx, body, term, tainted_value_locals, tainted_ptr_locals);
+        changed |= apply_terminator(
+            tcx,
+            body,
+            term,
+            tainted_value_locals,
+            tainted_ptr_locals,
+        );
     }
     changed
 }
