@@ -2,14 +2,29 @@
 
 ## Build
 ```
+cargo build --release -p runtime_abi
 cargo build --release -p runtime
 cargo install --path instrument-mir --bin instrument-mir
 cargo install --path instrument-mir --bin cargo-instrument-mir
 ```
 
+`runtime` now supports two build modes:
+
+- Default: `std`-backed host build (`cargo build -p runtime`)
+- Explicit `no_std`: rebuild `core`/`alloc` with aborting panics
+
+```bash
+CARGO_INCREMENTAL=0 \
+RUSTFLAGS='-C panic=abort' \
+cargo check -p runtime --no-default-features \
+  -Zbuild-std=core,alloc,panic_abort \
+  -Zbuild-std-features=panic_immediate_abort
+```
+
 ## Use
 
 ```bash
+cargo build -p runtime_abi --release
 cargo build -p runtime --release
 cargo instrument-mir --runtime-path=target/release --mir-out=./out.mir -p hello --bin hello --release
 ./target/release/hello
@@ -52,6 +67,9 @@ make rebuild EXAMPLE=hello
 # Release profile
 make instrument EXAMPLE=hello PROFILE=release
 make run EXAMPLE=hello PROFILE=release
+
+# Experimental: instrument full stdlib set (core+alloc+std) via -Z build-std
+make instrument-stdlib-all EXAMPLE=hello
 ```
 
 ## Running with dataflow analysis
@@ -248,11 +266,14 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_HEAP_ALLOCS_FROM_MIR`: `1/true` forces MIR-level heap alloc/free hooks.
 - `RZ_USE_STORAGE_DEAD`: `1/true` emits stack `live=false` on `StorageDead` (default off).
 - `RZ_INSTRUMENTED_CRATES`: comma-separated dependency allowlist treated as instrumented.
-- `RZ_INSTRUMENT_ALL_DEPS`: if non-zero/true, treat all *non-std-like*
-  (non `std` / `core` / `alloc`) dependency crates as instrumented.
-  Standard library crates are never treated as instrumented callees; instead,
-  their effects are modeled via wrapper classification and allocator-boundary
-  interception.
+- `RZ_INSTRUMENT_ALL_DEPS`: if non-zero/true, treat dependency crates as instrumented
+  by default (except runtime crates). Standard-library crates are controlled by
+  `RZ_INSTRUMENT_STDLIB`.
+- `RZ_INSTRUMENT_STDLIB`: stdlib instrumentation mode. Supported values:
+  `none` (default), `core`, `core_alloc`, `all`.
+  Use this together with `-Z build-std` to request target-side `core`/`alloc`/`std`
+  instrumentation. Current state: `core` is the furthest along; `core_alloc` and
+  `all` remain experimental, and some bootstrap/support crates are still skipped.
 - `RZ_PRINT_CRATES`: non-zero/true prints crate graph + instrumented classification.
 - `RZ_TRACE_CLASSIFY`: non-zero enables call-effect classifier tracing.
 - `RZ_TRACE_CLASSIFY_FILTER`: substring filter for classify traces.
@@ -346,7 +367,8 @@ most of the hook reduction.
 
 ## Standard Library Handling
 
-The standard library (`std`, `core`, `alloc`) is **not instrumented directly**.
+By default, the standard library (`std`, `core`, `alloc`) is **not instrumented directly**
+(`RZ_INSTRUMENT_STDLIB=none`).
 Instead, Rusteze relies on two complementary mechanisms:
 
 1. **Wrapper classification at the MIR level** for common pointer-producing and
@@ -362,9 +384,38 @@ This design avoids the need for `-Z build-std`, keeps the toolchain simple, and
 ensures that pointer provenance and allocation metadata remain consistent at the
 stdlib boundary.
 
-Bugs *inside* the standard library are not instrumented instruction-by-
-instruction, but misuses of stdlib APIs (e.g., out-of-bounds pointer arithmetic,
-use-after-free via raw pointers) are detected at the application boundary.
+Experimental stdlib instrumentation can be enabled in phases via
+`RZ_INSTRUMENT_STDLIB=core|core_alloc|all` together with `-Z build-std`.
+
+Current state (2026-03-04):
+
+1. Default mode (`RZ_INSTRUMENT_STDLIB=none`) is still the supported path. It
+   detects many stdlib-mediated bugs at the application boundary through wrapper
+   classification and allocator interception, without requiring `-Z build-std`.
+2. `cargo instrument-mir` now works with `-Z build-std=core,alloc,std`, and
+   `RZ_INSTRUMENT_STDLIB=core` works on simple targets such as `hello`.
+3. `RZ_INSTRUMENT_STDLIB=core_alloc` and `RZ_INSTRUMENT_STDLIB=all` exist, but
+   they are still experimental and are not yet validated end-to-end.
+4. `all` does not yet mean literal full coverage of every stdlib-related crate:
+   bootstrap/support crates such as `core`, `compiler_builtins`, `panic_*`,
+   `unwind`, `std_detect`, and `rustc_std_workspace_*` are still explicitly
+   skipped by the pass.
+
+So the project can now experiment with stdlib instrumentation, but the goal of
+instrumenting the entire Rust standard library is not complete yet.
+
+Example `core`-mode command:
+
+```bash
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_INSTRUMENT_STDLIB=core \
+cargo instrument-mir \
+  --runtime-path=target/build-std-debug/debug/deps \
+  --mir-out=./out.hello.core.mir \
+  -p hello --bin hello \
+  -Z build-std=core,alloc,std
+```
 
 ### Call-argument tag buffering
 
@@ -683,6 +734,7 @@ We can force loading extern crate with
 
 ```
 --extern=force:runtime={runtime_path}/libruntime.rlib
+--extern=force:runtime_abi={runtime_path}/libruntime_abi.rlib
 ```
 
 - Performance: For best performance, disable tracing (`RZ_LOG=warn` or unset). Future

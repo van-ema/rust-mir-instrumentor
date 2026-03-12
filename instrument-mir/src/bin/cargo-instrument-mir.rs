@@ -1,14 +1,29 @@
 use std::env;
+use std::path::{Path, PathBuf};
+
+fn absolutize(path: String, base: &Path) -> String {
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    };
+    path.to_string_lossy().to_string()
+}
 
 fn main() -> Result<(), i32> {
     let cargo = env::var("CARGO").unwrap_or("cargo".into());
     let mut cmd = std::process::Command::new(cargo);
     let driver = env::current_exe().unwrap().with_file_name("instrument-mir");
+    let workspace_root = env::current_dir().unwrap();
     if env::var("RZ_DEBUG_DRIVER")
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     {
-        eprintln!("[rusteze][trace] cargo-instrument-mir driver={}", driver.display());
+        eprintln!(
+            "[rusteze][trace] cargo-instrument-mir driver={}",
+            driver.display()
+        );
     }
 
     // Collect all extra arguments passed after "cargo instrument-mir"
@@ -39,10 +54,16 @@ fn main() -> Result<(), i32> {
     let mut extra_rf: Vec<String> = Vec::new();
 
     if let Some(path) = mir_out {
-        extra_rf.push(format!("--mir-out={}", path));
+        extra_rf.push(format!(
+            "--mir-out={}",
+            absolutize(path, workspace_root.as_path())
+        ));
     }
     if let Some(path) = runtime_path {
-        extra_rf.push(format!("--runtime-path={}", path));
+        extra_rf.push(format!(
+            "--runtime-path={}",
+            absolutize(path, workspace_root.as_path())
+        ));
     }
 
     if !extra_rf.is_empty() {
@@ -54,6 +75,9 @@ fn main() -> Result<(), i32> {
             format!("{} {}", existing, rf)
         };
         cmd.env("RUSTFLAGS", new_rf);
+    }
+    if env::var_os("RZ_WORKSPACE_ROOT").is_none() {
+        cmd.env("RZ_WORKSPACE_ROOT", &workspace_root);
     }
     let status = cmd
         .arg("build")

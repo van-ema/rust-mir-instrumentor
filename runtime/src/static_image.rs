@@ -1,3 +1,5 @@
+use crate::compat::RzVec as Vec;
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct StaticRange {
     pub(crate) start: usize,
@@ -12,6 +14,7 @@ pub(crate) fn collect_static_ranges() -> Vec<StaticRange> {
 #[cfg(target_os = "macos")]
 mod os {
     use super::StaticRange;
+    use crate::compat::RzVec as Vec;
     use core::mem;
     use core::ptr;
 
@@ -103,6 +106,7 @@ mod os {
 #[cfg(target_os = "linux")]
 mod os {
     use super::StaticRange;
+    use crate::compat::RzVec as Vec;
     use core::ffi::c_void;
 
     #[repr(C)]
@@ -178,6 +182,7 @@ mod os {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod os {
     use super::StaticRange;
+    use crate::compat::RzVec as Vec;
     pub(super) fn collect_static_ranges() -> Vec<StaticRange> {
         Vec::new()
     }

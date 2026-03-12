@@ -89,6 +89,7 @@ members = [
     "medium/smallvec_driver",
     "instrument-mir",
     "lib_hello",
+    "runtime_abi",
     "runtime",
 ]
 exclude = [

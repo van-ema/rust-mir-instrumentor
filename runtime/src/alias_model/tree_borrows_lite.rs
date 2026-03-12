@@ -1,9 +1,12 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use alloc::format;
+use alloc::vec;
+
+use crate::compat::{env_flag, HashMap, RzString as String, RzVec as Vec};
+use crate::sync::{Mutex, OnceLock};
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed,
-    rz_violation, tags, PtrKind, TagMeta,
+    allocs, append_location_if_enabled, find_alloc_containing, rz_sb_suppressed, rz_violation, tags, PtrKind,
+    TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -64,16 +67,12 @@ fn tb_protector_frames() -> &'static Mutex<Vec<TbProtectorFrame>> {
 
 #[inline]
 fn rz_tb_lite_enabled() -> bool {
-    std::env::var("RZ_TB_LITE")
-        .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_TB_LITE", true)
 }
 
 #[inline]
 fn rz_tb_dump_enabled() -> bool {
-    std::env::var("RZ_TB_DUMP")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_TB_DUMP", false)
 }
 
 impl AliasModel for TreeBorrowsLiteModel {
@@ -171,13 +170,6 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         return;
     }
 
-    let returned_tags: HashSet<u64> = ret_tags()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|((ret_callee_id, _addr), _tag)| *ret_callee_id == callee_id)
-        .map(|((_ret_callee_id, _addr), tag)| *tag)
-        .collect();
     let tmap = tags().lock().unwrap();
     let mut all = tb_state().lock().unwrap();
     for tag in frame.protected_tags {
@@ -190,9 +182,6 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         };
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
-            if !returned_tags.contains(&tag) {
-                tb_disable_node(node);
-            }
         }
     }
 }
@@ -347,40 +336,20 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         _ => return,
     };
 
+    let parent = if tmeta.parent == 0 {
+        0
+    } else {
+        let tmap = tags().lock().unwrap();
+        tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(tmeta.parent)
+    };
+
     let base = tb_base_for_addr(tmeta.pointee_addr);
+    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let perm = match kind {
         BorrowKind::Unique => TbPerm::Reserved { conflicted: false },
         BorrowKind::RawMut => TbPerm::Active,
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
-    let mut all = tb_state().lock().unwrap();
-    let tree = all.entry(base).or_default();
-    let parent = if tmeta.parent == 0 {
-        0
-    } else {
-        let tmap = tags().lock().unwrap();
-        let projected_helper_ref_parent = matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
-            && (tmeta.lineage_hint & 0b0000_0100) != 0
-            && tmap.get(&tmeta.parent).is_some_and(|meta| {
-                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
-            });
-        let effective_parent = if projected_helper_ref_parent {
-            tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(0)
-        } else {
-            tmeta.parent
-        };
-        match kind {
-            BorrowKind::Shared | BorrowKind::Unique => {
-                tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
-                    .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
-                    .unwrap_or(effective_parent)
-            }
-            BorrowKind::RawConst | BorrowKind::RawMut => {
-                tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
-            }
-        }
-    };
-    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     let node = TbNode {
         tag,
         parent,
@@ -392,6 +361,9 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         alive: true,
         protected,
     };
+
+    let mut all = tb_state().lock().unwrap();
+    let tree = all.entry(base).or_default();
     tree.nodes.insert(tag, node.clone());
 
     // Eager invalidation for mutable-reference creation keeps the tree state monotonic and
@@ -503,22 +475,6 @@ fn tb_lite_check(
         String::new()
     };
     if !tb_is_live_node(&node) {
-        if matches!(tmeta.kind, PtrKind::RefMut) {
-            if let Some(descendants) =
-                tb_lite_reactivatable_descendants(tree, access_tag, addr, size, tmeta.alloc_epoch)
-            {
-                for tag in descendants {
-                    if let Some(n) = tree.nodes.get_mut(&tag) {
-                        tb_disable_node(n);
-                    }
-                }
-                if let Some(n) = tree.nodes.get_mut(&access_tag) {
-                    n.perm = TbPerm::Active;
-                    n.alive = true;
-                }
-                return None;
-            }
-        }
         // Invalidated-reference accesses are always reported in TB-lite.
         let mut msg = format!(
             "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
@@ -572,9 +528,12 @@ fn tb_lite_check(
             // - protected Reserved becomes conflicted
             // - Active becomes Frozen (or Disabled if protected)
             // - Frozen/Disabled unchanged
-            (AliasAccessKind::Read, false, TbPerm::Reserved { conflicted: false }, true) => {
-                TbPerm::Reserved { conflicted: true }
-            }
+            (
+                AliasAccessKind::Read,
+                false,
+                TbPerm::Reserved { conflicted: false },
+                true,
+            ) => TbPerm::Reserved { conflicted: true },
             (AliasAccessKind::Read, false, TbPerm::Reserved { .. }, _) => n.perm,
             (AliasAccessKind::Read, false, TbPerm::Active, true) => TbPerm::Disabled,
             (AliasAccessKind::Read, false, TbPerm::Active, false) => TbPerm::Frozen,
@@ -585,23 +544,18 @@ fn tb_lite_check(
             // - Reserved(conflicted) while protected is UB (2-phase noalias violation)
             // - Reserved/Active activate to Active
             // - Frozen/Disabled cannot be written through
-            (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
-                if tb_has_usable_clean_unique_ancestor(
-                    &tree.nodes,
-                    n.tag,
-                    access_tag,
-                    addr,
-                    size,
-                ) {
-                    n.perm
-                } else {
-                    let mut msg = format!(
-                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
-                        access_tag, addr, size, tmeta.kind, n.tag
-                    );
-                    msg.push_str(&dump);
-                    return Some(msg);
-                }
+            (
+                AliasAccessKind::Write,
+                true,
+                TbPerm::Reserved { conflicted: true },
+                true,
+            ) => {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
+                    access_tag, addr, size, tmeta.kind, n.tag
+                );
+                msg.push_str(&dump);
+                return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
@@ -724,11 +678,7 @@ fn tb_dump(
 
 #[inline]
 fn tb_effective_len(bounds_len: usize) -> usize {
-    if bounds_len == 0 {
-        1
-    } else {
-        bounds_len
-    }
+    if bounds_len == 0 { 1 } else { bounds_len }
 }
 
 #[inline]
@@ -761,7 +711,7 @@ fn tb_disable_node(n: &mut TbNode) {
 }
 
 fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> Option<u64> {
-    for _ in 0..tmap.len().saturating_add(1) {
+    for _ in 0..32 {
         let t = tmap.get(&tag)?;
         if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
             return Some(tag);
@@ -774,57 +724,12 @@ fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> 
     None
 }
 
-fn tb_lite_find_materialized_ref_ancestor_tag(
-    tmap: &HashMap<u64, TagMeta>,
-    nodes: &HashMap<u64, TbNode>,
-    mut tag: u64,
-) -> Option<u64> {
-    for _ in 0..tmap.len().saturating_add(1) {
-        let t = tmap.get(&tag)?;
-        if nodes.contains_key(&tag) && matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
-            return Some(tag);
-        }
-        if t.parent == 0 {
-            return None;
-        }
-        tag = t.parent;
-    }
-    None
-}
-
-fn tb_lite_reactivatable_descendants(
-    tree: &TbAllocState,
-    access_tag: u64,
-    addr: usize,
-    size: usize,
-    alloc_epoch: u64,
-) -> Option<Vec<u64>> {
-    let overlapping_live: Vec<u64> = tree
-        .nodes
-        .values()
-        .filter(|n| tb_is_live_node(n))
-        .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
-        .filter(|n| alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
-        .map(|n| n.tag)
-        .collect();
-    if overlapping_live.is_empty() {
-        return Some(Vec::new());
-    }
-    if overlapping_live
-        .iter()
-        .all(|tag| *tag != access_tag && tb_is_ancestor(&tree.nodes, access_tag, *tag))
-    {
-        return Some(overlapping_live);
-    }
-    None
-}
-
 #[inline]
 fn tb_is_ancestor(nodes: &HashMap<u64, TbNode>, ancestor: u64, mut tag: u64) -> bool {
     if ancestor == tag {
         return true;
     }
-    for _ in 0..nodes.len().saturating_add(1) {
+    for _ in 0..64 {
         let Some(n) = nodes.get(&tag) else {
             return false;
         };

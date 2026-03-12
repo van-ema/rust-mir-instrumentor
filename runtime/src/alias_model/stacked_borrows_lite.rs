@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use alloc::format;
+
+use crate::compat::{env_flag, HashMap, RzString as String, RzVec as Vec};
+use crate::sync::{Mutex, OnceLock};
 
 use crate::{allocs, find_alloc_containing, rz_sb_suppressed, tags, PtrKind, TagMeta};
 
@@ -40,16 +42,12 @@ fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) ->
 
 #[inline]
 fn rz_sb_lite_enabled() -> bool {
-    std::env::var("RZ_SB_LITE")
-        .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_SB_LITE", true)
 }
 
 #[inline]
 fn rz_sb_dump_enabled() -> bool {
-    std::env::var("RZ_SB_DUMP")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_SB_DUMP", false)
 }
 
 impl AliasModel for StackedBorrowsLiteModel {

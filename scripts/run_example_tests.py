@@ -250,13 +250,16 @@ def main() -> int:
     repo_root = script_dir.parent
     os.chdir(repo_root)
 
+    target_root = Path(env.get("CARGO_TARGET_DIR", repo_root / "target" / "example-tests"))
+    env["CARGO_TARGET_DIR"] = str(target_root)
+
     profile_args: list[str] = []
-    runtime_path = repo_root / "target" / "debug"
-    bin_dir = repo_root / "target" / "debug"
+    runtime_path = target_root / "debug"
+    bin_dir = target_root / "debug"
     tool_dir = repo_root / "target" / "debug"
     if build_profile == "release":
-        runtime_path = repo_root / "target" / "release"
-        bin_dir = repo_root / "target" / "release"
+        runtime_path = target_root / "release"
+        bin_dir = target_root / "release"
         tool_dir = repo_root / "target" / "release"
         profile_args = ["--release"]
 

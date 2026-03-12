@@ -7,5 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["std"]
+std = []
 rz_log = []
 rz_alloc_dump = []

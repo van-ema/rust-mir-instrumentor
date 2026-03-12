@@ -87,3 +87,7 @@ impl rustc_driver::Callbacks for CompilerCallbacks {
         });
     }
 }
+
+pub(crate) struct NoopCallbacks;
+
+impl rustc_driver::Callbacks for NoopCallbacks {}

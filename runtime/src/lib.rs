@@ -1,57 +1,48 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![feature(rustc_attrs)]
 // runtime/src/lib.rs
 #![allow(unused)]
 #![allow(internal_features)]
-use core::ptr;
-use std::sync::OnceLock;
-use std::time::Instant;
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn atexit(cb: extern "C" fn()) -> i32;
-}
+use alloc::format;
+use core::ptr;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+mod compat;
+use compat::{
+    abort_process, capture_backtrace, env_flag, env_var_lowercase, write_stderr, BTreeMap, HashMap,
+    PlatformAlloc, RzString as String, RzVec as Vec,
+};
+mod sync;
+use sync::{Mutex, OnceLock};
+mod tls;
 
 mod static_image;
 use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
-mod dead_epoch_cleanup;
-mod exact_parent_index;
-mod lineage_cache;
-mod live_alloc_cache;
-mod tag_history;
-mod tag_lookup_cache;
-mod tag_pruning;
-mod tag_store;
 
-::std::thread_local! {
-    // Re-entrancy guard to prevent infinite recursion when the runtime allocates
-    // while recording allocation metadata.
-    static RZ_IN_ALLOC_HOOK: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
-
-    // Guard to disable allocator recording while inside any runtime hook.
-    // Logging (println!/format!) can allocate while locks are held.
-    static RZ_IN_RUNTIME_HOOK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
-
-    // Temporarily suppress SB-lite enforcement for coarse "unknown call" hooks.
-    static RZ_SB_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
-
-    // Temporarily relax epoch-mismatch checks for coarse allow-untagged hooks.
-    static RZ_RELAX_EPOCH_CHECK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
+#[cfg(not(feature = "std"))]
+#[panic_handler]
+fn rz_panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    abort_process()
 }
 
 struct RzRuntimeGuard;
 impl RzRuntimeGuard {
     #[inline]
     fn enter() -> Self {
-        RZ_IN_RUNTIME_HOOK.with(|c| c.set(c.get().saturating_add(1)));
+        tls::set_runtime_depth(tls::runtime_depth().saturating_add(1));
         Self
     }
 }
 impl Drop for RzRuntimeGuard {
     #[inline]
     fn drop(&mut self) {
-        RZ_IN_RUNTIME_HOOK.with(|c| c.set(c.get().saturating_sub(1)));
+        tls::set_runtime_depth(tls::runtime_depth().saturating_sub(1));
     }
 }
 
@@ -61,18 +52,15 @@ struct SbSuppressGuard {
 impl SbSuppressGuard {
     #[inline]
     fn enter() -> Self {
-        let prev = RZ_SB_SUPPRESS.with(|c| {
-            let p = c.get();
-            c.set(true);
-            p
-        });
+        let prev = tls::sb_suppressed();
+        tls::set_sb_suppressed(true);
         Self { prev }
     }
 }
 impl Drop for SbSuppressGuard {
     #[inline]
     fn drop(&mut self) {
-        RZ_SB_SUPPRESS.with(|c| c.set(self.prev));
+        tls::set_sb_suppressed(self.prev);
     }
 }
 
@@ -80,282 +68,50 @@ struct RelaxEpochGuard;
 impl RelaxEpochGuard {
     #[inline]
     fn enter() -> Self {
-        RZ_RELAX_EPOCH_CHECK.with(|c| c.set(c.get().saturating_add(1)));
+        tls::set_relax_epoch_depth(tls::relax_epoch_depth().saturating_add(1));
         Self
     }
 }
 impl Drop for RelaxEpochGuard {
     #[inline]
     fn drop(&mut self) {
-        RZ_RELAX_EPOCH_CHECK.with(|c| c.set(c.get().saturating_sub(1)));
-    }
-}
-
-struct HookProfileCounters {
-    write_calls: AtomicU64,
-    write_total_ns: AtomicU64,
-    write_tag_lookup_ns: AtomicU64,
-    write_alias_check_ns: AtomicU64,
-    write_alloc_lookup_ns: AtomicU64,
-    read_calls: AtomicU64,
-    read_total_ns: AtomicU64,
-    read_tag_lookup_ns: AtomicU64,
-    read_alias_check_ns: AtomicU64,
-    read_alloc_lookup_ns: AtomicU64,
-    ref_create_calls: AtomicU64,
-    ref_create_total_ns: AtomicU64,
-    ref_create_validate_ns: AtomicU64,
-    ref_create_alloc_snapshot_ns: AtomicU64,
-    ref_create_lineage_repair_ns: AtomicU64,
-    ref_create_insert_ns: AtomicU64,
-    ref_create_tag_store_insert_ns: AtomicU64,
-    ref_create_exact_parent_update_ns: AtomicU64,
-    ref_create_lineage_cache_update_ns: AtomicU64,
-    ref_create_alias_on_tag_created_ns: AtomicU64,
-    raw_create_calls: AtomicU64,
-    raw_create_total_ns: AtomicU64,
-    ptr_use_calls: AtomicU64,
-    ptr_use_total_ns: AtomicU64,
-    record_alloc_calls: AtomicU64,
-    record_alloc_total_ns: AtomicU64,
-}
-
-impl HookProfileCounters {
-    const fn new() -> Self {
-        Self {
-            write_calls: AtomicU64::new(0),
-            write_total_ns: AtomicU64::new(0),
-            write_tag_lookup_ns: AtomicU64::new(0),
-            write_alias_check_ns: AtomicU64::new(0),
-            write_alloc_lookup_ns: AtomicU64::new(0),
-            read_calls: AtomicU64::new(0),
-            read_total_ns: AtomicU64::new(0),
-            read_tag_lookup_ns: AtomicU64::new(0),
-            read_alias_check_ns: AtomicU64::new(0),
-            read_alloc_lookup_ns: AtomicU64::new(0),
-            ref_create_calls: AtomicU64::new(0),
-            ref_create_total_ns: AtomicU64::new(0),
-            ref_create_validate_ns: AtomicU64::new(0),
-            ref_create_alloc_snapshot_ns: AtomicU64::new(0),
-            ref_create_lineage_repair_ns: AtomicU64::new(0),
-            ref_create_insert_ns: AtomicU64::new(0),
-            ref_create_tag_store_insert_ns: AtomicU64::new(0),
-            ref_create_exact_parent_update_ns: AtomicU64::new(0),
-            ref_create_lineage_cache_update_ns: AtomicU64::new(0),
-            ref_create_alias_on_tag_created_ns: AtomicU64::new(0),
-            raw_create_calls: AtomicU64::new(0),
-            raw_create_total_ns: AtomicU64::new(0),
-            ptr_use_calls: AtomicU64::new(0),
-            ptr_use_total_ns: AtomicU64::new(0),
-            record_alloc_calls: AtomicU64::new(0),
-            record_alloc_total_ns: AtomicU64::new(0),
-        }
-    }
-}
-
-static RZ_HOOK_PROFILE: OnceLock<HookProfileCounters> = OnceLock::new();
-
-#[inline]
-fn rz_hook_profile() -> &'static HookProfileCounters {
-    rz_maybe_register_hook_profile_atexit();
-    RZ_HOOK_PROFILE.get_or_init(HookProfileCounters::new)
-}
-
-#[inline]
-fn rz_profile_hooks_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RZ_PROFILE_HOOKS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    })
-}
-
-#[inline]
-fn rz_dump_hook_profile_at_exit_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("RZ_DUMP_HOOK_PROFILE_AT_EXIT")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    })
-}
-
-#[inline]
-fn rz_profile_add_elapsed(counter: &AtomicU64, start: Instant) {
-    let nanos = start.elapsed().as_nanos();
-    let clipped = nanos.min(u64::MAX as u128) as u64;
-    counter.fetch_add(clipped, Ordering::Relaxed);
-}
-
-#[cfg(unix)]
-extern "C" fn rz_dump_hook_profile_atexit() {
-    __rz_dump_hook_profile();
-}
-
-#[inline]
-fn rz_maybe_register_hook_profile_atexit() {
-    static REGISTERED: OnceLock<()> = OnceLock::new();
-    if !rz_profile_hooks_enabled() || !rz_dump_hook_profile_at_exit_enabled() {
-        return;
-    }
-    let _ = REGISTERED.get_or_init(|| {
-        #[cfg(unix)]
-        unsafe {
-            // Register once so repro/benchmark runs can dump aggregate runtime hook costs
-            // without modifying individual harness binaries.
-            let _ = atexit(rz_dump_hook_profile_atexit);
-        }
-    });
-}
-
-fn rz_elapsed_ns(start: Instant) -> u64 {
-    let ns = start.elapsed().as_nanos();
-    core::cmp::min(ns, u64::MAX as u128) as u64
-}
-
-#[inline]
-fn rz_profile_add(counter: &AtomicU64, start: Option<Instant>) {
-    if let Some(t0) = start {
-        counter.fetch_add(rz_elapsed_ns(t0), Ordering::Relaxed);
-    }
-}
-
-struct HookProfileGuard {
-    start: Option<Instant>,
-    total_counter: Option<&'static AtomicU64>,
-}
-
-impl HookProfileGuard {
-    #[inline]
-    fn write(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.write_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.write_total_ns),
-        }
-    }
-
-    #[inline]
-    fn read(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.read_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.read_total_ns),
-        }
-    }
-
-    #[inline]
-    fn ref_create(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.ref_create_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.ref_create_total_ns),
-        }
-    }
-
-    #[inline]
-    fn raw_create(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.raw_create_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.raw_create_total_ns),
-        }
-    }
-
-    #[inline]
-    fn ptr_use(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.ptr_use_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.ptr_use_total_ns),
-        }
-    }
-
-    #[inline]
-    fn record_alloc(profile: Option<&'static HookProfileCounters>) -> Self {
-        let Some(p) = profile else {
-            return Self {
-                start: None,
-                total_counter: None,
-            };
-        };
-        p.record_alloc_calls.fetch_add(1, Ordering::Relaxed);
-        Self {
-            start: Some(Instant::now()),
-            total_counter: Some(&p.record_alloc_total_ns),
-        }
-    }
-}
-
-impl Drop for HookProfileGuard {
-    #[inline]
-    fn drop(&mut self) {
-        let (Some(t0), Some(total)) = (self.start.as_ref(), self.total_counter) else {
-            return;
-        };
-        total.fetch_add(rz_elapsed_ns(*t0), Ordering::Relaxed);
+        tls::set_relax_epoch_depth(tls::relax_epoch_depth().saturating_sub(1));
     }
 }
 
 #[inline]
 fn rz_in_runtime_hook() -> bool {
-    RZ_IN_RUNTIME_HOOK.with(|c| c.get() != 0)
+    tls::runtime_depth() != 0
+}
+
+#[inline]
+fn rz_try_enter_runtime_hook() -> Option<RzRuntimeGuard> {
+    if rz_in_runtime_hook() {
+        None
+    } else {
+        Some(RzRuntimeGuard::enter())
+    }
 }
 
 #[inline]
 fn rz_sb_suppressed() -> bool {
-    RZ_SB_SUPPRESS.with(|c| c.get())
+    tls::sb_suppressed()
 }
 
 #[inline]
 fn rz_epoch_check_relaxed() -> bool {
-    RZ_RELAX_EPOCH_CHECK.with(|c| c.get() != 0)
+    tls::relax_epoch_depth() != 0
 }
 
 #[inline]
 fn rz_abort_on_double_free() -> bool {
     // Default: abort on double free to avoid cascading UB/noise.
-    std::env::var("RZ_ABORT_ON_DOUBLE_FREE")
-        .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_ABORT_ON_DOUBLE_FREE", true)
 }
 
 #[inline]
 fn rz_abort_on_violation() -> bool {
-    std::env::var("RZ_ABORT_ON_VIOLATION")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_ABORT_ON_VIOLATION", false)
 }
 
 #[inline]
@@ -366,90 +122,6 @@ fn rz_stack_addr_hint(addr: usize) -> bool {
     let lo = sp.saturating_sub(8 * 1024 * 1024);
     let hi = sp.saturating_add(8 * 1024 * 1024);
     addr >= lo && addr <= hi
-}
-
-#[inline]
-fn rz_tls_addr_hint(addr: usize) -> bool {
-    // Heuristic: treat addresses near our thread-local guard as TLS.
-    // This suppresses WILD_POINTER reports for thread-local data (e.g., Tokio budget)
-    // that is not tracked by stack/heap alloc metadata.
-    RZ_IN_RUNTIME_HOOK.with(|c| {
-        let tls = c as *const _ as usize;
-        let lo = tls.saturating_sub(8 * 1024 * 1024);
-        let hi = tls.saturating_add(8 * 1024 * 1024);
-        addr >= lo && addr <= hi
-    })
-}
-
-#[derive(Copy, Clone, Debug)]
-enum UntrackedRegionKind {
-    Tls,
-}
-
-#[inline]
-fn rz_untracked_region_strict() -> bool {
-    std::env::var("RZ_STRICT_UNTRACKED_REGION")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-}
-
-#[inline]
-fn rz_tls_pseudo_range() -> (usize, usize) {
-    RZ_IN_RUNTIME_HOOK.with(|c| {
-        let tls = c as *const _ as usize;
-        (
-            tls.saturating_sub(8 * 1024 * 1024),
-            tls.saturating_add(8 * 1024 * 1024),
-        )
-    })
-}
-
-#[inline]
-fn rz_untracked_region_for_access(addr: usize, size: usize) -> Option<UntrackedRegionKind> {
-    let (start, end) = rz_tls_pseudo_range();
-    let access_end = addr.saturating_add(size.max(1));
-    let stack_like = rz_stack_addr_hint(addr) || rz_stack_addr_hint(access_end.saturating_sub(1));
-    if addr >= start && access_end <= end && !stack_like {
-        return Some(UntrackedRegionKind::Tls);
-    }
-    None
-}
-
-#[inline]
-fn rz_handle_untracked_region(
-    access_kind: &str,
-    tag: u64,
-    tmeta: &TagMeta,
-    addr: usize,
-    size: usize,
-) -> bool {
-    let Some(region) = rz_untracked_region_for_access(addr, size) else {
-        return false;
-    };
-
-    // Keep TLS suppression narrow: only for tags with unknown allocation provenance
-    // that also look TLS-originated. This avoids masking real heap/stack OOB accesses
-    // that happen to land inside the coarse TLS pseudo-window.
-    if tmeta.alloc_epoch != 0 || !(rz_tls_addr_hint(tmeta.pointee_addr) || rz_tls_addr_hint(addr)) {
-        return false;
-    }
-
-    if rz_untracked_region_strict() {
-        let region_name = match region {
-            UntrackedRegionKind::Tls => "TLS",
-        };
-        let msg = append_location_if_enabled(
-            format!(
-                "{access_kind} via tag={tag} addr=0x{addr:x} size={size}\n(untracked region: {region_name}) kind={:?} parent={} pointee=0x{:x}",
-                tmeta.kind,
-                tmeta.parent,
-                tmeta.pointee_addr
-            ),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("UNTRACKED_REGION_ACCESS", msg);
-    }
-    true
 }
 
 fn rz_static_ranges() -> &'static Vec<StaticRange> {
@@ -464,6 +136,7 @@ fn rz_static_range_for_addr(addr: usize) -> Option<&'static StaticRange> {
         .find(|r| addr >= r.start && addr < r.end)
 }
 
+
 #[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     if ptr.is_null() {
@@ -477,68 +150,68 @@ fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
 
 struct RzGlobalAlloc;
 
-unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
-    unsafe fn alloc(&self, layout: ::std::alloc::Layout) -> *mut u8 {
-        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
-            return ::std::alloc::System.alloc(layout);
+unsafe impl core::alloc::GlobalAlloc for RzGlobalAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        if rz_in_runtime_hook() || tls::in_alloc_hook() {
+            return PlatformAlloc.alloc(layout);
         }
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
-        let p = ::std::alloc::System.alloc(layout);
+        tls::set_in_alloc_hook(true);
+        let p = PlatformAlloc.alloc(layout);
         rz_record_heap_event(p, layout.size(), true);
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        tls::set_in_alloc_hook(false);
         p
     }
 
-    unsafe fn alloc_zeroed(&self, layout: ::std::alloc::Layout) -> *mut u8 {
-        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
-            return ::std::alloc::System.alloc_zeroed(layout);
+    unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
+        if rz_in_runtime_hook() || tls::in_alloc_hook() {
+            return PlatformAlloc.alloc_zeroed(layout);
         }
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
-        let p = ::std::alloc::System.alloc_zeroed(layout);
+        tls::set_in_alloc_hook(true);
+        let p = PlatformAlloc.alloc_zeroed(layout);
         rz_record_heap_event(p, layout.size(), true);
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        tls::set_in_alloc_hook(false);
         p
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: ::std::alloc::Layout) {
-        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
-            return ::std::alloc::System.dealloc(ptr, layout);
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        if rz_in_runtime_hook() || tls::in_alloc_hook() {
+            return PlatformAlloc.dealloc(ptr, layout);
         }
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+        tls::set_in_alloc_hook(true);
 
         // Validate before calling the system allocator to avoid abort on double-free.
         let ok = rz_pre_free_check(ptr);
         if ok {
-            ::std::alloc::System.dealloc(ptr, layout);
+            PlatformAlloc.dealloc(ptr, layout);
         }
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        tls::set_in_alloc_hook(false);
     }
 
     unsafe fn realloc(
         &self,
         ptr: *mut u8,
-        layout: ::std::alloc::Layout,
+        layout: core::alloc::Layout,
         new_size: usize,
     ) -> *mut u8 {
-        if rz_in_runtime_hook() || RZ_IN_ALLOC_HOOK.with(|f| f.get()) {
-            return ::std::alloc::System.realloc(ptr, layout, new_size);
+        if rz_in_runtime_hook() || tls::in_alloc_hook() {
+            return PlatformAlloc.realloc(ptr, layout, new_size);
         }
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
+        tls::set_in_alloc_hook(true);
 
         // Validate old pointer without marking it dead yet.
         // If invalid/double-freed, skip the system realloc to avoid abort.
         if !ptr.is_null() && !rz_pre_realloc_check(ptr) {
-            RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+            tls::set_in_alloc_hook(false);
             return core::ptr::null_mut();
         }
 
-        let p = ::std::alloc::System.realloc(ptr, layout, new_size);
+        let p = PlatformAlloc.realloc(ptr, layout, new_size);
         if p.is_null() {
             // realloc failed (or new_size == 0). If size==0, treat as free.
             if new_size == 0 && !ptr.is_null() {
                 __rz_record_alloc(ptr as usize, 0, 0);
             }
-            RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+            tls::set_in_alloc_hook(false);
             return p;
         }
 
@@ -554,7 +227,7 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
             __rz_record_alloc(p as usize, new_size, 1);
         }
 
-        RZ_IN_ALLOC_HOOK.with(|f| f.set(false));
+        tls::set_in_alloc_hook(false);
         p
     }
 }
@@ -564,10 +237,6 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
 static RZ_ALLOC: RzGlobalAlloc = RzGlobalAlloc;
 
 // === end global allocator wrapper ===========================================
-use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Mutex;
 
 #[cfg(feature = "rz_log")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -587,13 +256,9 @@ enum LogLevel {
 
 #[cfg(feature = "rz_log")]
 fn rz_log_level() -> LogLevel {
-    match std::env::var("RZ_LOG")
-        .unwrap_or_else(|_| "warn".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "trace" => LogLevel::Trace,
-        "info" => LogLevel::Info,
+    match env_var_lowercase("RZ_LOG").as_deref() {
+        Some("trace") => LogLevel::Trace,
+        Some("info") => LogLevel::Info,
         _ => LogLevel::Warn,
     }
 }
@@ -625,10 +290,7 @@ struct RzStackBuf {
 impl RzStackBuf {
     #[inline]
     fn new() -> Self {
-        Self {
-            buf: [0u8; 1024],
-            len: 0,
-        }
+        Self { buf: [0u8; 1024], len: 0 }
     }
 
     #[inline]
@@ -655,33 +317,18 @@ impl core::fmt::Write for RzStackBuf {
 #[cfg(feature = "rz_log")]
 #[inline]
 fn rz_emit_args(args: core::fmt::Arguments<'_>) {
-    #[cfg(unix)]
-    unsafe {
-        let mut sb = RzStackBuf::new();
-        let _ = core::fmt::write(&mut sb, args);
-        let b = sb.as_bytes();
-        let _ = write(2, b.as_ptr(), b.len());
-        let _ = write(2, b"\n".as_ptr(), 1);
-    }
-
-    #[cfg(not(unix))]
-    {
-        eprintln!("{}", args);
-    }
+    let mut sb = RzStackBuf::new();
+    let _ = core::fmt::write(&mut sb, args);
+    let b = sb.as_bytes();
+    write_stderr(b);
+    write_stderr(b"\n");
 }
 
 #[inline]
 fn rz_emit_str(s: &str) {
-    #[cfg(unix)]
-    unsafe {
-        let _ = write(2, s.as_bytes().as_ptr(), s.as_bytes().len());
-    }
-
-    #[cfg(not(unix))]
-    {
-        eprint!("{}", s);
-    }
+    write_stderr(s.as_bytes());
 }
+
 
 #[cfg(feature = "rz_log")]
 macro_rules! rz_log {
@@ -741,6 +388,7 @@ macro_rules! rz_trace {
     };
 }
 
+
 /// Pre-free validation to avoid process abort on double-free/invalid-free.
 /// Returns `true` if it is safe to call the underlying system deallocator.
 ///
@@ -766,9 +414,7 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
             //
             // Default: allow the system deallocator to run to avoid false positives and leaks.
             // Opt-in strict mode: report and skip the system deallocator.
-            let strict = std::env::var("RZ_STRICT_FREE_CHECK")
-                .ok()
-                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+            let strict = env_flag("RZ_STRICT_FREE_CHECK", false);
 
             if strict {
                 rz_violation(
@@ -797,7 +443,7 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
                 );
 
                 if rz_abort_on_double_free() {
-                    ::std::process::abort();
+                    abort_process();
                 }
 
                 return false;
@@ -806,7 +452,7 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
             // Mark as dead in our bookkeeping now (and bump epoch on death transition).
             // Use the same logic as the normal record path to keep epochs consistent.
             drop(amap);
-            __rz_record_alloc(base, 0, 0);
+            rz_record_alloc_impl(base, 0, 0);
             true
         }
     }
@@ -829,9 +475,7 @@ fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
 
     match amap.get(&base) {
         None => {
-            let strict = std::env::var("RZ_STRICT_FREE_CHECK")
-                .ok()
-                .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+            let strict = env_flag("RZ_STRICT_FREE_CHECK", false);
 
             if strict {
                 rz_violation(
@@ -860,7 +504,7 @@ fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
                 );
 
                 if rz_abort_on_double_free() {
-                    ::std::process::abort();
+                    abort_process();
                 }
 
                 return false;
@@ -870,10 +514,11 @@ fn rz_pre_realloc_check(ptr: *mut u8) -> bool {
     }
 }
 
+
 static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
 
 /// Metadata for a tracked allocation (stack or heap).
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct AllocMeta {
     /// Whether the allocation is currently live.
     pub live: bool,
@@ -895,7 +540,7 @@ pub enum PtrKind {
 }
 
 /// Metadata associated with a borrow tag.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TagMeta {
     /// Address of the pointee (exposed provenance / numeric address).
     pub pointee_addr: usize,
@@ -906,26 +551,21 @@ pub struct TagMeta {
     /// Whether the pointer has escaped its original scope (e.g., passed across a call boundary).
     pub escaped: bool,
     /// Allocation epoch observed at creation time (0 if unknown).
-    /// Best-effort snapshot used to disambiguate address reuse
-    /// (e.g., stack slots or freed heap memory).
+    /// TODO: This is a best-effort snapshot used to disambiguate
+    /// address reuse (e.g., stack slots or freed heap memory). Currently,
+    /// epochs are matched only when the pointer equals the allocation base
+    /// address exactly. This should be extended to:
+    ///   - map interior pointers to their base allocation
+    ///   - use allocation ranges instead of exact address equality
+    ///   - reject accesses when tag.alloc_epoch != alloc.epoch
     pub alloc_epoch: u64,
     /// Whether the tag was created while the containing allocation was live.
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
-    /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
-    /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source.
-    pub lineage_hint: u8,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
-    /// Whether we captured an allocation-origin snapshot for this tag.
-    pub origin_known: bool,
-    /// Base address of the allocation that originated this tag.
-    pub origin_base: usize,
-    /// End address of the allocation that originated this tag (half-open).
-    /// For unknown-size allocations this is equal to `origin_base`.
-    pub origin_end: usize,
 }
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
@@ -945,7 +585,7 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
+fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -982,11 +622,7 @@ fn find_alloc_containing<'a>(
         };
 
         if addr < end {
-            let slot = if meta.live {
-                &mut best_live
-            } else {
-                &mut best_dead
-            };
+            let slot = if meta.live { &mut best_live } else { &mut best_dead };
             match slot {
                 None => *slot = Some((*base, meta, end)),
                 Some((_b, _m, best_end)) => {
@@ -1007,179 +643,19 @@ fn find_alloc_containing<'a>(
     best_unknown
 }
 
-/// Best-effort origin lookup for provenance-aware OOB classification.
-///
-/// Unlike direct access lookup, this also accepts the exact one-past-end address of a tracked
-/// allocation. Example:
-///   let p = v.as_ptr().add(v.len()); // legal to compute, illegal to dereference
-/// A later read through `p` should be classified as OUT_OF_BOUNDS relative to `v`'s allocation,
-/// not as a generic WILD_POINTER.
-#[inline]
-fn find_alloc_origin_candidate<'a>(
-    amap: &'a BTreeMap<usize, AllocMeta>,
-    addr: usize,
-) -> Option<(usize, &'a AllocMeta)> {
-    if let Some(found) = find_alloc_containing(amap, addr) {
-        return Some(found);
-    }
-
-    let mut best_live: Option<(usize, &'a AllocMeta)> = None;
-    let mut best_dead: Option<(usize, &'a AllocMeta)> = None;
-
-    for (base, meta) in amap.range(..addr).rev() {
-        if meta.size == 0 {
-            continue;
-        }
-        let Some(end) = base.checked_add(meta.size) else {
-            continue;
-        };
-        if end != addr {
-            continue;
-        }
-
-        if meta.live {
-            best_live = Some((*base, meta));
-            break;
-        }
-        if best_dead.is_none() {
-            best_dead = Some((*base, meta));
-        }
-    }
-
-    best_live.or(best_dead)
-}
-
-#[inline]
-fn lookup_alloc_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
-    live_alloc_cache::lookup_containing(addr).or_else(|| {
-        let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-    })
-}
-
-#[inline]
-fn lookup_alloc_origin_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
-    if let Some(found) = live_alloc_cache::lookup_containing(addr) {
-        return Some(found);
-    }
-    let amap = allocs().lock().unwrap();
-    find_alloc_origin_candidate(&amap, addr).map(|(base, meta)| (base, *meta))
-}
-
-/// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
-/// If instrumentation emits a root tag (`parent=0`) for an address that already has
-/// same-address non-root tags in the same allocation epoch, attach to the newest one.
-///
-/// We intentionally do not guess based on overlapping ranges here. Exact same-address repair
-/// covers the real "parent tag was lost" case without introducing range-overlap heuristics.
-#[inline]
-fn recover_parent_for_alloc_root(
-    pointee_addr: usize,
-    alloc_epoch: u64,
-    require_mut_parent: bool,
-) -> u64 {
-    if alloc_epoch == 0 || pointee_addr == 0 {
-        return 0;
-    }
-
-    if let Some(tag) =
-        lineage_cache::lookup_repaired_parent(pointee_addr, alloc_epoch, require_mut_parent)
-    {
-        return tag;
-    }
-
-    if let Some(tag) = exact_parent_index::lookup(pointee_addr, alloc_epoch, require_mut_parent) {
-        if let Some(meta) = tag_store::get(tag) {
-            lineage_cache::remember_non_root_tag(tag, &meta);
-        }
-        return tag;
-    }
-
-    0
-}
-
 #[inline]
 fn rz_allow_untracked_stack_ref(tmeta: &TagMeta, addr: usize) -> bool {
     matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
         && tmeta.alloc_epoch == 0
-        && (rz_stack_addr_hint(addr)
-            || rz_stack_addr_hint(tmeta.pointee_addr)
-            || rz_tls_addr_hint(addr)
-            || rz_tls_addr_hint(tmeta.pointee_addr))
+        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
 }
 
 #[inline]
 fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
-    if tmeta.alloc_epoch != 0 {
-        return false;
-    }
-    let is_stack = rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr);
-    let is_tls = rz_tls_addr_hint(addr) || rz_tls_addr_hint(tmeta.pointee_addr);
-    if !(is_stack || is_tls) {
-        return false;
-    }
-
-    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        return false;
-    }
-
-    // Root untracked stack/TLS raws are low-confidence by construction.
-    if tmeta.parent == 0 {
-        return true;
-    }
-
-    // Optimized MIR often threads pointer values through short derived chains
-    // (`Ref -> Raw -> Raw`) while stack-slot metadata is absent. Keep this
-    // suppression narrow: only for untracked stack/TLS chains and shallow depth.
-    let tmap = tags().lock().unwrap();
-    let mut cur = tmeta.parent;
-    let mut depth = 0usize;
-    while cur != 0 && depth < 4 {
-        let Some(pm) = tmap.get(&cur) else {
-            break;
-        };
-        if pm.alloc_epoch == 0
-            && (rz_stack_addr_hint(pm.pointee_addr) || rz_tls_addr_hint(pm.pointee_addr))
-            && matches!(
-                pm.kind,
-                PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
-            )
-        {
-            return true;
-        }
-        cur = pm.parent;
-        depth += 1;
-    }
-    false
-}
-
-#[inline]
-fn rz_allow_bounded_stack_ref_no_alloc_noise(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
-    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
-        return false;
-    }
-    if tmeta.bounds_len == 0 || size == 0 {
-        return false;
-    }
-    if !(rz_stack_addr_hint(addr)
-        || rz_stack_addr_hint(tmeta.pointee_addr)
-        || rz_tls_addr_hint(addr)
-        || rz_tls_addr_hint(tmeta.pointee_addr))
-    {
-        return false;
-    }
-
-    let access_end = match addr.checked_add(size) {
-        Some(end) => end,
-        None => return false,
-    };
-    let bounds_end = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
-
-    // Prefer explicit ref bounds over coarse/missing stack alloc metadata. This catches
-    // optimized tail-buffer patterns like `tmpbuf: [u8; 64]` -> `&tmpbuf[..]` -> SIMD lane
-    // reads, where the reference metadata is precise but stack-slot tracking only retained a
-    // tiny carrier alloc or no alloc at all for later lanes.
-    addr >= tmeta.pointee_addr && access_end <= bounds_end
+    matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        && tmeta.parent == 0
+        && tmeta.alloc_epoch == 0
+        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
 }
 
 #[inline]
@@ -1199,9 +675,7 @@ fn rz_allow_stack_raw_root_epoch_noise(tmeta: &TagMeta, ameta: &AllocMeta, addr:
 
 #[inline]
 fn rz_stack_ref_oob_noise_enabled() -> bool {
-    std::env::var("RZ_STACK_REF_OOB_NOISE")
-        .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_STACK_REF_OOB_NOISE", true)
 }
 
 #[inline]
@@ -1232,127 +706,9 @@ fn rz_allow_stack_ref_oob_noise(
     // Interior references into stack-allocated aggregates can legitimately read/write a value
     // that straddles a coarse tracked slot boundary when optimized MIR loses precise object
     // boundaries for the selected alloc record.
-    let crosses_coarse_slot_end = tmeta.parent != 0
-        && tmeta.pointee_addr >= base
-        && tmeta.pointee_addr < alloc_end
-        && access_end > alloc_end;
-    pointee_outside_alloc || access_larger_than_slot || crosses_coarse_slot_end
-}
-
-#[inline]
-fn rz_allow_stack_ref_root_boundary_oob_noise(
-    tmeta: &TagMeta,
-    ameta: &AllocMeta,
-    base: usize,
-    addr: usize,
-    size: usize,
-) -> bool {
-    // Narrow fallback for root refs created after lineage loss: a valid field read/write can
-    // start at the end of a tiny stack carrier slot (typically pointer-sized pair).
-    // On AArch64/NEON this also shows up as 16-byte vector lane reads from a 64-byte temporary
-    // (e.g. simd-json stage1's local tmpbuf), where coarse stack-slot tracking records only the
-    // first 16-byte lane as the containing alloc.
-    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
-        return false;
-    }
-    if tmeta.parent != 0 || tmeta.bounds_len != 0 {
-        return false;
-    }
-    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
-        return false;
-    }
-
-    let usize_sz = std::mem::size_of::<usize>();
-    if ameta.size > 2 * usize_sz {
-        return false;
-    }
-
-    let alloc_end = base.saturating_add(ameta.size);
-    let access_end = addr.saturating_add(size);
-    let starts_at_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= usize_sz;
-    let vector_lane = 2 * usize_sz;
-    let small_access = size > 0 && size <= vector_lane;
-    starts_at_boundary && small_access && access_end > alloc_end
-}
-
-#[inline]
-fn rz_allow_stack_raw_root_oob_noise(
-    tmeta: &TagMeta,
-    ameta: &AllocMeta,
-    base: usize,
-    addr: usize,
-    size: usize,
-) -> bool {
-    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        return false;
-    }
-    if tmeta.parent != 0 {
-        return false;
-    }
-    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
-        return false;
-    }
-
-    // Root-tagged stack raws are low-confidence when lineage is missing, but keep this
-    // suppression narrow: tolerate only small near-boundary overhangs. Broad interior-slot
-    // suppression masked real OOB writes such as:
-    //   let q = (p as *mut u8).add(size_of::<S>() - 1);
-    //   ptr::write_unaligned(q.add(8) as *mut u64, ...)
-    // where `q` lands inside a tracked stack slot and the 8-byte write truly crosses the
-    // containing allocation boundary.
-    let alloc_end = base.saturating_add(ameta.size);
-    let access_end = addr.saturating_add(size);
-    let near_boundary = addr >= alloc_end && addr.saturating_sub(alloc_end) <= 16;
-    near_boundary && size <= 16 && access_end > alloc_end
-}
-
-#[inline]
-fn rz_allow_projected_raw_stack_slot_oob_noise(
-    tmeta: &TagMeta,
-    ameta: &AllocMeta,
-    base: usize,
-    addr: usize,
-    size: usize,
-) -> bool {
-    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        return false;
-    }
-    // Strong projected-source hint only; keep this path narrowly targeted.
-    if (tmeta.lineage_hint & 0b0000_0100) == 0 || tmeta.parent == 0 {
-        return false;
-    }
-    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
-        return false;
-    }
-
-    let usize_sz = std::mem::size_of::<usize>();
-    if ameta.size > 2 * usize_sz || size <= 8 * usize_sz {
-        return false;
-    }
-
-    let alloc_end = base.saturating_add(ameta.size);
-    let access_end = addr.saturating_add(size);
-    if access_end <= alloc_end {
-        return false;
-    }
-    if tmeta.pointee_addr < base || tmeta.pointee_addr >= alloc_end {
-        return false;
-    }
-
-    let tmap = tags().lock().unwrap();
-    let mut cur = tmeta.parent;
-    let mut depth = 0usize;
-    while cur != 0 && depth < 8 {
-        let Some(parent) = tmap.get(&cur) else {
-            break;
-        };
-        if parent.pointee_addr >= base && parent.pointee_addr < alloc_end {
-            return true;
-        }
-        cur = parent.parent;
-        depth += 1;
-    }
-    false
+    let interior_crosses_slot_end =
+        tmeta.pointee_addr > base && access_end > alloc_end;
+    pointee_outside_alloc || access_larger_than_slot || interior_crosses_slot_end
 }
 
 #[inline(never)]
@@ -1372,13 +728,11 @@ fn rz_violation(kind: &str, msg: String) {
     rz_emit_str("===================================================\n\n");
 
     if rz_abort_on_violation() {
-        std::process::abort();
+        abort_process();
     }
 
     // Fail-fast only if requested
-    let failfast = std::env::var("RUSTEZE_FAILFAST")
-        .ok()
-        .map_or(false, |v| v != "0");
+    let failfast = env_flag("RUSTEZE_FAILFAST", false);
     if failfast {
         // Enable backtraces with `RUST_BACKTRACE=1`
         panic!("rusteze violation: {kind}");
@@ -1386,17 +740,13 @@ fn rz_violation(kind: &str, msg: String) {
 }
 
 fn backtrace_enabled(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag(var, false)
 }
 
 #[cfg(feature = "rz_alloc_dump")]
 #[inline]
 fn rz_dump_alloc_on_violation() -> bool {
-    std::env::var("RZ_DUMP_ALLOC_ON_VIOLATION")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_DUMP_ALLOC_ON_VIOLATION", false)
 }
 
 #[cfg(not(feature = "rz_alloc_dump"))]
@@ -1408,9 +758,7 @@ fn rz_dump_alloc_on_violation() -> bool {
 #[cfg(feature = "rz_alloc_dump")]
 #[inline]
 fn rz_dump_alloc_match_addr_enabled() -> bool {
-    std::env::var("RZ_DUMP_ALLOC_MATCH_ADDR")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_DUMP_ALLOC_MATCH_ADDR", false)
 }
 
 #[cfg(not(feature = "rz_alloc_dump"))]
@@ -1421,23 +769,17 @@ fn rz_dump_alloc_match_addr_enabled() -> bool {
 
 #[inline]
 fn rz_allow_untagged() -> bool {
-    std::env::var("RZ_ALLOW_UNTAGGED")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_ALLOW_UNTAGGED", false)
 }
 
 #[inline]
 fn rz_tag0_as_root() -> bool {
-    std::env::var("RZ_TAG0_AS_ROOT")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_TAG0_AS_ROOT", false)
 }
 
 #[inline]
 fn rz_log_alloc_enabled() -> bool {
-    std::env::var("RZ_LOG_ALLOC")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag("RZ_LOG_ALLOC", false)
 }
 
 #[cfg(feature = "rz_log")]
@@ -1452,23 +794,22 @@ fn rz_emit_alloc(_args: core::fmt::Arguments<'_>) {}
 
 fn append_backtrace_if_enabled(mut msg: String, var: &str) -> String {
     if backtrace_enabled(var) {
-        let bt = std::backtrace::Backtrace::force_capture();
-        msg.push_str("\nbacktrace:\n");
-        msg.push_str(&format!("{bt:?}"));
+        if let Some(bt) = capture_backtrace() {
+            msg.push_str("\nbacktrace:\n");
+            msg.push_str(&bt);
+        }
     }
     msg
 }
 
 fn location_enabled(var: &str) -> bool {
-    std::env::var(var)
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag(var, false)
 }
 
 #[track_caller]
 fn append_location_if_enabled(mut msg: String, var: &str) -> String {
     if location_enabled(var) {
-        let loc = std::panic::Location::caller();
+        let loc = core::panic::Location::caller();
         msg.push_str(&format!(
             "\nloc={}:{}:{}",
             loc.file(),
@@ -1495,7 +836,7 @@ fn origin_alloc_for_tag<'a>(
     for _ in 0..32 {
         let t: &TagMeta = tmap.get(&tag)?;
 
-        if let Some((base, ameta)) = find_alloc_origin_candidate(amap, t.pointee_addr) {
+        if let Some((base, ameta)) = find_alloc_containing(amap, t.pointee_addr) {
             // If both sides have epochs, require a match.
             if t.alloc_epoch != 0 && ameta.epoch != 0 && t.alloc_epoch != ameta.epoch {
                 // Epoch mismatch: treat as unrelated (likely address reuse / stale).
@@ -1512,94 +853,17 @@ fn origin_alloc_for_tag<'a>(
     None
 }
 
-#[inline]
-fn origin_end_from_alloc(base: usize, ameta: &AllocMeta) -> usize {
-    if ameta.size == 0 {
-        base
-    } else {
-        base.saturating_add(ameta.size)
-    }
-}
-
-#[inline]
-fn tag_origin_contains_access(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
-    if !tmeta.origin_known || size == 0 {
-        return false;
-    }
-
-    let access_end = match addr.checked_add(size) {
-        Some(e) => e,
-        None => return false,
-    };
-
-    if tmeta.origin_end > tmeta.origin_base {
-        addr >= tmeta.origin_base && access_end <= tmeta.origin_end
-    } else {
-        // Unknown-size alloc snapshot: only exact-base accesses are trusted.
-        addr == tmeta.origin_base
-    }
-}
-
-#[inline]
-fn tag_origin_oob_cached(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
-    if !tmeta.origin_known || size == 0 || tmeta.origin_end <= tmeta.origin_base {
-        return false;
-    }
-    let access_end = match addr.checked_add(size) {
-        Some(e) => e,
-        None => return true,
-    };
-    addr < tmeta.origin_base || access_end > tmeta.origin_end
-}
-
-#[inline]
-fn alloc_from_origin_base(tmeta: &TagMeta) -> Option<(usize, AllocMeta)> {
-    if !tmeta.origin_known {
-        return None;
-    }
-    let amap = allocs().lock().unwrap();
-    amap.get(&tmeta.origin_base)
-        .copied()
-        .map(|ameta| (tmeta.origin_base, ameta))
-}
-
-#[inline]
-fn refresh_tag_origin_cache(tag: u64, tmeta: &mut TagMeta, base: usize, ameta: &AllocMeta) {
-    let origin_end = origin_end_from_alloc(base, ameta);
-    if tmeta.origin_known && tmeta.origin_base == base && tmeta.origin_end == origin_end {
-        return;
-    }
-
-    tmeta.origin_known = true;
-    tmeta.origin_base = base;
-    tmeta.origin_end = origin_end;
-    tag_store::update(tag, *tmeta);
-}
-
-#[inline]
-fn snapshot_tag_origin(pointee_addr: usize, parent_tag: u64) -> (bool, usize, usize) {
-    if let Some((base, ameta)) = lookup_alloc_origin_snapshot(pointee_addr) {
-        return (true, base, origin_end_from_alloc(base, &ameta));
-    }
-
-    if parent_tag != 0 {
-        if let Some(parent_meta) = tag_store::get(parent_tag) {
-            if parent_meta.origin_known {
-                return (true, parent_meta.origin_base, parent_meta.origin_end);
-            }
-        }
-    }
-    (false, 0, 0)
-}
-
 /// Record (or update) allocation metadata. The key is the base address.
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::record_alloc(profile);
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
+    rz_record_alloc_impl(base_addr, size, live);
+}
 
+fn rz_record_alloc_impl(base_addr: usize, size: usize, live: u8) {
     // Record allocation events into a fixed-size ring buffer for post-mortem dumps.
     alloc_log_record(base_addr, size, live);
 
@@ -1609,7 +873,10 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         let is_stack = (live & 0x2) != 0;
         rz_emit_alloc(format_args!(
             "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
-            base_addr, size, new_live, is_stack
+            base_addr,
+            size,
+            new_live,
+            is_stack
         ));
     } else if rz_log_enabled(LogLevel::Trace) {
         // `live` bit 0: live/dead. bit 1: stack marker.
@@ -1685,9 +952,7 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         }
     }
 
-    let entry_snapshot = *entry;
     drop(m);
-    live_alloc_cache::update_alloc(base_addr, entry_snapshot);
     active_alias_model().on_alloc_state_change(base_addr, new_live);
     if let Some(dead_epoch) = compact_dead_epoch {
         dead_epoch_cleanup::reclaim_alloc_epoch(base_addr, dead_epoch);
@@ -1713,12 +978,7 @@ struct AllocLogEntry {
 #[cfg(feature = "rz_alloc_dump")]
 impl AllocLogEntry {
     const fn empty() -> Self {
-        Self {
-            seq: 0,
-            base: 0,
-            size: 0,
-            live: 0,
-        }
+        Self { seq: 0, base: 0, size: 0, live: 0 }
     }
 }
 
@@ -1742,24 +1002,14 @@ fn alloc_log_record(base_addr: usize, size: usize, live: u8) {
     let idx = ALLOC_LOG_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_SIZE;
     let seq = ALLOC_LOG_SEQ.fetch_add(1, Ordering::Relaxed);
     unsafe {
-        ALLOC_LOG[idx] = AllocLogEntry {
-            seq,
-            base: base_addr,
-            size,
-            live,
-        };
+        ALLOC_LOG[idx] = AllocLogEntry { seq, base: base_addr, size, live };
     }
     // Also keep a heap-only ring buffer to avoid stack noise.
     if (live & 0x2) == 0 {
         let hidx = ALLOC_LOG_HEAP_IDX.fetch_add(1, Ordering::Relaxed) % ALLOC_LOG_HEAP_SIZE;
         let hseq = ALLOC_LOG_HEAP_SEQ.fetch_add(1, Ordering::Relaxed);
         unsafe {
-            ALLOC_LOG_HEAP[hidx] = AllocLogEntry {
-                seq: hseq,
-                base: base_addr,
-                size,
-                live,
-            };
+            ALLOC_LOG_HEAP[hidx] = AllocLogEntry { seq: hseq, base: base_addr, size, live };
         }
     }
 }
@@ -1778,10 +1028,7 @@ fn alloc_log_dump() {
     impl LocalBuf {
         #[inline]
         fn new() -> Self {
-            Self {
-                buf: [0u8; 256],
-                len: 0,
-            }
+            Self { buf: [0u8; 256], len: 0 }
         }
         #[inline]
         fn as_bytes(&self) -> &[u8] {
@@ -1802,9 +1049,7 @@ fn alloc_log_dump() {
         }
     }
 
-    let heap_only = std::env::var("RZ_DUMP_ALLOC_HEAP_ONLY")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
+    let heap_only = env_flag("RZ_DUMP_ALLOC_HEAP_ONLY", false);
     if heap_only {
         rz_emit_str("\n[rusteze-runtime] last heap alloc events (most recent first):\n");
     } else {
@@ -1816,13 +1061,13 @@ fn alloc_log_dump() {
         (
             ALLOC_LOG_HEAP_IDX.load(Ordering::Relaxed),
             ALLOC_LOG_HEAP_SIZE,
-            unsafe { &raw const ALLOC_LOG_HEAP as *const [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] },
+            unsafe { &raw const ALLOC_LOG_HEAP as *const [AllocLogEntry; ALLOC_LOG_HEAP_SIZE] }
         )
     } else {
         (
             ALLOC_LOG_IDX.load(Ordering::Relaxed),
             ALLOC_LOG_SIZE,
-            unsafe { &raw const ALLOC_LOG as *const [AllocLogEntry; ALLOC_LOG_SIZE] },
+            unsafe { &raw const ALLOC_LOG as *const [AllocLogEntry; ALLOC_LOG_SIZE] }
         )
     };
 
@@ -1868,10 +1113,7 @@ fn alloc_log_dump_contains(addr: usize) {
     impl LocalBuf {
         #[inline]
         fn new() -> Self {
-            Self {
-                buf: [0u8; 256],
-                len: 0,
-            }
+            Self { buf: [0u8; 256], len: 0 }
         }
         #[inline]
         fn as_bytes(&self) -> &[u8] {
@@ -1934,199 +1176,35 @@ fn alloc_log_dump_contains(_addr: usize) {}
 /// Read-only helper for debugging/testing.
 #[no_mangle]
 pub extern "C" fn __rz_dump_state() {
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     let a = allocs().lock().unwrap();
     let t = tags().lock().unwrap();
     rz_info!("[rusteze-runtime] allocs={} tags={}", a.len(), t.len());
 }
 
-#[no_mangle]
-pub extern "C" fn __rz_reset_hook_profile() {
-    let Some(p) = RZ_HOOK_PROFILE.get() else {
-        return;
-    };
-    p.write_calls.store(0, Ordering::Relaxed);
-    p.write_total_ns.store(0, Ordering::Relaxed);
-    p.write_tag_lookup_ns.store(0, Ordering::Relaxed);
-    p.write_alias_check_ns.store(0, Ordering::Relaxed);
-    p.write_alloc_lookup_ns.store(0, Ordering::Relaxed);
-    p.read_calls.store(0, Ordering::Relaxed);
-    p.read_total_ns.store(0, Ordering::Relaxed);
-    p.read_tag_lookup_ns.store(0, Ordering::Relaxed);
-    p.read_alias_check_ns.store(0, Ordering::Relaxed);
-    p.read_alloc_lookup_ns.store(0, Ordering::Relaxed);
-    p.ref_create_calls.store(0, Ordering::Relaxed);
-    p.ref_create_total_ns.store(0, Ordering::Relaxed);
-    p.ref_create_validate_ns.store(0, Ordering::Relaxed);
-    p.ref_create_alloc_snapshot_ns.store(0, Ordering::Relaxed);
-    p.ref_create_lineage_repair_ns.store(0, Ordering::Relaxed);
-    p.ref_create_insert_ns.store(0, Ordering::Relaxed);
-    p.ref_create_tag_store_insert_ns.store(0, Ordering::Relaxed);
-    p.ref_create_exact_parent_update_ns
-        .store(0, Ordering::Relaxed);
-    p.ref_create_lineage_cache_update_ns
-        .store(0, Ordering::Relaxed);
-    p.ref_create_alias_on_tag_created_ns
-        .store(0, Ordering::Relaxed);
-    p.raw_create_calls.store(0, Ordering::Relaxed);
-    p.raw_create_total_ns.store(0, Ordering::Relaxed);
-    p.ptr_use_calls.store(0, Ordering::Relaxed);
-    p.ptr_use_total_ns.store(0, Ordering::Relaxed);
-    p.record_alloc_calls.store(0, Ordering::Relaxed);
-    p.record_alloc_total_ns.store(0, Ordering::Relaxed);
-}
-
-#[no_mangle]
-pub extern "C" fn __rz_dump_hook_profile() {
-    let _runtime_guard = RzRuntimeGuard::enter();
-    if !rz_profile_hooks_enabled() {
-        eprintln!("[rusteze-runtime] hook profile: disabled (set RZ_PROFILE_HOOKS=1)");
-        return;
-    }
-    let p = rz_hook_profile();
-    let write_calls = p.write_calls.load(Ordering::Relaxed);
-    let read_calls = p.read_calls.load(Ordering::Relaxed);
-    let write_total_ns = p.write_total_ns.load(Ordering::Relaxed);
-    let read_total_ns = p.read_total_ns.load(Ordering::Relaxed);
-    let write_tag_ns = p.write_tag_lookup_ns.load(Ordering::Relaxed);
-    let read_tag_ns = p.read_tag_lookup_ns.load(Ordering::Relaxed);
-    let write_alias_ns = p.write_alias_check_ns.load(Ordering::Relaxed);
-    let read_alias_ns = p.read_alias_check_ns.load(Ordering::Relaxed);
-    let write_alloc_ns = p.write_alloc_lookup_ns.load(Ordering::Relaxed);
-    let read_alloc_ns = p.read_alloc_lookup_ns.load(Ordering::Relaxed);
-    let ref_create_calls = p.ref_create_calls.load(Ordering::Relaxed);
-    let ref_create_total_ns = p.ref_create_total_ns.load(Ordering::Relaxed);
-    let ref_create_validate_ns = p.ref_create_validate_ns.load(Ordering::Relaxed);
-    let ref_create_alloc_snapshot_ns = p.ref_create_alloc_snapshot_ns.load(Ordering::Relaxed);
-    let ref_create_lineage_repair_ns = p.ref_create_lineage_repair_ns.load(Ordering::Relaxed);
-    let ref_create_insert_ns = p.ref_create_insert_ns.load(Ordering::Relaxed);
-    let ref_create_tag_store_insert_ns = p.ref_create_tag_store_insert_ns.load(Ordering::Relaxed);
-    let ref_create_exact_parent_update_ns =
-        p.ref_create_exact_parent_update_ns.load(Ordering::Relaxed);
-    let ref_create_lineage_cache_update_ns =
-        p.ref_create_lineage_cache_update_ns.load(Ordering::Relaxed);
-    let ref_create_alias_on_tag_created_ns =
-        p.ref_create_alias_on_tag_created_ns.load(Ordering::Relaxed);
-    let raw_create_calls = p.raw_create_calls.load(Ordering::Relaxed);
-    let raw_create_total_ns = p.raw_create_total_ns.load(Ordering::Relaxed);
-    let ptr_use_calls = p.ptr_use_calls.load(Ordering::Relaxed);
-    let ptr_use_total_ns = p.ptr_use_total_ns.load(Ordering::Relaxed);
-    let record_alloc_calls = p.record_alloc_calls.load(Ordering::Relaxed);
-    let record_alloc_total_ns = p.record_alloc_total_ns.load(Ordering::Relaxed);
-
-    let write_avg_ns = if write_calls == 0 {
-        0.0
-    } else {
-        write_total_ns as f64 / write_calls as f64
-    };
-    let read_avg_ns = if read_calls == 0 {
-        0.0
-    } else {
-        read_total_ns as f64 / read_calls as f64
-    };
-    let (alloc_entries, live_alloc_entries) = {
-        let amap = allocs().lock().unwrap();
-        let live = amap.values().filter(|m| m.live).count();
-        (amap.len(), live)
-    };
-    let tag_entries = tag_store::len();
-    let historical_live_tag_entries = tag_store::historical_live_len();
-    let dead_tag_entries = tag_store::dead_len();
-    let exact_parent_entries = exact_parent_index::len();
-    let tag_history_stats = tag_pruning::stats();
-    let call_arg_entries = call_arg_tags().lock().unwrap().len();
-    let ret_tag_entries = ret_tags().lock().unwrap().len();
-
-    eprintln!("[rusteze-runtime] hook profile (ns):");
-    eprintln!(
-        "  write: calls={} total={} avg_per_call={:.1} tag_lookup={} alias_check={} alloc_lookup={}",
-        write_calls, write_total_ns, write_avg_ns, write_tag_ns, write_alias_ns, write_alloc_ns
-    );
-    eprintln!(
-        "  read:  calls={} total={} avg_per_call={:.1} tag_lookup={} alias_check={} alloc_lookup={}",
-        read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
-    );
-    eprintln!(
-        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} lineage_repair={} insert={} tag_store_insert={} exact_parent_update={} lineage_cache_update={} alias_on_tag_created={}",
-        ref_create_calls,
-        ref_create_total_ns,
-        if ref_create_calls == 0 {
-            0.0
-        } else {
-            ref_create_total_ns as f64 / ref_create_calls as f64
-        },
-        ref_create_validate_ns,
-        ref_create_alloc_snapshot_ns,
-        ref_create_lineage_repair_ns,
-        ref_create_insert_ns,
-        ref_create_tag_store_insert_ns,
-        ref_create_exact_parent_update_ns,
-        ref_create_lineage_cache_update_ns,
-        ref_create_alias_on_tag_created_ns
-    );
-    eprintln!(
-        "  raw_create:  calls={} total={} avg_per_call={:.1}",
-        raw_create_calls,
-        raw_create_total_ns,
-        if raw_create_calls == 0 {
-            0.0
-        } else {
-            raw_create_total_ns as f64 / raw_create_calls as f64
-        }
-    );
-    eprintln!(
-        "  ptr_use:     calls={} total={} avg_per_call={:.1}",
-        ptr_use_calls,
-        ptr_use_total_ns,
-        if ptr_use_calls == 0 {
-            0.0
-        } else {
-            ptr_use_total_ns as f64 / ptr_use_calls as f64
-        }
-    );
-    eprintln!(
-        "  record_alloc:calls={} total={} avg_per_call={:.1}",
-        record_alloc_calls,
-        record_alloc_total_ns,
-        if record_alloc_calls == 0 {
-            0.0
-        } else {
-            record_alloc_total_ns as f64 / record_alloc_calls as f64
-        }
-    );
-    eprintln!(
-        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
-        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
-    );
-    eprintln!(
-        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} historical_live_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
-        tag_history_stats.active_epoch_buckets,
-        tag_history_stats.active_tag_entries,
-        tag_history_stats.historical_live_tag_entries,
-        tag_history_stats.dead_epoch_buckets,
-        tag_history_stats.dead_tag_entries,
-        tag_history_stats.shadowed_old_live_tag_candidates
-    );
-}
-
 /// Record/validate a write through a tracked pointer tag.
-/// Best-effort checks:
+/// For now this performs only best-effort checks:
 ///  - tag must exist
-///  - fast path uses tag-cached origin bounds + exact-base alloc lookup
-///  - slow path falls back to range lookup when cache is missing/invalid
+///  - if an allocation record exists at exactly `addr`, it must be live
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-#[track_caller]
-pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::write(profile);
+pub extern "C" fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
+    rz_ptr_write_impl(tag, addr, size);
+}
 
+#[track_caller]
+fn rz_ptr_write_impl(tag: u64, addr: usize, size: usize) {
     let tag = if tag == 0 {
         if rz_allow_untagged() {
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 1, 0, 0, 0)
+            rz_record_raw_ptr_creation_impl(addr, 1, 0, 0, 0)
         } else {
             tag
         }
@@ -2143,40 +1221,36 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
         return;
     }
-    let _g = RzRuntimeGuard::enter();
-    let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
-        let msg = append_location_if_enabled(
-            format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("UNKNOWN_TAG", msg);
-        return;
-    };
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+    let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
-        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-    } else {
-        Some(tag)
+        let Some(tmeta) = tmap.get(&tag) else {
+            let msg = append_location_if_enabled(
+                format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "UNKNOWN_TAG",
+                msg,
+            );
+            return;
+        };
+        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+        } else {
+            Some(tag)
+        };
+        (tmeta.clone(), sb_tag)
     };
-    if let Some(p) = profile {
-        rz_profile_add(&p.write_tag_lookup_ns, tag_lookup_start);
-    }
 
     if let Some(sb_tag) = sb_tag_opt {
-        let alias_check_start = profile.map(|_| Instant::now());
-        let alias_violation = active_alias_model().check_access(
+        if let Some(msg) = active_alias_model().check_access(
             sb_tag,
             tag,
             &tmeta,
             addr,
             size,
             AliasAccessKind::Write,
-        );
-        if let Some(p) = profile {
-            rz_profile_add(&p.write_alias_check_ns, alias_check_start);
-        }
-        if let Some(msg) = alias_violation {
+        ) {
             rz_violation(
                 active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -2185,77 +1259,26 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    // Fast path: tag-cached origin bounds + exact-base alloc lookup.
-    // Slow path falls back to range lookup only when cache is missing/invalid.
-    let alloc_lookup_start = profile.map(|_| Instant::now());
-    let trace_enabled = rz_log_enabled(LogLevel::Trace);
-    let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
-    let origin_base_alloc = alloc_from_origin_base(&tmeta);
-    let mut alloc_opt: Option<(usize, AllocMeta)> = None;
-
-    if !cached_origin_oob {
-        if tag_origin_contains_access(&tmeta, addr, size) {
-            alloc_opt = origin_base_alloc;
+    // Range-based allocation lookup.
+    let amap = allocs().lock().unwrap();
+    let alloc_opt = find_alloc_containing(&amap, addr);
+    if rz_log_enabled(LogLevel::Trace) {
+        rz_trace!("[rusteze-runtime] WRITE lookup: addr=0x{:x} size={} tag={}", addr, size, tag);
+        // Print up to 8 nearest bases <= addr for debugging.
+        let mut shown = 0usize;
+        for (b, m) in amap.range(..=addr).rev() {
+            if shown >= 8 { break; }
+            let end = b.saturating_add(m.size);
+            rz_trace!("  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}", b, m.size, m.live, m.epoch, end);
+            shown += 1;
         }
-
-        if alloc_opt.is_none() {
-            alloc_opt = if trace_enabled {
-                let amap = allocs().lock().unwrap();
-                rz_trace!(
-                    "[rusteze-runtime] WRITE lookup (slow): addr=0x{:x} size={} tag={}",
-                    addr,
-                    size,
-                    tag
-                );
-                let mut shown = 0usize;
-                for (b, m) in amap.range(..=addr).rev() {
-                    if shown >= 8 {
-                        break;
-                    }
-                    let end = b.saturating_add(m.size);
-                    rz_trace!(
-                        "  cand base=0x{:x} size={} live={} epoch={} end=0x{:x}",
-                        b,
-                        m.size,
-                        m.live,
-                        m.epoch,
-                        end
-                    );
-                    shown += 1;
-                }
-                find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-            } else {
-                live_alloc_cache::lookup_containing(addr).or_else(|| {
-                    let amap = allocs().lock().unwrap();
-                    find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-                })
-            };
-        }
-    } else if origin_base_alloc.is_none() {
-        // Cached origin exists but exact-base entry disappeared; revalidate via slow path.
-        alloc_opt = live_alloc_cache::lookup_containing(addr).or_else(|| {
-            let amap = allocs().lock().unwrap();
-            find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-        });
-    }
-
-    if let Some((base, ameta)) = alloc_opt {
-        refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
-    }
-    if let Some(p) = profile {
-        rz_profile_add(&p.write_alloc_lookup_ns, alloc_lookup_start);
     }
 
     let Some((base, ameta)) = alloc_opt else {
-        if rz_handle_untracked_region("WRITE", tag, &tmeta, addr, size) {
-            return;
-        }
-
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
-            || rz_allow_bounded_stack_ref_no_alloc_noise(&tmeta, addr, size)
         {
             return;
         }
@@ -2263,42 +1286,16 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_log_enabled(LogLevel::Trace) {
             rz_trace!("[rusteze-runtime] WRITE lookup result: no containing allocation");
         }
-        // If we can prove (via tag-cached origin + epoch snapshot) that this pointer was derived
+        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
-        let cached_origin_alloc = if tmeta.origin_known {
-            origin_base_alloc
-        } else {
-            None
-        };
-        let fallback_origin_alloc = if cached_origin_alloc.is_none() {
-            let amap = allocs().lock().unwrap();
-            let tmap = tags().lock().unwrap();
-            origin_alloc_for_tag(&tmap, &amap, tag).map(|(base, meta)| (base, *meta))
-        } else {
-            None
-        };
-        if let Some((obase, ometa)) = cached_origin_alloc.or(fallback_origin_alloc) {
+        let tmap = tags().lock().unwrap();
+        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 // If the access overlaps beyond the end of the origin allocation, it's OOB.
                 if addr >= obase && access_end > alloc_end {
-                    if rz_allow_stack_ref_oob_noise(&tmeta, &ometa, obase, addr, size) {
-                        return;
-                    }
-                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, &ometa, obase, addr, size)
-                    {
-                        return;
-                    }
-                    if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
-                        return;
-                    }
-                    if rz_allow_projected_raw_stack_slot_oob_noise(
-                        &tmeta, &ometa, obase, addr, size,
-                    ) {
-                        return;
-                    }
                     let msg = append_location_if_enabled(
                         format!(
                             "WRITE via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
@@ -2314,7 +1311,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     if rz_dump_alloc_match_addr_enabled() {
                         alloc_log_dump_contains(addr);
                     }
-                    rz_violation("OUT_OF_BOUNDS", msg);
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        msg,
+                    );
                     return;
                 }
             }
@@ -2336,7 +1336,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation("WRITE_TO_READONLY_STATIC", msg);
+                rz_violation(
+                    "WRITE_TO_READONLY_STATIC",
+                    msg,
+                );
                 return;
             }
         }
@@ -2353,7 +1356,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("WILD_POINTER", msg);
+        rz_violation(
+            "WILD_POINTER",
+            msg,
+        );
         return;
     };
 
@@ -2393,7 +1399,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("USE_AFTER_DEAD", msg);
+        rz_violation(
+            "USE_AFTER_DEAD",
+            msg,
+        );
         return;
     }
 
@@ -2432,7 +1441,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("STALE_POINTER_EPOCH_MISMATCH", msg);
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            msg,
+        );
         return;
     }
 
@@ -2453,7 +1465,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation("OUT_OF_BOUNDS", msg);
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
                 return;
             }
         };
@@ -2471,7 +1486,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
-            rz_violation("OUT_OF_BOUNDS", msg);
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
             return;
         }
     }
@@ -2494,7 +1512,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
                 if rz_dump_alloc_match_addr_enabled() {
                     alloc_log_dump_contains(addr);
                 }
-                rz_violation("OUT_OF_BOUNDS", msg);
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
                 return;
             }
         };
@@ -2505,10 +1526,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size)
-                || rz_allow_stack_raw_root_oob_noise(&tmeta, &ameta, base, addr, size)
-                || rz_allow_projected_raw_stack_slot_oob_noise(&tmeta, &ameta, base, addr, size)
-            {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
                 return;
             }
             let msg = append_location_if_enabled(
@@ -2524,7 +1542,10 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
             if rz_dump_alloc_match_addr_enabled() {
                 alloc_log_dump_contains(addr);
             }
-            rz_violation("OUT_OF_BOUNDS", msg);
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
             return;
         }
     }
@@ -2540,34 +1561,39 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 
 /// Like `__rz_ptr_write`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
-#[track_caller]
-pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
+pub extern "C" fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(tag, addr, size);
+    rz_ptr_write_impl(tag, addr, size);
 }
 
 /// Record/validate a read through a tracked pointer tag.
-/// Best-effort checks:
+/// For now this performs only best-effort checks:
 ///  - tag must exist
-///  - fast path uses tag-cached origin bounds + exact-base alloc lookup
-///  - slow path falls back to range lookup when cache is missing/invalid
+///  - if an allocation record exists at exactly `addr`, it must be live
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-#[track_caller]
-pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::read(profile);
+pub extern "C" fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
+    rz_ptr_read_impl(tag, addr, size);
+}
 
+#[track_caller]
+fn rz_ptr_read_impl(tag: u64, addr: usize, size: usize) {
     let tag = if tag == 0 {
         if rz_allow_untagged() {
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 0, 0, 0, 0)
+            rz_record_raw_ptr_creation_impl(addr, 0, 0, 0, 0)
         } else {
             tag
         }
@@ -2584,40 +1610,36 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         }
         return;
     }
-    let _g = RzRuntimeGuard::enter();
-    let tag_lookup_start = profile.map(|_| Instant::now());
-    let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
-        let msg = append_location_if_enabled(
-            format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("UNKNOWN_TAG", msg);
-        return;
-    };
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+    let (tmeta, sb_tag_opt) = {
         let tmap = tags().lock().unwrap();
-        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-    } else {
-        Some(tag)
+        let Some(tmeta) = tmap.get(&tag) else {
+            let msg = append_location_if_enabled(
+                format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(
+                "UNKNOWN_TAG",
+                msg,
+            );
+            return;
+        };
+        let sb_tag = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+            active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+        } else {
+            Some(tag)
+        };
+        (tmeta.clone(), sb_tag)
     };
-    if let Some(p) = profile {
-        rz_profile_add(&p.read_tag_lookup_ns, tag_lookup_start);
-    }
 
     if let Some(sb_tag) = sb_tag_opt {
-        let alias_check_start = profile.map(|_| Instant::now());
-        let alias_violation = active_alias_model().check_access(
+        if let Some(msg) = active_alias_model().check_access(
             sb_tag,
             tag,
             &tmeta,
             addr,
             size,
             AliasAccessKind::Read,
-        );
-        if let Some(p) = profile {
-            rz_profile_add(&p.read_alias_check_ns, alias_check_start);
-        }
-        if let Some(msg) = alias_violation {
+        ) {
             rz_violation(
                 active_alias_model().violation_kind(),
                 append_location_if_enabled(msg, "RZ_LOG_LOC"),
@@ -2626,89 +1648,28 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         }
     }
 
-    // Fast path: tag-cached origin bounds + exact-base alloc lookup.
-    // Slow path falls back to range lookup only when cache is missing/invalid.
-    let alloc_lookup_start = profile.map(|_| Instant::now());
-    let trace_enabled = rz_log_enabled(LogLevel::Trace);
-    let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
-    let origin_base_alloc = alloc_from_origin_base(&tmeta);
-    let mut alloc_opt: Option<(usize, AllocMeta)> = None;
-
-    if !cached_origin_oob {
-        if tag_origin_contains_access(&tmeta, addr, size) {
-            alloc_opt = origin_base_alloc;
-        }
-
-        if alloc_opt.is_none() {
-            alloc_opt = if trace_enabled {
-                let amap = allocs().lock().unwrap();
-                find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-            } else {
-                live_alloc_cache::lookup_containing(addr).or_else(|| {
-                    let amap = allocs().lock().unwrap();
-                    find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-                })
-            };
-        }
-    } else if origin_base_alloc.is_none() {
-        // Cached origin exists but exact-base entry disappeared; revalidate via slow path.
-        alloc_opt = live_alloc_cache::lookup_containing(addr).or_else(|| {
-            let amap = allocs().lock().unwrap();
-            find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
-        });
-    }
-
-    if let Some((base, ameta)) = alloc_opt {
-        refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
-    }
-    if let Some(p) = profile {
-        rz_profile_add(&p.read_alloc_lookup_ns, alloc_lookup_start);
-    }
+    // Range-based allocation lookup.
+    let amap = allocs().lock().unwrap();
+    let alloc_opt = find_alloc_containing(&amap, addr);
 
     let Some((base, ameta)) = alloc_opt else {
-        if rz_handle_untracked_region("READ", tag, &tmeta, addr, size) {
-            return;
-        }
-
         // Best-effort: when stack allocation metadata is missing, do not classify
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
-            || rz_allow_bounded_stack_ref_no_alloc_noise(&tmeta, addr, size)
         {
             return;
         }
 
-        // If we can prove (via tag-cached origin + epoch snapshot) that this pointer was derived
+        // If we can prove (via tag provenance + epoch snapshot) that this pointer was derived
         // from a particular allocation, classify this as OUT_OF_BOUNDS rather than WILD_POINTER.
-        let cached_origin_alloc = if tmeta.origin_known {
-            origin_base_alloc
-        } else {
-            None
-        };
-        let fallback_origin_alloc = if cached_origin_alloc.is_none() {
-            let amap = allocs().lock().unwrap();
-            let tmap = tags().lock().unwrap();
-            origin_alloc_for_tag(&tmap, &amap, tag).map(|(base, meta)| (base, *meta))
-        } else {
-            None
-        };
-        if let Some((obase, ometa)) = cached_origin_alloc.or(fallback_origin_alloc) {
+        let tmap = tags().lock().unwrap();
+        if let Some((obase, ometa)) = origin_alloc_for_tag(&tmap, &amap, tag) {
             if ometa.size != 0 && size != 0 {
                 let access_end = addr.saturating_add(size);
                 let alloc_end = obase.saturating_add(ometa.size);
 
                 if addr >= obase && access_end > alloc_end {
-                    if rz_allow_stack_ref_oob_noise(&tmeta, &ometa, obase, addr, size) {
-                        return;
-                    }
-                    if rz_allow_stack_ref_root_boundary_oob_noise(&tmeta, &ometa, obase, addr, size)
-                    {
-                        return;
-                    }
-                    if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
-                        return;
-                    }
                     let msg = append_location_if_enabled(
                         format!(
                             "READ via tag={tag} addr=0x{addr:x} size={size}\n(no containing alloc for addr, but tag derives from alloc)\norigin_alloc_base=0x{obase:x} origin_alloc_end=0x{alloc_end:x} origin_alloc_size={} origin_epoch={} tag_epoch={} kind={:?} parent={} pointee=0x{:x}",
@@ -2724,7 +1685,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     if rz_dump_alloc_match_addr_enabled() {
                         alloc_log_dump_contains(addr);
                     }
-                    rz_violation("OUT_OF_BOUNDS", msg);
+                    rz_violation(
+                        "OUT_OF_BOUNDS",
+                        msg,
+                    );
                     return;
                 }
             }
@@ -2748,7 +1712,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("WILD_POINTER", msg);
+        rz_violation(
+            "WILD_POINTER",
+            msg,
+        );
         return;
     };
 
@@ -2776,7 +1743,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("USE_AFTER_DEAD", msg);
+        rz_violation(
+            "USE_AFTER_DEAD",
+            msg,
+        );
         return;
     }
 
@@ -2815,7 +1785,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         if rz_dump_alloc_match_addr_enabled() {
             alloc_log_dump_contains(addr);
         }
-        rz_violation("STALE_POINTER_EPOCH_MISMATCH", msg);
+        rz_violation(
+            "STALE_POINTER_EPOCH_MISMATCH",
+            msg,
+        );
         return;
     }
 
@@ -2836,7 +1809,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                     ),
                     "RZ_LOG_LOC",
                 );
-                rz_violation("OUT_OF_BOUNDS", msg);
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
                 return;
             }
         };
@@ -2854,7 +1830,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 ),
                 "RZ_LOG_LOC",
             );
-            rz_violation("OUT_OF_BOUNDS", msg);
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
             return;
         }
     }
@@ -2877,7 +1856,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
                 if rz_dump_alloc_match_addr_enabled() {
                     alloc_log_dump_contains(addr);
                 }
-                rz_violation("OUT_OF_BOUNDS", msg);
+                rz_violation(
+                    "OUT_OF_BOUNDS",
+                    msg,
+                );
                 return;
             }
         };
@@ -2888,9 +1870,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         };
 
         if end > alloc_end {
-            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size)
-                || rz_allow_stack_raw_root_oob_noise(&tmeta, &ameta, base, addr, size)
-            {
+            if rz_allow_stack_ref_oob_noise(&tmeta, &ameta, base, addr, size) {
                 return;
             }
             let msg = append_location_if_enabled(
@@ -2906,7 +1886,10 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
             if rz_dump_alloc_match_addr_enabled() {
                 alloc_log_dump_contains(addr);
             }
-            rz_violation("OUT_OF_BOUNDS", msg);
+            rz_violation(
+                "OUT_OF_BOUNDS",
+                msg,
+            );
             return;
         }
     }
@@ -2922,20 +1905,24 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
 
 /// Like `__rz_ptr_read`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
-#[track_caller]
-pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
+pub extern "C" fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_read(tag, addr, size);
+    rz_ptr_read_impl(tag, addr, size);
 }
 
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     call_arg_tags()
         .lock()
         .unwrap()
@@ -2945,7 +1932,9 @@ pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return 0;
+    };
     let tag = call_arg_tags()
         .lock()
         .unwrap()
@@ -2960,19 +1949,19 @@ pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     ret_tags().lock().unwrap().insert((callee_id, addr), tag);
 }
 
 /// Take (consume) a pushed return-tag for a callee/return-address pair.
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
-    let _g = RzRuntimeGuard::enter();
-    ret_tags()
-        .lock()
-        .unwrap()
-        .remove(&(callee_id, addr))
-        .unwrap_or(0)
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return 0;
+    };
+    ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0)
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -2987,25 +1976,23 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     alias_exempt: u8,
     bounds_len: usize,
 ) -> u64 {
-    let _g = RzRuntimeGuard::enter();
-    let tag = {
-        ret_tags()
-            .lock()
-            .unwrap()
-            .remove(&(callee_id, addr))
-            .unwrap_or(0)
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return 0;
     };
+    let tag = { ret_tags().lock().unwrap().remove(&(callee_id, addr)).unwrap_or(0) };
     if tag != 0 {
         return tag;
     }
     // Fallback: synthesize a fresh raw-pointer tag rooted at this address.
-    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len)
+    rz_record_raw_ptr_creation_impl(addr, is_mut, 0, alias_exempt, bounds_len)
 }
 
 /// Notify runtime alias models that the current instrumented function is exiting.
 #[no_mangle]
 pub extern "C" fn __rz_exit_fn(callee_id: u64) {
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     active_alias_model().on_call_exit(callee_id);
 }
 
@@ -3026,27 +2013,18 @@ pub extern "C" fn __record_ref_creation(
     alias_exempt: u8,
     bounds_len: usize,
 ) -> u64 {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::ref_create(profile);
-    let _g = RzRuntimeGuard::enter();
-    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let kind = if is_mut != 0 {
-        PtrKind::RefMut
-    } else {
-        PtrKind::RefShared
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return 0;
     };
-    // `alias_exempt` is a bitfield emitted by instrumentation:
-    // - bit0: alias-exempt classification
-    // - bit1: basic lineage-repair hint
-    // - bit2: strong root-origin repair hint
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+    let kind = if is_mut != 0 { PtrKind::RefMut } else { PtrKind::RefShared };
 
     let validate_start = profile.map(|_| Instant::now());
     if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
         kind,
         parent_tag,
-        alias_exempt_flag,
+        alias_exempt != 0,
         bounds_len,
     ) {
         rz_violation(
@@ -3062,35 +2040,19 @@ pub extern "C" fn __record_ref_creation(
     // allocation snapshot to keep stack-slot reuse detectable.
     // Exception: if the new ref clearly points into a different allocation than the parent
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
-    let mut alloc_is_stack = false;
-    let mut alloc_size = 0usize;
-    let alloc_snapshot_start = profile.map(|_| Instant::now());
-    let (
-        mut alloc_epoch,
-        mut alloc_live_at_creation,
-        mut inherited_bounds_len,
-        mut resolved_parent_tag,
-    ) = if parent_tag != 0 {
-        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) =
-            tag_store::get(parent_tag)
-                .as_ref()
-                .map(|p| {
-                    (
-                        p.alloc_epoch,
-                        p.alloc_live_at_creation,
-                        Some(p.pointee_addr),
-                        p.bounds_len,
-                    )
-                })
-                .unwrap_or((0, false, None, 0));
+    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len, resolved_parent_tag) = if parent_tag != 0 {
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
+            .lock()
+            .unwrap()
+            .get(&parent_tag)
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
+            .unwrap_or((0, false, None, 0));
 
         if let Some(parent_pointee) = parent_pointee {
             let parent_alloc = lookup_alloc_snapshot(parent_pointee);
             let pointee_alloc = lookup_alloc_snapshot(pointee_addr);
             match (parent_alloc, pointee_alloc) {
                 (Some((parent_base, _parent_meta)), Some((pointee_base, pointee_meta))) => {
-                    alloc_is_stack = pointee_meta.is_stack;
-                    alloc_size = pointee_meta.size;
                     if parent_base != pointee_base
                         || (parent_epoch != 0
                             && pointee_meta.epoch != 0
@@ -3116,8 +2078,6 @@ pub extern "C" fn __record_ref_creation(
                     }
                 }
                 (None, Some((_pointee_base, pointee_meta))) => {
-                    alloc_is_stack = pointee_meta.is_stack;
-                    alloc_size = pointee_meta.size;
                     (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
                 }
                 (None, None) => {
@@ -3139,8 +2099,6 @@ pub extern "C" fn __record_ref_creation(
         // inheriting stale bounds/epoch from recycled stack storage.
         lookup_alloc_snapshot(pointee_addr)
             .map(|(_base, m)| {
-                alloc_is_stack = m.is_stack;
-                alloc_size = m.size;
                 if m.is_stack && !m.live {
                     (0, false, 0, 0)
                 } else {
@@ -3149,97 +2107,7 @@ pub extern "C" fn __record_ref_creation(
             })
             .unwrap_or((0, false, 0, 0))
     };
-    if let (Some(p), Some(start)) = (profile, alloc_snapshot_start) {
-        rz_profile_add_elapsed(&p.ref_create_alloc_snapshot_ns, start);
-    }
-
-    // Optimized MIR can lose parent tags for same-address ref reborrows on both stack and heap
-    // objects. Example:
-    //   let kind = self.kind();   // emits `&self` on a `BytesMut`
-    //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
-    // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
-    // that repair even when we reject broader overlap-based guessing.
-    let lineage_repair_start = profile.map(|_| Instant::now());
-    if resolved_parent_tag == 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RefMut),
-        );
-        if repaired_parent != 0 {
-            resolved_parent_tag = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                if inherited_bounds_len == 0 {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_ref_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
-                pointee_addr,
-                parent_tag,
-                resolved_parent_tag,
-                alloc_epoch,
-                alloc_size
-            );
-        }
-    }
-    if let (Some(p), Some(start)) = (profile, lineage_repair_start) {
-        rz_profile_add_elapsed(&p.ref_create_lineage_repair_ns, start);
-    }
-
-    // Optimized MIR may create `&mut (*raw_root)` or `&(*raw_root)` from a root raw tag that was
-    // synthesized only because provenance was temporarily lost while extracting a pointee from a
-    // wrapper (e.g. Box/NonNull/Result wrappers). If we can recover a same-address non-root tag
-    // in the same allocation epoch, prefer it over the raw root to keep the borrow tree intact.
-    if resolved_parent_tag != 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
-        let parent_is_root_raw = tag_store::get(resolved_parent_tag)
-            .as_ref()
-            .is_some_and(|meta| {
-                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
-            });
-        if parent_is_root_raw {
-            let repaired_parent = recover_parent_for_alloc_root(
-                pointee_addr,
-                alloc_epoch,
-                matches!(kind, PtrKind::RefMut),
-            );
-            if repaired_parent != 0 && repaired_parent != resolved_parent_tag {
-                let previous_parent = resolved_parent_tag;
-                resolved_parent_tag = repaired_parent;
-                if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                    if inherited_bounds_len == 0 {
-                        inherited_bounds_len = parent_meta.bounds_len;
-                    }
-                    if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                        alloc_epoch = parent_meta.alloc_epoch;
-                        alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                    }
-                }
-                rz_trace!(
-                    "__record_ref_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
-                    pointee_addr,
-                    parent_tag,
-                    previous_parent,
-                    resolved_parent_tag,
-                    alloc_epoch,
-                    alloc_size
-                );
-            }
-        }
-    }
-
-    let bounds_len = if bounds_len != 0 {
-        bounds_len
-    } else {
-        inherited_bounds_len
-    };
-    let insert_start = profile.map(|_| Instant::now());
-    let (origin_known, origin_base, origin_end) =
-        snapshot_tag_origin(pointee_addr, resolved_parent_tag);
+    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
         pointee_addr,
@@ -3248,33 +2116,10 @@ pub extern "C" fn __record_ref_creation(
         escaped: false,
         alloc_epoch,
         alloc_live_at_creation,
-        alias_exempt: alias_exempt_flag,
-        lineage_hint: alias_exempt & 0b0000_1110,
+        alias_exempt: alias_exempt != 0,
         bounds_len,
-        origin_known,
-        origin_base,
-        origin_end,
     };
-    let tag_store_insert_start = profile.map(|_| Instant::now());
-    tag_store::insert(tag, tmeta);
-    if tmeta.alloc_epoch != 0 && tmeta.origin_known {
-        tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
-    }
-    tag_pruning::remember_live_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
-        rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
-    }
-    let exact_parent_update_start = profile.map(|_| Instant::now());
-    exact_parent_index::remember_non_root_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, exact_parent_update_start) {
-        rz_profile_add_elapsed(&p.ref_create_exact_parent_update_ns, start);
-    }
-    let lineage_cache_update_start = profile.map(|_| Instant::now());
-    lineage_cache::remember_non_root_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, lineage_cache_update_start) {
-        rz_profile_add_elapsed(&p.ref_create_lineage_cache_update_ns, start);
-    }
-    let alias_on_tag_created_start = profile.map(|_| Instant::now());
+    tags().lock().unwrap().insert(tag, tmeta.clone());
     active_alias_model().on_tag_created(tag, &tmeta);
     if let (Some(p), Some(start)) = (profile, alias_on_tag_created_start) {
         rz_profile_add_elapsed(&p.ref_create_alias_on_tag_created_ns, start);
@@ -3307,77 +2152,44 @@ pub extern "C" fn __record_raw_ptr_creation(
     alias_exempt: u8,
     bounds_len: usize,
 ) -> u64 {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::raw_create(profile);
-    let _g = RzRuntimeGuard::enter();
-    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let kind = if is_mut != 0 {
-        PtrKind::RawMut
-    } else {
-        PtrKind::RawConst
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return 0;
     };
-    // `alias_exempt` is a bitfield emitted by instrumentation:
-    // - bit0: alias-exempt classification
-    // - bit1: basic lineage-repair hint
-    // - bit2: strong root-origin repair hint
-    // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
-    let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
-    let mut resolved_parent = derived_from;
-    let mut alloc_is_stack = false;
-    let mut alloc_size = 0usize;
-    let mut parent_alloc_mismatch = false;
-    let mut parent_is_root = false;
-    let mut parent_pointee_addr: Option<usize> = None;
+    rz_record_raw_ptr_creation_impl(pointee_addr, is_mut, derived_from, alias_exempt, bounds_len)
+}
+
+fn rz_record_raw_ptr_creation_impl(
+    pointee_addr: usize,
+    is_mut: u8,
+    derived_from: u64,
+    alias_exempt: u8,
+    bounds_len: usize,
+) -> u64 {
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+    let kind = if is_mut != 0 { PtrKind::RawMut } else { PtrKind::RawConst };
 
     // IMPORTANT: On retagging/derived pointers (derived_from != 0), prefer inheriting the
     // parent's alloc_epoch to keep the original allocation-instance snapshot and make
     // stack-slot reuse detectable as stale pointers. Exception: if the derived pointer
     // clearly points into a different allocation than the parent, refresh to the pointee's
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
-    let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) =
-        if derived_from != 0 {
-            let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) =
-                tag_store::get(derived_from)
-                    .as_ref()
-                    .map(|p| {
-                        (
-                            p.alloc_epoch,
-                            p.alloc_live_at_creation,
-                            Some(p.pointee_addr),
-                            p.bounds_len,
-                            p.parent,
-                        )
-                    })
-                    .unwrap_or((0, false, None, 0, 0));
-            parent_is_root = parent_parent == 0;
-            parent_pointee_addr = parent_pointee;
+    let (alloc_epoch, alloc_live_at_creation, inherited_bounds_len) = if derived_from != 0 {
+        let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) = tags()
+            .lock()
+            .unwrap()
+            .get(&derived_from)
+            .map(|p| (p.alloc_epoch, p.alloc_live_at_creation, Some(p.pointee_addr), p.bounds_len))
+            .unwrap_or((0, false, None, 0));
 
-            if let Some(parent_pointee) = parent_pointee {
-                let parent_alloc = lookup_alloc_snapshot(parent_pointee);
-                let pointee_alloc = lookup_alloc_snapshot(pointee_addr);
-                if let Some((pointee_base, pointee_meta)) = pointee_alloc {
-                    alloc_is_stack = pointee_meta.is_stack;
-                    alloc_size = pointee_meta.size;
-                    match parent_alloc {
-                        Some((parent_base, _)) if parent_base == pointee_base => {
-                            (parent_epoch, parent_live, inherited_bounds_len)
-                        }
-                        Some((_parent_base, _)) => {
-                            parent_alloc_mismatch = true;
-                            (pointee_meta.epoch, pointee_meta.live, 0)
-                        }
-                        None => {
-                            // Parent alloc metadata can be missing in optimized lowering
-                            // even when the child pointee alloc is known. Prefer the child
-                            // alloc snapshot and allow exact-address lineage recovery below.
-                            if parent_pointee != pointee_addr {
-                                parent_alloc_mismatch = true;
-                            }
-                            (pointee_meta.epoch, pointee_meta.live, 0)
-                        }
-                    }
+        if let Some(parent_pointee) = parent_pointee {
+            let amap = allocs().lock().unwrap();
+            let parent_alloc = find_alloc_containing(&amap, parent_pointee);
+            let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+            if let (Some((parent_base, _)), Some((pointee_base, pointee_meta))) =
+                (parent_alloc, pointee_alloc)
+            {
+                if parent_base != pointee_base {
+                    (pointee_meta.epoch, pointee_meta.live, 0)
                 } else {
                     (parent_epoch, parent_live, inherited_bounds_len)
                 }
@@ -3385,129 +2197,35 @@ pub extern "C" fn __record_raw_ptr_creation(
                 (parent_epoch, parent_live, inherited_bounds_len)
             }
         } else {
-            // Root creation: if the match is a dead stack slot, treat metadata as unknown
-            // to avoid inheriting stale bounds/epoch from recycled stack storage.
-            match lookup_alloc_snapshot(pointee_addr) {
-                Some((_base, m)) => {
-                    alloc_is_stack = m.is_stack;
-                    alloc_size = m.size;
-                    if m.is_stack && !m.live {
-                        (0, false, 0)
-                    } else {
-                        (m.epoch, m.live, 0)
-                    }
-                }
-                None => (0, false, 0),
-            }
-        };
-
-    // Optimized MIR can materialize projected raw pointers from wrapper/owner internals
-    // (e.g. Pin/Box/NonNull/Unique field extraction) without a recoverable source tag and emit
-    // `derived_from=0`. When this happens on a tracked allocation, attach to a same-address
-    // recent non-root tag in the same epoch to preserve lineage instead of seeding a fresh raw
-    // root that can later freeze an otherwise-valid borrow family.
-    if resolved_parent == 0
-        && projected_raw_hint
-        && alloc_epoch != 0
-        && alloc_size >= std::mem::size_of::<usize>()
-    {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RawMut),
-        );
-        if repaired_parent != 0 {
-            resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if inherited_bounds_len == 0 {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_raw_ptr_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
-                pointee_addr,
-                derived_from,
-                resolved_parent,
-                alloc_epoch,
-                alloc_size
-            );
+            (parent_epoch, parent_live, inherited_bounds_len)
         }
-    }
-
-    // Derived pointer creation can still lose effective lineage in optimized async lowering:
-    // a raw pointer may be emitted as "derived" from a freshly synthesized root that points to
-    // a different stack slot than the raw pointee. In that shape we prefer exact same-address
-    // non-root recovery over keeping the mismatched root parent.
-    if resolved_parent != 0
-        && parent_is_root
-        && (parent_alloc_mismatch || parent_pointee_addr.map_or(false, |pp| pp != pointee_addr))
-        && alloc_epoch != 0
-        && alloc_size >= std::mem::size_of::<usize>()
-    {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RawMut),
-        );
-        if repaired_parent != 0 && repaired_parent != resolved_parent {
-            let previous_parent = resolved_parent;
-            resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if inherited_bounds_len == 0 {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_raw_ptr_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
-                pointee_addr,
-                derived_from,
-                previous_parent,
-                resolved_parent,
-                alloc_epoch,
-                alloc_size
-            );
-        }
-    }
-
-    let bounds_len = if bounds_len != 0 {
-        bounds_len
-    } else if carry_bounds_from_source {
-        inherited_bounds_len
     } else {
-        0
+        // Root creation: if the match is a dead stack slot, treat metadata as unknown
+        // to avoid inheriting stale bounds/epoch from recycled stack storage.
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, pointee_addr)
+            .map(|(_base, m)| {
+                if m.is_stack && !m.live {
+                    (0, false, 0)
+                } else {
+                    (m.epoch, m.live, 0)
+                }
+            })
+            .unwrap_or((0, false, 0))
     };
-    let (origin_known, origin_base, origin_end) =
-        snapshot_tag_origin(pointee_addr, resolved_parent);
+    let bounds_len = if bounds_len != 0 { bounds_len } else { inherited_bounds_len };
 
     let tmeta = TagMeta {
         pointee_addr,
         kind,
-        parent: resolved_parent,
+        parent: derived_from,
         escaped: false,
         alloc_epoch,
         alloc_live_at_creation,
-        alias_exempt: alias_exempt_flag,
-        lineage_hint: alias_exempt & 0b0000_1110,
+        alias_exempt: alias_exempt != 0,
         bounds_len,
-        origin_known,
-        origin_base,
-        origin_end,
     };
-    tag_store::insert(tag, tmeta);
-    if tmeta.alloc_epoch != 0 && tmeta.origin_known {
-        tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
-    }
-    tag_pruning::remember_live_tag(tag, &tmeta);
-    exact_parent_index::remember_non_root_tag(tag, &tmeta);
-    lineage_cache::remember_non_root_tag(tag, &tmeta);
+    tags().lock().unwrap().insert(tag, tmeta.clone());
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {
@@ -3516,13 +2234,11 @@ pub extern "C" fn __record_raw_ptr_creation(
         _ => "?",
     };
     rz_trace!(
-        "__record_raw_ptr_creation called: tag={}, from={} (resolved={}), pointee=0x{:x}, kind={}, bounds={}",
+        "__record_raw_ptr_creation called: tag={}, from={}, pointee=0x{:x}, kind={}",
         tag,
         derived_from,
-        resolved_parent,
         pointee_addr,
-        kind_str,
-        bounds_len
+        kind_str
     );
     tag
 }
@@ -3534,9 +2250,9 @@ pub extern "C" fn __record_raw_ptr_creation(
 /// `addr` is the pointer value (exposed provenance), not an interior offset.
 #[no_mangle]
 pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::ptr_use(profile);
-    let _g = RzRuntimeGuard::enter();
+    let Some(_g) = rz_try_enter_runtime_hook() else {
+        return;
+    };
     if tag == 0 {
         rz_trace!(
             "[rusteze-runtime] USE: untagged ptr addr=0x{:x} (likely untracked/propagation missing)",
@@ -3545,8 +2261,9 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
         return;
     }
 
-    if let Some(tmeta) = tag_store::mark_escaped(tag) {
-        tag_pruning::mark_tag_escaped(tag, &tmeta);
+    let mut tmap = tags().lock().unwrap();
+    if let Some(tmeta) = tmap.get_mut(&tag) {
+        tmeta.escaped = true;
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,
@@ -3557,10 +2274,6 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
             tmeta.escaped
         );
     } else {
-        rz_trace!(
-            "[rusteze-runtime] USE: unknown tag={} addr=0x{:x}",
-            tag,
-            addr
-        );
+        rz_trace!("[rusteze-runtime] USE: unknown tag={} addr=0x{:x}", tag, addr);
     }
 }
