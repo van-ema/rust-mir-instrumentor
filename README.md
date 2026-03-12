@@ -54,6 +54,94 @@ make instrument EXAMPLE=hello PROFILE=release
 make run EXAMPLE=hello PROFILE=release
 ```
 
+## Running with dataflow analysis
+
+There are three distinct analysis modes.
+
+### 1. Metadata-local dataflow only
+
+This is the sound intra-procedural pass that prunes redundant metadata propagation
+(`TagProp`, ref-ancestor propagation). It does not change semantic hooks.
+
+```bash
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_METADATA_DATAFLOW=1 \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+```
+
+Add `RZ_METADATA_DATAFLOW_STATS=1` to print pruning totals during compilation.
+
+### 2. Local backward unsafe-sensitive analysis
+
+This is the active hook-gating analysis. It starts from unsafe-sensitive sinks in
+each MIR body, propagates relevance backward, and prunes access/creation hooks for
+pointer locals that cannot reach those sinks inside the current function.
+
+```bash
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_UNSAFE_DATAFLOW=1 \
+RZ_UNSAFE_DATAFLOW_STATS=1 \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+```
+
+This mode is single-build and does not require summary artifacts.
+
+### 3. Interprocedural unsafe-sensitive analysis
+
+This is the current cross-crate path. It runs in three phases:
+
+1. analyze-only build dumping per-function unsafe summaries
+2. offline fixed-point merge across crates
+3. normal instrumented build consuming merged summaries conservatively
+
+Use the wrapper:
+
+```bash
+AFL_PATH=/path/to/AFLplusplus \
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_INTERPROC_UNSAFE_SUMMARIES=1 \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+```
+
+The wrapper delegates to `scripts/afl_build_interproc.sh`.
+
+Manual equivalent:
+
+```bash
+AFL_PATH=/path/to/AFLplusplus \
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+HARNESS_TARGET_DIR=./target/afl-release-bytes-summary \
+RZ_ANALYZE_UNSAFE_SUMMARIES=1 \
+RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP=1 \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+
+python3 ./scripts/merge_unsafe_summaries.py \
+  --input-dir ./target/afl-release-bytes-summary/rusteze-unsafe-summaries \
+  --output-dir ./target/afl-release-bytes-merged \
+  --report ./target/afl-release-bytes-merged/merge.report.txt
+
+AFL_PATH=/path/to/AFLplusplus \
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_USE_UNSAFE_SUMMARIES=1 \
+RZ_UNSAFE_SUMMARY_INPUT_DIR=./target/afl-release-bytes-merged \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+```
+
+For benchmarking this mode, aggregate the final
+`[rusteze][unsafe-dflow][totals] crate=...` line for each crate across the full
+build log. Looking only at the final driver crate misses most dependency-side
+hook reductions.
+
 ## Env
 
 Project-specific environment variables are grouped below by component/script.
