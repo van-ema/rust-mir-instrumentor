@@ -10,6 +10,69 @@ FORWARD_TO_RETURN = 0x20000
 INHERITED_ESCAPE = 0x40000
 
 
+def merge_summary_into(dst, src):
+    dst["has_direct_sink"] = dst.get("has_direct_sink", False) or src.get("has_direct_sink", False)
+    dst["calls_unknown_boundary_direct"] = dst.get(
+        "calls_unknown_boundary_direct",
+        dst.get("calls_unknown_boundary", False),
+    ) or src.get(
+        "calls_unknown_boundary_direct",
+        src.get("calls_unknown_boundary", False),
+    )
+    dst["calls_unknown_boundary_inherited"] = dst.get(
+        "calls_unknown_boundary_inherited", False
+    ) or src.get("calls_unknown_boundary_inherited", False)
+    dst["calls_unknown_boundary"] = (
+        dst["calls_unknown_boundary_direct"] or dst["calls_unknown_boundary_inherited"]
+    )
+
+    dst_args = {arg["arg_index"]: arg for arg in dst.setdefault("ptr_args", [])}
+    for src_arg in src.get("ptr_args", []):
+        arg = dst_args.get(src_arg["arg_index"])
+        if arg is None:
+            arg = {
+                "arg_index": src_arg["arg_index"],
+                "direct_sink_mask": 0,
+                "propagation_mask": 0,
+            }
+            dst["ptr_args"].append(arg)
+            dst_args[src_arg["arg_index"]] = arg
+        arg["direct_sink_mask"] |= src_arg["direct_sink_mask"]
+        arg["propagation_mask"] |= src_arg["propagation_mask"]
+    dst["ptr_args"].sort(key=lambda e: e["arg_index"])
+
+
+def add_trait_alias_records(records, order_by_crate):
+    aliases = {}
+    for key, rec in list(records.items()):
+        trait_hash = rec.get("trait_function_hash")
+        if not trait_hash:
+            continue
+        alias_key = (rec["crate_name"], trait_hash)
+        alias = aliases.get(alias_key)
+        if alias is None:
+            alias = {
+                "crate_name": rec["crate_name"],
+                "function": rec.get("trait_function") or rec["function"],
+                "function_hash": trait_hash,
+                "trait_function": rec.get("trait_function") or rec["function"],
+                "trait_function_hash": trait_hash,
+                "has_direct_sink": False,
+                "calls_unknown_boundary": False,
+                "calls_unknown_boundary_direct": False,
+                "calls_unknown_boundary_inherited": False,
+                "ptr_args": [],
+                "local_callsites": [],
+            }
+            aliases[alias_key] = alias
+        merge_summary_into(alias, rec)
+    records.update(aliases)
+    for crate_name in order_by_crate:
+        order_by_crate[crate_name].extend(
+            key for key in aliases if key[0] == crate_name and key not in order_by_crate[crate_name]
+        )
+
+
 def load_dir_records(input_dir: Path):
     records = {}
     order_by_crate = {}
@@ -23,7 +86,8 @@ def load_dir_records(input_dir: Path):
                 if not line:
                     continue
                 rec = json.loads(line)
-                key = (rec["crate_name"], rec["function"])
+                function_key = rec.get("function_hash") or rec["function"]
+                key = (rec["crate_name"], function_key)
                 records[key] = rec
                 crate_records.append(key)
                 filename_by_crate.setdefault(rec["crate_name"], path.name)
@@ -31,6 +95,7 @@ def load_dir_records(input_dir: Path):
             crate_name = crate_records[0][0]
             order_by_crate.setdefault(crate_name, []).extend(crate_records)
 
+    add_trait_alias_records(records, order_by_crate)
     return records, order_by_crate, filename_by_crate
 
 
@@ -43,11 +108,14 @@ def load_single_file(path: Path):
             if not line:
                 continue
             rec = json.loads(line)
-            key = (rec["crate_name"], rec["function"])
+            function_key = rec.get("function_hash") or rec["function"]
+            key = (rec["crate_name"], function_key)
             records[key] = rec
             order.append(key)
     crate_name = order[0][0] if order else path.stem
-    return records, {crate_name: order}, {crate_name: path.name}
+    order_by_crate = {crate_name: order}
+    add_trait_alias_records(records, order_by_crate)
+    return records, order_by_crate, {crate_name: path.name}
 
 
 def ensure_arg(summary, arg_index):
@@ -66,7 +134,10 @@ def ensure_arg(summary, arg_index):
 
 
 def callee_key(call):
-    return (call["callee_crate_name"], call["callee_function"])
+    return (
+        call["callee_crate_name"],
+        call.get("callee_function_hash") or call["callee_function"],
+    )
 
 
 def propagate_once(records):
@@ -214,7 +285,7 @@ def write_report(base_records, merged_records, order_by_crate, report_path: Path
                     if prop_added & FORWARD_TO_RETURN:
                         lines.append(f"arg[{arg_index}].propagation.forward_to_return")
                 if lines:
-                    f.write(f"{crate_name}::{key[1]}\n")
+                    f.write(f"{crate_name}::{base['function']}\n")
                     for line in lines:
                         f.write(f"  - {line}\n")
 

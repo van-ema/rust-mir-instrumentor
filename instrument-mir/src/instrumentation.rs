@@ -60,6 +60,19 @@ struct UnsafeDflowStats {
 }
 
 #[derive(Default)]
+struct UnsafeCallDflowStats {
+    seed_arg_unknown_boundary: usize,
+    seed_arg_local_summary_missing: usize,
+    seed_arg_summary_direct_sink: usize,
+    seed_arg_summary_escape_unknown_direct: usize,
+    seed_arg_summary_escape_unknown_inherited: usize,
+    seed_arg_raw_fallback: usize,
+    backward_dst_unknown_boundary: usize,
+    backward_dst_local_summary_missing: usize,
+    backward_dst_forward_to_return: usize,
+}
+
+#[derive(Default)]
 struct UnsafeSummaryStats {
     functions_seen: usize,
     functions_with_direct_sink: usize,
@@ -1100,6 +1113,12 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    fn unsafe_dataflow_call_stats_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_CALL_STATS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
         std::env::var("RZ_ANALYZE_UNSAFE_SUMMARIES")
             .ok()
@@ -1194,6 +1213,69 @@ impl MyOptimizationPass {
             stats.hooks_total_before,
             stats.hooks_total_after,
             stats.hooks_total_before.saturating_sub(stats.hooks_total_after)
+        );
+    }
+
+    fn log_unsafe_dataflow_call_stats<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) {
+        if !self.unsafe_dataflow_call_stats_enabled() {
+            return;
+        }
+
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
+        let fn_name = tcx.def_path_str(body.source.def_id());
+        let call_stats = unsafe_influence.call_stats();
+
+        eprintln!(
+            "[rusteze][unsafe-call][fn] crate={} fn={} seed_arg_unknown={} seed_arg_local_missing={} seed_arg_direct_sink={} seed_arg_escape_unknown_direct={} seed_arg_escape_unknown_inherited={} seed_arg_raw_fallback={} backward_dst_unknown={} backward_dst_local_missing={} backward_dst_forward_to_return={}",
+            crate_name,
+            fn_name,
+            call_stats.seed_arg_unknown_boundary,
+            call_stats.seed_arg_local_summary_missing,
+            call_stats.seed_arg_summary_direct_sink,
+            call_stats.seed_arg_summary_escape_unknown_direct,
+            call_stats.seed_arg_summary_escape_unknown_inherited,
+            call_stats.seed_arg_raw_fallback,
+            call_stats.backward_dst_unknown_boundary,
+            call_stats.backward_dst_local_summary_missing,
+            call_stats.backward_dst_forward_to_return,
+        );
+
+        static STATS: OnceLock<Mutex<UnsafeCallDflowStats>> = OnceLock::new();
+        let mut stats = STATS
+            .get_or_init(|| Mutex::new(UnsafeCallDflowStats::default()))
+            .lock()
+            .unwrap();
+
+        stats.seed_arg_unknown_boundary += call_stats.seed_arg_unknown_boundary;
+        stats.seed_arg_local_summary_missing += call_stats.seed_arg_local_summary_missing;
+        stats.seed_arg_summary_direct_sink += call_stats.seed_arg_summary_direct_sink;
+        stats.seed_arg_summary_escape_unknown_direct +=
+            call_stats.seed_arg_summary_escape_unknown_direct;
+        stats.seed_arg_summary_escape_unknown_inherited +=
+            call_stats.seed_arg_summary_escape_unknown_inherited;
+        stats.seed_arg_raw_fallback += call_stats.seed_arg_raw_fallback;
+        stats.backward_dst_unknown_boundary += call_stats.backward_dst_unknown_boundary;
+        stats.backward_dst_local_summary_missing += call_stats.backward_dst_local_summary_missing;
+        stats.backward_dst_forward_to_return += call_stats.backward_dst_forward_to_return;
+
+        eprintln!(
+            "[rusteze][unsafe-call][totals] crate={} seed_arg_unknown={} seed_arg_local_missing={} seed_arg_direct_sink={} seed_arg_escape_unknown_direct={} seed_arg_escape_unknown_inherited={} seed_arg_raw_fallback={} backward_dst_unknown={} backward_dst_local_missing={} backward_dst_forward_to_return={}",
+            crate_name,
+            stats.seed_arg_unknown_boundary,
+            stats.seed_arg_local_summary_missing,
+            stats.seed_arg_summary_direct_sink,
+            stats.seed_arg_summary_escape_unknown_direct,
+            stats.seed_arg_summary_escape_unknown_inherited,
+            stats.seed_arg_raw_fallback,
+            stats.backward_dst_unknown_boundary,
+            stats.backward_dst_local_summary_missing,
+            stats.backward_dst_forward_to_return,
         );
     }
 
@@ -1342,12 +1424,31 @@ impl MyOptimizationPass {
         }
 
         let fn_name = tcx.def_path_str(body.source.def_id());
+        let fn_hash = {
+            let hash = tcx.def_path_hash(body.source.def_id());
+            format!("{:x}:{:x}", hash.stable_crate_id(), hash.local_hash())
+        };
+        let (trait_fn_name, trait_fn_hash) = tcx
+            .opt_associated_item(body.source.def_id())
+            .and_then(|item| item.trait_item_def_id)
+            .filter(|trait_did| *trait_did != body.source.def_id())
+            .map(|trait_did| {
+                let hash = tcx.def_path_hash(trait_did);
+                (
+                    tcx.def_path_str(trait_did),
+                    format!("{:x}:{:x}", hash.stable_crate_id(), hash.local_hash()),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), String::new()));
         let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
         let crate_name = crate_name_sym.as_str();
         let summary = unsafe_influence.summary();
         let record = UnsafeSummaryRecord {
             crate_name: crate_name.to_string(),
             function: fn_name,
+            function_hash: fn_hash,
+            trait_function: trait_fn_name,
+            trait_function_hash: trait_fn_hash,
             has_direct_sink: summary.has_direct_sink(),
             calls_unknown_boundary: summary.calls_unknown_boundary(),
             calls_unknown_boundary_direct: summary.calls_unknown_boundary_direct(),
@@ -1415,6 +1516,7 @@ impl MyOptimizationPass {
                 before_access,
                 before_access,
             );
+            self.log_unsafe_dataflow_call_stats(tcx, body, unsafe_influence);
             return insert_points;
         }
 
@@ -1461,6 +1563,7 @@ impl MyOptimizationPass {
             before_access,
             after_access,
         );
+        self.log_unsafe_dataflow_call_stats(tcx, body, unsafe_influence);
 
         insert_points
     }
@@ -7652,6 +7755,7 @@ impl MyOptimizationPass {
                 body,
                 self.unsafe_dataflow_selective_enabled(),
             );
+            self.log_unsafe_dataflow_call_stats(tcx, body, &unsafe_influence);
             self.log_unsafe_dataflow_summary_stats(tcx, body, &unsafe_influence);
             self.dump_unsafe_dataflow_summary(tcx, body, &unsafe_influence);
             return;

@@ -9,7 +9,7 @@ use rustc_middle::mir::{
     BasicBlockData, Body, CastKind, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
     StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
 };
-use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt, TyKind};
 
 #[derive(Clone, Debug)]
 pub(crate) struct UnsafeInfluence {
@@ -18,6 +18,7 @@ pub(crate) struct UnsafeInfluence {
     total_ptr_locals: usize,
     summary: UnsafeFunctionSummary,
     local_callsites: Vec<UnsafeCallsiteSummary>,
+    call_stats: UnsafeCallRelevanceStats,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,8 @@ pub(crate) struct UnsafeArgEdge {
 pub(crate) struct UnsafeCallsiteSummary {
     pub(crate) callee_crate_name: String,
     pub(crate) callee_function: String,
+    #[serde(default)]
+    pub(crate) callee_function_hash: String,
     pub(crate) arg_edges: Vec<UnsafeArgEdge>,
     pub(crate) return_to_return: bool,
 }
@@ -53,12 +56,31 @@ pub(crate) struct UnsafeCallsiteSummary {
 pub(crate) struct UnsafeSummaryRecord {
     pub(crate) crate_name: String,
     pub(crate) function: String,
+    #[serde(default)]
+    pub(crate) function_hash: String,
+    #[serde(default)]
+    pub(crate) trait_function: String,
+    #[serde(default)]
+    pub(crate) trait_function_hash: String,
     pub(crate) has_direct_sink: bool,
     pub(crate) calls_unknown_boundary: bool,
     pub(crate) calls_unknown_boundary_direct: bool,
     pub(crate) calls_unknown_boundary_inherited: bool,
     pub(crate) ptr_args: Vec<UnsafeArgSummary>,
     pub(crate) local_callsites: Vec<UnsafeCallsiteSummary>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UnsafeCallRelevanceStats {
+    pub(crate) seed_arg_unknown_boundary: usize,
+    pub(crate) seed_arg_local_summary_missing: usize,
+    pub(crate) seed_arg_summary_direct_sink: usize,
+    pub(crate) seed_arg_summary_escape_unknown_direct: usize,
+    pub(crate) seed_arg_summary_escape_unknown_inherited: usize,
+    pub(crate) seed_arg_raw_fallback: usize,
+    pub(crate) backward_dst_unknown_boundary: usize,
+    pub(crate) backward_dst_local_summary_missing: usize,
+    pub(crate) backward_dst_forward_to_return: usize,
 }
 
 
@@ -70,6 +92,7 @@ impl UnsafeInfluence {
             total_ptr_locals: 0,
             summary: UnsafeFunctionSummary::default(),
             local_callsites: Vec::new(),
+            call_stats: UnsafeCallRelevanceStats::default(),
         }
     }
 
@@ -98,6 +121,10 @@ impl UnsafeInfluence {
 
     pub(crate) fn local_callsites(&self) -> &[UnsafeCallsiteSummary] {
         &self.local_callsites
+    }
+
+    pub(crate) fn call_stats(&self) -> &UnsafeCallRelevanceStats {
+        &self.call_stats
     }
 }
 
@@ -178,12 +205,23 @@ pub(crate) fn use_loaded_unsafe_summaries_enabled() -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+fn trace_local_summary_missing_enabled() -> bool {
+    std::env::var("RZ_TRACE_LOCAL_SUMMARY_MISSING")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
 fn summary_input_dir() -> PathBuf {
     if let Ok(path) = std::env::var("RZ_UNSAFE_SUMMARY_INPUT_DIR") {
         return PathBuf::from(path);
     }
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     PathBuf::from(target_dir).join("rusteze-unsafe-summaries")
+}
+
+fn def_path_hash_key<'tcx>(tcx: TyCtxt<'tcx>, did: DefId) -> String {
+    let hash = tcx.def_path_hash(did);
+    format!("{:x}:{:x}", hash.stable_crate_id(), hash.local_hash())
 }
 
 fn loaded_unsafe_summaries() -> &'static HashMap<(String, String), UnsafeFunctionSummary> {
@@ -210,21 +248,47 @@ fn loaded_unsafe_summaries() -> &'static HashMap<(String, String), UnsafeFunctio
                 let Ok(record) = serde_json::from_str::<UnsafeSummaryRecord>(line) else {
                     continue;
                 };
-                map.insert(
-                    (record.crate_name, record.function),
-                    UnsafeFunctionSummary {
-                        has_direct_sink: record.has_direct_sink,
-                        calls_unknown_boundary_direct: record.calls_unknown_boundary_direct
-                            || (record.calls_unknown_boundary
-                                && !record.calls_unknown_boundary_inherited),
-                        calls_unknown_boundary_inherited: record.calls_unknown_boundary_inherited,
-                        ptr_args: record.ptr_args,
-                    },
-                );
+                let summary = UnsafeFunctionSummary {
+                    has_direct_sink: record.has_direct_sink,
+                    calls_unknown_boundary_direct: record.calls_unknown_boundary_direct
+                        || (record.calls_unknown_boundary
+                            && !record.calls_unknown_boundary_inherited),
+                    calls_unknown_boundary_inherited: record.calls_unknown_boundary_inherited,
+                    ptr_args: record.ptr_args,
+                };
+                let function_key = if record.function_hash.is_empty() {
+                    record.function.clone()
+                } else {
+                    record.function_hash.clone()
+                };
+                let crate_name = record.crate_name;
+                map.insert((crate_name.clone(), function_key), summary.clone());
+                if !record.trait_function_hash.is_empty() {
+                    merge_summary(
+                        map.entry((crate_name, record.trait_function_hash)).or_default(),
+                        &summary,
+                    );
+                }
             }
         }
         map
     })
+}
+
+fn merge_summary(dst: &mut UnsafeFunctionSummary, src: &UnsafeFunctionSummary) {
+    dst.has_direct_sink |= src.has_direct_sink;
+    dst.calls_unknown_boundary_direct |= src.calls_unknown_boundary_direct;
+    dst.calls_unknown_boundary_inherited |= src.calls_unknown_boundary_inherited;
+    for src_arg in &src.ptr_args {
+        match dst.ptr_args.iter_mut().find(|arg| arg.arg_index == src_arg.arg_index) {
+            Some(dst_arg) => {
+                dst_arg.direct_sink_mask |= src_arg.direct_sink_mask;
+                dst_arg.propagation_mask |= src_arg.propagation_mask;
+            }
+            None => dst.ptr_args.push(src_arg.clone()),
+        }
+    }
+    dst.ptr_args.sort_by_key(|arg| arg.arg_index);
 }
 
 fn is_pointer_ty<'tcx>(ty: rustc_middle::ty::Ty<'tcx>) -> bool {
@@ -382,13 +446,28 @@ fn resolve_callee_def_id<'tcx>(
     body: &Body<'tcx>,
     func: &Operand<'tcx>,
 ) -> Option<rustc_hir::def_id::DefId> {
+    fn resolve_instance_def_id<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        def_id: DefId,
+        args: GenericArgsRef<'tcx>,
+    ) -> DefId {
+        let typing_env = body.typing_env(tcx);
+        let normalized_args = tcx.try_normalize_erasing_regions(typing_env, args).unwrap_or(args);
+        Instance::try_resolve(tcx, typing_env, def_id, normalized_args)
+            .ok()
+            .flatten()
+            .map(|instance| instance.def_id())
+            .unwrap_or(def_id)
+    }
+
     match func {
         Operand::Constant(c) => match c.const_.ty().kind() {
-            TyKind::FnDef(def_id, _) => Some(*def_id),
+            TyKind::FnDef(def_id, args) => Some(resolve_instance_def_id(tcx, body, *def_id, args)),
             _ => None,
         },
         Operand::Copy(p) | Operand::Move(p) => match p.ty(&body.local_decls, tcx).ty.kind() {
-            TyKind::FnDef(def_id, _) => Some(*def_id),
+            TyKind::FnDef(def_id, args) => Some(resolve_instance_def_id(tcx, body, *def_id, args)),
             _ => None,
         },
         _ => None,
@@ -515,8 +594,8 @@ fn callee_summary<'tcx>(
     let did = resolve_callee_def_id(tcx, body, func)?;
     if use_loaded_unsafe_summaries_enabled() {
         let crate_name = tcx.crate_name(did.krate).as_str().to_string();
-        let function = tcx.def_path_str(did);
-        if let Some(summary) = loaded_unsafe_summaries().get(&(crate_name, function)) {
+        let function_hash = def_path_hash_key(tcx, did);
+        if let Some(summary) = loaded_unsafe_summaries().get(&(crate_name, function_hash)) {
             return Some(summary.clone());
         }
     }
@@ -525,6 +604,37 @@ fn callee_summary<'tcx>(
     } else {
         None
     }
+}
+
+fn trace_local_summary_missing<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) {
+    if !trace_local_summary_missing_enabled() || !use_loaded_unsafe_summaries_enabled() {
+        return;
+    }
+    let Some(did) = resolve_callee_def_id(tcx, body, func) else {
+        return;
+    };
+    if did.krate != LOCAL_CRATE {
+        return;
+    }
+    let caller = tcx.def_path_str(body.source.def_id());
+    let crate_name = tcx.crate_name(did.krate).as_str().to_string();
+    let function = tcx.def_path_str(did);
+    let function_hash = def_path_hash_key(tcx, did);
+    let summaries = loaded_unsafe_summaries();
+    let exact = summaries.contains_key(&(crate_name.clone(), function_hash.clone()));
+    eprintln!(
+        "[rusteze][unsafe-call][local-missing] crate={} caller={} callee={} callee_hash={} exact_match={} loaded_summary_count={}",
+        crate_name,
+        caller,
+        function,
+        function_hash,
+        exact,
+        summaries.len(),
+    );
 }
 
 fn instrumented_call_boundary<'tcx>(
@@ -963,6 +1073,7 @@ fn collect_callsites<'tcx>(
         out.push(UnsafeCallsiteSummary {
             callee_crate_name: tcx.crate_name(did.krate).as_str().to_string(),
             callee_function: tcx.def_path_str(did),
+            callee_function_hash: def_path_hash_key(tcx, did),
             arg_edges,
             return_to_return,
         });
@@ -1055,7 +1166,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         return UnsafeInfluence::disabled();
     }
 
-    let (tainted_ptr_locals, tainted_value_locals, total_ptr_locals) =
+    let (tainted_ptr_locals, tainted_value_locals, total_ptr_locals, call_stats) =
         compute_tainted_state(tcx, body);
 
     UnsafeInfluence {
@@ -1064,16 +1175,23 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         total_ptr_locals,
         summary: compute_function_summary(tcx, body, &tainted_value_locals),
         local_callsites: collect_callsites(tcx, body),
+        call_stats,
     }
 }
 
 fn compute_tainted_state<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
-) -> (HashSet<Local>, HashSet<Local>, usize) {
+) -> (
+    HashSet<Local>,
+    HashSet<Local>,
+    usize,
+    UnsafeCallRelevanceStats,
+) {
     let mut relevant_ptr_locals: HashSet<Local> = HashSet::new();
     let mut relevant_value_locals: HashSet<Local> = HashSet::new();
     let mut total_ptr_locals = 0usize;
+    let mut call_stats = UnsafeCallRelevanceStats::default();
 
     for local in body.local_decls.indices() {
         let ty = body.local_decls[local].ty;
@@ -1087,6 +1205,7 @@ fn compute_tainted_state<'tcx>(
         body,
         &mut relevant_value_locals,
         &mut relevant_ptr_locals,
+        &mut call_stats,
     );
 
     // Monotonic backward reachability: mark values/ptrs that can flow into unsafe-sensitive sinks.
@@ -1100,11 +1219,17 @@ fn compute_tainted_state<'tcx>(
                 block_data,
                 &mut relevant_value_locals,
                 &mut relevant_ptr_locals,
+                &mut call_stats,
             );
         }
     }
 
-    (relevant_ptr_locals, relevant_value_locals, total_ptr_locals)
+    (
+        relevant_ptr_locals,
+        relevant_value_locals,
+        total_ptr_locals,
+        call_stats,
+    )
 }
 
 fn apply_block<'tcx>(
@@ -1135,6 +1260,7 @@ fn seed_sink_relevance<'tcx>(
     body: &Body<'tcx>,
     relevant_value_locals: &mut HashSet<Local>,
     relevant_ptr_locals: &mut HashSet<Local>,
+    call_stats: &mut UnsafeCallRelevanceStats,
 ) {
     for block_data in body.basic_blocks.iter() {
         for stmt in block_data.statements.iter() {
@@ -1166,6 +1292,7 @@ fn seed_sink_relevance<'tcx>(
                 term,
                 relevant_value_locals,
                 relevant_ptr_locals,
+                call_stats,
             );
         }
     }
@@ -1177,6 +1304,7 @@ fn seed_terminator_sink_relevance<'tcx>(
     term: &Terminator<'tcx>,
     relevant_value_locals: &mut HashSet<Local>,
     relevant_ptr_locals: &mut HashSet<Local>,
+    call_stats: &mut UnsafeCallRelevanceStats,
 ) {
     let TerminatorKind::Call {
         func,
@@ -1192,6 +1320,9 @@ fn seed_terminator_sink_relevance<'tcx>(
     let local_summary_missing = resolve_callee_def_id(tcx, body, func)
         .is_some_and(|did| did.krate == LOCAL_CRATE)
         && callee_summary.is_none();
+    if local_summary_missing {
+        trace_local_summary_missing(tcx, body, func);
+    }
 
     for (arg_index, arg) in args.iter().enumerate() {
         let Some(place) = place_from_operand(&arg.node) else {
@@ -1203,17 +1334,38 @@ fn seed_terminator_sink_relevance<'tcx>(
             continue;
         }
         let is_raw = is_raw_pointer_ty(ty);
-        let sink_relevant = if unknown_boundary || local_summary_missing {
+        let sink_relevant = if unknown_boundary {
+            call_stats.seed_arg_unknown_boundary += 1;
+            true
+        } else if local_summary_missing {
+            call_stats.seed_arg_local_summary_missing += 1;
             true
         } else if let Some(summary) = callee_summary.as_ref() {
-            summary.ptr_args().iter().any(|entry| {
-                entry.arg_index() == arg_index
-                    && (entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary())
-            })
+            summary.ptr_args().iter().find(|entry| entry.arg_index() == arg_index).is_some_and(
+                |entry| {
+                    let mut relevant = false;
+                    if entry.reaches_direct_sink() {
+                        call_stats.seed_arg_summary_direct_sink += 1;
+                        relevant = true;
+                    }
+                    if entry.escapes_to_direct_unknown_boundary() {
+                        call_stats.seed_arg_summary_escape_unknown_direct += 1;
+                        relevant = true;
+                    }
+                    if entry.escapes_to_inherited_unknown_boundary() {
+                        call_stats.seed_arg_summary_escape_unknown_inherited += 1;
+                        relevant = true;
+                    }
+                    relevant
+                },
+            )
         } else {
             // If an instrumented non-local callee has no summary available, keep raw-pointer
             // arguments conservative. Once a summary exists, only actual sink/escape effects
             // should keep the caller local relevant.
+            if is_raw {
+                call_stats.seed_arg_raw_fallback += 1;
+            }
             is_raw
         };
         if sink_relevant {
@@ -1231,6 +1383,7 @@ fn backward_apply_block<'tcx>(
     block_data: &BasicBlockData<'tcx>,
     relevant_value_locals: &mut HashSet<Local>,
     relevant_ptr_locals: &mut HashSet<Local>,
+    call_stats: &mut UnsafeCallRelevanceStats,
 ) -> bool {
     let mut changed = false;
     if let Some(term) = block_data.terminator.as_ref() {
@@ -1240,6 +1393,7 @@ fn backward_apply_block<'tcx>(
             term,
             relevant_value_locals,
             relevant_ptr_locals,
+            call_stats,
         );
     }
     for stmt in block_data.statements.iter().rev() {
@@ -1323,6 +1477,7 @@ fn backward_apply_terminator<'tcx>(
     term: &Terminator<'tcx>,
     relevant_value_locals: &mut HashSet<Local>,
     relevant_ptr_locals: &mut HashSet<Local>,
+    call_stats: &mut UnsafeCallRelevanceStats,
 ) -> bool {
     let mut changed = false;
     let TerminatorKind::Call {
@@ -1341,7 +1496,15 @@ fn backward_apply_terminator<'tcx>(
             let conservative_local_fallback = resolve_callee_def_id(tcx, body, func)
                 .is_some_and(|did| did.krate == LOCAL_CRATE)
                 && callee_summary.is_none();
+            if conservative_local_fallback {
+                trace_local_summary_missing(tcx, body, func);
+            }
             if unknown_boundary || conservative_local_fallback {
+                if unknown_boundary {
+                    call_stats.backward_dst_unknown_boundary += 1;
+                } else {
+                    call_stats.backward_dst_local_summary_missing += 1;
+                }
                 for arg in args.iter() {
                     if let Some(place) = place_from_operand(&arg.node) {
                         if is_pointer_ty(body.local_decls[place.local].ty) {
@@ -1359,6 +1522,7 @@ fn backward_apply_terminator<'tcx>(
                         if summary.ptr_args().iter().any(|entry| {
                             entry.arg_index() == arg_index && entry.forwarded_to_return()
                         }) {
+                            call_stats.backward_dst_forward_to_return += 1;
                             changed |= mark_value_local(place.local, relevant_value_locals);
                             changed |= mark_ptr_local(place.local, relevant_ptr_locals);
                         }
