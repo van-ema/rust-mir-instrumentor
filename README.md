@@ -166,6 +166,14 @@ Project-specific environment variables are grouped below by component/script.
 - `AFL_NO_AFFINITY`: set to `1` by `afl_fuzz.sh`.
 - `ASAN_OPTIONS` / `ASAN_SYMBOLIZER_PATH`: explicitly unset in `afl_fuzz.sh`.
 - `TRACE`: `afl_build.sh` shell tracing when `TRACE=1`.
+- `scripts/merge_unsafe_summaries.py`: offline fixed-point merge for unsafe-summary JSONL dumps.
+  It supports per-file mode (`--input` / `--output`) and whole-build cross-crate mode
+  (`--input-dir` / `--output-dir`), plus `--report` for a human-readable propagation diff.
+- `scripts/afl_build_interproc.sh`: native three-phase build wrapper:
+  analyze-only summary pass, offline merge, then normal instrumented build consuming merged
+  summaries.
+- `RZ_INTERPROC_ANALYZE_TARGET_DIR`: optional analyze-pass target dir override used by
+  `scripts/afl_build_interproc.sh`.
 
 ### Docker AFL wrapper (`scripts/docker_afl.sh`)
 - `IMAGE`: docker image tag (default `rusteze-afl`).

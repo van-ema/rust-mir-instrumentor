@@ -43,6 +43,7 @@ pub(crate) struct UnsafeArgEdge {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnsafeCallsiteSummary {
+    pub(crate) callee_crate_name: String,
     pub(crate) callee_function: String,
     pub(crate) arg_edges: Vec<UnsafeArgEdge>,
     pub(crate) return_to_return: bool,
@@ -899,7 +900,7 @@ fn compute_function_summary<'tcx>(
     summary
 }
 
-fn collect_local_callsites<'tcx>(
+fn collect_callsites<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
 ) -> Vec<UnsafeCallsiteSummary> {
@@ -926,7 +927,7 @@ fn collect_local_callsites<'tcx>(
         let Some(did) = resolve_callee_def_id(tcx, body, func) else {
             continue;
         };
-        if did.krate != LOCAL_CRATE {
+        if !instrumented_call_boundary(tcx, body, func) {
             continue;
         }
 
@@ -958,6 +959,7 @@ fn collect_local_callsites<'tcx>(
         }
 
         out.push(UnsafeCallsiteSummary {
+            callee_crate_name: tcx.crate_name(did.krate).as_str().to_string(),
             callee_function: tcx.def_path_str(did),
             arg_edges,
             return_to_return,
@@ -1059,7 +1061,7 @@ pub(crate) fn compute_unsafe_influence<'tcx>(
         tainted_ptr_locals,
         total_ptr_locals,
         summary: compute_function_summary(tcx, body, &tainted_value_locals),
-        local_callsites: collect_local_callsites(tcx, body),
+        local_callsites: collect_callsites(tcx, body),
     }
 }
 
