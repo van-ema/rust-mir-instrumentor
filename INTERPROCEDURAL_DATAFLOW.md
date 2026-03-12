@@ -259,6 +259,165 @@ Each stage must clear the same gates before proceeding:
 This ensures every pruning step is justified by evidence rather than by intuition.
 
 ## Progress
+## Crate-Local Fixed-Point Algorithm
+
+The reverted summary-consumer path used **intra-procedural** per-function summaries as if they were already interprocedural. That was the wrong abstraction boundary. The result was not a clean pruning win: a few `escape_unknown` bits went down, but many more caller functions became classified as `has_direct_sink` or `calls_unknown_boundary`, so the overall unsafe-sensitive slice grew.
+
+The correct next algorithm is a **crate-local fixed point** over local function summaries.
+
+### Summary of the failure mode
+
+Producer summaries currently mean:
+- what happens inside function `F`'s body itself
+- with modeled external callees treated via built-in conservative summaries
+- without propagating effects through local callees to a fixed point
+
+Consumer mode tried to use those summaries at call sites anyway:
+- if callee arg `i` reached a direct sink, mark caller actual arg `i` unsafe-relevant
+- if callee arg `i` escaped to unknown, mark caller actual arg `i` unsafe-relevant
+- if callee arg `i` forwarded to return, taint the caller destination
+
+That is only valid once the callee summaries themselves already include local-callee effects.
+
+### Phase A: build base summaries for all local functions
+
+For every local MIR body `F`, compute a summary **without consulting local callees**.
+
+Conceptually:
+
+```rust
+struct FunctionBase {
+    def_id: LocalDefId,
+    ptr_arg_count: usize,
+    local_summary: UnsafeFunctionSummary,
+    callsites: Vec<CallSiteInfo>,
+}
+
+struct CallSiteInfo {
+    callee: Option<DefId>,
+    actual_ptr_args: Vec<(usize, Local)>,
+    dest_local: Option<Local>,
+}
+```
+
+`local_summary` should only contain effects from `F` itself:
+- raw deref
+- raw creation / provenance-sensitive casts
+- direct raw-sensitive call use
+- unknown external boundaries
+- direct return forwarding visible in `F`
+
+Local callees are recorded in `callsites`, not recursively expanded.
+
+### Phase B: build the crate-local call graph
+
+From `callsites`, build edges `F -> G` for local callees only.
+
+Then run a worklist or SCC-based fixed point.
+
+### Phase C: propagated summary state
+
+Use the same summary shape already in the codebase:
+
+```rust
+struct PropagatedSummary {
+    has_direct_sink: bool,
+    calls_unknown_boundary: bool,
+    ptr_args: Vec<UnsafeArgSummary>,
+}
+```
+
+Per pointer arg, keep:
+- `direct_sink_mask`
+- `propagation_mask`
+
+Initialize:
+
+```text
+prop_summary[F] = base.local_summary[F]
+```
+
+### Phase D: fixed-point propagation
+
+Iterate until no summary changes. For each caller `F`:
+
+1. Start from `base.local_summary(F)`.
+2. For each local callsite `F -> G`:
+   - read current `prop_summary[G]`
+   - for each mapped pointer arg `(arg_index, caller_local)`:
+     - if `G.ptr_args[arg_index].direct_sink_mask != 0`, seed `caller_local` in `F` as sink-reaching
+     - if `G.ptr_args[arg_index].propagation_mask` contains `ESCAPE_UNKNOWN`, seed `caller_local` as escaping unknown
+     - if `G.ptr_args[arg_index].propagation_mask` contains `FORWARD_TO_RETURN`, seed the call destination as derived from `caller_local`
+3. Re-run `F`'s intra-procedural transfer using those call-derived seeds.
+4. Compare the new summary with `prop_summary[F]`.
+5. If it changed, enqueue callers of `F`.
+
+Important: the call-derived facts are **inputs to `F`'s local analysis**, not ad hoc post-processing on the final summary.
+
+### Example: sink propagation through wrappers
+
+```rust
+fn h(p: *const u8) {
+    unsafe { *p; }
+}
+
+fn g(p: *const u8) {
+    h(p);
+}
+
+fn f(p: *const u8) {
+    g(p);
+}
+```
+
+Base summaries:
+- `h(arg0)` has `direct_sink`
+- `g(arg0)` does not yet
+- `f(arg0)` does not yet
+
+After fixed point:
+- `h(arg0)` direct sink
+- `g(arg0)` direct sink
+- `f(arg0)` direct sink
+
+### Example: return forwarding through helpers
+
+```rust
+fn id_ref<'a>(p: &'a [u8]) -> &'a [u8] { p }
+
+fn wrap<'a>(p: &'a [u8]) -> &'a [u8] {
+    id_ref(p)
+}
+```
+
+Base summaries:
+- `id_ref(arg0)` has `FORWARD_TO_RETURN`
+- `wrap(arg0)` may not yet
+
+After fixed point:
+- `wrap(arg0)` also has `FORWARD_TO_RETURN`
+
+### Soundness constraints
+
+- missing callee summary => conservative fallback
+- unknown external callees remain unknown
+- summary bits only grow during propagation
+- callsite arg mapping must be exact for pointer args
+- do not consume summaries for pruning until they are fixed-point summaries
+
+### Implementation boundary
+
+This should be implemented **outside** the current on-demand `optimized_mir` override path.
+
+Do not:
+- query local callee MIR on demand while instrumenting another function
+- use raw intra-procedural summaries directly for pruning
+
+Do:
+- collect all local base summaries first
+- propagate them crate-wide to a fixed point
+- only then use them as analysis results
+
 
 ### Step 1 implemented: stronger intra-procedural unsafe-sensitive analysis
 

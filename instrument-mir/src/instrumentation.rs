@@ -9,7 +9,7 @@ mod metadata_dataflow;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
-use crate::unsafe_dataflow::{self, UnsafeInfluence};
+use crate::unsafe_dataflow::{self, UnsafeInfluence, UnsafeSummaryRecord};
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
@@ -64,9 +64,13 @@ struct UnsafeSummaryStats {
     functions_seen: usize,
     functions_with_direct_sink: usize,
     functions_calling_unknown_boundary: usize,
+    functions_calling_unknown_boundary_direct: usize,
+    functions_calling_unknown_boundary_inherited: usize,
     ptr_args_total: usize,
     ptr_args_with_direct_sink: usize,
     ptr_args_escaping_unknown: usize,
+    ptr_args_escaping_unknown_direct: usize,
+    ptr_args_escaping_unknown_inherited: usize,
     ptr_args_forwarded_to_return: usize,
 }
 
@@ -1205,6 +1209,16 @@ impl MyOptimizationPass {
             .iter()
             .filter(|arg| arg.escapes_to_unknown_boundary())
             .count();
+        let ptr_args_escaping_unknown_direct = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_direct_unknown_boundary())
+            .count();
+        let ptr_args_escaping_unknown_inherited = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_inherited_unknown_boundary())
+            .count();
         let ptr_args_forwarded_to_return = summary
             .ptr_args()
             .iter()
@@ -1212,25 +1226,31 @@ impl MyOptimizationPass {
             .count();
 
         eprintln!(
-            "[rusteze][unsafe-summary][fn] fn={} direct_sink={} calls_unknown_boundary={} ptr_args={} direct_sink_args={} escape_unknown={} to_return={}",
+            "[rusteze][unsafe-summary][fn] fn={} direct_sink={} calls_unknown_boundary={} direct_unknown={} inherited_unknown={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
             fn_name,
             summary.has_direct_sink(),
             summary.calls_unknown_boundary(),
+            summary.calls_unknown_boundary_direct(),
+            summary.calls_unknown_boundary_inherited(),
             ptr_args_total,
             ptr_args_with_direct_sink,
             ptr_args_escaping_unknown,
+            ptr_args_escaping_unknown_direct,
+            ptr_args_escaping_unknown_inherited,
             ptr_args_forwarded_to_return
         );
 
         for arg in summary.ptr_args() {
             eprintln!(
-                "[rusteze][unsafe-summary][arg] fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} to_return={}",
+                "[rusteze][unsafe-summary][arg] fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
                 fn_name,
                 arg.arg_index,
                 arg.direct_sink_mask,
                 arg.propagation_mask,
                 arg.reaches_direct_sink(),
                 arg.escapes_to_unknown_boundary(),
+                arg.escapes_to_direct_unknown_boundary(),
+                arg.escapes_to_inherited_unknown_boundary(),
                 arg.forwarded_to_return()
             );
         }
@@ -1244,40 +1264,31 @@ impl MyOptimizationPass {
         stats.functions_seen += 1;
         stats.functions_with_direct_sink += usize::from(summary.has_direct_sink());
         stats.functions_calling_unknown_boundary += usize::from(summary.calls_unknown_boundary());
+        stats.functions_calling_unknown_boundary_direct +=
+            usize::from(summary.calls_unknown_boundary_direct());
+        stats.functions_calling_unknown_boundary_inherited +=
+            usize::from(summary.calls_unknown_boundary_inherited());
         stats.ptr_args_total += ptr_args_total;
         stats.ptr_args_with_direct_sink += ptr_args_with_direct_sink;
         stats.ptr_args_escaping_unknown += ptr_args_escaping_unknown;
+        stats.ptr_args_escaping_unknown_direct += ptr_args_escaping_unknown_direct;
+        stats.ptr_args_escaping_unknown_inherited += ptr_args_escaping_unknown_inherited;
         stats.ptr_args_forwarded_to_return += ptr_args_forwarded_to_return;
 
         eprintln!(
-            "[rusteze][unsafe-summary][totals] fns={} direct_sink_fns={} calls_unknown_boundary_fns={} ptr_args={} direct_sink_args={} escape_unknown={} to_return={}",
+            "[rusteze][unsafe-summary][totals] fns={} direct_sink_fns={} calls_unknown_boundary_fns={} direct_unknown_fns={} inherited_unknown_fns={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
             stats.functions_seen,
             stats.functions_with_direct_sink,
             stats.functions_calling_unknown_boundary,
+            stats.functions_calling_unknown_boundary_direct,
+            stats.functions_calling_unknown_boundary_inherited,
             stats.ptr_args_total,
             stats.ptr_args_with_direct_sink,
             stats.ptr_args_escaping_unknown,
+            stats.ptr_args_escaping_unknown_direct,
+            stats.ptr_args_escaping_unknown_inherited,
             stats.ptr_args_forwarded_to_return
         );
-    }
-
-    fn json_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 8);
-        for ch in s.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if c.is_control() => {
-                    use std::fmt::Write as _;
-                    let _ = write!(out, "\\u{:04x}", c as u32);
-                }
-                c => out.push(c),
-            }
-        }
-        out
     }
 
     fn unsafe_summary_dump_path<'tcx>(&self, tcx: TyCtxt<'tcx>) -> PathBuf {
@@ -1318,30 +1329,21 @@ impl MyOptimizationPass {
         let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
         let crate_name = crate_name_sym.as_str();
         let summary = unsafe_influence.summary();
-        let mut line = String::new();
-        line.push('{');
-        line.push_str(&format!(
-            "\"crate\":\"{}\",\"function\":\"{}\",\"has_direct_sink\":{},\"calls_unknown_boundary\":{},\"ptr_args\":[",
-            Self::json_escape(crate_name),
-            Self::json_escape(&fn_name),
-            summary.has_direct_sink(),
-            summary.calls_unknown_boundary(),
-        ));
-        for (i, arg) in summary.ptr_args().iter().enumerate() {
-            if i != 0 {
-                line.push(',');
-            }
-            line.push_str(&format!(
-                "{{\"arg_index\":{},\"direct_sink_mask\":{},\"propagation_mask\":{},\"reaches_direct_sink\":{},\"escapes_to_unknown_boundary\":{},\"forwarded_to_return\":{}}}",
-                arg.arg_index(),
-                arg.direct_sink_mask(),
-                arg.propagation_mask(),
-                arg.reaches_direct_sink(),
-                arg.escapes_to_unknown_boundary(),
-                arg.forwarded_to_return()
-            ));
-        }
-        line.push_str("]}\n");
+        let record = UnsafeSummaryRecord {
+            crate_name: crate_name.to_string(),
+            function: fn_name,
+            has_direct_sink: summary.has_direct_sink(),
+            calls_unknown_boundary: summary.calls_unknown_boundary(),
+            calls_unknown_boundary_direct: summary.calls_unknown_boundary_direct(),
+            calls_unknown_boundary_inherited: summary.calls_unknown_boundary_inherited(),
+            ptr_args: summary.ptr_args().to_vec(),
+            local_callsites: unsafe_influence.local_callsites().to_vec(),
+        };
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            rz_pass_warn!(self, "[rusteze][unsafe-summary] failed to serialize summary");
+            return;
+        };
+        line.push('\n');
 
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(mut file) => {

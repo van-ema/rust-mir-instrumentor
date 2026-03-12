@@ -103,6 +103,21 @@ Project-specific environment variables are grouped below by component/script.
   not rewrite semantic hooks like `PtrRead` / `PtrWrite`.
 - `RZ_METADATA_DATAFLOW_STATS`: non-zero prints metadata-dataflow pruning stats during
   instrumentation.
+- `RZ_UNSAFE_DATAFLOW`: enables conservative unsafe-sensitive hook gating and summary computation.
+- `RZ_UNSAFE_DATAFLOW_STATS`: non-zero prints unsafe-dataflow hook-pruning totals during
+  instrumentation.
+- `RZ_UNSAFE_DATAFLOW_SUMMARY_STATS`: non-zero prints per-function unsafe-summary statistics,
+  including direct vs inherited unknown-boundary state.
+- `RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP`: non-zero dumps one JSONL unsafe-summary record per analyzed
+  function to `${CARGO_TARGET_DIR:-target}/rusteze-unsafe-summaries/<crate>.jsonl`.
+- `RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP_PATH`: optional explicit path override for the JSONL dump file.
+- `RZ_ANALYZE_UNSAFE_SUMMARIES`: analyze-only mode. The pass computes/dumps unsafe summaries and
+  returns without mutating MIR or inserting runtime hooks.
+- `RZ_USE_UNSAFE_SUMMARIES`: enables loading precomputed unsafe-summary JSONL files during a normal
+  instrumentation build. This is intended for the second phase after running analyze-only mode and
+  an offline merge step.
+- `RZ_UNSAFE_SUMMARY_INPUT_DIR`: optional directory override for summary loading. Default is
+  `${CARGO_TARGET_DIR:-target}/rusteze-unsafe-summaries`.
 - `RZ_FILTER_STDLIB_USES`: std/core/alloc coarse-use filtering (`1` default, set `0` to disable).
 - `RZ_WARN_UNKNOWN_CALLS`: unknown-call warnings (default on; set `0` to disable).
 - `RZ_TRACE_UNKNOWN_CALLS`: extra unknown-call trace diagnostics.
