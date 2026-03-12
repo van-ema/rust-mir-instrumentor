@@ -1144,11 +1144,14 @@ impl MyOptimizationPass {
             return;
         }
 
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
         let fn_name = tcx.def_path_str(body.source.def_id());
         let access_dropped = access_hooks_before.saturating_sub(access_hooks_after);
         let total_dropped = hooks_total_before.saturating_sub(hooks_total_after);
         eprintln!(
-            "[rusteze][unsafe-dflow][fn] fn={} enabled={} tainted_ptrs={} total_ptrs={} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            "[rusteze][unsafe-dflow][fn] crate={} fn={} enabled={} tainted_ptrs={} total_ptrs={} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            crate_name,
             fn_name,
             unsafe_influence.enabled(),
             unsafe_influence.tainted_ptr_count(),
@@ -1179,7 +1182,8 @@ impl MyOptimizationPass {
         stats.access_hooks_after += access_hooks_after;
 
         eprintln!(
-            "[rusteze][unsafe-dflow][totals] fns={} enabled_fns={} ptr_locals tainted/total={}/{} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            "[rusteze][unsafe-dflow][totals] crate={} fns={} enabled_fns={} ptr_locals tainted/total={}/{} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            crate_name,
             stats.functions_seen,
             stats.functions_enabled,
             stats.ptr_locals_tainted_total,
@@ -1203,6 +1207,8 @@ impl MyOptimizationPass {
             return;
         }
 
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
         let fn_name = tcx.def_path_str(body.source.def_id());
         let summary = unsafe_influence.summary();
         let ptr_args_total = summary.ptr_args().len();
@@ -1233,7 +1239,8 @@ impl MyOptimizationPass {
             .count();
 
         eprintln!(
-            "[rusteze][unsafe-summary][fn] fn={} direct_sink={} calls_unknown_boundary={} direct_unknown={} inherited_unknown={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            "[rusteze][unsafe-summary][fn] crate={} fn={} direct_sink={} calls_unknown_boundary={} direct_unknown={} inherited_unknown={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            crate_name,
             fn_name,
             summary.has_direct_sink(),
             summary.calls_unknown_boundary(),
@@ -1249,7 +1256,8 @@ impl MyOptimizationPass {
 
         for arg in summary.ptr_args() {
             eprintln!(
-                "[rusteze][unsafe-summary][arg] fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+                "[rusteze][unsafe-summary][arg] crate={} fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+                crate_name,
                 fn_name,
                 arg.arg_index,
                 arg.direct_sink_mask,
@@ -1283,7 +1291,8 @@ impl MyOptimizationPass {
         stats.ptr_args_forwarded_to_return += ptr_args_forwarded_to_return;
 
         eprintln!(
-            "[rusteze][unsafe-summary][totals] fns={} direct_sink_fns={} calls_unknown_boundary_fns={} direct_unknown_fns={} inherited_unknown_fns={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            "[rusteze][unsafe-summary][totals] crate={} fns={} direct_sink_fns={} calls_unknown_boundary_fns={} direct_unknown_fns={} inherited_unknown_fns={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            crate_name,
             stats.functions_seen,
             stats.functions_with_direct_sink,
             stats.functions_calling_unknown_boundary,
