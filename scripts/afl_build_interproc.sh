@@ -26,6 +26,7 @@ MERGED_SUMMARY_DIR="$(canonical_path "$MERGED_SUMMARY_DIR")"
 
 echo "[rusteze] phase 1/3: analyze-only build -> ${ANALYZE_TARGET_DIR}"
 env \
+  RZ_INTERPROC_STAGE=1 \
   HARNESS_TARGET_DIR="${ANALYZE_TARGET_DIR}" \
   RZ_ANALYZE_UNSAFE_SUMMARIES=1 \
   RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP=1 \
@@ -49,6 +50,7 @@ python3 ./scripts/merge_unsafe_summaries.py \
 
 echo "[rusteze] phase 3/3: instrumented build using merged summaries -> ${BASE_TARGET_DIR}"
 env \
+  RZ_INTERPROC_STAGE=1 \
   HARNESS_TARGET_DIR="${BASE_TARGET_DIR}" \
   RZ_ANALYZE_UNSAFE_SUMMARIES=0 \
   RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP=0 \

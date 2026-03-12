@@ -174,6 +174,8 @@ Project-specific environment variables are grouped below by component/script.
   summaries.
 - `RZ_INTERPROC_ANALYZE_TARGET_DIR`: optional analyze-pass target dir override used by
   `scripts/afl_build_interproc.sh`.
+- `RZ_INTERPROC_UNSAFE_SUMMARIES`: if set to `1`, `scripts/afl_build.sh` automatically delegates
+  to the three-phase interprocedural flow in `scripts/afl_build_interproc.sh`.
 
 ### Docker AFL wrapper (`scripts/docker_afl.sh`)
 - `IMAGE`: docker image tag (default `rusteze-afl`).

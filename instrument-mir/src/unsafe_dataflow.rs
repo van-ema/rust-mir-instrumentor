@@ -619,7 +619,6 @@ fn apply_terminator<'tcx>(
         let mut ptr_arg_locals: Vec<(usize, Local)> = Vec::new();
         let mut raw_ptr_arg_locals: Vec<Local> = Vec::new();
         let mut any_raw_arg = false;
-        let mut any_tainted_arg = false;
 
         for (arg_index, arg) in args.iter().enumerate() {
             if let Some(p) = place_from_operand(&arg.node) {
@@ -632,7 +631,6 @@ fn apply_terminator<'tcx>(
                         raw_ptr_arg_locals.push(local);
                     }
                     any_raw_arg |= is_raw;
-                    any_tainted_arg |= tainted_value_locals.contains(&local);
                 }
             }
         }
@@ -684,21 +682,25 @@ fn apply_terminator<'tcx>(
             let dst_ty = body.local_decls[dst_local].ty;
             if is_pointer_ty(dst_ty) {
                 let local_returned_from_arg = callee_summary.as_ref().is_some_and(|summary| {
-                    ptr_arg_locals.iter().any(|(arg_index, _)| {
-                        summary
-                            .ptr_args()
-                            .iter()
-                            .any(|entry| {
+                    ptr_arg_locals.iter().any(|(arg_index, local)| {
+                        tainted_value_locals.contains(local)
+                            && summary.ptr_args().iter().any(|entry| {
                                 entry.arg_index() == *arg_index && entry.forwarded_to_return()
                             })
                     })
                 });
-                if unknown_boundary
-                    || any_raw_arg
-                    || any_tainted_arg
-                    || local_returned_from_arg
-                    || conservative_local_fallback
-                {
+                let returned_relevant = if unknown_boundary || conservative_local_fallback {
+                    true
+                } else if callee_summary.is_some() {
+                    local_returned_from_arg
+                } else {
+                    // For modeled-but-unsummarized instrumented callees, keep only the raw-pointer
+                    // fallback conservative. Plain tainted pointer/reference args should not make a
+                    // pointer return look relevant unless the callee summary says the return flows
+                    // from them.
+                    any_raw_arg
+                };
+                if returned_relevant {
                     changed |= taint_value_local(dst_local, tainted_value_locals);
                     changed |= taint_local(dst_local, tainted_ptr_locals);
                 }
@@ -1220,22 +1222,7 @@ fn seed_terminator_sink_relevance<'tcx>(
         }
     }
 
-    if let Some(dst_local) = destination.as_local() {
-        if is_pointer_ty(body.local_decls[dst_local].ty) {
-            let returned_relevant = unknown_boundary
-                || local_summary_missing
-                || callee_summary.as_ref().is_some_and(|summary| {
-                    summary
-                        .ptr_args()
-                        .iter()
-                        .any(|entry| entry.forwarded_to_return())
-                });
-            if returned_relevant {
-                mark_value_local(dst_local, relevant_value_locals);
-                mark_ptr_local(dst_local, relevant_ptr_locals);
-            }
-        }
-    }
+    let _ = destination;
 }
 
 fn backward_apply_block<'tcx>(

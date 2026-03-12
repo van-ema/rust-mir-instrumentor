@@ -19,6 +19,7 @@ PROFILE="${PROFILE:-release}"
 TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
+RZ_INTERPROC_UNSAFE_SUMMARIES="${RZ_INTERPROC_UNSAFE_SUMMARIES:-0}"
 
 case "$TARGET" in
   bytes) BIN="afl_bytes_driver"; FEATURE="bytes_driver" ;;
@@ -35,6 +36,10 @@ case "$TARGET" in
   hyper) BIN="afl_hyper_driver"; FEATURE="hyper_driver" ;;
   *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper)" >&2; exit 2 ;;
 esac
+
+if [[ "${RZ_INTERPROC_UNSAFE_SUMMARIES}" == "1" && "${RZ_INTERPROC_STAGE:-0}" != "1" ]]; then
+  exec env RZ_INTERPROC_STAGE=1 ./scripts/afl_build_interproc.sh
+fi
 
 if [[ "$TARGET" == "serde" || "$TARGET" == "serde_json" ]]; then
   if [[ ! -f "third_party/serde/serde/Cargo.toml" ]]; then
