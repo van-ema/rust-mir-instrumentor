@@ -48,6 +48,9 @@ The project has two main components:
 - Build policy: always use `RZ_INSTRUMENT_ALL_DEPS=1`. Only `std`/`core` are treated
   as non-instrumented for unknown-call warnings and classification heuristics.
 - Compile with CARGO_INCREMENTAL=0 to force building the crates.
+- Soundness policy: every analysis, optimization, and instrumentation rewrite must be sound by
+  default. If soundness is not established yet, keep the behavior disabled by default and gate it
+  behind an explicit opt-in flag until it is proven safe.
 
 5. **Fuzzing objective and crash policy**
 - Primary objective: implement and improve `rusteze` in this repository, and use it to fuzz real-world Rust targets to find bugs/vulnerabilities.

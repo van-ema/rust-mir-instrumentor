@@ -1,10 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+
+mod metadata_dataflow;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
-use crate::unsafe_dataflow::{self, UnsafeInfluence};
+use crate::unsafe_dataflow::{self, UnsafeInfluence, UnsafeSummaryRecord};
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::Mutability;
@@ -52,6 +57,21 @@ struct UnsafeDflowStats {
     hooks_total_after: usize,
     access_hooks_before: usize,
     access_hooks_after: usize,
+}
+
+#[derive(Default)]
+struct UnsafeSummaryStats {
+    functions_seen: usize,
+    functions_with_direct_sink: usize,
+    functions_calling_unknown_boundary: usize,
+    functions_calling_unknown_boundary_direct: usize,
+    functions_calling_unknown_boundary_inherited: usize,
+    ptr_args_total: usize,
+    ptr_args_with_direct_sink: usize,
+    ptr_args_escaping_unknown: usize,
+    ptr_args_escaping_unknown_direct: usize,
+    ptr_args_escaping_unknown_inherited: usize,
+    ptr_args_forwarded_to_return: usize,
 }
 
 
@@ -523,7 +543,12 @@ enum InstrKind<'tcx> {
     PtrUse { ptr_local: Local },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
-    TagProp { dst: Local, src: Local },
+    TagProp {
+        dst: Local,
+        src: Local,
+        copy_tag: bool,
+        copy_ref_ancestor: bool,
+    },
     /// Fresh tag for a derived pointer value (pointer arithmetic like add/sub/offset).
     /// Emits either ref/raw creation based on destination kind, with `parent=tag(src)`.
     PtrDerive { dst: Local, src: Local, is_mut: bool, is_ref: bool },
@@ -1063,19 +1088,44 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    fn unsafe_dataflow_summary_stats_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_STATS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    fn unsafe_dataflow_summary_dump_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
+    fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
+        std::env::var("RZ_ANALYZE_UNSAFE_SUMMARIES")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn trace_unsafe_dataflow_enabled(&self) -> bool {
         std::env::var("RZ_TRACE_UNSAFE_DATAFLOW")
             .ok()
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
-    fn ptr_access_local_from_instr_kind<'tcx>(kind: &InstrKind<'tcx>) -> Option<Local> {
+    fn unsafe_dataflow_gated_local<'tcx>(
+        kind: &InstrKind<'tcx>,
+        place: &Place<'tcx>,
+    ) -> Option<Local> {
         match kind {
             InstrKind::PtrRead { ptr_local, .. }
             | InstrKind::PtrWrite { ptr_local, .. }
             | InstrKind::PtrReadAllowUntagged { ptr_local, .. }
             | InstrKind::PtrWriteAllowUntagged { ptr_local, .. }
-            | InstrKind::PtrUse { ptr_local } => Some(*ptr_local),
+            | InstrKind::PtrUse { ptr_local }
+            | InstrKind::RawRoot { ptr_local, .. }
+            | InstrKind::RetRoot { dst_local: ptr_local, .. }
+            | InstrKind::PtrDerive { dst: ptr_local, .. } => Some(*ptr_local),
+            InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
             _ => None,
         }
     }
@@ -1094,11 +1144,14 @@ impl MyOptimizationPass {
             return;
         }
 
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
         let fn_name = tcx.def_path_str(body.source.def_id());
         let access_dropped = access_hooks_before.saturating_sub(access_hooks_after);
         let total_dropped = hooks_total_before.saturating_sub(hooks_total_after);
         eprintln!(
-            "[rusteze][unsafe-dflow][fn] fn={} enabled={} tainted_ptrs={} total_ptrs={} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            "[rusteze][unsafe-dflow][fn] crate={} fn={} enabled={} tainted_ptrs={} total_ptrs={} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            crate_name,
             fn_name,
             unsafe_influence.enabled(),
             unsafe_influence.tainted_ptr_count(),
@@ -1129,7 +1182,8 @@ impl MyOptimizationPass {
         stats.access_hooks_after += access_hooks_after;
 
         eprintln!(
-            "[rusteze][unsafe-dflow][totals] fns={} enabled_fns={} ptr_locals tainted/total={}/{} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            "[rusteze][unsafe-dflow][totals] crate={} fns={} enabled_fns={} ptr_locals tainted/total={}/{} access_hooks {}->{} dropped={} total_hooks {}->{} dropped={}",
+            crate_name,
             stats.functions_seen,
             stats.functions_enabled,
             stats.ptr_locals_tainted_total,
@@ -1143,6 +1197,192 @@ impl MyOptimizationPass {
         );
     }
 
+    fn log_unsafe_dataflow_summary_stats<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) {
+        if !self.unsafe_dataflow_summary_stats_enabled() {
+            return;
+        }
+
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
+        let fn_name = tcx.def_path_str(body.source.def_id());
+        let summary = unsafe_influence.summary();
+        let ptr_args_total = summary.ptr_args().len();
+        let ptr_args_with_direct_sink = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.reaches_direct_sink())
+            .count();
+        let ptr_args_escaping_unknown = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_unknown_boundary())
+            .count();
+        let ptr_args_escaping_unknown_direct = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_direct_unknown_boundary())
+            .count();
+        let ptr_args_escaping_unknown_inherited = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.escapes_to_inherited_unknown_boundary())
+            .count();
+        let ptr_args_forwarded_to_return = summary
+            .ptr_args()
+            .iter()
+            .filter(|arg| arg.forwarded_to_return())
+            .count();
+
+        eprintln!(
+            "[rusteze][unsafe-summary][fn] crate={} fn={} direct_sink={} calls_unknown_boundary={} direct_unknown={} inherited_unknown={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            crate_name,
+            fn_name,
+            summary.has_direct_sink(),
+            summary.calls_unknown_boundary(),
+            summary.calls_unknown_boundary_direct(),
+            summary.calls_unknown_boundary_inherited(),
+            ptr_args_total,
+            ptr_args_with_direct_sink,
+            ptr_args_escaping_unknown,
+            ptr_args_escaping_unknown_direct,
+            ptr_args_escaping_unknown_inherited,
+            ptr_args_forwarded_to_return
+        );
+
+        for arg in summary.ptr_args() {
+            eprintln!(
+                "[rusteze][unsafe-summary][arg] crate={} fn={} arg_index={} direct_sink_mask=0x{:x} propagation_mask=0x{:x} direct_sink={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+                crate_name,
+                fn_name,
+                arg.arg_index,
+                arg.direct_sink_mask,
+                arg.propagation_mask,
+                arg.reaches_direct_sink(),
+                arg.escapes_to_unknown_boundary(),
+                arg.escapes_to_direct_unknown_boundary(),
+                arg.escapes_to_inherited_unknown_boundary(),
+                arg.forwarded_to_return()
+            );
+        }
+
+        static STATS: OnceLock<Mutex<UnsafeSummaryStats>> = OnceLock::new();
+        let mut stats = STATS
+            .get_or_init(|| Mutex::new(UnsafeSummaryStats::default()))
+            .lock()
+            .unwrap();
+
+        stats.functions_seen += 1;
+        stats.functions_with_direct_sink += usize::from(summary.has_direct_sink());
+        stats.functions_calling_unknown_boundary += usize::from(summary.calls_unknown_boundary());
+        stats.functions_calling_unknown_boundary_direct +=
+            usize::from(summary.calls_unknown_boundary_direct());
+        stats.functions_calling_unknown_boundary_inherited +=
+            usize::from(summary.calls_unknown_boundary_inherited());
+        stats.ptr_args_total += ptr_args_total;
+        stats.ptr_args_with_direct_sink += ptr_args_with_direct_sink;
+        stats.ptr_args_escaping_unknown += ptr_args_escaping_unknown;
+        stats.ptr_args_escaping_unknown_direct += ptr_args_escaping_unknown_direct;
+        stats.ptr_args_escaping_unknown_inherited += ptr_args_escaping_unknown_inherited;
+        stats.ptr_args_forwarded_to_return += ptr_args_forwarded_to_return;
+
+        eprintln!(
+            "[rusteze][unsafe-summary][totals] crate={} fns={} direct_sink_fns={} calls_unknown_boundary_fns={} direct_unknown_fns={} inherited_unknown_fns={} ptr_args={} direct_sink_args={} escape_unknown={} direct_escape_unknown={} inherited_escape_unknown={} to_return={}",
+            crate_name,
+            stats.functions_seen,
+            stats.functions_with_direct_sink,
+            stats.functions_calling_unknown_boundary,
+            stats.functions_calling_unknown_boundary_direct,
+            stats.functions_calling_unknown_boundary_inherited,
+            stats.ptr_args_total,
+            stats.ptr_args_with_direct_sink,
+            stats.ptr_args_escaping_unknown,
+            stats.ptr_args_escaping_unknown_direct,
+            stats.ptr_args_escaping_unknown_inherited,
+            stats.ptr_args_forwarded_to_return
+        );
+    }
+
+    fn unsafe_summary_dump_path<'tcx>(&self, tcx: TyCtxt<'tcx>) -> PathBuf {
+        let crate_name = tcx.crate_name(LOCAL_CRATE).as_str().replace('-', "_");
+        if let Ok(path) = std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP_PATH") {
+            return PathBuf::from(path);
+        }
+        let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+        PathBuf::from(target_dir)
+            .join("rusteze-unsafe-summaries")
+            .join(format!("{crate_name}.jsonl"))
+    }
+
+    fn dump_unsafe_dataflow_summary<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        unsafe_influence: &UnsafeInfluence,
+    ) {
+        if !self.unsafe_dataflow_summary_dump_enabled() {
+            return;
+        }
+
+        let path = self.unsafe_summary_dump_path(tcx);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][unsafe-summary] failed to create dump dir {}: {}",
+                    parent.display(),
+                    err
+                );
+                return;
+            }
+        }
+
+        let fn_name = tcx.def_path_str(body.source.def_id());
+        let crate_name_sym = tcx.crate_name(LOCAL_CRATE);
+        let crate_name = crate_name_sym.as_str();
+        let summary = unsafe_influence.summary();
+        let record = UnsafeSummaryRecord {
+            crate_name: crate_name.to_string(),
+            function: fn_name,
+            has_direct_sink: summary.has_direct_sink(),
+            calls_unknown_boundary: summary.calls_unknown_boundary(),
+            calls_unknown_boundary_direct: summary.calls_unknown_boundary_direct(),
+            calls_unknown_boundary_inherited: summary.calls_unknown_boundary_inherited(),
+            ptr_args: summary.ptr_args().to_vec(),
+            local_callsites: unsafe_influence.local_callsites().to_vec(),
+        };
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            rz_pass_warn!(self, "[rusteze][unsafe-summary] failed to serialize summary");
+            return;
+        };
+        line.push('\n');
+
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()) {
+                    rz_pass_warn!(
+                        self,
+                        "[rusteze][unsafe-summary] failed to write {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                rz_pass_warn!(
+                    self,
+                    "[rusteze][unsafe-summary] failed to open {}: {}",
+                    path.display(),
+                    err
+                );
+            }
+        }
+    }
+
     fn filter_insert_points_by_unsafe_dataflow<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -1153,7 +1393,16 @@ impl MyOptimizationPass {
         let before_total = insert_points.len();
         let before_access = insert_points
             .iter()
-            .filter(|ip| Self::ptr_access_local_from_instr_kind(&ip.kind).is_some())
+            .filter(|ip| {
+                matches!(
+                    ip.kind,
+                    InstrKind::PtrRead { .. }
+                        | InstrKind::PtrWrite { .. }
+                        | InstrKind::PtrReadAllowUntagged { .. }
+                        | InstrKind::PtrWriteAllowUntagged { .. }
+                        | InstrKind::PtrUse { .. }
+                )
+            })
             .count();
 
         if !unsafe_influence.enabled() {
@@ -1170,7 +1419,7 @@ impl MyOptimizationPass {
         }
 
         insert_points.retain(|ip| {
-            let ptr_local_opt = Self::ptr_access_local_from_instr_kind(&ip.kind);
+            let ptr_local_opt = Self::unsafe_dataflow_gated_local(&ip.kind, &ip.place);
             ptr_local_opt
                 .map(|l| unsafe_influence.should_instrument_ptr_local(l))
                 .unwrap_or(true)
@@ -1179,7 +1428,16 @@ impl MyOptimizationPass {
         let after_total = insert_points.len();
         let after_access = insert_points
             .iter()
-            .filter(|ip| Self::ptr_access_local_from_instr_kind(&ip.kind).is_some())
+            .filter(|ip| {
+                matches!(
+                    ip.kind,
+                    InstrKind::PtrRead { .. }
+                        | InstrKind::PtrWrite { .. }
+                        | InstrKind::PtrReadAllowUntagged { .. }
+                        | InstrKind::PtrWriteAllowUntagged { .. }
+                        | InstrKind::PtrUse { .. }
+                )
+            })
             .count();
 
         if self.trace_unsafe_dataflow_enabled() {
@@ -3170,7 +3428,12 @@ impl MyOptimizationPass {
                                         insert_before: false,
                                         source_info: stmt.source_info,
                                         place: Place::from(dst_local),
-                                        kind: InstrKind::TagProp { dst: dst_local, src: src_local },
+                                        kind: InstrKind::TagProp {
+                                            dst: dst_local,
+                                            src: src_local,
+                                            copy_tag: true,
+                                            copy_ref_ancestor: true,
+                                        },
                                     });
                                 }
                                 tagged_ptr_locals.insert(dst_local);
@@ -5146,14 +5409,18 @@ impl MyOptimizationPass {
         // Append return points normally; they stay associated with return blocks.
         insert_points.extend(fallback_return_points);
 
-        let insert_points = self.filter_insert_points_by_unsafe_dataflow(
+        let mut insert_points = self.filter_insert_points_by_unsafe_dataflow(
             tcx,
             body,
             insert_points,
             unsafe_influence,
         );
+        metadata_dataflow::apply_metadata_dataflow(self, body, &mut insert_points);
 
-        ScanResult { insert_points, ptr_locals_needing_tag }
+        ScanResult {
+            insert_points,
+            ptr_locals_needing_tag,
+        }
     }
 
     fn allocate_tag_locals<'tcx>(
@@ -5758,46 +6025,60 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::TagProp { dst, src } = creation_kind {
+            if let InstrKind::TagProp {
+                dst,
+                src,
+                copy_tag,
+                copy_ref_ancestor,
+            } = creation_kind
+            {
                 // println!(
                 //     "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
                 //     dst,
                 //     src
                 // );
-                let dst_tag = *tag_local_for_ptr_local
-                    .get(&dst)
-                    .expect("missing tag local for TagProp dst");
+                let prop_stmt = if copy_tag {
+                    let dst_tag = *tag_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing tag local for TagProp dst");
 
-                let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
-                    Operand::Copy(Place::from(*src_tag))
-                } else {
-                    self.const_u64(tcx, source_info.span, 0)
-                };
-
-                let prop_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(dst_tag),
-                        Rvalue::Use(src_op),
-                    ))),
-                );
-
-                let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
-                    .get(&dst)
-                    .expect("missing ref-ancestor local for TagProp dst");
-                let src_ref_ancestor_op: Operand<'tcx> =
-                    if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
-                        Operand::Copy(Place::from(*src_ref_ancestor))
+                    let src_op: Operand<'tcx> = if let Some(src_tag) = tag_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*src_tag))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
                     };
-                let prop_ref_ancestor_stmt = Statement::new(
-                    source_info,
-                    StatementKind::Assign(Box::new((
-                        Place::from(dst_ref_ancestor),
-                        Rvalue::Use(src_ref_ancestor_op),
-                    ))),
-                );
+
+                    Some(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(dst_tag),
+                            Rvalue::Use(src_op),
+                        ))),
+                    ))
+                } else {
+                    None
+                };
+
+                let prop_ref_ancestor_stmt = if copy_ref_ancestor {
+                    let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing ref-ancestor local for TagProp dst");
+                    let src_ref_ancestor_op: Operand<'tcx> =
+                        if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
+                            Operand::Copy(Place::from(*src_ref_ancestor))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        };
+                    Some(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(dst_ref_ancestor),
+                            Rvalue::Use(src_ref_ancestor_op),
+                        ))),
+                    ))
+                } else {
+                    None
+                };
 
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let insert_at = if stmt_idx >= bd.statements.len() {
@@ -5805,8 +6086,14 @@ impl MyOptimizationPass {
                 } else {
                     stmt_idx + 1
                 };
-                bd.statements.insert(insert_at, prop_stmt);
-                bd.statements.insert(insert_at + 1, prop_ref_ancestor_stmt);
+                let mut next_insert = insert_at;
+                if let Some(prop_stmt) = prop_stmt {
+                    bd.statements.insert(next_insert, prop_stmt);
+                    next_insert += 1;
+                }
+                if let Some(prop_ref_ancestor_stmt) = prop_ref_ancestor_stmt {
+                    bd.statements.insert(next_insert, prop_ref_ancestor_stmt);
+                }
                 continue;
             }
 
@@ -7359,6 +7646,17 @@ impl MyOptimizationPass {
             );
         }
 
+        if self.analyze_unsafe_summaries_only_enabled() {
+            let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(
+                tcx,
+                body,
+                self.unsafe_dataflow_selective_enabled(),
+            );
+            self.log_unsafe_dataflow_summary_stats(tcx, body, &unsafe_influence);
+            self.dump_unsafe_dataflow_summary(tcx, body, &unsafe_influence);
+            return;
+        }
+
 
         // self.print_runtime_items(tcx);
 
@@ -7423,6 +7721,8 @@ impl MyOptimizationPass {
             body,
             self.unsafe_dataflow_selective_enabled(),
         );
+        self.log_unsafe_dataflow_summary_stats(tcx, body, &unsafe_influence);
+        self.dump_unsafe_dataflow_summary(tcx, body, &unsafe_influence);
         if self.trace_unsafe_dataflow_enabled() && unsafe_influence.enabled() {
             rz_pass_warn!(
                 self,
