@@ -379,6 +379,9 @@ Current status:
 - intra-procedural unsafe-sensitive analysis is active
 - per-function summaries are active
 - std/core/alloc external summary classification is active for selected APIs
+- an analyze-only summary mode is active:
+  - `RZ_ANALYZE_UNSAFE_SUMMARIES=1`
+  - computes summaries and dumps/logs them without mutating MIR
 - same-session crate-local propagation is deferred until we implement a summary pipeline that does
   not violate rustc's MIR query ownership model
 

@@ -1096,6 +1096,12 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
+        std::env::var("RZ_ANALYZE_UNSAFE_SUMMARIES")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn trace_unsafe_dataflow_enabled(&self) -> bool {
         std::env::var("RZ_TRACE_UNSAFE_DATAFLOW")
             .ok()
@@ -7602,6 +7608,17 @@ impl MyOptimizationPass {
                 body.source.def_id(),
                 def_path
             );
+        }
+
+        if self.analyze_unsafe_summaries_only_enabled() {
+            let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(
+                tcx,
+                body,
+                self.unsafe_dataflow_selective_enabled(),
+            );
+            self.log_unsafe_dataflow_summary_stats(tcx, body, &unsafe_influence);
+            self.dump_unsafe_dataflow_summary(tcx, body, &unsafe_influence);
+            return;
         }
 
 
