@@ -115,7 +115,8 @@ Project-specific environment variables are grouped below by component/script.
   returns without mutating MIR or inserting runtime hooks.
 - `RZ_USE_UNSAFE_SUMMARIES`: enables loading precomputed unsafe-summary JSONL files during a normal
   instrumentation build. This is intended for the second phase after running analyze-only mode and
-  an offline merge step.
+  an offline merge step. Loaded summaries are consumed conservatively at call boundaries by the
+  backward unsafe-sensitive analysis.
 - `RZ_UNSAFE_SUMMARY_INPUT_DIR`: optional directory override for summary loading. Default is
   `${CARGO_TARGET_DIR:-target}/rusteze-unsafe-summaries`.
 - `RZ_FILTER_STDLIB_USES`: std/core/alloc coarse-use filtering (`1` default, set `0` to disable).
@@ -168,7 +169,8 @@ Project-specific environment variables are grouped below by component/script.
 - `TRACE`: `afl_build.sh` shell tracing when `TRACE=1`.
 - `scripts/merge_unsafe_summaries.py`: offline fixed-point merge for unsafe-summary JSONL dumps.
   It supports per-file mode (`--input` / `--output`) and whole-build cross-crate mode
-  (`--input-dir` / `--output-dir`), plus `--report` for a human-readable propagation diff.
+  (`--input-dir` / `--output-dir`), plus `--report` for a human-readable propagation diff. The
+  merged output is the supported input for interprocedural hook gating.
 - `scripts/afl_build_interproc.sh`: native three-phase build wrapper:
   analyze-only summary pass, offline merge, then normal instrumented build consuming merged
   summaries.
@@ -176,6 +178,21 @@ Project-specific environment variables are grouped below by component/script.
   `scripts/afl_build_interproc.sh`.
 - `RZ_INTERPROC_UNSAFE_SUMMARIES`: if set to `1`, `scripts/afl_build.sh` automatically delegates
   to the three-phase interprocedural flow in `scripts/afl_build_interproc.sh`.
+
+Recommended interprocedural native build:
+
+```bash
+AFL_PATH=/path/to/AFLplusplus \
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_INTERPROC_UNSAFE_SUMMARIES=1 \
+TARGET=bytes PROFILE=release \
+./scripts/afl_build.sh
+```
+
+For benchmarking, prefer aggregating `[rusteze][unsafe-dflow][totals] crate=...` across the full
+build log rather than looking only at the final driver crate. Dependency crates often account for
+most of the hook reduction.
 
 ### Docker AFL wrapper (`scripts/docker_afl.sh`)
 - `IMAGE`: docker image tag (default `rusteze-afl`).

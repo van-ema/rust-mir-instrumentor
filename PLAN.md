@@ -80,20 +80,10 @@ Open tasks:
 1. Tune remaining high-overhead targets.
 - Focus on `toml`, `zip`, and other parser-heavy outliers.
 - Use profiling split to separate alias-model vs alloc-check costs.
-2. Rework MIR-side dataflow optimization on a sound basis.
-- Replace the current experimental pointer-provenance rewrite idea with a metadata-local analysis.
-- Analyze emitted tag/ref-ancestor state, not pointer-value equivalence.
-- Keep any new optimization opt-in until soundness is established on examples and smoke fuzzing.
-3. Metadata-dataflow implementation plan.
-- Build the analysis after instrumentation planning, over the metadata program we actually emit.
-- Track abstract tag/ref-ancestor state (`Unknown`, concrete source local, fresh assignment, join).
-- Remove only propagation hooks proven redundant at the metadata-local level.
-- Add backward metadata liveness so dead overwritten metadata stores can be pruned.
-- Treat tag and ref-ancestor propagation independently so a `TagProp` can keep only the
-  still-live half when the other copy is redundant.
-- Optimize only metadata propagation (`TagProp`, ref-ancestor propagation, dead metadata stores).
-- Do not rewrite semantic consumers (`PtrRead`, `PtrWrite`, `PtrUse`, `CallArgPush`, `RetPush`).
-- Add stats for metadata hooks before/after optimization; semantic-hook rewrites should remain zero.
-4. Validate and regressions.
+2. Improve interprocedural unsafe-sensitive pruning.
+- Keep the current two-phase summary pipeline (`analyze-only` -> merge -> instrumented build) sound and conservative.
+- Tighten backward call-boundary transfer so merged summaries remove more irrelevant creation/access hooks across dependencies.
+- Measure whole-build totals across dependencies, not only final harness crates.
+3. Validate and regressions.
 - Benchmark with and without alias model (`tb_lite` and `none`) using `scripts/bench_overhead.py`.
 - Ensure functional tests/fuzz smoke still pass after each optimization step.

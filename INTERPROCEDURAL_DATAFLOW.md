@@ -519,35 +519,51 @@ The summary model is intentionally coarse but now separates:
 
 This makes it possible to inspect real builds before using summaries for optimization.
 
-### Step 3 blocked for now: local same-session propagation needs a different implementation
+### Step 3 implemented as an offline two-stage pipeline
 
-A first attempt at same-session crate-local propagation was made, but it ran into rustc query-model
-constraints:
+The current implementation avoids rustc query-cycle and MIR-ownership issues by moving
+interprocedural propagation out of the per-body override path.
 
-- querying other local bodies through `optimized_mir` from inside the pass created query cycles
-- precomputing summaries from `optimized_mir` in `after_analysis` stole MIR bodies before the
-  custom pass could use them
-- precomputing from `mir_for_ctfe` is invalid for non-const functions
-- borrowing earlier `Steal<Body>`-based MIR in `after_analysis` is also not generally available,
-  because some bodies are already stolen by that point
+Implemented pipeline:
 
-So crate-local interprocedural propagation is **not enabled** in the current implementation.
+1. `RZ_ANALYZE_UNSAFE_SUMMARIES=1`
+   - compile in analyze-only mode
+   - compute/dump one JSONL unsafe-summary record per function
+   - record local and cross-crate call edges in the summary artifact
+2. `scripts/merge_unsafe_summaries.py`
+   - read all crate summary files
+   - propagate summaries across the call graph to a fixed point
+   - preserve the distinction between:
+     - direct sink / direct unknown
+     - inherited sink / inherited unknown
+3. normal build with:
+   - `RZ_USE_UNSAFE_SUMMARIES=1`
+   - `RZ_UNSAFE_SUMMARY_INPUT_DIR=<merged-dir>`
+   - merged summaries are consumed conservatively by the backward unsafe-sensitive analysis
+
+This design keeps the analysis sound by default:
+- no recursive MIR queries while instrumenting another body
+- no reuse of stolen MIR bodies
+- missing summary still falls back to ``instrument more''
 
 Current status:
 
-- intra-procedural unsafe-sensitive analysis is active
+- intra-procedural backward sink-reachability is active
 - per-function summaries are active
 - std/core/alloc external summary classification is active for selected APIs
-- an analyze-only summary mode is active:
-  - `RZ_ANALYZE_UNSAFE_SUMMARIES=1`
-  - computes summaries and dumps/logs them without mutating MIR
-- same-session crate-local propagation is deferred until we implement a summary pipeline that does
-  not violate rustc's MIR query ownership model
+- offline cross-crate merge is active
+- merged summaries are consumed conservatively at call boundaries
+- the three-phase native wrapper is available through:
+  - `scripts/afl_build_interproc.sh`
+  - or `RZ_INTERPROC_UNSAFE_SUMMARIES=1 ./scripts/afl_build.sh`
 
-The likely direction is still:
+Current measured effect:
 
-- a true two-stage local pipeline over a precomputed body cache, or
-- the broader two-build summary/index design described earlier in this document
+- whole-build hook totals drop across dependencies on representative targets such as
+  `bytes`, `toml`, and `quick_xml`
+- the largest wins currently come from tighter call-return relevance plus creation-hook gating
+- throughput gains are target-dependent; dependency-heavy targets benefit more clearly than
+  harness-only comparisons suggest
 
 ## Why this differs from the failed provenance-dataflow experiment
 
@@ -570,48 +586,48 @@ It does **not** assume that two pointer carriers are interchangeable at every se
 ### Compiler-side pieces
 
 1. `instrument-mir` analyze-only mode
-- new CLI mode or env gate
-- emits per-crate summaries
+- implemented via:
+  - `RZ_ANALYZE_UNSAFE_SUMMARIES=1`
+- emits per-crate JSONL summaries
 
 2. summary merge tool
-- separate binary or script
-- reads all crate summaries
-- computes merged program index
+- implemented as:
+  - `scripts/merge_unsafe_summaries.py`
+- reads all crate summaries and computes a fixed point
 
 3. guided instrumentation mode
-- existing pass loads the merged index if present
-- uses summaries conservatively
+- implemented via:
+  - `RZ_USE_UNSAFE_SUMMARIES=1`
+- existing pass loads merged summaries if present and uses them conservatively
 
-### Suggested files
+### Current files
 
-- `instrument-mir/src/summary.rs`
-  - summary structs + serialization
-- `instrument-mir/src/summary_collect.rs`
-  - crate-local summary extraction
-- `instrument-mir/src/program_index.rs`
-  - merged index format + lookup helpers
-- `instrument-mir/src/bin/rusteze-merge-summaries.rs`
-  - merge tool
+- `instrument-mir/src/unsafe_dataflow.rs`
+  - summary structs
+  - analyze-only collection
+  - conservative merged-summary consumption
+- `scripts/merge_unsafe_summaries.py`
+  - offline fixed-point merge
+- `scripts/afl_build_interproc.sh`
+  - three-phase native build wrapper
 
-This keeps whole-program logic separate from the current local instrumentation code path.
+This keeps the merge logic outside the current local instrumentation code path while still making
+the result available to the pass.
 
 ## Build integration
 
-The easiest integration point is the existing cargo wrapper flow.
+The current integration point is the existing AFL build wrapper flow.
 
-Suggested flow:
+Implemented flow:
 
-1. `cargo instrument-mir --analyze-only ...`
-   - runs a first build
-   - emits per-crate summaries
+1. analyze-only build
+2. offline merge
+3. normal instrumented build consuming merged summaries
 
-2. `rusteze-merge-summaries target/rusteze-summaries ...`
-   - produces `program_index.json`
+Convenience entry points:
 
-3. `cargo instrument-mir --use-program-index=... ...`
-   - second build with real instrumentation
-
-This can later be wrapped by a convenience script, but the underlying contract should stay explicit.
+- `scripts/afl_build_interproc.sh`
+- `RZ_INTERPROC_UNSAFE_SUMMARIES=1 ./scripts/afl_build.sh`
 
 ## Generic and trait-dispatch caveats
 
@@ -645,19 +661,23 @@ Validation must happen in stages.
 - no new immediate false positives on existing corpora
 
 ### Stage 3: usefulness
-- reduced propagation-hook count
+- reduced whole-build hook totals across dependencies
 - improved call/return modeling on real crates
-- measurable overhead reduction on parser-heavy targets
+- measurable overhead reduction on dependency-heavy targets such as `quick_xml`
 
-## Recommended first milestone
+## Current limitations / next steps
 
-Do not start with aggressive pruning.
+The current implementation is working, but still conservative:
 
-Start with:
-1. per-function summaries
-2. merged whole-program unsafe/pointer-relevance propagation
-3. better call/return summaries in the second build
+- merged summaries mainly improve call-boundary relevance; they are not yet used for semantic-hook
+  retargeting or aggressive metadata rewrites
+- inherited unknown still blocks pruning, by design
+- throughput wins are target-dependent and need better whole-build evaluation than final-driver-only
+  totals
 
-Only after that should we use the index to prune metadata propagation hooks.
+Next engineering targets:
 
-That sequencing keeps the first interprocedural version conservative and debuggable.
+1. tighten backward call-boundary transfer further when merged summaries prove a callee harmless
+2. improve whole-build observability/reporting across dependencies
+3. benchmark repeated native Linux runs on representative targets to separate real wins from AFL
+   noise
