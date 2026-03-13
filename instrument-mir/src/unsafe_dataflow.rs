@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -81,6 +81,13 @@ pub(crate) struct UnsafeCallRelevanceStats {
     pub(crate) backward_dst_unknown_boundary: usize,
     pub(crate) backward_dst_local_summary_missing: usize,
     pub(crate) backward_dst_forward_to_return: usize,
+    pub(crate) unknown_callees: BTreeMap<String, UnsafeUnknownCalleeStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UnsafeUnknownCalleeStats {
+    pub(crate) seed_arg_unknown_boundary: usize,
+    pub(crate) backward_dst_unknown_boundary: usize,
 }
 
 
@@ -207,6 +214,12 @@ pub(crate) fn use_loaded_unsafe_summaries_enabled() -> bool {
 
 fn trace_local_summary_missing_enabled() -> bool {
     std::env::var("RZ_TRACE_LOCAL_SUMMARY_MISSING")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+fn unknown_callee_stats_enabled() -> bool {
+    std::env::var("RZ_UNSAFE_DATAFLOW_UNKNOWN_CALLEE_STATS")
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
@@ -515,8 +528,53 @@ fn known_external_summary<'tcx>(
             || p.ends_with("::as_mut")
             || p.ends_with("::as_slice")
             || p.ends_with("::as_mut_slice")
+            || p.ends_with("::borrow")
+            || p.ends_with("::into")
             || p.ends_with("::deref")
             || p.ends_with("::deref_mut")
+            || p.ends_with("::index")
+            || p.ends_with("::index_mut")
+            || p.ends_with("::fill_buf")
+            || p.ends_with("::from_utf8")
+            || p.ends_with("::get")
+            || p.ends_with("::strip_suffix")
+            || p.ends_with("::strip_prefix")
+    ) {
+        if let Some(arg_index) = arg0_ptr {
+            summary.ptr_args.push(make_pointer_arg_summary(
+                arg_index,
+                0,
+                UnsafeArgSummary::PROP_FORWARD_TO_RETURN,
+            ));
+        }
+        return Some(summary);
+    }
+
+    // Simple state-mutating helpers that should not taint caller pointer provenance.
+    if matches!(
+        path.as_str(),
+        p if p.ends_with("::write_str")
+            || p.ends_with("::write_fmt")
+            || p.ends_with("::consume")
+            || p.ends_with("::kind")
+            || p.ends_with("::size_of_val")
+            || p.ends_with("::bswap")
+            || p.ends_with("::starts_with")
+            || p.ends_with("::ends_with")
+            || p.ends_with("::eq_ignore_ascii_case")
+            || p.ends_with("::finish")
+            || p.ends_with("::fmt")
+    ) {
+        return Some(summary);
+    }
+
+    // Builder-style formatting helpers return the builder reference in arg0 and otherwise should
+    // not taint caller pointer provenance.
+    if matches!(
+        path.as_str(),
+        p if p.ends_with("::field")
+            || p.ends_with("::debug_struct")
+            || p.ends_with("::debug_tuple")
     ) {
         if let Some(arg_index) = arg0_ptr {
             summary.ptr_args.push(make_pointer_arg_summary(
@@ -551,6 +609,27 @@ fn known_external_summary<'tcx>(
                 arg_index,
                 UnsafeArgSummary::DIRECT_RAW_CREATION,
                 UnsafeArgSummary::PROP_FORWARD_TO_RETURN,
+            ));
+        }
+        return Some(summary);
+    }
+
+    // Raw/value comparisons read through their pointer-like inputs but do not otherwise
+    // introduce unknown call effects. Model them as direct sinks on the pointer args.
+    if path.contains("compare_bytes")
+        || path.ends_with("::equal")
+        || path.ends_with("::eq")
+        || path.ends_with("::cmp")
+        || path.ends_with("::partial_cmp")
+        || path.ends_with("::hash")
+        || path.ends_with("::atomic_load")
+    {
+        summary.has_direct_sink = true;
+        for arg_index in ptr_arg_indices {
+            summary.ptr_args.push(make_pointer_arg_summary(
+                arg_index,
+                UnsafeArgSummary::DIRECT_RAW_ARG_TO_CALL,
+                0,
             ));
         }
         return Some(summary);
@@ -660,6 +739,56 @@ fn instrumented_call_boundary<'tcx>(
     instrumented_crates_cached(tcx).contains(crate_name)
 }
 
+fn unknown_callee_label<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> String {
+    match resolve_callee_def_id(tcx, body, func) {
+        Some(did) => {
+            let crate_name_sym = tcx.crate_name(did.krate);
+            let crate_name = crate_name_sym.as_str();
+            let path = tcx.def_path_str(did);
+            format!("{crate_name}::{path}")
+        }
+        None => "<unresolved>".to_string(),
+    }
+}
+
+fn record_unknown_callee_seed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    call_stats: &mut UnsafeCallRelevanceStats,
+) {
+    if !unknown_callee_stats_enabled() {
+        return;
+    }
+    let label = unknown_callee_label(tcx, body, func);
+    call_stats
+        .unknown_callees
+        .entry(label)
+        .or_default()
+        .seed_arg_unknown_boundary += 1;
+}
+
+fn record_unknown_callee_backward<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    call_stats: &mut UnsafeCallRelevanceStats,
+) {
+    if !unknown_callee_stats_enabled() {
+        return;
+    }
+    let label = unknown_callee_label(tcx, body, func);
+    call_stats
+        .unknown_callees
+        .entry(label)
+        .or_default()
+        .backward_dst_unknown_boundary += 1;
+}
+
 fn apply_statement<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -745,11 +874,12 @@ fn apply_terminator<'tcx>(
             }
         }
 
-        // Conservative boundary: treat only unresolved or intentionally-uninstrumented callees
-        // (std/core/runtime/uninstrumented deps) as unknown. Cross-crate calls to instrumented
-        // dependencies should not taint by default.
-        let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
         let callee_summary = callee_summary(tcx, body, func);
+        // Treat a non-instrumented boundary as "unknown" only when we have no usable summary for
+        // it. Hand-modeled std/core helpers and merged interprocedural summaries should sharpen
+        // call behavior instead of falling back to blanket taint.
+        let unknown_boundary =
+            !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
         let conservative_local_fallback = !unknown_boundary
             && resolve_callee_def_id(tcx, body, func)
                 .is_some_and(|did| did.krate == LOCAL_CRATE)
@@ -904,8 +1034,9 @@ fn summarize_arg_effects<'tcx>(
                         }
                     }
                 }
-                let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
                 let callee_summary = callee_summary(tcx, body, func);
+                let unknown_boundary =
+                    !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
                 if unknown_boundary && any_tainted_ptr_arg {
                     propagation_mask |= UnsafeArgSummary::PROP_ESCAPE_UNKNOWN;
                 }
@@ -961,8 +1092,9 @@ fn compute_function_summary<'tcx>(
         }
         if let Some(term) = block_data.terminator.as_ref() {
             if let TerminatorKind::Call { func, args, .. } = &term.kind {
-                let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
                 let callee_summary = callee_summary(tcx, body, func);
+                let unknown_boundary =
+                    !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
                 summary.calls_unknown_boundary_direct |= unknown_boundary
                     || (resolve_callee_def_id(tcx, body, func)
                         .is_some_and(|did| did.krate != LOCAL_CRATE)
@@ -1315,8 +1447,9 @@ fn seed_terminator_sink_relevance<'tcx>(
         return;
     };
 
-    let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
     let callee_summary = callee_summary(tcx, body, func);
+    let unknown_boundary =
+        !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
     let local_summary_missing = resolve_callee_def_id(tcx, body, func)
         .is_some_and(|did| did.krate == LOCAL_CRATE)
         && callee_summary.is_none();
@@ -1336,6 +1469,7 @@ fn seed_terminator_sink_relevance<'tcx>(
         let is_raw = is_raw_pointer_ty(ty);
         let sink_relevant = if unknown_boundary {
             call_stats.seed_arg_unknown_boundary += 1;
+            record_unknown_callee_seed(tcx, body, func, call_stats);
             true
         } else if local_summary_missing {
             call_stats.seed_arg_local_summary_missing += 1;
@@ -1492,7 +1626,8 @@ fn backward_apply_terminator<'tcx>(
     if let Some(dst_local) = destination.as_local() {
         if relevant_value_locals.contains(&dst_local) {
             let callee_summary = callee_summary(tcx, body, func);
-            let unknown_boundary = !instrumented_call_boundary(tcx, body, func);
+            let unknown_boundary =
+                !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
             let conservative_local_fallback = resolve_callee_def_id(tcx, body, func)
                 .is_some_and(|did| did.krate == LOCAL_CRATE)
                 && callee_summary.is_none();
@@ -1502,6 +1637,7 @@ fn backward_apply_terminator<'tcx>(
             if unknown_boundary || conservative_local_fallback {
                 if unknown_boundary {
                     call_stats.backward_dst_unknown_boundary += 1;
+                    record_unknown_callee_backward(tcx, body, func, call_stats);
                 } else {
                     call_stats.backward_dst_local_summary_missing += 1;
                 }

@@ -70,6 +70,7 @@ struct UnsafeCallDflowStats {
     backward_dst_unknown_boundary: usize,
     backward_dst_local_summary_missing: usize,
     backward_dst_forward_to_return: usize,
+    unknown_callees: std::collections::BTreeMap<String, (usize, usize)>,
 }
 
 #[derive(Default)]
@@ -1119,6 +1120,12 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
+    fn unsafe_dataflow_unknown_callee_stats_enabled(&self) -> bool {
+        std::env::var("RZ_UNSAFE_DATAFLOW_UNKNOWN_CALLEE_STATS")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
         std::env::var("RZ_ANALYZE_UNSAFE_SUMMARIES")
             .ok()
@@ -1263,6 +1270,11 @@ impl MyOptimizationPass {
         stats.backward_dst_unknown_boundary += call_stats.backward_dst_unknown_boundary;
         stats.backward_dst_local_summary_missing += call_stats.backward_dst_local_summary_missing;
         stats.backward_dst_forward_to_return += call_stats.backward_dst_forward_to_return;
+        for (callee, counts) in &call_stats.unknown_callees {
+            let entry = stats.unknown_callees.entry(callee.clone()).or_default();
+            entry.0 += counts.seed_arg_unknown_boundary;
+            entry.1 += counts.backward_dst_unknown_boundary;
+        }
 
         eprintln!(
             "[rusteze][unsafe-call][totals] crate={} seed_arg_unknown={} seed_arg_local_missing={} seed_arg_direct_sink={} seed_arg_escape_unknown_direct={} seed_arg_escape_unknown_inherited={} seed_arg_raw_fallback={} backward_dst_unknown={} backward_dst_local_missing={} backward_dst_forward_to_return={}",
@@ -1277,6 +1289,21 @@ impl MyOptimizationPass {
             stats.backward_dst_local_summary_missing,
             stats.backward_dst_forward_to_return,
         );
+        if self.unsafe_dataflow_unknown_callee_stats_enabled() {
+            for (callee, (seed_unknown, backward_unknown)) in stats
+                .unknown_callees
+                .iter()
+                .filter(|(_, counts)| counts.0 != 0 || counts.1 != 0)
+            {
+                eprintln!(
+                    "[rusteze][unsafe-call][unknown] crate={} callee={} seed_arg_unknown={} backward_dst_unknown={}",
+                    crate_name,
+                    callee,
+                    seed_unknown,
+                    backward_unknown,
+                );
+            }
+        }
     }
 
     fn log_unsafe_dataflow_summary_stats<'tcx>(
