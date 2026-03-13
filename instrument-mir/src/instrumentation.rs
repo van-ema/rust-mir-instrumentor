@@ -306,7 +306,17 @@ static ALLOC_SHIM_EFFECT_RULES: &[EffectRule] = &[
     ),
     EffectRule::one(
         MatchKind::Contains,
+        "alloc::dealloc",
+        CallEffect::AllocShim(AllocShimKind::Dealloc),
+    ),
+    EffectRule::one(
+        MatchKind::Contains,
         "alloc::alloc::realloc",
+        CallEffect::AllocShim(AllocShimKind::Realloc),
+    ),
+    EffectRule::one(
+        MatchKind::Contains,
+        "alloc::realloc",
         CallEffect::AllocShim(AllocShimKind::Realloc),
     ),
     // std::alloc wrappers (often take `Layout`).
@@ -6116,6 +6126,7 @@ impl MyOptimizationPass {
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
+        let current_body_effect = self.classify_call_effect(&tcx.def_path_str(body.source.def_id()));
         let ret_take_enabled = self.ret_take_enabled();
 
         // 6a: Remove is_plain_store/is_plain_load computation.
@@ -6161,9 +6172,7 @@ impl MyOptimizationPass {
                 CallEffect::AllocShim(kind) => {
                     let suppress_wrapper_dealloc = callee_instrumented
                         && matches!(kind, AllocShimKind::Dealloc)
-                        && callee_path_opt
-                            .as_deref()
-                            .is_some_and(|p| !p.contains("__rust_dealloc"));
+                        && matches!(current_body_effect, CallEffect::AllocShim(AllocShimKind::Dealloc));
                     let suppress_wrapper_realloc = callee_instrumented
                         && matches!(kind, AllocShimKind::Realloc)
                         && callee_path_opt

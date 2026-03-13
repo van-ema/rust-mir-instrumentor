@@ -1,3 +1,3 @@
 # name|command
-bytes_driver|cargo instrument-mir --runtime-path=target/debug --mir-out=./out.medium_bytes_driver.mir -p medium_bytes_driver --bin medium_bytes_driver && ./target/debug/medium_bytes_driver
-smallvec_driver|cargo instrument-mir --runtime-path=target/debug --mir-out=./out.medium_smallvec_driver.mir -p medium_smallvec_driver --bin medium_smallvec_driver && ./target/debug/medium_smallvec_driver
+bytes_driver|cargo instrument-mir --runtime-path="${RZ_HARNESS_RUNTIME_PATH}" --mir-out=./out.medium_bytes_driver.mir -p medium_bytes_driver --bin medium_bytes_driver ${RZ_HARNESS_PROFILE_FLAG} ${RZ_HARNESS_BUILD_STD_ARGS} && "${RZ_HARNESS_BIN_DIR}"/medium_bytes_driver
+smallvec_driver|cargo instrument-mir --runtime-path="${RZ_HARNESS_RUNTIME_PATH}" --mir-out=./out.medium_smallvec_driver.mir -p medium_smallvec_driver --bin medium_smallvec_driver ${RZ_HARNESS_PROFILE_FLAG} ${RZ_HARNESS_BUILD_STD_ARGS} && "${RZ_HARNESS_BIN_DIR}"/medium_smallvec_driver

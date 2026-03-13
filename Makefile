@@ -49,7 +49,7 @@ INSTRUMENT_ENV := $(COMMON_ENV) RZ_INSTRUMENT_STDLIB=$(RZ_INSTRUMENT_STDLIB)
 RUNTIME_PATH := $(TARGET_ROOT)/$(PROFILE_DIR)/deps
 BIN_PATH := $(TARGET_ROOT)/$(PROFILE_DIR)/$(EXAMPLE)
 
-.PHONY: clean clean-mir runtime tools instrument run rebuild instrument-stdlib-core instrument-stdlib-core-alloc instrument-stdlib-all test-stdlib-core test-stdlib-core-alloc test-stdlib-all
+.PHONY: clean clean-mir runtime tools instrument run rebuild instrument-stdlib-core instrument-stdlib-core-alloc instrument-stdlib-all test-stdlib-core test-stdlib-core-alloc test-stdlib-all test-medium-stdlib-all test-fuzz-stdlib-all-smoke
 
 clean:
 	$(CARGO_ENV) $(CARGO_CMD) clean
@@ -86,6 +86,12 @@ test-stdlib-core-alloc:
 
 test-stdlib-all:
 	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-all BATCH_BUILD_STD=$(BATCH_BUILD_STD) $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=all python3 scripts/run_example_tests.py
+
+test-medium-stdlib-all:
+	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-medium-all $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=all FLAKY_EXAMPLES= MEDIUM_COMMANDS_FILE=scripts/medium_commands.txt scripts/run_harness.sh
+
+test-fuzz-stdlib-all-smoke:
+	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-fuzz-all $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=all scripts/run_fuzz_smoke.sh
 
 run:
 	$(BIN_PATH)

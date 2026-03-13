@@ -349,11 +349,13 @@ Current state (2026-03-13)
 		•	the default example suite passes with no mismatches under `scripts/run_example_tests.py`
 		•	the example harness now uses an isolated target dir, which avoids stale local `libcore` artifacts contaminating stdlib experiments
 		•	the full example suite passes with `RZ_INSTRUMENT_STDLIB=all` under `-Z build-std=core,alloc,std`
-		•	dedicated Makefile targets exist for `test-stdlib-core`, `test-stdlib-core-alloc`, and `test-stdlib-all`
+		•	the medium-driver gate passes with `RZ_INSTRUMENT_STDLIB=all` for `bytes` and `smallvec`
+		•	a fuzz-smoke gate passes with `RZ_INSTRUMENT_STDLIB=all` for seeded `afl_bytes_driver` and `afl_smallvec_driver`
+		•	dedicated Makefile targets exist for `test-stdlib-core`, `test-stdlib-core-alloc`, `test-stdlib-all`, `test-medium-stdlib-all`, and `test-fuzz-stdlib-all-smoke`
 	•	Known blockers to full stdlib instrumentation
 		•	bootstrap crates are still force-skipped (`core`, `compiler_builtins`, `panic_*`, `unwind`, `std_detect`, `rustc_std_workspace_*`)
 		•	build-std support crates are still excluded with broad path-based filtering
-		•	`all` is green on the example suite, but medium drivers and fuzz smoke are not yet part of the stdlib-all gate
+		•	the default fuzz-smoke gate is currently limited to `bytes` and `smallvec`; `serde_json` still hits a host-side proc-macro/build-std crate-collision path
 
 Implementation plan
 	1.	P1: unblock bootstrap crates

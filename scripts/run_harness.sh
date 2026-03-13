@@ -4,7 +4,11 @@ set -euo pipefail
 CARGO="${CARGO:-cargo}"
 PROFILE="${PROFILE:-FAST}"
 BUILD_PROFILE="${BUILD_PROFILE:-debug}"
-FLAKY_EXAMPLES="${FLAKY_EXAMPLES:-memset_u8_dynamic}"
+BUILD_STD="${BUILD_STD:-0}"
+BUILD_STD_CRATES="${BUILD_STD_CRATES:-alloc,std,core}"
+BUILD_STD_FEATURES="${BUILD_STD_FEATURES:-}"
+TARGET_ROOT="${TARGET_ROOT:-${CARGO_TARGET_DIR:-}}"
+FLAKY_EXAMPLES="${FLAKY_EXAMPLES-memset_u8_dynamic}"
 FLAKY_RUNS="${FLAKY_RUNS:-200}"
 REPORT_DIR="${REPORT_DIR:-reports/harness}"
 MEDIUM_COMMANDS_FILE="${MEDIUM_COMMANDS_FILE:-}"
@@ -19,8 +23,8 @@ if [[ "${BUILD_PROFILE}" != "debug" && "${BUILD_PROFILE}" != "release" ]]; then
   exit 1
 fi
 
-if ! command -v cargo-instrument-mir >/dev/null 2>&1 || ! command -v instrument-mir >/dev/null 2>&1; then
-  echo "cargo-instrument-mir or instrument-mir not found; run 'make tools' first." >&2
+if [[ "${BUILD_STD}" != "0" && "${BUILD_STD}" != "1" ]]; then
+  echo "Unknown BUILD_STD=${BUILD_STD}. Use 0 or 1." >&2
   exit 1
 fi
 
@@ -71,24 +75,85 @@ export RZ_INSTRUMENT_ALL_DEPS="${RZ_INSTRUMENT_ALL_DEPS:-1}"
 
 profile_flag=()
 runtime_features=()
-runtime_path="${repo_root}/target/debug"
-bin_dir="${repo_root}/target/debug"
+build_std_args=()
+profile_dir="debug"
+if [[ -z "${TARGET_ROOT}" ]]; then
+  TARGET_ROOT="${repo_root}/target/harness"
+  if [[ "${BUILD_STD}" == "1" ]]; then
+    TARGET_ROOT="${TARGET_ROOT}/build-std-${BUILD_PROFILE}"
+  fi
+fi
+export CARGO_TARGET_DIR="${TARGET_ROOT}"
+runtime_path="${TARGET_ROOT}/debug/deps"
+bin_dir="${TARGET_ROOT}/debug"
 if [[ "${BUILD_PROFILE}" == "release" ]]; then
   profile_flag=(--release)
-  runtime_path="${repo_root}/target/release"
-  bin_dir="${repo_root}/target/release"
+  profile_dir="release"
+  runtime_path="${TARGET_ROOT}/release/deps"
+  bin_dir="${TARGET_ROOT}/release"
 else
   runtime_features=(--features rz_log)
 fi
 
-build_runtime_cmd=("${CARGO}" build -p runtime)
+if [[ "${BUILD_STD}" == "1" ]]; then
+  build_std_args=(-Z "build-std=${BUILD_STD_CRATES}")
+  if [[ -n "${BUILD_STD_FEATURES}" ]]; then
+    build_std_args+=(-Z "build-std-features=${BUILD_STD_FEATURES}")
+  fi
+fi
+
+export RZ_HARNESS_TARGET_ROOT="${TARGET_ROOT}"
+export RZ_HARNESS_RUNTIME_PATH="${runtime_path}"
+export RZ_HARNESS_BIN_DIR="${bin_dir}"
+export RZ_HARNESS_BUILD_PROFILE="${BUILD_PROFILE}"
+export RZ_HARNESS_PROFILE_FLAG="${profile_flag[*]:-}"
+export RZ_HARNESS_BUILD_STD="${BUILD_STD}"
+export RZ_HARNESS_BUILD_STD_ARGS="${build_std_args[*]:-}"
+
+tool_target_root="${repo_root}/target"
+tool_dir="${tool_target_root}/${profile_dir}"
+tool_build_cmd=("${CARGO}" build -p instrument-mir --bins)
 if (( ${#profile_flag[@]} )); then
+  tool_build_cmd+=("${profile_flag[@]}")
+fi
+CARGO_TARGET_DIR="${tool_target_root}" "${tool_build_cmd[@]}"
+if [[ ! -x "${tool_dir}/cargo-instrument-mir" || ! -x "${tool_dir}/instrument-mir" ]]; then
+  echo "instrument-mir tools were not built successfully" >&2
+  exit 1
+fi
+export PATH="${tool_dir}:${PATH}"
+
+build_runtime_cmd=("${CARGO}" build -p runtime)
+build_runtime_abi_cmd=("${CARGO}" build -p runtime_abi)
+if (( ${#profile_flag[@]} )); then
+  build_runtime_abi_cmd+=("${profile_flag[@]}")
   build_runtime_cmd+=("${profile_flag[@]}")
+fi
+if (( ${#build_std_args[@]} )); then
+  build_runtime_abi_cmd+=("${build_std_args[@]}")
+  build_runtime_cmd+=("${build_std_args[@]}")
 fi
 if (( ${#runtime_features[@]} )); then
   build_runtime_cmd+=("${runtime_features[@]}")
 fi
-"${build_runtime_cmd[@]}"
+
+if [[ "${BUILD_STD}" == "1" ]]; then
+  env \
+    RZ_INSTRUMENT_ALL_DEPS=0 \
+    RZ_INSTRUMENT_STDLIB="${RZ_INSTRUMENT_STDLIB:-none}" \
+    RZ_SKIP_RUNTIME_HOOKS=1 \
+    RUSTC=instrument-mir \
+    "${build_runtime_abi_cmd[@]}"
+  env \
+    RZ_INSTRUMENT_ALL_DEPS=0 \
+    RZ_INSTRUMENT_STDLIB="${RZ_INSTRUMENT_STDLIB:-none}" \
+    RZ_SKIP_RUNTIME_HOOKS=1 \
+    RUSTC=instrument-mir \
+    "${build_runtime_cmd[@]}"
+else
+  "${build_runtime_abi_cmd[@]}"
+  "${build_runtime_cmd[@]}"
+fi
 
 extract_signature() {
   local log_file="$1"
@@ -138,6 +203,9 @@ instrument_example() {
   )
   if (( ${#profile_flag[@]} )); then
     cmd+=("${profile_flag[@]}")
+  fi
+  if (( ${#build_std_args[@]} )); then
+    cmd+=("${build_std_args[@]}")
   fi
 
   if ! "${cmd[@]}" > "${log_file}" 2>&1; then

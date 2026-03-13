@@ -75,6 +75,8 @@ make instrument-stdlib-all EXAMPLE=hello
 make test-stdlib-core
 make test-stdlib-core-alloc
 make test-stdlib-all
+make test-medium-stdlib-all
+make test-fuzz-stdlib-all-smoke
 ```
 
 ## Running with dataflow analysis
@@ -363,7 +365,8 @@ most of the hook reduction.
 - All host `RZ_*`, `RUSTEZE_*`, `TRACE`, `RUST_BACKTRACE`: forwarded into container when set.
 
 ### Harness / utility scripts
-- `scripts/run_harness.sh`: `CARGO`, `PROFILE` (`FAST|DEBUG`), `BUILD_PROFILE` (`debug|release`), `FLAKY_EXAMPLES`, `FLAKY_RUNS`, `REPORT_DIR`, `MEDIUM_COMMANDS_FILE`, `STOP_ON_VIOLATION`, `REINSTRUMENT`, `RZ_LOG`, `RZ_INSTRUMENT_ALL_DEPS`, `CARGO_INCREMENTAL`.
+- `scripts/run_harness.sh`: `CARGO`, `PROFILE` (`FAST|DEBUG`), `BUILD_PROFILE` (`debug|release`), `BUILD_STD` (`0|1`), `BUILD_STD_CRATES`, `BUILD_STD_FEATURES`, `TARGET_ROOT`, `FLAKY_EXAMPLES`, `FLAKY_RUNS`, `REPORT_DIR`, `MEDIUM_COMMANDS_FILE`, `STOP_ON_VIOLATION`, `REINSTRUMENT`, `RZ_LOG`, `RZ_INSTRUMENT_ALL_DEPS`, `CARGO_INCREMENTAL`.
+- `scripts/run_fuzz_smoke.sh`: `CARGO`, `BUILD_PROFILE` (`debug|release`), `BUILD_STD` (`0|1`), `BUILD_STD_CRATES`, `BUILD_STD_FEATURES`, `TARGET_ROOT`, `TARGETS` (`bytes smallvec` by default), `REPORT_DIR`, `RUSTEZE_FAILFAST`, `RZ_ABORT_ON_VIOLATION`, `RZ_LOG`, `RZ_INSTRUMENT_ALL_DEPS`, `CARGO_INCREMENTAL`.
 - `scripts/run_with_trace.sh`: `EXAMPLE` (required), `PROFILE`, `OUT`, `CARGO_INCREMENTAL`, `RZ_INSTRUMENT_ALL_DEPS`.
 - `scripts/afl_setup.sh`: optional repo pin vars `REF_BYTES`, `REF_SMALLVEC`, `REF_SERDE`, `REF_SERDE_JSON`, `REF_TOML`, `REF_UUID`, `REF_QUICK_XML`, `REF_BASE64`, `REF_ITOA`, `REF_SIMD_JSON`, `REF_ZIP`, `REF_RKYV`, `REF_HYPER`; also reads `AFL_PATH`, `AFL_FUZZ`, `AFL_COMPILER_RT`.
 - `afl_harness/src/bin/afl_smallvec_driver.rs`: `AFL_MAX_STEPS`, `AFL_MAX_LEN`.
@@ -400,8 +403,12 @@ Current state (2026-03-13):
 2. `cargo instrument-mir` now works with `-Z build-std=core,alloc,std`, and
    `RZ_INSTRUMENT_STDLIB=all` is validated across the full example suite.
 3. Dedicated suite targets are available:
-   `make test-stdlib-core`, `make test-stdlib-core-alloc`, `make test-stdlib-all`.
-4. `all` does not yet mean literal full coverage of every stdlib-related crate:
+   `make test-stdlib-core`, `make test-stdlib-core-alloc`, `make test-stdlib-all`,
+   `make test-medium-stdlib-all`, `make test-fuzz-stdlib-all-smoke`.
+4. The current fuzz-smoke gate covers the seeded `bytes` and `smallvec` AFL harnesses
+   under `stdlib-all`. `serde_json` is not part of the default smoke set yet because
+   it still hits a host-side proc-macro/build-std crate-collision path.
+5. `all` does not yet mean literal full coverage of every stdlib-related crate:
    bootstrap/support crates such as `core`, `compiler_builtins`, `panic_*`,
    `unwind`, `std_detect`, and `rustc_std_workspace_*` are still explicitly
    skipped by the pass.
