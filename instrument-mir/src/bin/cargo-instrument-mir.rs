@@ -54,10 +54,7 @@ fn main() -> Result<(), i32> {
     let mut extra_rf: Vec<String> = Vec::new();
 
     if let Some(path) = mir_out {
-        extra_rf.push(format!(
-            "--mir-out={}",
-            absolutize(path, workspace_root.as_path())
-        ));
+        cmd.env("RZ_MIR_OUT", absolutize(path, workspace_root.as_path()));
     }
     if let Some(path) = runtime_path {
         extra_rf.push(format!(

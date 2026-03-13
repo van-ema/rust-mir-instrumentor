@@ -193,7 +193,7 @@ fn main() {
     std::process::exit(rustc_driver::catch_with_exit_code(move || {
         let mut args: Vec<String> = std::env::args().collect();
 
-        let mut mir_out: Option<String> = None;
+        let mut mir_out: Option<String> = std::env::var("RZ_MIR_OUT").ok();
 
         args.retain(|arg| {
             if let Some(rest) = arg.strip_prefix("--mir-out=") {
@@ -265,7 +265,8 @@ fn main() {
             || (instrument_all_deps && !is_stdlib_side_crate);
         let wants_runtime_externs = wants_instrumentation
             || (skip_runtime_hooks && stdlib_mode.includes(crate_name));
-        let needs_runtime_externs = !is_query_probe
+        let needs_runtime_externs = runtime_path.is_some()
+            && !is_query_probe
             && !is_build_script
             && !is_proc_macro
             && !is_runtime_crate
@@ -273,6 +274,10 @@ fn main() {
             && !is_build_std_support_crate
             && wants_runtime_externs;
         let needs_instrumentation = needs_runtime_externs && wants_instrumentation && !skip_runtime_hooks;
+        let missing_runtime_path = runtime_path.is_none()
+            && !is_query_probe
+            && !skip_runtime_hooks
+            && wants_instrumentation;
 
         if !needs_runtime_externs {
             return rustc_driver::run_compiler(&args, &mut NoopCallbacks);
@@ -312,7 +317,7 @@ fn main() {
                     runtime_path
                 );
             }
-        } else if needs_runtime_externs {
+        } else if missing_runtime_path {
             panic!("missing --runtime-path argument (pass it via `cargo instrument-mir --runtime-path=...`)");
         }
         // args.push("-Zdump-mir=main".to_string());

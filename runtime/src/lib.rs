@@ -434,6 +434,9 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
         }
         Some(meta) => {
             if !meta.live {
+                if pending_mir_frees().lock().unwrap().remove(&base).is_some() {
+                    return true;
+                }
                 rz_violation(
                     "DOUBLE_FREE",
                     format!(
@@ -572,6 +575,7 @@ static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
+static PENDING_MIR_FREES: OnceLock<Mutex<HashMap<usize, ()>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -587,6 +591,10 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
 
 fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_mir_frees() -> &'static Mutex<HashMap<usize, ()>> {
+    PENDING_MIR_FREES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Find the allocation whose range [base, base+size) contains `addr`.
@@ -656,6 +664,24 @@ fn rz_allow_untracked_stack_raw_root(tmeta: &TagMeta, addr: usize) -> bool {
         && tmeta.parent == 0
         && tmeta.alloc_epoch == 0
         && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
+}
+
+#[inline]
+fn rz_allow_untracked_stack_raw_derived(tmeta: &TagMeta, addr: usize) -> bool {
+    matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        && tmeta.parent != 0
+        && tmeta.alloc_epoch == 0
+        && (rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr))
+}
+
+#[inline]
+fn rz_allow_untracked_ref_metadata_copy(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
+    let word = core::mem::size_of::<usize>();
+    matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+        && tmeta.alloc_epoch == 0
+        && tmeta.bounds_len == 0
+        && tmeta.pointee_addr == addr
+        && (size == word || size == 2 * word)
 }
 
 #[inline]
@@ -906,6 +932,25 @@ fn rz_record_alloc_impl(base_addr: usize, size: usize, live: u8) {
 
     let new_live = (live & 0x1) != 0;
 
+    // In stdlib-instrumented builds, heap alloc/free tracking can come entirely from MIR hooks
+    // instead of the global allocator wrapper. A repeated dead update for the same heap base
+    // then represents a real double-free path and must not be silently accepted.
+    if !new_live && !entry.live && !entry.is_stack && entry.epoch != 0 {
+        rz_violation(
+            "DOUBLE_FREE",
+            format!(
+                "DOUBLE_FREE base=0x{base_addr:x} alloc_epoch={} size={}",
+                entry.epoch, entry.size
+            ),
+        );
+
+        if rz_abort_on_double_free() {
+            abort_process();
+        }
+
+        return;
+    }
+
     // We treat `epoch` as an allocation-instance counter for a given base address.
     // We must bump it not only on death, but also on reuse (dead -> live), otherwise
     // a later allocation at the same numeric address could "revive" stale pointers.
@@ -918,6 +963,9 @@ fn rz_record_alloc_impl(base_addr: usize, size: usize, live: u8) {
     // Death transition: live to dead
     if !new_live && entry.live {
         entry.epoch = entry.epoch.wrapping_add(1);
+        if !entry.is_stack && !tls::in_alloc_hook() {
+            pending_mir_frees().lock().unwrap().insert(base_addr, ());
+        }
     }
 
     let was_live = entry.live;
@@ -927,6 +975,9 @@ fn rz_record_alloc_impl(base_addr: usize, size: usize, live: u8) {
     if new_live && !was_live {
         if entry.epoch != 0 {
             entry.epoch = entry.epoch.wrapping_add(1);
+        }
+        if !entry.is_stack {
+            pending_mir_frees().lock().unwrap().remove(&base_addr);
         }
     }
 
@@ -1279,6 +1330,8 @@ fn rz_ptr_write_impl(tag: u64, addr: usize, size: usize) {
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+            || rz_allow_untracked_stack_raw_derived(&tmeta, addr)
+            || rz_allow_untracked_ref_metadata_copy(&tmeta, addr, size)
         {
             return;
         }
@@ -1657,6 +1710,8 @@ fn rz_ptr_read_impl(tag: u64, addr: usize, size: usize) {
         // references into the current stack window as wild pointers.
         if rz_allow_untracked_stack_ref(&tmeta, addr)
             || rz_allow_untracked_stack_raw_root(&tmeta, addr)
+            || rz_allow_untracked_stack_raw_derived(&tmeta, addr)
+            || rz_allow_untracked_ref_metadata_copy(&tmeta, addr, size)
         {
             return;
         }

@@ -678,20 +678,22 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     ),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::write_bytes)
     EffectRule::one(MatchKind::EndsWith, "::write_bytes", CallEffect::MemSet),
-    // Plain wrappers.
-    // Use suffix matching for `read`/`write` so we don't accidentally match `write_bytes`/`read_bytes`.
+    // Plain pointer wrappers.
+    // Keep these scoped to `ptr::*` paths so we do not accidentally classify unrelated
+    // methods such as `std::io::Write::write` or `std::io::Read::read` as memory stores/loads
+    // through `self`.
     EffectRule::one(
         MatchKind::Contains,
         "::ptr::read_unaligned",
         CallEffect::Load,
     ),
-    EffectRule::one(MatchKind::EndsWith, "::read", CallEffect::Load),
+    EffectRule::one(MatchKind::Contains, "::ptr::read", CallEffect::Load),
     EffectRule::one(
         MatchKind::Contains,
         "::ptr::write_unaligned",
         CallEffect::Store,
     ),
-    EffectRule::one(MatchKind::EndsWith, "::write", CallEffect::Store),
+    EffectRule::one(MatchKind::Contains, "::ptr::write", CallEffect::Store),
     // Memcpy/memmove-like.
     EffectRule::one(
         MatchKind::Contains,
@@ -1765,6 +1767,50 @@ impl MyOptimizationPass {
         }
     }
 
+    fn pointee_is_pointer_ty<'tcx>(&self, ptr_ty: Ty<'tcx>) -> bool {
+        match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => self.is_pointer_ty(*pointee),
+            _ => false,
+        }
+    }
+
+    fn is_metadata_like_access_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        depth: usize,
+    ) -> bool {
+        if depth > 4 {
+            return false;
+        }
+
+        match ty.kind() {
+            TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Uint(_)
+            | TyKind::Int(_)
+            | TyKind::Float(_) => depth != 0,
+            TyKind::Tuple(fields) => fields
+                .iter()
+                .all(|field_ty| self.is_metadata_like_access_ty(tcx, field_ty, depth + 1)),
+            TyKind::Array(elem_ty, len) => {
+                let Some(n) = len.try_to_target_usize(tcx) else {
+                    return false;
+                };
+                n <= 8 && self.is_metadata_like_access_ty(tcx, *elem_ty, depth + 1)
+            }
+            TyKind::Adt(adt, args) if adt.is_struct() => {
+                let variant = adt.non_enum_variant();
+                !variant.fields.is_empty()
+                    && variant.fields.iter().all(|field| {
+                        self.is_metadata_like_access_ty(tcx, field.ty(tcx, args), depth + 1)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     /// Return true when call-boundary return tagging is safe and useful for this pointer type.
     ///
     /// We always include thin pointers. For wide pointers, we currently include slice/str
@@ -2001,12 +2047,23 @@ impl MyOptimizationPass {
     }
 
     /// If true, emit MIR-based heap alloc/free hooks (`HeapAlloc` / `__rz_record_alloc`).
-    /// Default: false (we rely on the runtime's global allocator wrapper in `runtime/src/lib.rs`).
-    /// Set `RZ_HEAP_ALLOCS_FROM_MIR=1` to force the old behavior.
+    /// Default: false for non-stdlib builds, because we usually rely on the runtime's global
+    /// allocator wrapper in `runtime/src/lib.rs`.
+    ///
+    /// For `RZ_INSTRUMENT_STDLIB=core_alloc|all`, enable this automatically: final binaries link
+    /// `runtime` natively to avoid build-std crate collisions, so `runtime`'s global allocator
+    /// does not own std/program heap allocations.
+    ///
+    /// `RZ_HEAP_ALLOCS_FROM_MIR` still overrides the default either way.
     fn heap_allocs_from_mir_enabled(&self) -> bool {
-        std::env::var("RZ_HEAP_ALLOCS_FROM_MIR")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        if let Ok(value) = std::env::var("RZ_HEAP_ALLOCS_FROM_MIR") {
+            return value != "0" && value.to_ascii_lowercase() != "false";
+        }
+
+        matches!(
+            StdlibInstrumentationMode::from_env(),
+            StdlibInstrumentationMode::CoreAlloc | StdlibInstrumentationMode::All
+        )
     }
 
     /// Caller-side return-tag recovery is always enabled.
@@ -4634,9 +4691,15 @@ impl MyOptimizationPass {
                             // only metadata/provenance plumbing (e.g. forwarding `&&T` / raw ptr
                             // values through temporaries). Instrumenting those as memory READs can
                             // misclassify them as data accesses and produce false OOB/stale reports.
-                            // We only instrument deref reads when the loaded value is non-pointer data.
+                            // We only instrument deref reads when the loaded value is non-pointer,
+                            // non-metadata data.
                             let skip_pointer_value_read = self.is_pointer_ty(loaded_ty);
-                            if skip_fn_ptr_read || skip_vtable_field_read || skip_pointer_value_read
+                            let skip_metadata_like_read =
+                                self.is_metadata_like_access_ty(tcx, loaded_ty, 0);
+                            if skip_fn_ptr_read
+                                || skip_vtable_field_read
+                                || skip_pointer_value_read
+                                || skip_metadata_like_read
                             {
                                 // Skip only the READ instrumentation; continue scanning this stmt.
                             } else {
@@ -4695,35 +4758,39 @@ impl MyOptimizationPass {
                     // Best-effort size: use the type of the *place being written* (after projections).
                     // This yields the correct size for patterns like `(*p).field = ...` or `(*p)[i] = ...`.
                     let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
-                    let size_op = self.size_operand_for_deref(
-                        tcx,
-                        body,
-                        ptr_local,
-                        lhs_ty,
-                        stmt.source_info.span,
-                    );
+                    if !self.is_pointer_ty(lhs_ty)
+                        && !self.is_metadata_like_access_ty(tcx, lhs_ty, 0)
+                    {
+                        let size_op = self.size_operand_for_deref(
+                            tcx,
+                            body,
+                            ptr_local,
+                            lhs_ty,
+                            stmt.source_info.span,
+                        );
 
-                    self.ensure_raw_root_before(
-                        tcx,
-                        body,
-                        bb,
-                        stmt_idx,
-                        stmt.source_info,
-                        ptr_local,
-                        insert_points,
-                        ptr_locals_needing_tag,
-                        tagged_ptr_locals,
-                        ptr_locals_with_tag_sources,
-                    );
-                    ptr_locals_needing_tag.insert(ptr_local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx,
-                        insert_before: true,
-                        source_info: stmt.source_info,
-                        place: lhs_place.clone(),
-                        kind: InstrKind::PtrWrite { ptr_local, size_op },
-                    });
+                        self.ensure_raw_root_before(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            stmt.source_info,
+                            ptr_local,
+                            insert_points,
+                            ptr_locals_needing_tag,
+                            tagged_ptr_locals,
+                            ptr_locals_with_tag_sources,
+                        );
+                        ptr_locals_needing_tag.insert(ptr_local);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            insert_before: true,
+                            source_info: stmt.source_info,
+                            place: lhs_place.clone(),
+                            kind: InstrKind::PtrWrite { ptr_local, size_op },
+                        });
+                    }
                 }
             }
         }
@@ -5780,36 +5847,54 @@ impl MyOptimizationPass {
                 };
 
                 if let Some(src) = src_local {
-                    *classified_read_ptr_local = Some(src);
-                    ptr_locals_needing_tag.insert(src);
-                    let size_op = size_op_for(src);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: src_place.unwrap_or(Place::from(src)),
-                        kind: InstrKind::PtrRead {
-                            ptr_local: src,
-                            size_op,
-                        },
-                    });
+                    let src_ptr_ty = body.local_decls[src].ty;
+                    let src_pointee_is_metadata_like = match src_ptr_ty.kind() {
+                        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                            self.is_metadata_like_access_ty(tcx, *pointee, 0)
+                        }
+                        _ => false,
+                    };
+                    if !self.pointee_is_pointer_ty(src_ptr_ty) && !src_pointee_is_metadata_like {
+                        *classified_read_ptr_local = Some(src);
+                        ptr_locals_needing_tag.insert(src);
+                        let size_op = size_op_for(src);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: src_place.unwrap_or(Place::from(src)),
+                            kind: InstrKind::PtrRead {
+                                ptr_local: src,
+                                size_op,
+                            },
+                        });
+                    }
                 }
                 if let Some(dst) = dst_local {
-                    *classified_write_ptr_local = Some(dst);
-                    ptr_locals_needing_tag.insert(dst);
-                    let size_op = size_op_for(dst);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: dst_place.unwrap_or(Place::from(dst)),
-                        kind: InstrKind::PtrWrite {
-                            ptr_local: dst,
-                            size_op,
-                        },
-                    });
+                    let dst_ptr_ty = body.local_decls[dst].ty;
+                    let dst_pointee_is_metadata_like = match dst_ptr_ty.kind() {
+                        TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                            self.is_metadata_like_access_ty(tcx, *pointee, 0)
+                        }
+                        _ => false,
+                    };
+                    if !self.pointee_is_pointer_ty(dst_ptr_ty) && !dst_pointee_is_metadata_like {
+                        *classified_write_ptr_local = Some(dst);
+                        ptr_locals_needing_tag.insert(dst);
+                        let size_op = size_op_for(dst);
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: dst_place.unwrap_or(Place::from(dst)),
+                            kind: InstrKind::PtrWrite {
+                                ptr_local: dst,
+                                size_op,
+                            },
+                        });
+                    }
                 }
             }
         } else if is_memset {
@@ -5963,41 +6048,9 @@ impl MyOptimizationPass {
                 }
             }
             AllocShimKind::Realloc => {
-                // Record old ptr dead, new ptr live. Signature: (ptr, old_size, align, new_size) -> *mut u8
-                if let Some(first) = args.get(0) {
-                    if let Some(p) = self.place_from_operand(&first.node) {
-                        let old_ptr_local = p.local;
-                        let old_ptr_ty = body.local_decls[old_ptr_local].ty;
-                        if self.is_addr_exposable_ptr_ty(tcx, body, old_ptr_ty) {
-                            let old_size_op: Operand<'tcx> = if args.len() >= 2 {
-                                let arg1_ty = args[1].node.ty(body, tcx);
-                                if matches!(arg1_ty.kind(), TyKind::Uint(_)) {
-                                    args[1].node.clone()
-                                } else {
-                                    self.const_usize(tcx, term.source_info.span, 0)
-                                }
-                            } else {
-                                self.const_usize(tcx, term.source_info.span, 0)
-                            };
-                            let old_size_op = SizeOperand::Const(old_size_op);
-
-                            ptr_locals_needing_tag.insert(old_ptr_local);
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: true,
-                                source_info: term.source_info,
-                                place: Place::from(old_ptr_local),
-                                kind: InstrKind::HeapAlloc {
-                                    ptr_local: old_ptr_local,
-                                    live: false,
-                                    size_op: old_size_op,
-                                },
-                            });
-                        }
-                    }
-                }
-
+                // Realloc is handled by the runtime allocator wrapper for old-base death vs
+                // same-base retention. Do not pre-mark the old pointer as dead here: that turns
+                // same-base realloc into a false stale/double-free path.
                 if let Some(dst_local) = destination.as_local() {
                     let dst_ty = body.local_decls[dst_local].ty;
                     if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
@@ -6107,7 +6160,24 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::AllocShim(kind) => {
-                    if self.heap_allocs_from_mir_enabled() {
+                    let suppress_wrapper_dealloc = callee_instrumented
+                        && matches!(kind, AllocShimKind::Dealloc)
+                        && callee_path_opt
+                            .as_deref()
+                            .is_some_and(|p| !p.contains("__rust_dealloc"));
+                    let suppress_wrapper_realloc = callee_instrumented
+                        && matches!(kind, AllocShimKind::Realloc)
+                        && callee_path_opt
+                            .as_deref()
+                            .is_some_and(|p| !p.contains("__rust_realloc"));
+
+                    // Keep caller-side modeling for allocation-returning shims so the returned
+                    // pointer has allocation metadata before the caller's first use. However, if
+                    // the wrapper body itself is instrumented, suppress the extra caller-side
+                    // transition at wrapper boundaries: the leaf allocator shim already records it.
+                    if suppress_wrapper_dealloc || suppress_wrapper_realloc {
+                        // No caller-side hook for instrumented dealloc/realloc wrapper bodies.
+                    } else if self.heap_allocs_from_mir_enabled() {
                         // Old behavior: emit HeapAlloc hooks from MIR (may require Layout.size extraction).
                         self.push_alloc_shim_effects(
                             tcx,
@@ -6724,6 +6794,110 @@ impl MyOptimizationPass {
         }
     }
 
+    fn push_post_drop_retag<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        target_bb: BasicBlock,
+        source_info: SourceInfo,
+        ptr_local: Local,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+        tagged_ptr_locals: &mut HashSet<Local>,
+    ) {
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        if !self.supports_call_boundary_ret_tag_ty(tcx, body, ptr_ty) {
+            return;
+        }
+
+        let (is_mut, is_ref) = match ptr_ty.kind() {
+            TyKind::Ref(_, _, mutbl) => (matches!(mutbl, Mutability::Mut), true),
+            TyKind::RawPtr(_, mutbl) => (matches!(mutbl, Mutability::Mut), false),
+            _ => return,
+        };
+
+        ptr_locals_needing_tag.insert(ptr_local);
+        tagged_ptr_locals.insert(ptr_local);
+        insert_points.push(InsertPoint {
+            bb: target_bb,
+            stmt_idx: 0,
+            insert_before: false,
+            source_info,
+            place: Place::from(ptr_local),
+            kind: InstrKind::RetRoot {
+                dst_local: ptr_local,
+                is_mut,
+                is_ref,
+            },
+        });
+    }
+
+    fn scan_drop_terminator<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        place: &Place<'tcx>,
+        target: BasicBlock,
+        unwind: UnwindAction,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+        tagged_ptr_locals: &mut HashSet<Local>,
+    ) {
+        let Some(first_proj) = place.projection.first() else {
+            return;
+        };
+        if !matches!(first_proj, ProjectionElem::Deref) {
+            return;
+        }
+
+        let ptr_local = place.local;
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        if !self.is_pointer_ty(ptr_ty) {
+            return;
+        }
+
+        // A drop terminator is effectively `drop_in_place(*ptr_local)`. The callee may
+        // temporarily retag/reborrow the pointee, so continuing to use the caller's pre-drop
+        // tag after the terminator can produce stale-tag false positives. Re-seed the base
+        // pointer local in each drop successor before any subsequent caller-side read/write.
+        self.push_post_drop_retag(
+            tcx,
+            body,
+            target,
+            term.source_info,
+            ptr_local,
+            insert_points,
+            ptr_locals_needing_tag,
+            tagged_ptr_locals,
+        );
+
+        if let UnwindAction::Cleanup(cleanup_bb) = unwind {
+            self.push_post_drop_retag(
+                tcx,
+                body,
+                cleanup_bb,
+                term.source_info,
+                ptr_local,
+                insert_points,
+                ptr_locals_needing_tag,
+                tagged_ptr_locals,
+            );
+        }
+
+        // Keep deref-drop bases tagged even if no successor retag is needed; later analyses may
+        // emit instrumentation against the same local in cleanup blocks.
+        if let Some(base_local) =
+            self.backtrack_deref_base_local(ptr_local, &block_data.statements)
+        {
+            if self.is_pointer_ty(body.local_decls[base_local].ty) {
+                ptr_locals_needing_tag.insert(base_local);
+                tagged_ptr_locals.insert(base_local);
+            }
+        }
+    }
+
     fn scan_body<'tcx>(&self, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> ScanResult<'tcx> {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
@@ -6828,6 +7002,27 @@ impl MyOptimizationPass {
                         func,
                         args,
                         destination,
+                        &mut insert_points,
+                        &mut ptr_locals_needing_tag,
+                        &mut tagged_ptr_locals,
+                    );
+                }
+
+                if let TerminatorKind::Drop {
+                    place,
+                    target,
+                    unwind,
+                    ..
+                } = &term.kind
+                {
+                    self.scan_drop_terminator(
+                        tcx,
+                        body,
+                        block_data,
+                        term,
+                        place,
+                        *target,
+                        *unwind,
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
                         &mut tagged_ptr_locals,
