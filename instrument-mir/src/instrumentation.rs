@@ -256,8 +256,9 @@ fn strip_trait_impl_prefix(def_path: &str) -> Option<String> {
 }
 
 // Order matters: first match wins.
-// These rules cover "simple" std/core wrapper classification that is purely path-string based.
-static CALL_EFFECT_RULES: &[EffectRule] = &[
+// These rules are still needed even when the callee is instrumented, because allocator
+// shims require explicit boundary handling across wrappers and leaf symbols.
+static ALLOC_SHIM_EFFECT_RULES: &[EffectRule] = &[
     // ---- Allocator shims & wrappers (order matters) ----
 
     // Low-level shims.
@@ -330,6 +331,11 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "std::alloc::realloc",
         CallEffect::AllocShim(AllocShimKind::Realloc),
     ),
+];
+
+// Legacy path-string fallback modeling used when the callee body itself is not instrumented.
+// In `stdlib-all`, these rules are intentionally bypassed in favor of the callee's MIR.
+static LEGACY_CALL_EFFECT_RULES: &[EffectRule] = &[
     // No-op helpers.
     EffectRule::one(MatchKind::EndsWith, "::is_null", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::eq", CallEffect::Ignore),
@@ -2994,7 +3000,11 @@ impl MyOptimizationPass {
         normalize_def_path(def_path)
     }
 
-    fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
+    fn match_call_effect_rules(
+        &self,
+        def_path: &str,
+        rules: &[EffectRule],
+    ) -> Option<CallEffect> {
         let def_path_norm = self.normalize_def_path(def_path);
         // Strip only a *trailing* monomorphization like `::<T>`.
         // Do NOT strip generic args that appear in the middle of a path like
@@ -3017,7 +3027,7 @@ impl MyOptimizationPass {
             }
         };
 
-        for r in CALL_EFFECT_RULES {
+        for r in rules {
             let m1 = match r.kind1 {
                 MatchKind::Contains => {
                     def_path.contains(r.needle1) || def_path_norm.contains(r.needle1)
@@ -3509,6 +3519,11 @@ impl MyOptimizationPass {
         }
 
         None
+    }
+
+    fn match_call_effect_rule(&self, def_path: &str) -> Option<CallEffect> {
+        self.match_call_effect_rules(def_path, ALLOC_SHIM_EFFECT_RULES)
+            .or_else(|| self.match_call_effect_rules(def_path, LEGACY_CALL_EFFECT_RULES))
     }
 
     /// Returns true when alias checks should be skipped for this pointee type.
@@ -5335,39 +5350,22 @@ impl MyOptimizationPass {
         CallEffect::Unknown
     }
 
-    fn operand_base_adt_name<'tcx>(
+    fn fallback_call_effect_for_callee(
         &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        operand: &Operand<'tcx>,
-    ) -> Option<String> {
-        let mut ty = operand.ty(body, tcx);
-        loop {
-            match ty.kind() {
-                TyKind::Ref(_, inner, _) => ty = *inner,
-                TyKind::RawPtr(inner, _) => ty = *inner,
-                TyKind::Adt(adt, _) => return Some(tcx.def_path_str(adt.did())),
-                _ => return None,
-            }
-        }
-    }
-
-    fn classify_call_effect_from_receiver_type<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        args: &Box<[Spanned<Operand<'tcx>>]>,
-        def_path: &str,
+        effect: CallEffect,
+        callee_instrumented: bool,
     ) -> Option<CallEffect> {
-        let receiver_name = self.operand_base_adt_name(tcx, body, &args.get(0)?.node)?;
-
-        if (def_path.ends_with("::as_ptr") || def_path.ends_with("::as_mut_ptr"))
-            && receiver_name.ends_with("SmallVec")
-        {
-            return Some(CallEffect::PtrDerive);
+        if !callee_instrumented {
+            return Some(effect);
         }
 
-        None
+        // Once a callee body is instrumented, prefer the MIR we inserted into that body over
+        // path-string fallback modeling. Keep only allocator shims here, since they still need
+        // explicit boundary handling across wrappers/leaf shims.
+        match effect {
+            CallEffect::AllocShim(..) => Some(effect),
+            _ => None,
+        }
     }
 
     /// Best-effort: compute byte size operand for memory ops given a pointer local and a count operand.
@@ -6125,7 +6123,8 @@ impl MyOptimizationPass {
         // Centralized effect classification for direct calls.
         let mut call_effect_opt: Option<CallEffect> = callee_path_opt
             .as_deref()
-            .map(|p| self.classify_call_effect(p));
+            .map(|p| self.classify_call_effect(p))
+            .and_then(|effect| self.fallback_call_effect_for_callee(effect, callee_instrumented));
         let unknown_call =
             !callee_instrumented && matches!(call_effect_opt, None | Some(CallEffect::Unknown));
 
@@ -9741,6 +9740,28 @@ mod tests {
         assert_eq!(
             effect_for("place::<impl Place<u32>>::write_unchecked"),
             CallEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn instrumented_callee_keeps_only_alloc_fallbacks() {
+        let pass = MyOptimizationPass;
+
+        assert_eq!(
+            pass.fallback_call_effect_for_callee(CallEffect::AllocShim(super::AllocShimKind::Alloc), true),
+            Some(CallEffect::AllocShim(super::AllocShimKind::Alloc))
+        );
+        assert_eq!(
+            pass.fallback_call_effect_for_callee(CallEffect::PtrDerive, true),
+            None
+        );
+        assert_eq!(
+            pass.fallback_call_effect_for_callee(CallEffect::MemCopy, true),
+            None
+        );
+        assert_eq!(
+            pass.fallback_call_effect_for_callee(CallEffect::Store, false),
+            Some(CallEffect::Store)
         );
     }
 }

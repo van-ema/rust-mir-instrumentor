@@ -70,6 +70,11 @@ make run EXAMPLE=hello PROFILE=release
 
 # Experimental: instrument full stdlib set (core+alloc+std) via -Z build-std
 make instrument-stdlib-all EXAMPLE=hello
+
+# Run the full example suite with stdlib instrumentation modes
+make test-stdlib-core
+make test-stdlib-core-alloc
+make test-stdlib-all
 ```
 
 ## Running with dataflow analysis
@@ -272,8 +277,8 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_INSTRUMENT_STDLIB`: stdlib instrumentation mode. Supported values:
   `none` (default), `core`, `core_alloc`, `all`.
   Use this together with `-Z build-std` to request target-side `core`/`alloc`/`std`
-  instrumentation. Current state: `core` is the furthest along; `core_alloc` and
-  `all` remain experimental, and some bootstrap/support crates are still skipped.
+  instrumentation. Current state: the full example suite is green in `all` mode,
+  but some bootstrap/support crates are still intentionally skipped.
 - `RZ_PRINT_CRATES`: non-zero/true prints crate graph + instrumented classification.
 - `RZ_TRACE_CLASSIFY`: non-zero enables call-effect classifier tracing.
 - `RZ_TRACE_CLASSIFY_FILTER`: substring filter for classify traces.
@@ -387,32 +392,32 @@ stdlib boundary.
 Experimental stdlib instrumentation can be enabled in phases via
 `RZ_INSTRUMENT_STDLIB=core|core_alloc|all` together with `-Z build-std`.
 
-Current state (2026-03-04):
+Current state (2026-03-13):
 
 1. Default mode (`RZ_INSTRUMENT_STDLIB=none`) is still the supported path. It
    detects many stdlib-mediated bugs at the application boundary through wrapper
    classification and allocator interception, without requiring `-Z build-std`.
 2. `cargo instrument-mir` now works with `-Z build-std=core,alloc,std`, and
-   `RZ_INSTRUMENT_STDLIB=core` works on simple targets such as `hello`.
-3. `RZ_INSTRUMENT_STDLIB=core_alloc` and `RZ_INSTRUMENT_STDLIB=all` exist, but
-   they are still experimental and are not yet validated end-to-end.
+   `RZ_INSTRUMENT_STDLIB=all` is validated across the full example suite.
+3. Dedicated suite targets are available:
+   `make test-stdlib-core`, `make test-stdlib-core-alloc`, `make test-stdlib-all`.
 4. `all` does not yet mean literal full coverage of every stdlib-related crate:
    bootstrap/support crates such as `core`, `compiler_builtins`, `panic_*`,
    `unwind`, `std_detect`, and `rustc_std_workspace_*` are still explicitly
    skipped by the pass.
 
-So the project can now experiment with stdlib instrumentation, but the goal of
-instrumenting the entire Rust standard library is not complete yet.
+So the project now has a reproducible, green `stdlib-all` validation path, but
+the goal of instrumenting every stdlib-related crate is not complete yet.
 
-Example `core`-mode command:
+Example `all`-mode command:
 
 ```bash
 CARGO_INCREMENTAL=0 \
 RZ_INSTRUMENT_ALL_DEPS=1 \
-RZ_INSTRUMENT_STDLIB=core \
+RZ_INSTRUMENT_STDLIB=all \
 cargo instrument-mir \
   --runtime-path=target/build-std-debug/debug/deps \
-  --mir-out=./out.hello.core.mir \
+  --mir-out=./out.hello.all.mir \
   -p hello --bin hello \
   -Z build-std=core,alloc,std
 ```

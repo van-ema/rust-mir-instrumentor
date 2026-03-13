@@ -6,10 +6,12 @@ CARGO ?= cargo
 CARGO_INCREMENTAL ?= 0
 RZ_INSTRUMENT_ALL_DEPS ?= 1
 RZ_INSTRUMENT_STDLIB ?= none
+BATCH_BUILD_STD ?= 1
 
 BUILD_STD ?= 0
 BUILD_STD_CRATES ?= alloc,std,core
 BUILD_STD_FEATURES ?=
+SUITE_TARGET_ROOT ?= $(abspath target/example-tests-stdlib-all)
 
 CARGO_CMD := $(CARGO)
 TARGET_ROOT ?= $(abspath target)
@@ -42,11 +44,12 @@ RUNTIME_ENV_EXTRA := RZ_INSTRUMENT_ALL_DEPS=0 RZ_INSTRUMENT_STDLIB=$(RZ_INSTRUME
 endif
 
 CARGO_ENV := CARGO_TARGET_DIR=$(TARGET_ROOT)
-INSTRUMENT_ENV := CARGO_INCREMENTAL=$(CARGO_INCREMENTAL) RZ_INSTRUMENT_ALL_DEPS=$(RZ_INSTRUMENT_ALL_DEPS) RZ_INSTRUMENT_STDLIB=$(RZ_INSTRUMENT_STDLIB)
+COMMON_ENV := CARGO_INCREMENTAL=$(CARGO_INCREMENTAL) RZ_INSTRUMENT_ALL_DEPS=$(RZ_INSTRUMENT_ALL_DEPS)
+INSTRUMENT_ENV := $(COMMON_ENV) RZ_INSTRUMENT_STDLIB=$(RZ_INSTRUMENT_STDLIB)
 RUNTIME_PATH := $(TARGET_ROOT)/$(PROFILE_DIR)/deps
 BIN_PATH := $(TARGET_ROOT)/$(PROFILE_DIR)/$(EXAMPLE)
 
-.PHONY: clean clean-mir runtime tools instrument run rebuild instrument-stdlib-all
+.PHONY: clean clean-mir runtime tools instrument run rebuild instrument-stdlib-core instrument-stdlib-core-alloc instrument-stdlib-all test-stdlib-core test-stdlib-core-alloc test-stdlib-all
 
 clean:
 	$(CARGO_ENV) $(CARGO_CMD) clean
@@ -66,8 +69,23 @@ instrument: clean-mir clean tools runtime
 	$(CARGO_ENV) $(INSTRUMENT_ENV) $(CARGO_CMD) instrument-mir --runtime-path=$(RUNTIME_PATH) --mir-out=$(MIR_OUT) -p $(EXAMPLE) $(PROFILE_FLAG) $(BUILD_STD_ARGS) $(EXTRA_ARGS)
 
 # Full stdlib instrumentation (core + alloc + std) via build-std.
+instrument-stdlib-core:
+	$(MAKE) instrument BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=core
+
+instrument-stdlib-core-alloc:
+	$(MAKE) instrument BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=core_alloc
+
 instrument-stdlib-all:
 	$(MAKE) instrument BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=all
+
+test-stdlib-core:
+	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-core BATCH_BUILD_STD=$(BATCH_BUILD_STD) $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=core python3 scripts/run_example_tests.py
+
+test-stdlib-core-alloc:
+	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-core-alloc BATCH_BUILD_STD=$(BATCH_BUILD_STD) $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=core_alloc python3 scripts/run_example_tests.py
+
+test-stdlib-all:
+	CARGO_TARGET_DIR=$(SUITE_TARGET_ROOT)-all BATCH_BUILD_STD=$(BATCH_BUILD_STD) $(COMMON_ENV) BUILD_STD=1 BUILD_STD_CRATES=core,alloc,std RZ_INSTRUMENT_STDLIB=all python3 scripts/run_example_tests.py
 
 run:
 	$(BIN_PATH)

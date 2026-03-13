@@ -331,7 +331,7 @@ Constraints
 	•	Roll out in stages: `core`, then `core+alloc`, then `core+alloc+std`.
 	•	Do not instrument host/build-script helper crates by accident while validating target-side stdlib crates.
 
-Current state (2026-03-04)
+Current state (2026-03-13)
 	•	Completed
 		•	M1 ABI split + hook resolution:
 			•	workspace includes `runtime_abi`
@@ -348,10 +348,12 @@ Current state (2026-03-04)
 	•	Validated
 		•	the default example suite passes with no mismatches under `scripts/run_example_tests.py`
 		•	the example harness now uses an isolated target dir, which avoids stale local `libcore` artifacts contaminating stdlib experiments
+		•	the full example suite passes with `RZ_INSTRUMENT_STDLIB=all` under `-Z build-std=core,alloc,std`
+		•	dedicated Makefile targets exist for `test-stdlib-core`, `test-stdlib-core-alloc`, and `test-stdlib-all`
 	•	Known blockers to full stdlib instrumentation
 		•	bootstrap crates are still force-skipped (`core`, `compiler_builtins`, `panic_*`, `unwind`, `std_detect`, `rustc_std_workspace_*`)
 		•	build-std support crates are still excluded with broad path-based filtering
-		•	`core_alloc` and `all` modes exist but are not yet validated end-to-end on examples, medium drivers, or fuzz smoke
+		•	`all` is green on the example suite, but medium drivers and fuzz smoke are not yet part of the stdlib-all gate
 
 Implementation plan
 	1.	P1: unblock bootstrap crates
