@@ -15,6 +15,7 @@ mod static_image;
 use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
+mod exact_parent_index;
 mod lineage_cache;
 mod live_alloc_cache;
 mod tag_lookup_cache;
@@ -100,6 +101,10 @@ struct HookProfileCounters {
     read_alloc_lookup_ns: AtomicU64,
     ref_create_calls: AtomicU64,
     ref_create_total_ns: AtomicU64,
+    ref_create_validate_ns: AtomicU64,
+    ref_create_alloc_snapshot_ns: AtomicU64,
+    ref_create_lineage_repair_ns: AtomicU64,
+    ref_create_insert_ns: AtomicU64,
     raw_create_calls: AtomicU64,
     raw_create_total_ns: AtomicU64,
     ptr_use_calls: AtomicU64,
@@ -123,6 +128,10 @@ impl HookProfileCounters {
             read_alloc_lookup_ns: AtomicU64::new(0),
             ref_create_calls: AtomicU64::new(0),
             ref_create_total_ns: AtomicU64::new(0),
+            ref_create_validate_ns: AtomicU64::new(0),
+            ref_create_alloc_snapshot_ns: AtomicU64::new(0),
+            ref_create_lineage_repair_ns: AtomicU64::new(0),
+            ref_create_insert_ns: AtomicU64::new(0),
             raw_create_calls: AtomicU64::new(0),
             raw_create_total_ns: AtomicU64::new(0),
             ptr_use_calls: AtomicU64::new(0),
@@ -159,6 +168,13 @@ fn rz_dump_hook_profile_at_exit_enabled() -> bool {
             .ok()
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     })
+}
+
+#[inline]
+fn rz_profile_add_elapsed(counter: &AtomicU64, start: Instant) {
+    let nanos = start.elapsed().as_nanos();
+    let clipped = nanos.min(u64::MAX as u128) as u64;
+    counter.fetch_add(clipped, Ordering::Relaxed);
 }
 
 #[cfg(unix)]
@@ -1023,6 +1039,23 @@ fn find_alloc_origin_candidate<'a>(
     best_live.or(best_dead)
 }
 
+#[inline]
+fn lookup_alloc_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
+    live_alloc_cache::lookup_containing(addr).or_else(|| {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
+    })
+}
+
+#[inline]
+fn lookup_alloc_origin_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
+    if let Some(found) = live_alloc_cache::lookup_containing(addr) {
+        return Some(found);
+    }
+    let amap = allocs().lock().unwrap();
+    find_alloc_origin_candidate(&amap, addr).map(|(base, meta)| (base, *meta))
+}
+
 /// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
 /// If instrumentation emits a root tag (`parent=0`) for an address that already has
 /// same-address non-root tags in the same allocation epoch, attach to the newest one.
@@ -1045,44 +1078,14 @@ fn recover_parent_for_alloc_root(
         return tag;
     }
 
-    let amap = allocs().lock().unwrap();
-    let root_base = find_alloc_containing(&amap, pointee_addr).map(|(base, _)| base);
-    let tmap = tags().lock().unwrap();
-    let mut exact_parent = 0u64;
-
-    for (&tag, meta) in tmap.iter() {
-        if meta.parent == 0 {
-            continue;
+    if let Some(tag) = exact_parent_index::lookup(pointee_addr, alloc_epoch, require_mut_parent) {
+        if let Some(meta) = tag_store::get(tag) {
+            lineage_cache::remember_non_root_tag(tag, &meta);
         }
-        if meta.alloc_epoch != 0 && meta.alloc_epoch != alloc_epoch {
-            continue;
-        }
-        if require_mut_parent && !matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
-            continue;
-        }
-        if let Some(base) = root_base {
-            let Some((cand_base, _)) = find_alloc_containing(&amap, meta.pointee_addr) else {
-                continue;
-            };
-            if cand_base != base {
-                continue;
-            }
-        }
-
-        if meta.pointee_addr == pointee_addr {
-            if tag > exact_parent {
-                exact_parent = tag;
-            }
-        }
+        return tag;
     }
 
-    if exact_parent != 0 {
-        if let Some(meta) = tmap.get(&exact_parent).copied() {
-            lineage_cache::remember_non_root_tag(exact_parent, &meta);
-        }
-    }
-
-    exact_parent
+    0
 }
 
 #[inline]
@@ -1565,11 +1568,9 @@ fn refresh_tag_origin_cache(tag: u64, tmeta: &mut TagMeta, base: usize, ameta: &
 
 #[inline]
 fn snapshot_tag_origin(pointee_addr: usize, parent_tag: u64) -> (bool, usize, usize) {
-    let amap = allocs().lock().unwrap();
-    if let Some((base, ameta)) = find_alloc_origin_candidate(&amap, pointee_addr) {
-        return (true, base, origin_end_from_alloc(base, ameta));
+    if let Some((base, ameta)) = lookup_alloc_origin_snapshot(pointee_addr) {
+        return (true, base, origin_end_from_alloc(base, &ameta));
     }
-    drop(amap);
 
     if parent_tag != 0 {
         if let Some(parent_meta) = tag_store::get(parent_tag) {
@@ -1927,6 +1928,10 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.read_alloc_lookup_ns.store(0, Ordering::Relaxed);
     p.ref_create_calls.store(0, Ordering::Relaxed);
     p.ref_create_total_ns.store(0, Ordering::Relaxed);
+    p.ref_create_validate_ns.store(0, Ordering::Relaxed);
+    p.ref_create_alloc_snapshot_ns.store(0, Ordering::Relaxed);
+    p.ref_create_lineage_repair_ns.store(0, Ordering::Relaxed);
+    p.ref_create_insert_ns.store(0, Ordering::Relaxed);
     p.raw_create_calls.store(0, Ordering::Relaxed);
     p.raw_create_total_ns.store(0, Ordering::Relaxed);
     p.ptr_use_calls.store(0, Ordering::Relaxed);
@@ -1954,6 +1959,10 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let read_alloc_ns = p.read_alloc_lookup_ns.load(Ordering::Relaxed);
     let ref_create_calls = p.ref_create_calls.load(Ordering::Relaxed);
     let ref_create_total_ns = p.ref_create_total_ns.load(Ordering::Relaxed);
+    let ref_create_validate_ns = p.ref_create_validate_ns.load(Ordering::Relaxed);
+    let ref_create_alloc_snapshot_ns = p.ref_create_alloc_snapshot_ns.load(Ordering::Relaxed);
+    let ref_create_lineage_repair_ns = p.ref_create_lineage_repair_ns.load(Ordering::Relaxed);
+    let ref_create_insert_ns = p.ref_create_insert_ns.load(Ordering::Relaxed);
     let raw_create_calls = p.raw_create_calls.load(Ordering::Relaxed);
     let raw_create_total_ns = p.raw_create_total_ns.load(Ordering::Relaxed);
     let ptr_use_calls = p.ptr_use_calls.load(Ordering::Relaxed);
@@ -1971,6 +1980,15 @@ pub extern "C" fn __rz_dump_hook_profile() {
     } else {
         read_total_ns as f64 / read_calls as f64
     };
+    let (alloc_entries, live_alloc_entries) = {
+        let amap = allocs().lock().unwrap();
+        let live = amap.values().filter(|m| m.live).count();
+        (amap.len(), live)
+    };
+    let tag_entries = tag_store::len();
+    let exact_parent_entries = exact_parent_index::len();
+    let call_arg_entries = call_arg_tags().lock().unwrap().len();
+    let ret_tag_entries = ret_tags().lock().unwrap().len();
 
     eprintln!("[rusteze-runtime] hook profile (ns):");
     eprintln!(
@@ -1982,14 +2000,18 @@ pub extern "C" fn __rz_dump_hook_profile() {
         read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
     );
     eprintln!(
-        "  ref_create:  calls={} total={} avg_per_call={:.1}",
+        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} lineage_repair={} insert={}",
         ref_create_calls,
         ref_create_total_ns,
         if ref_create_calls == 0 {
             0.0
         } else {
             ref_create_total_ns as f64 / ref_create_calls as f64
-        }
+        },
+        ref_create_validate_ns,
+        ref_create_alloc_snapshot_ns,
+        ref_create_lineage_repair_ns,
+        ref_create_insert_ns
     );
     eprintln!(
         "  raw_create:  calls={} total={} avg_per_call={:.1}",
@@ -2020,6 +2042,10 @@ pub extern "C" fn __rz_dump_hook_profile() {
         } else {
             record_alloc_total_ns as f64 / record_alloc_calls as f64
         }
+    );
+    eprintln!(
+        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
+        alloc_entries, live_alloc_entries, tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
     );
 }
 
@@ -2955,6 +2981,7 @@ pub extern "C" fn __record_ref_creation(
     // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
 
+    let validate_start = profile.map(|_| Instant::now());
     if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
         kind,
@@ -2967,6 +2994,9 @@ pub extern "C" fn __record_ref_creation(
             append_location_if_enabled(msg, "RZ_LOG_LOC"),
         );
     }
+    if let (Some(p), Some(start)) = (profile, validate_start) {
+        rz_profile_add_elapsed(&p.ref_create_validate_ns, start);
+    }
 
     // IMPORTANT: On retagging/reborrows (parent_tag != 0), prefer inheriting the parent's
     // allocation snapshot to keep stack-slot reuse detectable.
@@ -2974,6 +3004,7 @@ pub extern "C" fn __record_ref_creation(
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
+    let alloc_snapshot_start = profile.map(|_| Instant::now());
     let (
         mut alloc_epoch,
         mut alloc_live_at_creation,
@@ -2994,9 +3025,8 @@ pub extern "C" fn __record_ref_creation(
                 .unwrap_or((0, false, None, 0));
 
         if let Some(parent_pointee) = parent_pointee {
-            let amap = allocs().lock().unwrap();
-            let parent_alloc = find_alloc_containing(&amap, parent_pointee);
-            let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+            let parent_alloc = lookup_alloc_snapshot(parent_pointee);
+            let pointee_alloc = lookup_alloc_snapshot(pointee_addr);
             match (parent_alloc, pointee_alloc) {
                 (Some((parent_base, _parent_meta)), Some((pointee_base, pointee_meta))) => {
                     alloc_is_stack = pointee_meta.is_stack;
@@ -3047,8 +3077,7 @@ pub extern "C" fn __record_ref_creation(
         // Root creation: snapshot from the allocation that contains this address (range lookup).
         // If the match is a dead stack slot, treat metadata as unknown to avoid
         // inheriting stale bounds/epoch from recycled stack storage.
-        let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, pointee_addr)
+        lookup_alloc_snapshot(pointee_addr)
             .map(|(_base, m)| {
                 alloc_is_stack = m.is_stack;
                 alloc_size = m.size;
@@ -3060,6 +3089,9 @@ pub extern "C" fn __record_ref_creation(
             })
             .unwrap_or((0, false, 0, 0))
     };
+    if let (Some(p), Some(start)) = (profile, alloc_snapshot_start) {
+        rz_profile_add_elapsed(&p.ref_create_alloc_snapshot_ns, start);
+    }
 
     // Optimized MIR can lose parent tags for same-address ref reborrows on both stack and heap
     // objects. Example:
@@ -3067,6 +3099,7 @@ pub extern "C" fn __record_ref_creation(
     //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
     // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
     // that repair even when we reject broader overlap-based guessing.
+    let lineage_repair_start = profile.map(|_| Instant::now());
     if resolved_parent_tag == 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
@@ -3094,12 +3127,16 @@ pub extern "C" fn __record_ref_creation(
             );
         }
     }
+    if let (Some(p), Some(start)) = (profile, lineage_repair_start) {
+        rz_profile_add_elapsed(&p.ref_create_lineage_repair_ns, start);
+    }
 
     let bounds_len = if bounds_len != 0 {
         bounds_len
     } else {
         inherited_bounds_len
     };
+    let insert_start = profile.map(|_| Instant::now());
     let (origin_known, origin_base, origin_end) =
         snapshot_tag_origin(pointee_addr, resolved_parent_tag);
 
@@ -3120,6 +3157,9 @@ pub extern "C" fn __record_ref_creation(
     tag_store::insert(tag, tmeta.clone());
     lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
+    if let (Some(p), Some(start)) = (profile, insert_start) {
+        rz_profile_add_elapsed(&p.ref_create_insert_ns, start);
+    }
 
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
@@ -3193,9 +3233,8 @@ pub extern "C" fn __record_raw_ptr_creation(
             parent_pointee_addr = parent_pointee;
 
             if let Some(parent_pointee) = parent_pointee {
-                let amap = allocs().lock().unwrap();
-                let parent_alloc = find_alloc_containing(&amap, parent_pointee);
-                let pointee_alloc = find_alloc_containing(&amap, pointee_addr);
+                let parent_alloc = lookup_alloc_snapshot(parent_pointee);
+                let pointee_alloc = lookup_alloc_snapshot(pointee_addr);
                 if let Some((pointee_base, pointee_meta)) = pointee_alloc {
                     alloc_is_stack = pointee_meta.is_stack;
                     alloc_size = pointee_meta.size;
@@ -3226,8 +3265,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         } else {
             // Root creation: if the match is a dead stack slot, treat metadata as unknown
             // to avoid inheriting stale bounds/epoch from recycled stack storage.
-            let amap = allocs().lock().unwrap();
-            match find_alloc_containing(&amap, pointee_addr) {
+            match lookup_alloc_snapshot(pointee_addr) {
                 Some((_base, m)) => {
                     alloc_is_stack = m.is_stack;
                     alloc_size = m.size;

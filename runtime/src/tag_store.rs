@@ -1,4 +1,4 @@
-use crate::{tags, TagMeta};
+use crate::{exact_parent_index, tags, TagMeta};
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -62,6 +62,7 @@ pub(crate) fn insert(tag: u64, tmeta: TagMeta) {
     let idx = shard_index(tag);
     shards()[idx].map.lock().unwrap().insert(tag, tmeta);
     shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
+    exact_parent_index::remember_non_root_tag(tag, &tmeta);
 }
 
 #[inline]
@@ -82,4 +83,9 @@ pub(crate) fn mark_escaped(tag: u64) -> Option<TagMeta> {
     shards()[idx].map.lock().unwrap().insert(tag, updated);
     shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
     Some(updated)
+}
+
+#[inline]
+pub(crate) fn len() -> usize {
+    tags().lock().unwrap().len()
 }
