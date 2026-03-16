@@ -105,6 +105,10 @@ struct HookProfileCounters {
     ref_create_alloc_snapshot_ns: AtomicU64,
     ref_create_lineage_repair_ns: AtomicU64,
     ref_create_insert_ns: AtomicU64,
+    ref_create_tag_store_insert_ns: AtomicU64,
+    ref_create_exact_parent_update_ns: AtomicU64,
+    ref_create_lineage_cache_update_ns: AtomicU64,
+    ref_create_alias_on_tag_created_ns: AtomicU64,
     raw_create_calls: AtomicU64,
     raw_create_total_ns: AtomicU64,
     ptr_use_calls: AtomicU64,
@@ -132,6 +136,10 @@ impl HookProfileCounters {
             ref_create_alloc_snapshot_ns: AtomicU64::new(0),
             ref_create_lineage_repair_ns: AtomicU64::new(0),
             ref_create_insert_ns: AtomicU64::new(0),
+            ref_create_tag_store_insert_ns: AtomicU64::new(0),
+            ref_create_exact_parent_update_ns: AtomicU64::new(0),
+            ref_create_lineage_cache_update_ns: AtomicU64::new(0),
+            ref_create_alias_on_tag_created_ns: AtomicU64::new(0),
             raw_create_calls: AtomicU64::new(0),
             raw_create_total_ns: AtomicU64::new(0),
             ptr_use_calls: AtomicU64::new(0),
@@ -1632,6 +1640,11 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     // We treat `epoch` as an allocation-instance counter for a given base address.
     // We must bump it not only on death, but also on reuse (dead -> live), otherwise
     // a later allocation at the same numeric address could "revive" stale pointers.
+    let compact_dead_epoch = if !new_live && entry.live {
+        Some(entry.epoch)
+    } else {
+        None
+    };
 
     // Death transition: live to dead
     if !new_live && entry.live {
@@ -1663,6 +1676,9 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     drop(m);
     live_alloc_cache::update_alloc(base_addr, entry_snapshot);
     active_alias_model().on_alloc_state_change(base_addr, new_live);
+    if let Some(dead_epoch) = compact_dead_epoch {
+        tag_store::compact_alloc_epoch(base_addr, dead_epoch);
+    }
 }
 
 // === allocation event ring buffer (no-alloc, best-effort) ===================
@@ -1932,6 +1948,10 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.ref_create_alloc_snapshot_ns.store(0, Ordering::Relaxed);
     p.ref_create_lineage_repair_ns.store(0, Ordering::Relaxed);
     p.ref_create_insert_ns.store(0, Ordering::Relaxed);
+    p.ref_create_tag_store_insert_ns.store(0, Ordering::Relaxed);
+    p.ref_create_exact_parent_update_ns.store(0, Ordering::Relaxed);
+    p.ref_create_lineage_cache_update_ns.store(0, Ordering::Relaxed);
+    p.ref_create_alias_on_tag_created_ns.store(0, Ordering::Relaxed);
     p.raw_create_calls.store(0, Ordering::Relaxed);
     p.raw_create_total_ns.store(0, Ordering::Relaxed);
     p.ptr_use_calls.store(0, Ordering::Relaxed);
@@ -1963,6 +1983,14 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let ref_create_alloc_snapshot_ns = p.ref_create_alloc_snapshot_ns.load(Ordering::Relaxed);
     let ref_create_lineage_repair_ns = p.ref_create_lineage_repair_ns.load(Ordering::Relaxed);
     let ref_create_insert_ns = p.ref_create_insert_ns.load(Ordering::Relaxed);
+    let ref_create_tag_store_insert_ns =
+        p.ref_create_tag_store_insert_ns.load(Ordering::Relaxed);
+    let ref_create_exact_parent_update_ns =
+        p.ref_create_exact_parent_update_ns.load(Ordering::Relaxed);
+    let ref_create_lineage_cache_update_ns =
+        p.ref_create_lineage_cache_update_ns.load(Ordering::Relaxed);
+    let ref_create_alias_on_tag_created_ns =
+        p.ref_create_alias_on_tag_created_ns.load(Ordering::Relaxed);
     let raw_create_calls = p.raw_create_calls.load(Ordering::Relaxed);
     let raw_create_total_ns = p.raw_create_total_ns.load(Ordering::Relaxed);
     let ptr_use_calls = p.ptr_use_calls.load(Ordering::Relaxed);
@@ -1986,6 +2014,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
         (amap.len(), live)
     };
     let tag_entries = tag_store::len();
+    let dead_tag_entries = tag_store::dead_len();
     let exact_parent_entries = exact_parent_index::len();
     let call_arg_entries = call_arg_tags().lock().unwrap().len();
     let ret_tag_entries = ret_tags().lock().unwrap().len();
@@ -2000,7 +2029,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
         read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
     );
     eprintln!(
-        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} lineage_repair={} insert={}",
+        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} lineage_repair={} insert={} tag_store_insert={} exact_parent_update={} lineage_cache_update={} alias_on_tag_created={}",
         ref_create_calls,
         ref_create_total_ns,
         if ref_create_calls == 0 {
@@ -2011,7 +2040,11 @@ pub extern "C" fn __rz_dump_hook_profile() {
         ref_create_validate_ns,
         ref_create_alloc_snapshot_ns,
         ref_create_lineage_repair_ns,
-        ref_create_insert_ns
+        ref_create_insert_ns,
+        ref_create_tag_store_insert_ns,
+        ref_create_exact_parent_update_ns,
+        ref_create_lineage_cache_update_ns,
+        ref_create_alias_on_tag_created_ns
     );
     eprintln!(
         "  raw_create:  calls={} total={} avg_per_call={:.1}",
@@ -2044,8 +2077,8 @@ pub extern "C" fn __rz_dump_hook_profile() {
         }
     );
     eprintln!(
-        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
-        alloc_entries, live_alloc_entries, tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
+        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
+        alloc_entries, live_alloc_entries, tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
     );
 }
 
@@ -3154,9 +3187,29 @@ pub extern "C" fn __record_ref_creation(
         origin_base,
         origin_end,
     };
-    tag_store::insert(tag, tmeta.clone());
+    let tag_store_insert_start = profile.map(|_| Instant::now());
+    tag_store::insert(tag, tmeta);
+    if tmeta.alloc_epoch != 0 && tmeta.origin_known {
+        tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
+    }
+    if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
+        rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
+    }
+    let exact_parent_update_start = profile.map(|_| Instant::now());
+    exact_parent_index::remember_non_root_tag(tag, &tmeta);
+    if let (Some(p), Some(start)) = (profile, exact_parent_update_start) {
+        rz_profile_add_elapsed(&p.ref_create_exact_parent_update_ns, start);
+    }
+    let lineage_cache_update_start = profile.map(|_| Instant::now());
     lineage_cache::remember_non_root_tag(tag, &tmeta);
+    if let (Some(p), Some(start)) = (profile, lineage_cache_update_start) {
+        rz_profile_add_elapsed(&p.ref_create_lineage_cache_update_ns, start);
+    }
+    let alias_on_tag_created_start = profile.map(|_| Instant::now());
     active_alias_model().on_tag_created(tag, &tmeta);
+    if let (Some(p), Some(start)) = (profile, alias_on_tag_created_start) {
+        rz_profile_add_elapsed(&p.ref_create_alias_on_tag_created_ns, start);
+    }
     if let (Some(p), Some(start)) = (profile, insert_start) {
         rz_profile_add_elapsed(&p.ref_create_insert_ns, start);
     }
@@ -3379,7 +3432,11 @@ pub extern "C" fn __record_raw_ptr_creation(
         origin_base,
         origin_end,
     };
-    tag_store::insert(tag, tmeta.clone());
+    tag_store::insert(tag, tmeta);
+    if tmeta.alloc_epoch != 0 && tmeta.origin_known {
+        tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
+    }
+    exact_parent_index::remember_non_root_tag(tag, &tmeta);
     lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
 
