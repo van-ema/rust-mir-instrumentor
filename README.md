@@ -142,6 +142,50 @@ For benchmarking this mode, aggregate the final
 build log. Looking only at the final driver crate misses most dependency-side
 hook reductions.
 
+### Running the example suite with the 3-phase analysis
+
+To run the full examples under the same interprocedural analyze/merge/consume
+pipeline, enable the wrapper flag when invoking the example runner:
+
+```bash
+RZ_INTERPROC_UNSAFE_SUMMARIES=1 \
+CARGO_INCREMENTAL=0 \
+python3 scripts/run_example_tests.py
+```
+
+That causes each example build to use the three-phase flow:
+1. analyze-only summary build
+2. offline summary merge
+3. final instrumented build consuming merged summaries
+
+Manual equivalent for a single example-style build:
+
+```bash
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+HARNESS_TARGET_DIR=./target/example-summary \
+RZ_ANALYZE_UNSAFE_SUMMARIES=1 \
+RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP=1 \
+cargo build
+
+python3 ./scripts/merge_unsafe_summaries.py \
+  --input-dir ./target/example-summary/rusteze-unsafe-summaries \
+  --output-dir ./target/example-merged \
+  --report ./target/example-merged/merge.report.txt
+
+CARGO_INCREMENTAL=0 \
+RZ_INSTRUMENT_ALL_DEPS=1 \
+RZ_USE_UNSAFE_SUMMARIES=1 \
+RZ_UNSAFE_SUMMARY_INPUT_DIR=./target/example-merged \
+cargo build
+```
+
+For normal validation of the repository, the wrapper form is the intended one:
+
+```bash
+RZ_INTERPROC_UNSAFE_SUMMARIES=1 CARGO_INCREMENTAL=0 python3 scripts/run_example_tests.py
+```
+
 ## Env
 
 Project-specific environment variables are grouped below by component/script.
