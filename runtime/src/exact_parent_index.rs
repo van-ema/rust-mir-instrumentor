@@ -15,6 +15,7 @@ struct ExactParentShard {
 }
 
 static EXACT_PARENT_SHARDS: OnceLock<Vec<ExactParentShard>> = OnceLock::new();
+static EXACT_PARENT_EPOCH_KEYS: OnceLock<Mutex<HashMap<(usize, u64), Vec<usize>>>> = OnceLock::new();
 
 #[inline]
 fn shards() -> &'static [ExactParentShard] {
@@ -27,6 +28,11 @@ fn shards() -> &'static [ExactParentShard] {
                 .collect()
         })
         .as_slice()
+}
+
+#[inline]
+fn epoch_keys() -> &'static Mutex<HashMap<(usize, u64), Vec<usize>>> {
+    EXACT_PARENT_EPOCH_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[inline]
@@ -66,18 +72,34 @@ fn validate_candidate(
 
 #[inline]
 pub(crate) fn remember_non_root_tag(tag: u64, tmeta: &TagMeta) {
-    if tag == 0 || tmeta.parent == 0 || tmeta.alloc_epoch == 0 || tmeta.pointee_addr == 0 {
+    if tag == 0
+        || tmeta.parent == 0
+        || tmeta.alloc_epoch == 0
+        || tmeta.pointee_addr == 0
+        || !tmeta.origin_known
+        || tmeta.origin_base == 0
+    {
         return;
     }
 
     let idx = shard_index(tmeta.pointee_addr, tmeta.alloc_epoch);
     let mut map = shards()[idx].map.lock().unwrap();
+    let is_new_key = !map.contains_key(&(tmeta.pointee_addr, tmeta.alloc_epoch));
     let entry = map
         .entry((tmeta.pointee_addr, tmeta.alloc_epoch))
         .or_insert_with(ExactParentEntry::default);
     entry.any_tag = tag;
     if is_mut_parent_kind(tmeta.kind) {
         entry.mut_tag = tag;
+    }
+    drop(map);
+
+    if is_new_key {
+        let mut reverse = epoch_keys().lock().unwrap();
+        reverse
+            .entry((tmeta.origin_base, tmeta.alloc_epoch))
+            .or_default()
+            .push(tmeta.pointee_addr);
     }
 }
 
@@ -117,4 +139,20 @@ pub(crate) fn len() -> usize {
         .iter()
         .map(|shard| shard.map.lock().unwrap().len())
         .sum()
+}
+
+#[inline]
+pub(crate) fn remove_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
+    if base_addr == 0 || alloc_epoch == 0 {
+        return;
+    }
+    let Some(pointee_addrs) = epoch_keys().lock().unwrap().remove(&(base_addr, alloc_epoch)) else {
+        return;
+    };
+
+    for pointee_addr in pointee_addrs {
+        let idx = shard_index(pointee_addr, alloc_epoch);
+        let mut map = shards()[idx].map.lock().unwrap();
+        map.remove(&(pointee_addr, alloc_epoch));
+    }
 }

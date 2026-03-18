@@ -16,6 +16,7 @@ use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
 mod exact_parent_index;
+mod dead_epoch_cleanup;
 mod lineage_cache;
 mod live_alloc_cache;
 mod tag_lookup_cache;
@@ -1677,7 +1678,7 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     live_alloc_cache::update_alloc(base_addr, entry_snapshot);
     active_alias_model().on_alloc_state_change(base_addr, new_live);
     if let Some(dead_epoch) = compact_dead_epoch {
-        tag_store::compact_alloc_epoch(base_addr, dead_epoch);
+        dead_epoch_cleanup::reclaim_alloc_epoch(base_addr, dead_epoch);
     }
 }
 

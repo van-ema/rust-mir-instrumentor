@@ -125,3 +125,11 @@ pub(crate) fn remember_non_root_tag(tag: u64, tmeta: &TagMeta) {
     });
 }
 
+#[inline]
+pub(crate) fn note_dead_epoch(_base_addr: usize, _alloc_epoch: u64) {
+    // The lineage cache is a fixed-size thread-local array keyed by
+    // (pointee_addr, alloc_epoch). It does not grow unboundedly, so there is no
+    // global dead-epoch state to reclaim here. Dead-epoch entries self-invalidate
+    // on the next lookup because tag_store::get() returns compact dead-tag
+    // metadata with `parent=0`, which fails candidate validation.
+}
