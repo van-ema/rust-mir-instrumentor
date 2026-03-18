@@ -17,6 +17,7 @@ use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
+use rustc_middle::mir::visit::{MutatingUseContext, NonUseContext, PlaceContext, Visitor};
 use rustc_middle::ty::{ConstKind as TyConstKind, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
 use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
 use rustc_middle::ty::TyKind;
@@ -37,6 +38,33 @@ impl FunctionDefId for DefId {
 impl<'tcx> FunctionDefId for Instance<'tcx> {
     fn func_def_id(&self) -> DefId {
         self.def_id()
+    }
+}
+
+struct LocalUseCounter<'a> {
+    stats: &'a mut HashMap<Local, LocalRefUseStats>,
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for LocalUseCounter<'a> {
+    fn visit_place(
+        &mut self,
+        place: &Place<'tcx>,
+        context: PlaceContext,
+        location: Location,
+    ) {
+        let is_def = matches!(
+            context,
+            PlaceContext::MutatingUse(MutatingUseContext::Store)
+                | PlaceContext::MutatingUse(MutatingUseContext::Deinit)
+                | PlaceContext::MutatingUse(MutatingUseContext::SetDiscriminant)
+                | PlaceContext::MutatingUse(MutatingUseContext::AsmOutput)
+                | PlaceContext::MutatingUse(MutatingUseContext::Call)
+                | PlaceContext::MutatingUse(MutatingUseContext::Yield)
+        );
+        if !is_def && !matches!(context, PlaceContext::NonUse(NonUseContext::VarDebugInfo)) {
+            self.stats.entry(place.local).or_default().uses += 1;
+        }
+        self.super_place(place, context, location);
     }
 }
 
@@ -86,6 +114,12 @@ struct UnsafeSummaryStats {
     ptr_args_escaping_unknown_direct: usize,
     ptr_args_escaping_unknown_inherited: usize,
     ptr_args_forwarded_to_return: usize,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct LocalRefUseStats {
+    defs: usize,
+    uses: usize,
 }
 
 
@@ -389,11 +423,16 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // Index/IndexMut return references into the receiver.
     EffectRule::two(MatchKind::Contains, "::ops::IndexMut", MatchKind::EndsWith, "::index_mut", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::ops::Index", MatchKind::EndsWith, "::index", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "SliceIndex", MatchKind::EndsWith, "::index_mut", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "SliceIndex", MatchKind::EndsWith, "::index", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::slice::index::<impl", MatchKind::EndsWith, "::index_mut", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::slice::index::<impl", MatchKind::EndsWith, "::index", CallEffect::PtrDerive),
 
     // Slice helpers.
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::get", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::get_mut", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::last_mut", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::len", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::is_empty", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::slice::<impl [", MatchKind::EndsWith, "::split_at_mut", CallEffect::Ignore),
@@ -440,6 +479,8 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::two(MatchKind::Contains, "::io::Cursor", MatchKind::EndsWith, "::position", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::io::Cursor", MatchKind::EndsWith, "::set_position", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "::io::IoSlice", MatchKind::EndsWith, "::new", CallEffect::Ignore),
+    // Pure state queries that only read scalar state from a receiver. These are common in parser
+    // and codec hot paths and do not justify materializing a tracked temporary shared borrow.
 
     // Atomic ops (load/store vs RMW).
     EffectRule::two(MatchKind::Contains, "::sync::atomic::Atomic", MatchKind::EndsWith, "::load", CallEffect::Load),
@@ -975,6 +1016,7 @@ impl MyOptimizationPass {
                     _ => {}
                 }
             }
+
         }
 
         locals
@@ -1815,6 +1857,144 @@ impl MyOptimizationPass {
             Operand::Copy(p) | Operand::Move(p) => Some(*p),
             _ => None,
         }
+    }
+
+    fn compute_local_ref_use_stats<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+    ) -> HashMap<Local, LocalRefUseStats> {
+        let mut stats: HashMap<Local, LocalRefUseStats> = HashMap::new();
+
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            for stmt in &block_data.statements {
+                if let StatementKind::Assign(box (place, _)) = &stmt.kind {
+                    if let Some(local) = place.as_local() {
+                        stats.entry(local).or_default().defs += 1;
+                    }
+                }
+            }
+
+            let mut counter = LocalUseCounter { stats: &mut stats };
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                counter.visit_statement(
+                    stmt,
+                    Location {
+                        block: bb,
+                        statement_index: stmt_idx,
+                    },
+                );
+            }
+            counter.visit_terminator(
+                block_data.terminator(),
+                Location {
+                    block: bb,
+                    statement_index: block_data.statements.len(),
+                },
+            );
+        }
+
+        stats
+    }
+
+    fn compute_summary_elidable_shared_call_ref_locals<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+    ) -> HashSet<Local> {
+        if !unsafe_dataflow::use_loaded_unsafe_summaries_enabled() {
+            return HashSet::new();
+        }
+
+        let local_stats = self.compute_local_ref_use_stats(body);
+        let mut eligible = HashSet::new();
+
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            let Some(term) = &block_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                ..
+            } = &term.kind else {
+                continue;
+            };
+
+            if self.is_pointer_ty(destination.ty(&body.local_decls, tcx).ty) {
+                continue;
+            }
+
+            let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
+                continue;
+            };
+            let Some(summary) = unsafe_dataflow::summary_for_def_id(tcx, callee_did) else {
+                continue;
+            };
+
+            for (arg_index, arg) in args.iter().enumerate() {
+                let Some(place) = self.place_from_operand(&arg.node) else {
+                    continue;
+                };
+                let local = place.local;
+                let Some(stat) = local_stats.get(&local) else {
+                    continue;
+                };
+                if stat.defs != 1 || stat.uses != 1 {
+                    continue;
+                }
+
+                let Some(def_stmt) = block_data
+                    .statements
+                    .iter()
+                    .find(|stmt| matches!(
+                        &stmt.kind,
+                        StatementKind::Assign(box (lhs, Rvalue::Ref(_, BorrowKind::Shared, src_place)))
+                            if lhs.as_local() == Some(local)
+                                && !src_place.projection.iter().any(|proj| matches!(proj, ProjectionElem::Deref))
+                    )) else {
+                    continue;
+                };
+
+                let StatementKind::Assign(box (_, Rvalue::Ref(_, BorrowKind::Shared, src_place))) =
+                    &def_stmt.kind
+                else {
+                    continue;
+                };
+
+                let local_ty = body.local_decls[local].ty;
+                if !matches!(local_ty.kind(), TyKind::Ref(_, _, Mutability::Not)) {
+                    continue;
+                }
+
+                if src_place
+                    .projection
+                    .iter()
+                    .any(|proj| matches!(proj, ProjectionElem::Deref))
+                {
+                    continue;
+                }
+
+                let Some(arg_summary) = summary
+                    .ptr_args()
+                    .iter()
+                    .find(|entry| entry.arg_index() == arg_index)
+                else {
+                    continue;
+                };
+
+                if arg_summary.reaches_direct_sink()
+                    || arg_summary.escapes_to_unknown_boundary()
+                    || arg_summary.forwarded_to_return()
+                {
+                    continue;
+                }
+
+                eligible.insert(local);
+            }
+        }
+
+        eligible
     }
 
     fn normalize_def_path(&self, def_path: &str) -> String {
@@ -2926,6 +3106,91 @@ impl MyOptimizationPass {
     /// The immediate `src_place.local` for `_elt` can be a projection-heavy temp with no tag local.
     /// If we use only that local, parent becomes `0` and the new ref is treated as a root sibling.
     /// Backtracking recovers `_out_slice` (or another pointer carrier), so parent lineage is kept.
+    fn recover_parent_source_local_for_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        src_place: Place<'tcx>,
+        is_raw_creation: bool,
+    ) -> Option<Local> {
+        let mut candidate_local: Option<Local> = None;
+        let block_stmts = &body.basic_blocks[bb].statements;
+        let upto = stmt_idx.min(block_stmts.len());
+
+        let src_local = src_place.local;
+        if self.is_pointer_ty(body.local_decls[src_local].ty) {
+            // For projected sources like `(*tmp)[i]`, `(*tmp)[a..b]`, or `(*tmp).field`,
+            // `src_local` is often a short-lived wrapper temp created by optimized MIR. Its tag
+            // can be a root-like raw helper instead of the real parent lineage we want the new
+            // ref/raw to inherit from. Prefer backtracking through simple same-block forwarding
+            // first, and only fall back to the immediate local if that fails.
+            let has_complex_projection = !src_place.projection.is_empty()
+                && !(src_place.projection.len() == 1
+                    && matches!(src_place.projection[0], ProjectionElem::Deref));
+            if has_complex_projection {
+                candidate_local =
+                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto]);
+                if candidate_local.is_some() {
+                    // Keep the recovered source instead of the projection temp.
+                } else {
+                    candidate_local = Some(src_local);
+                }
+            } else {
+            // For raw creation from projected pointer-field loads (`(*ref_to_struct).ptr_field`),
+            // using `src_place.local` as parent incorrectly picks the container-ref tag.
+            // That ties the raw pointer to the stack slot of the wrapper object instead of the
+            // real pointee carried in the field.
+            let projected_raw_field_load = is_raw_creation
+                && !src_place.projection.is_empty()
+                && matches!(
+                    src_place.projection.first(),
+                    Some(ProjectionElem::Deref)
+                )
+                && src_place
+                    .projection
+                    .iter()
+                    .skip(1)
+                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
+            if projected_raw_field_load {
+                candidate_local =
+                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto]);
+            } else {
+                candidate_local = Some(src_local);
+            }
+            }
+        } else {
+            candidate_local = self.backtrack_pointer_source_local(
+                body,
+                src_local,
+                &block_stmts[..upto],
+            );
+        }
+
+        if candidate_local.is_none() && !src_place.projection.is_empty() {
+            // Field/subslice-heavy places like `self.buffer[a..b]` often have a non-pointer carrier
+            // local (`Vec<T>`, struct field, tuple field) even though an earlier projection prefix
+            // is pointer-typed (`self`, `&mut self.field`, etc.). Using the nearest pointer-typed
+            // prefix local preserves the surrounding borrow family instead of dropping straight to
+            // a raw root for the projected child.
+            for prefix_len in (0..src_place.projection.len()).rev() {
+                let prefix = PlaceRef {
+                    local: src_place.local,
+                    projection: &src_place.projection[..prefix_len],
+                }
+                .to_place(tcx);
+                let prefix_ty = prefix.ty(&body.local_decls, tcx).ty;
+                if self.is_pointer_ty(prefix_ty) {
+                    candidate_local = Some(prefix.local);
+                    break;
+                }
+            }
+        }
+
+        candidate_local
+    }
+
     fn parent_tag_operand_for_src_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -3133,6 +3398,7 @@ impl MyOptimizationPass {
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
+        summary_elidable_shared_call_ref_locals: &HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
         track_all_stack_allocs: bool,
     ) {
@@ -3461,6 +3727,34 @@ impl MyOptimizationPass {
                             _ => None,
                         };
                         if let Some(p) = projected_ptr_place {
+                            if src_local_opt.is_none() {
+                                src_local_opt = self.recover_parent_source_local_for_place(
+                                    tcx,
+                                    body,
+                                    bb,
+                                    stmt_idx,
+                                    p,
+                                    false,
+                                );
+                            }
+
+                            if src_local_opt.is_none()
+                                && matches!(p.projection.first(), Some(ProjectionElem::Deref))
+                                && p.projection
+                                    .iter()
+                                    .skip(1)
+                                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
+                                && self.is_pointer_ty(body.local_decls[p.local].ty)
+                            {
+                                // Wrapper structs that carry borrows (e.g. `UnfilterBuf<'_>`) often
+                                // surface a field borrow as `((*wrapper_ref).field: &mut [u8])`.
+                                // We do not track field-local tags separately, so falling straight
+                                // to RawRoot loses lineage and creates false aliasing roots. In
+                                // this narrow wrapper-field shape, keep the copied field pointer in
+                                // the surrounding borrow family by deriving it from the wrapper ref.
+                                src_local_opt = Some(p.local);
+                            }
+
                             // Pointer-value load through deref, e.g.:
                             //   _r = &_p;        // _r: &*const T
                             //   _dst = copy (*_r)
@@ -3861,7 +4155,9 @@ impl MyOptimizationPass {
         if let StatementKind::Assign(box (place, Rvalue::Ref(_, bk, src_place))) = &stmt.kind {
             if let Some(lhs_local) = place.as_local() {
                 let lhs_ty = body.local_decls[lhs_local].ty;
-                if self.is_pointer_ty(lhs_ty) {
+                if self.is_pointer_ty(lhs_ty)
+                    && !summary_elidable_shared_call_ref_locals.contains(&lhs_local)
+                {
                     ptr_locals_needing_tag.insert(lhs_local);
                     tagged_ptr_locals.insert(lhs_local);
                     insert_points.push(InsertPoint {
@@ -3906,6 +4202,11 @@ impl MyOptimizationPass {
     /// This MUST be kept consistent with instrumentation emission so that
     /// `warn_unknown_call_if_needed` does not drift from actual handling.
     fn classify_call_effect(&self, def_path: &str) -> CallEffect {
+        if def_path.contains("decompress::Decompressor")
+            && def_path.ends_with("::is_done")
+        {
+            return CallEffect::Ignore;
+        }
         if self.is_box_into_raw_wrapper(def_path) {
             return CallEffect::BoxIntoRaw;
         }
@@ -4122,28 +4423,63 @@ impl MyOptimizationPass {
         def_id_opt.map(|def_id| (def_id, self.callee_id_u64(tcx, def_id)))
     }
 
-    /// Best-effort: recover the pointer source local from call arg0.
+    /// Best-effort: recover the pointer source local from a call argument.
     ///
-    /// For wrappers like `read_via_copy` and pointer arithmetic helpers, arg0 carries the
-    /// provenance source for a returned pointer value.
-    fn call_arg0_pointer_source_local<'tcx>(
+    /// Most pointer-derivation wrappers carry provenance in arg0, but some trait-based helpers
+    /// (notably `SliceIndex::index{,_mut}`) take the pointer-bearing slice in arg1 and use arg0
+    /// for an index/range value.
+    fn call_arg_pointer_source_local<'tcx>(
         &self,
+        tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block_data: &BasicBlockData<'tcx>,
         args: &Box<[Spanned<Operand<'tcx>>]>,
+        arg_index: usize,
     ) -> Option<Local> {
-        let first = args.get(0)?;
+        let first = args.get(arg_index)?;
         let arg_place = self.place_from_operand(&first.node)?;
         let arg_local = arg_place.local;
         let arg_ty = body.local_decls[arg_local].ty;
         if self.is_pointer_ty(arg_ty) {
             return Some(arg_local);
         }
+        if !arg_place.projection.is_empty() {
+            for prefix_len in (0..arg_place.projection.len()).rev() {
+                let prefix = PlaceRef {
+                    local: arg_place.local,
+                    projection: &arg_place.projection[..prefix_len],
+                }
+                .to_place(tcx);
+                let prefix_ty = prefix.ty(&body.local_decls, tcx).ty;
+                if self.is_pointer_ty(prefix_ty) {
+                    return Some(prefix.local);
+                }
+            }
+        }
+        if let Some(src_local) =
+            self.backtrack_pointer_source_local(body, arg_local, &block_data.statements)
+        {
+            return Some(src_local);
+        }
         let base_local = self.backtrack_unsize_base_local(arg_local, &block_data.statements)?;
         if self.is_pointer_ty(body.local_decls[base_local].ty) {
             Some(base_local)
         } else {
             None
+        }
+    }
+
+    fn ptr_derive_source_arg_index(&self, def_path: &str) -> usize {
+        if def_path.contains("SliceIndex")
+            && (def_path.ends_with("::index") || def_path.ends_with("::index_mut"))
+        {
+            1
+        } else if def_path.contains("::slice::index::<impl")
+            && (def_path.ends_with("::index") || def_path.ends_with("::index_mut"))
+        {
+            1
+        } else {
+            0
         }
     }
 
@@ -4936,8 +5272,17 @@ impl MyOptimizationPass {
                             let dst_ty = body.local_decls[dst_local].ty;
                             // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
                             if self.is_pointer_ty(dst_ty) {
-                                if let Some(src_local) =
-                                    self.call_arg0_pointer_source_local(body, block_data, args)
+                                let src_arg_index = callee_path_opt
+                                    .as_deref()
+                                    .map(|p| self.ptr_derive_source_arg_index(p))
+                                    .unwrap_or(0);
+                                if let Some(src_local) = self.call_arg_pointer_source_local(
+                                    tcx,
+                                    body,
+                                    block_data,
+                                    args,
+                                    src_arg_index,
+                                )
                                 {
                                     ptr_locals_needing_tag.insert(dst_local);
                                     ptr_locals_needing_tag.insert(src_local);
@@ -5264,7 +5609,7 @@ impl MyOptimizationPass {
                         && matches!(call_effect_opt, Some(CallEffect::Load))
                     {
                         if let Some(src_local) =
-                            self.call_arg0_pointer_source_local(body, block_data, args)
+                            self.call_arg_pointer_source_local(tcx, body, block_data, args, 0)
                         {
                             ptr_locals_needing_tag.insert(dst_local);
                             ptr_locals_needing_tag.insert(src_local);
@@ -5346,6 +5691,8 @@ impl MyOptimizationPass {
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
         let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
         let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
+        let summary_elidable_shared_call_ref_locals =
+            self.compute_summary_elidable_shared_call_ref_locals(tcx, body);
 
         let mut explicitly_tracked: HashSet<Local> = HashSet::new();
         for block_data in body.basic_blocks.iter() {
@@ -5420,6 +5767,7 @@ impl MyOptimizationPass {
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
                     &ptr_locals_with_tag_sources,
+                    &summary_elidable_shared_call_ref_locals,
                     &interesting_stack_locals,
                     track_all_stack_allocs,
                 );
@@ -6852,10 +7200,33 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
-                        Operand::Copy(Place::from(*tl))
+                    let tag_op: Operand<'tcx> = if place.projection.is_empty() {
+                        if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
+                            Operand::Copy(Place::from(*tl))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        }
                     } else {
-                        self.const_u64(tcx, source_info.span, 0)
+                        // For projected call arguments such as subslices (`output[a..b]`) or
+                        // field projections, pushing the carrier local's current tag is often too
+                        // weak: optimized MIR can keep only a wrapper temp tagged while the actual
+                        // projected argument never materializes its own stable tag before the call.
+                        //
+                        // The callee only needs a parent lineage to retag its local argument at
+                        // the callee address. Reuse the same parent-selection logic we use for
+                        // ref/raw creation so interprocedural retagging stays attached to the
+                        // source borrow family instead of falling back to a root inside the callee.
+                        self.parent_tag_operand_for_src_place(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            source_info,
+                            place,
+                            tag_local_for_ptr_local,
+                            ref_ancestor_local_for_ptr_local,
+                            false,
+                        )
                     };
 
                     let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
@@ -6984,6 +7355,21 @@ impl MyOptimizationPass {
                             )
                         }
                         InstrKind::Raw { src, .. } => {
+                            let src_local = src.local;
+                            let src_is_plain_ref_deref = src.projection.len() == 1
+                                && matches!(src.projection[0], ProjectionElem::Deref)
+                                && matches!(body.local_decls[src_local].ty.kind(), TyKind::Ref(..));
+                            if src_is_plain_ref_deref {
+                                if let Some(tl) = tag_local_for_ptr_local.get(&src_local) {
+                                    Operand::Copy(Place::from(*tl))
+                                } else if let Some(tl) =
+                                    ref_ancestor_local_for_ptr_local.get(&src_local)
+                                {
+                                    Operand::Copy(Place::from(*tl))
+                                } else {
+                                    self.const_u64(tcx, source_info.span, 0)
+                                }
+                            } else {
                             self.parent_tag_operand_for_src_place(
                                 tcx,
                                 body,
@@ -6995,6 +7381,7 @@ impl MyOptimizationPass {
                                 ref_ancestor_local_for_ptr_local,
                                 true,
                             )
+                            }
                         }
                         _ => self.const_u64(tcx, source_info.span, 0),
                     };
@@ -7030,6 +7417,14 @@ impl MyOptimizationPass {
                             if !src.projection.is_empty() {
                                 flags |= 0b100;
                             }
+                            let src_ty = src.ty(&body.local_decls, tcx).ty;
+                            if self.is_pointer_ty(src_ty) && !self.is_thin_ptr_ty(tcx, body, src_ty) {
+                                // Wide-pointer reborrows often lower through a temporary thin raw
+                                // data pointer. If that helper raw root loses lineage, the runtime
+                                // should prefer dropping the bad raw-root parent over freezing the
+                                // eventual wide ref/write as a foreign sibling.
+                                flags |= 0b1_0000;
+                            }
                             flags
                         }
                         InstrKind::Raw { src, .. } => {
@@ -7054,12 +7449,12 @@ impl MyOptimizationPass {
                         }
                         InstrKind::RetRoot { dst_local, .. } => {
                             let mut flags = if alias_exempt { 1 } else { 0 };
-                            if matches!(body.local_decls[*dst_local].ty.kind(), TyKind::Ref(..)) {
-                                // Return-root ref creation has the same failure mode as call
-                                // arg/ret retagging: optimized MIR can lose the parent and emit a
-                                // fresh stack root at an address that already has live lineage.
-                                flags |= 0b10;
-                            }
+                            // Return-root creation means caller-side provenance recovery failed.
+                            // Mark both refs and raws as eligible for exact same-address repair:
+                            // uninstrumented std/core pointer-returning wrappers can otherwise
+                            // synthesize a fresh root for a pointer that should remain attached to
+                            // an existing live lineage at the same address.
+                            flags |= 0b10;
                             flags
                         }
                         _ => {
@@ -7791,6 +8186,14 @@ impl MyOptimizationPass {
             );
         }
 
+        // Some helpers are intentionally classified as pure scalar queries. Instrumenting their
+        // bodies only materializes administrative borrows that can outlive the query and create
+        // false Tree Borrows freezes in callers. `fdeflate::Decompressor::is_done` is the current
+        // concrete case in the PNG decode path.
+        if def_path.contains("decompress::Decompressor") && def_path.ends_with("::is_done") {
+            return;
+        }
+
         if self.analyze_unsafe_summaries_only_enabled() {
             let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(
                 tcx,
@@ -8062,11 +8465,31 @@ mod tests {
             CallEffect::Ignore
         );
         assert_eq!(
+            effect_for("core::slice::<impl [T]>::len"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
             effect_for("core::slice::index::<impl core::ops::Index<I> for [T]>::index"),
             CallEffect::PtrDerive
         );
         assert_eq!(
             effect_for("core::slice::index::<impl core::ops::IndexMut<I> for [T]>::index_mut"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::slice::index::<impl std::slice::SliceIndex<[u8]> for std::ops::Range<usize>>::index_mut"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("<std::ops::Range<usize> as std::slice::SliceIndex<[u8]>>::index_mut"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::slice::index::<impl std::slice::SliceIndex<[u8]> for usize>::index"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("<usize as std::slice::SliceIndex<[u8]>>::index"),
             CallEffect::PtrDerive
         );
         assert_eq!(
@@ -8124,6 +8547,12 @@ mod tests {
         assert_eq!(
             effect_for("<alloc::vec::Vec<T, A> as core::ops::Index<I>>::index"),
             CallEffect::PtrDerive
+        );
+        assert_eq!(
+            MyOptimizationPass.classify_call_effect(
+                "decompress::Decompressor::is_done"
+            ),
+            CallEffect::Ignore
         );
     }
 }
