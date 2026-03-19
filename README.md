@@ -75,9 +75,10 @@ Add `RZ_METADATA_DATAFLOW_STATS=1` to print pruning totals during compilation.
 
 ### 2. Local backward unsafe-sensitive analysis
 
-This is the active hook-gating analysis. It starts from unsafe-sensitive sinks in
-each MIR body, propagates relevance backward, and prunes access/creation hooks for
-pointer locals that cannot reach those sinks inside the current function.
+This was the original local backward hook-gating analysis. It starts from
+unsafe-sensitive sinks in each MIR body, propagates relevance backward, and
+prunes hooks for pointer locals that cannot reach those sinks inside the current
+function.
 
 ```bash
 CARGO_INCREMENTAL=0 \
@@ -88,7 +89,9 @@ TARGET=bytes PROFILE=release \
 ./scripts/afl_build.sh
 ```
 
-This mode is single-build and does not require summary artifacts.
+This local-only mode is no longer the supported user-facing path because it is
+not sound enough for the full example suite. The supported unsafe-sensitive
+analysis mode is the interprocedural flow below.
 
 ### 3. Interprocedural unsafe-sensitive analysis
 
@@ -110,6 +113,10 @@ TARGET=bytes PROFILE=release \
 ```
 
 The wrapper delegates to `scripts/afl_build_interproc.sh`.
+
+In the current sound configuration, interprocedural pruning is intentionally
+limited to raw-pointer access hooks. Provenance-creating hooks and
+reference-typed accesses remain unpruned.
 
 Manual equivalent:
 
@@ -235,7 +242,9 @@ Project-specific environment variables are grouped below by component/script.
   not rewrite semantic hooks like `PtrRead` / `PtrWrite`.
 - `RZ_METADATA_DATAFLOW_STATS`: non-zero prints metadata-dataflow pruning stats during
   instrumentation.
-- `RZ_UNSAFE_DATAFLOW`: enables conservative unsafe-sensitive hook gating and summary computation.
+- `RZ_UNSAFE_DATAFLOW`: legacy local-only unsafe-dataflow toggle. This is no longer the supported
+  user-facing pruning mode. The supported path is `RZ_INTERPROC_UNSAFE_SUMMARIES=1`, while
+  summary generation/consumption still uses the underlying unsafe-dataflow machinery internally.
 - `RZ_UNSAFE_DATAFLOW_STATS`: non-zero prints unsafe-dataflow hook-pruning totals during
   instrumentation.
 - `RZ_UNSAFE_DATAFLOW_SUMMARY_STATS`: non-zero prints per-function unsafe-summary statistics,
@@ -308,8 +317,10 @@ Project-specific environment variables are grouped below by component/script.
   summaries.
 - `RZ_INTERPROC_ANALYZE_TARGET_DIR`: optional analyze-pass target dir override used by
   `scripts/afl_build_interproc.sh`.
-- `RZ_INTERPROC_UNSAFE_SUMMARIES`: if set to `1`, `scripts/afl_build.sh` automatically delegates
-  to the three-phase interprocedural flow in `scripts/afl_build_interproc.sh`.
+- `RZ_INTERPROC_UNSAFE_SUMMARIES`: if set to `1`, `scripts/afl_build.sh` and
+  `scripts/run_example_tests.py` use the three-phase interprocedural
+  analyze/merge/consume flow. For `afl_build.sh`, this delegates to
+  `scripts/afl_build_interproc.sh`.
 
 Recommended interprocedural native build:
 

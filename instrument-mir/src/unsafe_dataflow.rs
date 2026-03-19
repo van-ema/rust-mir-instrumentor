@@ -200,28 +200,37 @@ impl UnsafeArgSummary {
     }
 }
 
-pub(crate) fn unsafe_dataflow_enabled() -> bool {
-    std::env::var("RZ_UNSAFE_DATAFLOW")
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+pub(crate) fn analyze_unsafe_summaries_enabled() -> bool {
+    env_flag_enabled("RZ_ANALYZE_UNSAFE_SUMMARIES")
+}
+
+pub(crate) fn unsafe_dataflow_enabled() -> bool {
+    // Supported activation paths:
+    //  - analyze-only summary generation
+    //  - normal builds consuming merged summaries
+    //
+    // Plain `RZ_UNSAFE_DATAFLOW=1` without summaries is intentionally no longer a
+    // pruning mode because the local-only path is not sound enough for the full
+    // example suite.
+    analyze_unsafe_summaries_enabled() || use_loaded_unsafe_summaries_enabled()
 }
 
 pub(crate) fn use_loaded_unsafe_summaries_enabled() -> bool {
-    std::env::var("RZ_USE_UNSAFE_SUMMARIES")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag_enabled("RZ_USE_UNSAFE_SUMMARIES")
 }
 
 fn trace_local_summary_missing_enabled() -> bool {
-    std::env::var("RZ_TRACE_LOCAL_SUMMARY_MISSING")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag_enabled("RZ_TRACE_LOCAL_SUMMARY_MISSING")
 }
 
 fn unknown_callee_stats_enabled() -> bool {
-    std::env::var("RZ_UNSAFE_DATAFLOW_UNKNOWN_CALLEE_STATS")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    env_flag_enabled("RZ_UNSAFE_DATAFLOW_UNKNOWN_CALLEE_STATS")
 }
 
 fn summary_input_dir() -> PathBuf {

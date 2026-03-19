@@ -727,6 +727,10 @@ impl MyOptimizationPass {
         matches!(ty.kind(), TyKind::Ref(..) | TyKind::RawPtr(..))
     }
 
+    fn is_raw_pointer_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        matches!(ty.kind(), TyKind::RawPtr(..))
+    }
+
     /// Best-effort detection of "vtable-like" structs: all fields are function pointers.
     fn is_fn_table_adt_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         let TyKind::Adt(adt, args) = ty.kind() else { return false };
@@ -1089,9 +1093,12 @@ impl MyOptimizationPass {
 
     /// Enable crate-local unsafe-influence dataflow gating for pointer access hooks.
     ///
-    /// Default: disabled.
-    /// Set `RZ_UNSAFE_DATAFLOW=1` to keep heavy pointer access hooks only for locals that
-    /// are conservatively tainted by unsafe influence (raw pointers / unknown-call boundaries).
+    /// Supported modes:
+    /// - analyze-only summary generation (`RZ_ANALYZE_UNSAFE_SUMMARIES=1`)
+    /// - final builds consuming merged summaries (`RZ_USE_UNSAFE_SUMMARIES=1`)
+    ///
+    /// Plain local-only `RZ_UNSAFE_DATAFLOW=1` pruning is intentionally not supported as a
+    /// user-facing mode because it is not sound enough for the full example suite.
     fn unsafe_dataflow_selective_enabled(&self) -> bool {
         unsafe_dataflow::unsafe_dataflow_enabled()
     }
@@ -1127,9 +1134,7 @@ impl MyOptimizationPass {
     }
 
     fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
-        std::env::var("RZ_ANALYZE_UNSAFE_SUMMARIES")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        unsafe_dataflow::analyze_unsafe_summaries_enabled()
     }
 
     fn trace_unsafe_dataflow_enabled(&self) -> bool {
@@ -1548,8 +1553,18 @@ impl MyOptimizationPass {
         }
 
         insert_points.retain(|ip| {
+            if !matches!(
+                ip.kind,
+                InstrKind::PtrRead { .. }
+                    | InstrKind::PtrWrite { .. }
+                    | InstrKind::PtrReadAllowUntagged { .. }
+                    | InstrKind::PtrWriteAllowUntagged { .. }
+            ) {
+                return true;
+            }
             let ptr_local_opt = Self::unsafe_dataflow_gated_local(&ip.kind, &ip.place);
             ptr_local_opt
+                .filter(|&l| self.is_raw_pointer_ty(body.local_decls[l].ty))
                 .map(|l| unsafe_influence.should_instrument_ptr_local(l))
                 .unwrap_or(true)
         });

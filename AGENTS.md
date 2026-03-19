@@ -65,6 +65,12 @@ The project has two main components:
 - Do not commit while any targeted test is failing.
 - Before every commit, run the full example test suite, not only examples related to the touched
   code.
-- Do not commit while any example is failing: all examples must pass before committing.
-- After each commit, re-run the full example test suite (`python3 scripts/run_example_tests.py`)
-  and verify it is still fully green on the committed revision.
+- Before every commit, run the full example test suite in both supported modes:
+  - default:
+    - `python3 scripts/run_example_tests.py`
+  - interprocedural analysis:
+    - `RZ_INTERPROC_UNSAFE_SUMMARIES=1 CARGO_INCREMENTAL=0 python3 scripts/run_example_tests.py`
+- Do not commit while any example is failing in either mode: both suites must pass before
+  committing.
+- After each commit, re-run the full example test suite in both supported modes and verify both
+  are still fully green on the committed revision.

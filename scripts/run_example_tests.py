@@ -145,6 +145,84 @@ def load_examples(cargo: str, env: dict[str, str]) -> list[tuple[str, str, Path]
     return sorted(examples)
 
 
+def env_flag_enabled(env: dict[str, str], name: str) -> bool:
+    raw = env.get(name)
+    if raw is None:
+        return False
+    return raw != "0" and raw.lower() != "false"
+
+
+def run_cmd(cmd: list[str], env: dict[str, str], log_path: Path) -> int:
+    with log_path.open("a") as f:
+        f.write(f"$ {' '.join(cmd)}\n")
+        f.flush()
+        result = subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT)
+    return result.returncode
+
+
+def instrument_example(
+    cargo: str,
+    base_env: dict[str, str],
+    instr_cmd: list[str],
+    repo_root: Path,
+    run_dir: Path,
+    log_dir_name: str,
+    instr_log: Path,
+) -> tuple[int, Path]:
+    profile = "release" if "--release" in instr_cmd else "debug"
+
+    if not env_flag_enabled(base_env, "RZ_INTERPROC_UNSAFE_SUMMARIES"):
+        return run_cmd(instr_cmd, base_env, instr_log), repo_root / "target" / profile
+
+    base_target_dir = run_dir / "_interproc_targets" / log_dir_name
+    analyze_target_dir = base_target_dir / "summary-pass"
+    final_target_dir = base_target_dir / "final"
+    merged_summary_dir = base_target_dir / "merged-summaries"
+    merge_report = merged_summary_dir / "merge.report.txt"
+
+    shutil.rmtree(base_target_dir, ignore_errors=True)
+    analyze_target_dir.mkdir(parents=True, exist_ok=True)
+    merged_summary_dir.mkdir(parents=True, exist_ok=True)
+    final_target_dir.mkdir(parents=True, exist_ok=True)
+
+    analyze_env = base_env.copy()
+    analyze_env["CARGO_TARGET_DIR"] = str(analyze_target_dir)
+    analyze_env["RZ_ANALYZE_UNSAFE_SUMMARIES"] = "1"
+    analyze_env["RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP"] = "1"
+    analyze_env["RZ_USE_UNSAFE_SUMMARIES"] = "0"
+
+    if run_cmd(instr_cmd, analyze_env, instr_log) != 0:
+        return 1, final_target_dir / profile
+
+    summary_input_dir = analyze_target_dir / "rusteze-unsafe-summaries"
+    if not summary_input_dir.is_dir():
+        with instr_log.open("a") as f:
+            f.write(f"missing summary dump dir: {summary_input_dir}\n")
+        return 1, final_target_dir / profile
+
+    merge_cmd = [
+        sys.executable,
+        str(repo_root / "scripts" / "merge_unsafe_summaries.py"),
+        "--input-dir",
+        str(summary_input_dir),
+        "--output-dir",
+        str(merged_summary_dir),
+        "--report",
+        str(merge_report),
+    ]
+    if run_cmd(merge_cmd, base_env, instr_log) != 0:
+        return 1, final_target_dir / profile
+
+    final_env = base_env.copy()
+    final_env["CARGO_TARGET_DIR"] = str(final_target_dir)
+    final_env["RZ_ANALYZE_UNSAFE_SUMMARIES"] = "0"
+    final_env["RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP"] = "0"
+    final_env["RZ_USE_UNSAFE_SUMMARIES"] = "1"
+    final_env["RZ_UNSAFE_SUMMARY_INPUT_DIR"] = str(merged_summary_dir)
+
+    return run_cmd(instr_cmd, final_env, instr_log), final_target_dir / profile
+
+
 def main() -> int:
     env = os.environ.copy()
     env.setdefault("CARGO_INCREMENTAL", "0")
@@ -246,15 +324,23 @@ def main() -> int:
             bin_name,
         ] + profile_args
 
-        with instr_log.open("w") as f:
-            result = subprocess.run(instr_cmd, env=env, stdout=f, stderr=subprocess.STDOUT)
-        if result.returncode != 0:
+        instr_log.write_text("")
+        result_code, bin_dir_for_run = instrument_example(
+            cargo,
+            env,
+            instr_cmd,
+            repo_root,
+            run_dir,
+            log_dir_name,
+            instr_log,
+        )
+        if result_code != 0:
             with summary_file.open("a") as f:
                 f.write(f"{label}\tinstrument_fail\t{expected or 'missing'}\t-\n")
             failures += 1
             continue
 
-        bin_path = bin_dir / bin_name
+        bin_path = bin_dir_for_run / bin_name
         with run_log.open("w") as f:
             run_result = subprocess.run([str(bin_path)], env=env, stdout=f, stderr=subprocess.STDOUT)
 
