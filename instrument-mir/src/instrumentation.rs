@@ -2104,6 +2104,27 @@ impl MyOptimizationPass {
         SizeOperand::SizeOf(ty)
     }
 
+    /// Compute stack-slot size for a local type.
+    ///
+    /// For local stack slots we want to preserve `SizeOf(ty)` even for generic ADTs where
+    /// `ty.is_sized(...)` can be inconclusive during instrumentation. Those locals are still
+    /// sized once monomorphized, and dropping them to size 0 loses the surrounding stack
+    /// allocation metadata needed for interior references.
+    fn size_operand_for_stack_local_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        match ty.kind() {
+            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) | TyKind::Foreign(..) => {
+                SizeOperand::Const(self.const_usize(tcx, span, 0))
+            }
+            _ => self.size_operand_for_ty(tcx, body, ty, span),
+        }
+    }
+
     /// Compute access size for a deref of `ptr_local` producing `access_ty`.
     /// For wide pointers to slices/str, derive the size from pointer metadata.
     fn size_operand_for_deref<'tcx>(
@@ -2839,6 +2860,62 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Backtrack an aggregate field globally when `agg_local` has exactly one aggregate
+    /// definition in the function body.
+    ///
+    /// This is a conservative recovery for enum/aggregate wrappers such as
+    /// `Result<&T, E>` or `ControlFlow<_, &T>` where the pointer is stored in a non-pointer
+    /// local and later extracted through a `Downcast + Field` projection in a different block.
+    fn backtrack_global_aggregate_field_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        agg_local: Local,
+        field_idx: usize,
+    ) -> Option<Local> {
+        let mut recovered: Option<Option<Local>> = None;
+
+        for block_data in body.basic_blocks.iter() {
+            for stmt in &block_data.statements {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else { continue };
+                if place.as_local() != Some(agg_local) {
+                    continue;
+                }
+
+                let local = match rvalue {
+                    Rvalue::Aggregate(_kind, ops) => ops
+                        .iter()
+                        .nth(field_idx)
+                        .and_then(|op| self.place_from_operand(op))
+                        .map(|p| p.local),
+                    _ => return None,
+                };
+
+                match recovered {
+                    Some(existing) if existing != local => return None,
+                    Some(_) => {}
+                    None => recovered = Some(local),
+                }
+            }
+        }
+
+        recovered.flatten()
+    }
+
+    fn downcast_field_projection_index<'tcx>(&self, place: Place<'tcx>) -> Option<usize> {
+        let (last, prefix) = place.projection.split_last()?;
+        let ProjectionElem::Field(field, _) = last else {
+            return None;
+        };
+        if prefix
+            .iter()
+            .all(|pe| matches!(pe, ProjectionElem::Downcast(..)))
+        {
+            Some(field.index())
+        } else {
+            None
+        }
+    }
+
     /// Resolve a pointer local backing a call argument place.
     ///
     /// For plain pointer locals, return the local directly.
@@ -3057,7 +3134,15 @@ impl MyOptimizationPass {
                 }
 
                 let next_local = match rvalue {
-                    Rvalue::Use(op) => self.place_from_operand(op).and_then(|p| p.as_local()),
+                    Rvalue::Use(op) => self.place_from_operand(op).and_then(|p| {
+                        p.as_local().or_else(|| {
+                            if self.is_pointer_ty(body.local_decls[p.local].ty) {
+                                Some(p.local)
+                            } else {
+                                None
+                            }
+                        })
+                    }),
                     Rvalue::CopyForDeref(p) => p.as_local(),
                     Rvalue::Cast(
                         CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
@@ -3065,7 +3150,15 @@ impl MyOptimizationPass {
                         _,
                     )
                     | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
-                        self.place_from_operand(op).and_then(|p| p.as_local())
+                        self.place_from_operand(op).and_then(|p| {
+                            p.as_local().or_else(|| {
+                                if self.is_pointer_ty(body.local_decls[p.local].ty) {
+                                    Some(p.local)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
                     }
                     Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
                         Some(src_place.local)
@@ -3191,6 +3284,103 @@ impl MyOptimizationPass {
         candidate_local
     }
 
+    fn recover_pointer_source_local_for_projected_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        src_place: Place<'tcx>,
+        is_raw_creation: bool,
+    ) -> Option<Local> {
+        let block_data = &body.basic_blocks[bb];
+        let mut src_local_opt = self.recover_parent_source_local_for_place(
+            tcx,
+            body,
+            bb,
+            stmt_idx,
+            src_place,
+            is_raw_creation,
+        );
+
+        if src_local_opt.is_none() && !self.is_pointer_ty(body.local_decls[src_place.local].ty) {
+            src_local_opt = self
+                .backtrack_single_pointer_arg_call_result_source_local(
+                    tcx,
+                    body,
+                    bb,
+                    src_place.local,
+                );
+        }
+
+        if src_local_opt.is_none()
+            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && src_place
+                .projection
+                .iter()
+                .skip(1)
+                .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
+            && self.is_pointer_ty(body.local_decls[src_place.local].ty)
+        {
+            src_local_opt = Some(src_place.local);
+        }
+
+        if src_local_opt.is_none()
+            && !src_place.projection.is_empty()
+            && matches!(src_place.projection[0], ProjectionElem::Deref)
+        {
+            if let Some(backtracked_local) = self.backtrack_deref_base_local(
+                src_place.local,
+                &block_data.statements[..stmt_idx],
+            ) {
+                if self.is_pointer_ty(body.local_decls[backtracked_local].ty) {
+                    src_local_opt = Some(backtracked_local);
+                }
+            }
+        }
+
+        if !src_place.projection.is_empty() {
+            let base_local = src_place.local;
+            let base_ty = body.local_decls[base_local].ty;
+            if self.is_pointer_ty(base_ty) && !self.is_thin_ptr_ty(tcx, body, base_ty) {
+                if src_place.projection.len() >= 1
+                    && matches!(src_place.projection[0], ProjectionElem::Deref)
+                {
+                    if src_place.projection.len() >= 2 {
+                        if let ProjectionElem::Field(field, _) = src_place.projection[1] {
+                            if field.index() == 0 {
+                                src_local_opt = Some(base_local);
+                            }
+                        }
+                    }
+                } else if let ProjectionElem::Field(field, _) = src_place.projection[0] {
+                    if field.index() == 0 {
+                        src_local_opt = Some(base_local);
+                    }
+                }
+            }
+        }
+
+        if src_local_opt.is_none() {
+            if let Some(field_idx) = self.downcast_field_projection_index(src_place) {
+                src_local_opt = self.backtrack_aggregate_field_local(
+                    src_place.local,
+                    field_idx,
+                    &block_data.statements[..stmt_idx],
+                );
+                if src_local_opt.is_none() {
+                    src_local_opt = self.backtrack_global_aggregate_field_local(
+                        body,
+                        src_place.local,
+                        field_idx,
+                    );
+                }
+            }
+        }
+
+        src_local_opt
+    }
+
     fn parent_tag_operand_for_src_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -3203,40 +3393,36 @@ impl MyOptimizationPass {
         ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
         is_raw_creation: bool,
     ) -> Operand<'tcx> {
-        let mut candidate_local: Option<Local> = None;
-        let block_stmts = &body.basic_blocks[bb].statements;
-        let upto = stmt_idx.min(block_stmts.len());
-
-        let src_local = src_place.local;
-        if self.is_pointer_ty(body.local_decls[src_local].ty) {
-            // For raw creation from projected pointer-field loads (`(*ref_to_struct).ptr_field`),
-            // using `src_place.local` as parent incorrectly picks the container-ref tag.
-            // That ties the raw pointer to the stack slot of the wrapper object instead of the
-            // real pointee carried in the field.
-            let projected_raw_field_load = is_raw_creation
-                && !src_place.projection.is_empty()
-                && matches!(
-                    src_place.projection.first(),
-                    Some(ProjectionElem::Deref)
-                )
-                && src_place
-                    .projection
-                    .iter()
-                    .skip(1)
-                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
-            if projected_raw_field_load {
-                candidate_local =
-                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto]);
+        let candidate_local = if src_place.projection.is_empty() {
+            let block_stmts = &body.basic_blocks[bb].statements;
+            let upto = stmt_idx.min(block_stmts.len());
+            let src_local = src_place.local;
+            if self.is_pointer_ty(body.local_decls[src_local].ty) {
+                let projected_raw_field_load = is_raw_creation
+                    && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+                    && src_place
+                        .projection
+                        .iter()
+                        .skip(1)
+                        .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
+                if projected_raw_field_load {
+                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
+                } else {
+                    Some(src_local)
+                }
             } else {
-                candidate_local = Some(src_local);
+                self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
             }
         } else {
-            candidate_local = self.backtrack_pointer_source_local(
+            self.recover_pointer_source_local_for_projected_place(
+                tcx,
                 body,
-                src_local,
-                &block_stmts[..upto],
-            );
-        }
+                bb,
+                stmt_idx,
+                src_place,
+                is_raw_creation,
+            )
+        };
 
         if let Some(local) = candidate_local {
             // Prefer the source local's concrete tag first.
@@ -3417,7 +3603,7 @@ impl MyOptimizationPass {
                     let ty = body.local_decls[local].ty;
                     if !(self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local)) {
                         let size_op =
-                            self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span);
+                            self.size_operand_for_stack_local_ty(tcx, body, ty, stmt.source_info.span);
                         if !matches!(size_op, SizeOperand::Const(_)) {
                             insert_points.push(InsertPoint {
                                 bb,
@@ -3453,7 +3639,7 @@ impl MyOptimizationPass {
                     // Record pointer-typed locals only if their address is taken (interesting locals).
                     if !(self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local)) {
                         let size_op =
-                            self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span);
+                            self.size_operand_for_stack_local_ty(tcx, body, ty, stmt.source_info.span);
                         if !matches!(size_op, SizeOperand::Const(_)) {
                             insert_points.push(InsertPoint {
                                 bb,
@@ -3724,93 +3910,25 @@ impl MyOptimizationPass {
                         let projected_ptr_place = match rvalue {
                             Rvalue::Use(op) => self.place_from_operand(op),
                             Rvalue::BinaryOp(BinOp::Offset, ops) => self.place_from_operand(&ops.0),
+                            Rvalue::Cast(
+                                CastKind::PtrToPtr
+                                | CastKind::PointerCoercion(_, _)
+                                | CastKind::Transmute
+                                | CastKind::PointerWithExposedProvenance,
+                                op,
+                                _,
+                            ) => self.place_from_operand(op),
                             _ => None,
                         };
                         if let Some(p) = projected_ptr_place {
-                            if src_local_opt.is_none() {
-                                src_local_opt = self.recover_parent_source_local_for_place(
-                                    tcx,
-                                    body,
-                                    bb,
-                                    stmt_idx,
-                                    p,
-                                    false,
-                                );
-                            }
-
-                            if src_local_opt.is_none()
-                                && matches!(p.projection.first(), Some(ProjectionElem::Deref))
-                                && p.projection
-                                    .iter()
-                                    .skip(1)
-                                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
-                                && self.is_pointer_ty(body.local_decls[p.local].ty)
-                            {
-                                // Wrapper structs that carry borrows (e.g. `UnfilterBuf<'_>`) often
-                                // surface a field borrow as `((*wrapper_ref).field: &mut [u8])`.
-                                // We do not track field-local tags separately, so falling straight
-                                // to RawRoot loses lineage and creates false aliasing roots. In
-                                // this narrow wrapper-field shape, keep the copied field pointer in
-                                // the surrounding borrow family by deriving it from the wrapper ref.
-                                src_local_opt = Some(p.local);
-                            }
-
-                            // Pointer-value load through deref, e.g.:
-                            //   _r = &_p;        // _r: &*const T
-                            //   _dst = copy (*_r)
-                            // Recover `_p` so `_dst` inherits provenance instead of being retagged
-                            // as a fresh root. Root-retagging here is too imprecise and can attach
-                            // later accesses to the wrong stack slot.
-                            if src_local_opt.is_none()
-                                && !p.projection.is_empty()
-                                && matches!(p.projection[0], ProjectionElem::Deref)
-                            {
-                                if let Some(backtracked_local) = self.backtrack_deref_base_local(
-                                    p.local,
-                                    &block_data.statements[..stmt_idx],
-                                ) {
-                                    if self.is_pointer_ty(body.local_decls[backtracked_local].ty) {
-                                        src_local_opt = Some(backtracked_local);
-                                    }
-                                }
-                            }
-
-                            // If we are extracting the data pointer from a wide pointer
-                            // (e.g., `(*slice).0`), preserve the base tag.
-                            if !p.projection.is_empty() {
-                                let base_local = p.local;
-                                let base_ty = body.local_decls[base_local].ty;
-                                if self.is_pointer_ty(base_ty)
-                                    && !self.is_thin_ptr_ty(tcx, body, base_ty)
-                                {
-                                    if p.projection.len() >= 1
-                                        && matches!(p.projection[0], ProjectionElem::Deref)
-                                    {
-                                        if p.projection.len() >= 2 {
-                                            if let ProjectionElem::Field(field, _) = p.projection[1] {
-                                                if field.index() == 0 {
-                                                    src_local_opt = Some(base_local);
-                                                }
-                                            }
-                                        }
-                                    } else if let ProjectionElem::Field(field, _) = p.projection[0] {
-                                        if field.index() == 0 {
-                                            src_local_opt = Some(base_local);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if src_local_opt.is_none() && p.projection.len() == 1 {
-                                if let ProjectionElem::Field(field, _ty) = p.projection[0] {
-                                    let field_idx = field.index();
-                                    src_local_opt = self.backtrack_aggregate_field_local(
-                                        p.local,
-                                        field_idx,
-                                        &block_data.statements[..stmt_idx],
-                                    );
-                                }
-                            }
+                            src_local_opt = self.recover_pointer_source_local_for_projected_place(
+                                tcx,
+                                body,
+                                bb,
+                                stmt_idx,
+                                p,
+                                false,
+                            );
                         }
                     }
 
@@ -4467,6 +4585,77 @@ impl MyOptimizationPass {
         } else {
             None
         }
+    }
+
+    /// Recover a pointer lineage source when a call writes an aggregate result into `agg_local`
+    /// and a successor block later extracts a pointer field from that aggregate.
+    ///
+    /// Narrow shape handled:
+    /// - predecessor terminator is a call whose `destination.local == agg_local`
+    /// - call target is the current block
+    /// - among the call arguments there is exactly one recoverable pointer source local
+    ///
+    /// This covers wrappers like `Result<&T, E>` where MIR stores the aggregate result in a
+    /// non-pointer local and a later `_dst = move ((_ret as Ok).0)` would otherwise lose the
+    /// original parent lineage and fall back to `RawRoot`.
+    fn backtrack_single_pointer_arg_call_result_source_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        agg_local: Local,
+    ) -> Option<Local> {
+        let mut recovered: Option<Local> = None;
+        let mut matched_call = false;
+
+        for pred_bb in body.basic_blocks.indices() {
+            let pred_data = &body.basic_blocks[pred_bb];
+            let Some(term) = &pred_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                args,
+                destination,
+                target,
+                ..
+            } = &term.kind
+            else {
+                continue;
+            };
+
+            if *target != Some(bb) || destination.local != agg_local {
+                continue;
+            }
+            matched_call = true;
+
+            let mut ptr_sources = HashSet::new();
+            for arg_index in 0..args.len() {
+                if let Some(src_local) = self.call_arg_pointer_source_local(
+                    tcx,
+                    body,
+                    pred_data,
+                    args,
+                    arg_index,
+                ) {
+                    ptr_sources.insert(src_local);
+                    if ptr_sources.len() > 1 {
+                        return None;
+                    }
+                }
+            }
+
+            let Some(src_local) = ptr_sources.into_iter().next() else {
+                return None;
+            };
+
+            match recovered {
+                Some(existing) if existing != src_local => return None,
+                Some(_) => {}
+                None => recovered = Some(src_local),
+            }
+        }
+
+        if matched_call { recovered } else { None }
     }
 
     fn ptr_derive_source_arg_index(&self, def_path: &str) -> usize {
@@ -5733,7 +5922,7 @@ impl MyOptimizationPass {
             if self.is_pointer_ty(ty) && !interesting_stack_locals.contains(&local) {
                 continue;
             }
-            let size_op = self.size_operand_for_ty(tcx, body, ty, rustc_span::DUMMY_SP);
+            let size_op = self.size_operand_for_stack_local_ty(tcx, body, ty, rustc_span::DUMMY_SP);
             if matches!(size_op, SizeOperand::Const(_)) {
                 continue;
             }

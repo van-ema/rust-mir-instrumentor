@@ -359,14 +359,24 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         0
     } else {
         let tmap = tags().lock().unwrap();
+        let projected_helper_ref_parent = matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+            && (tmeta.lineage_hint & 0b0000_0100) != 0
+            && tmap.get(&tmeta.parent).is_some_and(|meta| {
+                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
+            });
+        let effective_parent = if projected_helper_ref_parent {
+            tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(0)
+        } else {
+            tmeta.parent
+        };
         match kind {
             BorrowKind::Shared | BorrowKind::Unique => {
-                tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, tmeta.parent)
-                    .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent))
-                    .unwrap_or(tmeta.parent)
+                tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                    .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
+                    .unwrap_or(effective_parent)
             }
             BorrowKind::RawConst | BorrowKind::RawMut => {
-                tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(tmeta.parent)
+                tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
             }
         }
     };
