@@ -17,6 +17,7 @@ simd_json_driver = ["dep:simd-json"]
 zip_driver = ["dep:zip"]
 rkyv_driver = ["dep:rkyv"]
 hyper_driver = ["dep:hyper", "dep:tokio", "dep:http-body-util"]
+image_driver = ["dep:image"]
 
 [dependencies]
 bytes = { path = "../third_party/bytes", optional = true }
@@ -34,6 +35,7 @@ rkyv = { version = "0.8", default-features = false, features = ["std", "alloc", 
 hyper = { path = "../third_party/hyper", features = ["full"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"], optional = true }
+image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png"], optional = true }
 
 [[bin]]
 name = "afl_bytes_driver"
@@ -94,3 +96,8 @@ required-features = ["rkyv_driver"]
 name = "afl_hyper_driver"
 path = "src/bin/afl_hyper_driver.rs"
 required-features = ["hyper_driver"]
+
+[[bin]]
+name = "afl_image_driver"
+path = "src/bin/afl_image_driver.rs"
+required-features = ["image_driver"]

@@ -8,7 +8,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_FUZZ="${AFL_FUZZ:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image
 TIMEOUT_MS="${TIMEOUT_MS:-}" # optional, forwarded to AFL++ via -t
 
 case "$TARGET" in
@@ -24,7 +24,8 @@ case "$TARGET" in
   zip) BIN="afl_zip_driver" ;;
   rkyv) BIN="afl_rkyv_driver" ;;
   hyper) BIN="afl_hyper_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper)" >&2; exit 2 ;;
+  image) BIN="afl_image_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image)" >&2; exit 2 ;;
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
@@ -41,15 +42,18 @@ fi
 
 # AFL++ requires at least one seed file.
 if ! find "$IN_DIR" -maxdepth 1 -type f -print -quit | grep -q .; then
-  case "$TARGET" in
-    hyper)
-      # Use a minimally valid HTTP/1.1 request so AFL dry-run has at least
-      # one non-trivial, non-crashing seed for async network parsing.
-      printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${IN_DIR}/seed0"
-      ;;
-    *)
-      printf '\x00' > "${IN_DIR}/seed0"
-      ;;
+    case "$TARGET" in
+      hyper)
+        # Use a minimally valid HTTP/1.1 request so AFL dry-run has at least
+        # one non-trivial, non-crashing seed for async network parsing.
+        printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${IN_DIR}/seed0"
+        ;;
+      image)
+        cp benchmarks/eco_bench/data/eco_image_input.png "${IN_DIR}/seed0"
+        ;;
+      *)
+        printf '\x00' > "${IN_DIR}/seed0"
+        ;;
   esac
 fi
 

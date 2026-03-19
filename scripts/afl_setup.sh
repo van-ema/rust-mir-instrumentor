@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 THIRD_PARTY_DIR="${REPO_ROOT}/third_party"
 
 # Popular + actively maintained fuzz targets.
-DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper)
+DEFAULT_TARGETS=(bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper image)
 
 usage() {
   cat <<'EOF'
@@ -14,7 +14,7 @@ Usage:
   ./scripts/afl_setup.sh [target ...]
 
 Targets:
-  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper
+  bytes smallvec serde serde_json toml uuid quick_xml base64 itoa simd_json zip rkyv hyper image
 
 Behavior:
   1) clones missing third_party repos for selected targets
@@ -89,7 +89,7 @@ ref_var_name_for_target() {
 
 validate_target() {
   case "$1" in
-    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa|simd_json|zip|rkyv|hyper) ;;
+    bytes|smallvec|serde|serde_json|toml|uuid|quick_xml|base64|itoa|simd_json|zip|rkyv|hyper|image) ;;
     *) echo "error: unknown target '$1'" >&2; usage; exit 2 ;;
   esac
 }
@@ -219,6 +219,9 @@ for target in "${select_targets[@]}"; do
     case "${target}" in
       hyper)
         printf 'GET / HTTP/1.1\r\nHost: fuzz.local\r\nConnection: close\r\n\r\n' > "${in_dir}/seed0"
+        ;;
+      image)
+        cp "${REPO_ROOT}/benchmarks/eco_bench/data/eco_image_input.png" "${in_dir}/seed0"
         ;;
       *)
         printf '\x00' > "${in_dir}/seed0"
