@@ -207,7 +207,6 @@ fn rz_maybe_register_hook_profile_atexit() {
     });
 }
 
-#[inline]
 fn rz_elapsed_ns(start: Instant) -> u64 {
     let ns = start.elapsed().as_nanos();
     core::cmp::min(ns, u64::MAX as u128) as u64
@@ -3165,6 +3164,45 @@ pub extern "C" fn __record_ref_creation(
         rz_profile_add_elapsed(&p.ref_create_lineage_repair_ns, start);
     }
 
+    // Optimized MIR may create `&mut (*raw_root)` or `&(*raw_root)` from a root raw tag that was
+    // synthesized only because provenance was temporarily lost while extracting a pointee from a
+    // wrapper (e.g. Box/NonNull/Result wrappers). If we can recover a same-address non-root tag
+    // in the same allocation epoch, prefer it over the raw root to keep the borrow tree intact.
+    if resolved_parent_tag != 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
+        let parent_is_root_raw = tag_store::get(resolved_parent_tag).as_ref().is_some_and(|meta| {
+            meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        });
+        if parent_is_root_raw {
+            let repaired_parent = recover_parent_for_alloc_root(
+                pointee_addr,
+                alloc_epoch,
+                matches!(kind, PtrKind::RefMut),
+            );
+            if repaired_parent != 0 && repaired_parent != resolved_parent_tag {
+                let previous_parent = resolved_parent_tag;
+                resolved_parent_tag = repaired_parent;
+                if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
+                    if inherited_bounds_len == 0 {
+                        inherited_bounds_len = parent_meta.bounds_len;
+                    }
+                    if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
+                        alloc_epoch = parent_meta.alloc_epoch;
+                        alloc_live_at_creation = parent_meta.alloc_live_at_creation;
+                    }
+                }
+                rz_trace!(
+                    "__record_ref_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
+                    pointee_addr,
+                    parent_tag,
+                    previous_parent,
+                    resolved_parent_tag,
+                    alloc_epoch,
+                    alloc_size
+                );
+            }
+        }
+    }
+
     let bounds_len = if bounds_len != 0 {
         bounds_len
     } else {
@@ -3333,12 +3371,13 @@ pub extern "C" fn __record_raw_ptr_creation(
             }
         };
 
-    // Optimized MIR can materialize `&raw mut` from projected wrappers (e.g. Pin field access)
-    // without a recoverable source local and emit `derived_from=0`. When this happens on stack
-    // pointers, attach to a same-address recent non-root tag in the same epoch to preserve lineage.
+    // Optimized MIR can materialize projected raw pointers from wrapper/owner internals
+    // (e.g. Pin/Box/NonNull/Unique field extraction) without a recoverable source tag and emit
+    // `derived_from=0`. When this happens on a tracked allocation, attach to a same-address
+    // recent non-root tag in the same epoch to preserve lineage instead of seeding a fresh raw
+    // root that can later freeze an otherwise-valid borrow family.
     if resolved_parent == 0
         && projected_raw_hint
-        && alloc_is_stack
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {
@@ -3376,7 +3415,6 @@ pub extern "C" fn __record_raw_ptr_creation(
     if resolved_parent != 0
         && parent_is_root
         && (parent_alloc_mismatch || parent_pointee_addr.map_or(false, |pp| pp != pointee_addr))
-        && alloc_is_stack
         && alloc_epoch != 0
         && alloc_size >= std::mem::size_of::<usize>()
     {

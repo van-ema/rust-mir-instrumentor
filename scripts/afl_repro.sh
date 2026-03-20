@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${OUT_DIR:-fuzz/out/${TARGET}}"
 ONLY=""
@@ -53,7 +53,8 @@ case "$TARGET" in
   zip) BIN="afl_zip_driver" ;;
   rkyv) BIN="afl_rkyv_driver" ;;
   hyper) BIN="afl_hyper_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper)" >&2; exit 2 ;;
+  image) BIN="afl_image_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image)" >&2; exit 2 ;;
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"

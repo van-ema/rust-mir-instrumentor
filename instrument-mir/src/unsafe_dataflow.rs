@@ -674,7 +674,7 @@ fn known_external_summary<'tcx>(
     None
 }
 
-fn callee_summary<'tcx>(
+pub(crate) fn callee_summary<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     func: &Operand<'tcx>,
@@ -687,6 +687,25 @@ fn callee_summary<'tcx>(
             return Some(summary.clone());
         }
     }
+    if did.krate != LOCAL_CRATE {
+        known_external_summary(tcx, did)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn summary_for_def_id<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: DefId,
+) -> Option<UnsafeFunctionSummary> {
+    if use_loaded_unsafe_summaries_enabled() {
+        let crate_name = tcx.crate_name(did.krate).as_str().to_string();
+        let function_hash = def_path_hash_key(tcx, did);
+        if let Some(summary) = loaded_unsafe_summaries().get(&(crate_name, function_hash)) {
+            return Some(summary.clone());
+        }
+    }
+
     if did.krate != LOCAL_CRATE {
         known_external_summary(tcx, did)
     } else {

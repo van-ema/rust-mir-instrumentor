@@ -10,6 +10,7 @@ rusteze-profile = []
 base64 = "0.22"
 bytes = "1"
 hyper = { version = "1.7.0", default-features = false, features = ["http1", "client"] }
+image = { version = "=0.25.8", default-features = false, features = ["png"] }
 itoa = "1"
 quick-xml = "0.37"
 serde_json = "1"

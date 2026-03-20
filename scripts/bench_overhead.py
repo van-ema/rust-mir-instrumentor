@@ -247,6 +247,10 @@ def cargo_build_rusteze(
 ) -> Path:
     env = env.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
+    tmp_dir = target_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("TMPDIR", str(tmp_dir))
+    env.setdefault("RUSTC_TMPDIR", str(tmp_dir))
 
     cmd = [
         cargo,
@@ -264,6 +268,82 @@ def cargo_build_rusteze(
         cmd.append("--release")
 
     subprocess.run(cmd, env=env, check=True)
+
+    bin_path = target_dir / profile / target.bin
+    if not bin_path.exists():
+        die(f"instrumented binary not found: {bin_path}")
+    return bin_path
+
+
+def cargo_build_rusteze_interproc3(
+    cargo: str,
+    env: dict[str, str],
+    profile: str,
+    target_dir: Path,
+    target: Target,
+    runtime_dir: Path,
+    mir_out: Path | None,
+) -> Path:
+    analyze_target_dir = Path(f"{target_dir}-summary-pass")
+    merged_summary_dir = Path(f"{target_dir}-unsafe-summaries-merged")
+    summary_dump_dir = analyze_target_dir / "rusteze-unsafe-summaries"
+
+    shutil.rmtree(analyze_target_dir, ignore_errors=True)
+    shutil.rmtree(merged_summary_dir, ignore_errors=True)
+    merged_summary_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        cargo,
+        "instrument-mir",
+        f"--runtime-path={runtime_dir}",
+        "-p",
+        target.pkg,
+        "--bin",
+        target.bin,
+    ]
+    add_required_features(cmd, target)
+    if mir_out is not None:
+        cmd.insert(3, f"--mir-out={mir_out}")
+    if profile == "release":
+        cmd.append("--release")
+
+    analyze_env = env.copy()
+    analyze_env["CARGO_TARGET_DIR"] = str(analyze_target_dir)
+    analyze_tmp_dir = analyze_target_dir / "tmp"
+    analyze_tmp_dir.mkdir(parents=True, exist_ok=True)
+    analyze_env.setdefault("TMPDIR", str(analyze_tmp_dir))
+    analyze_env.setdefault("RUSTC_TMPDIR", str(analyze_tmp_dir))
+    analyze_env["RZ_ANALYZE_UNSAFE_SUMMARIES"] = "1"
+    analyze_env["RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP"] = "1"
+    analyze_env["RZ_USE_UNSAFE_SUMMARIES"] = "0"
+    subprocess.run(cmd, env=analyze_env, check=True)
+
+    if not summary_dump_dir.exists():
+        die(f"missing summary dump dir: {summary_dump_dir}")
+
+    merge_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "merge_unsafe_summaries.py"),
+        "--input-dir",
+        str(summary_dump_dir),
+        "--output-dir",
+        str(merged_summary_dir),
+        "--report",
+        str(merged_summary_dir / "merge.report.txt"),
+    ]
+    subprocess.run(merge_cmd, env=env, check=True)
+
+    final_env = env.copy()
+    final_env["CARGO_TARGET_DIR"] = str(target_dir)
+    final_tmp_dir = target_dir / "tmp"
+    final_tmp_dir.mkdir(parents=True, exist_ok=True)
+    final_env.setdefault("TMPDIR", str(final_tmp_dir))
+    final_env.setdefault("RUSTC_TMPDIR", str(final_tmp_dir))
+    final_env["RZ_ANALYZE_UNSAFE_SUMMARIES"] = "0"
+    final_env["RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP"] = "0"
+    final_env["RZ_USE_UNSAFE_SUMMARIES"] = "1"
+    final_env["RZ_UNSAFE_SUMMARY_INPUT_DIR"] = str(merged_summary_dir)
+    subprocess.run(cmd, env=final_env, check=True)
 
     bin_path = target_dir / profile / target.bin
     if not bin_path.exists():
@@ -352,6 +432,11 @@ def main() -> int:
     ap.add_argument("--no-timeout", action="store_true")
     ap.add_argument("--report-dir", default="reports/overhead")
     ap.add_argument("--emit-mir", action="store_true", help="Write MIR output per target (debugging)")
+    ap.add_argument(
+        "--interproc3",
+        action="store_true",
+        help="Use the 3-phase interprocedural unsafe-summary pipeline for rusteze builds.",
+    )
     ap.add_argument(
         "--input-file",
         default="",
@@ -449,15 +534,26 @@ def main() -> int:
         mir_out = None
         if args.emit_mir:
             mir_out = report_dir / f"out.{t.pkg}__{t.bin}.mir"
-        rz_bin = cargo_build_rusteze(
-            cargo,
-            env,
-            args.profile,
-            rz_target_dir,
-            t,
-            rz_runtime_dir,
-            mir_out,
-        )
+        if args.interproc3:
+            rz_bin = cargo_build_rusteze_interproc3(
+                cargo,
+                env,
+                args.profile,
+                rz_target_dir,
+                t,
+                rz_runtime_dir,
+                mir_out,
+            )
+        else:
+            rz_bin = cargo_build_rusteze(
+                cargo,
+                env,
+                args.profile,
+                rz_target_dir,
+                t,
+                rz_runtime_dir,
+                mir_out,
+            )
 
         base_times, base_codes = run_timed(
             base_bin,
