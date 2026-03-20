@@ -15,11 +15,13 @@ mod static_image;
 use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
-mod exact_parent_index;
 mod dead_epoch_cleanup;
+mod exact_parent_index;
 mod lineage_cache;
 mod live_alloc_cache;
+mod tag_history;
 mod tag_lookup_cache;
+mod tag_pruning;
 mod tag_store;
 
 ::std::thread_local! {
@@ -1949,9 +1951,12 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.ref_create_lineage_repair_ns.store(0, Ordering::Relaxed);
     p.ref_create_insert_ns.store(0, Ordering::Relaxed);
     p.ref_create_tag_store_insert_ns.store(0, Ordering::Relaxed);
-    p.ref_create_exact_parent_update_ns.store(0, Ordering::Relaxed);
-    p.ref_create_lineage_cache_update_ns.store(0, Ordering::Relaxed);
-    p.ref_create_alias_on_tag_created_ns.store(0, Ordering::Relaxed);
+    p.ref_create_exact_parent_update_ns
+        .store(0, Ordering::Relaxed);
+    p.ref_create_lineage_cache_update_ns
+        .store(0, Ordering::Relaxed);
+    p.ref_create_alias_on_tag_created_ns
+        .store(0, Ordering::Relaxed);
     p.raw_create_calls.store(0, Ordering::Relaxed);
     p.raw_create_total_ns.store(0, Ordering::Relaxed);
     p.ptr_use_calls.store(0, Ordering::Relaxed);
@@ -1983,8 +1988,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let ref_create_alloc_snapshot_ns = p.ref_create_alloc_snapshot_ns.load(Ordering::Relaxed);
     let ref_create_lineage_repair_ns = p.ref_create_lineage_repair_ns.load(Ordering::Relaxed);
     let ref_create_insert_ns = p.ref_create_insert_ns.load(Ordering::Relaxed);
-    let ref_create_tag_store_insert_ns =
-        p.ref_create_tag_store_insert_ns.load(Ordering::Relaxed);
+    let ref_create_tag_store_insert_ns = p.ref_create_tag_store_insert_ns.load(Ordering::Relaxed);
     let ref_create_exact_parent_update_ns =
         p.ref_create_exact_parent_update_ns.load(Ordering::Relaxed);
     let ref_create_lineage_cache_update_ns =
@@ -2016,6 +2020,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let tag_entries = tag_store::len();
     let dead_tag_entries = tag_store::dead_len();
     let exact_parent_entries = exact_parent_index::len();
+    let tag_history_stats = tag_pruning::stats();
     let call_arg_entries = call_arg_tags().lock().unwrap().len();
     let ret_tag_entries = ret_tags().lock().unwrap().len();
 
@@ -2079,6 +2084,14 @@ pub extern "C" fn __rz_dump_hook_profile() {
     eprintln!(
         "  state: alloc_entries={} live_alloc_entries={} tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
         alloc_entries, live_alloc_entries, tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
+    );
+    eprintln!(
+        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
+        tag_history_stats.active_epoch_buckets,
+        tag_history_stats.active_tag_entries,
+        tag_history_stats.dead_epoch_buckets,
+        tag_history_stats.dead_tag_entries,
+        tag_history_stats.shadowed_old_live_tag_candidates
     );
 }
 
@@ -3169,9 +3182,11 @@ pub extern "C" fn __record_ref_creation(
     // wrapper (e.g. Box/NonNull/Result wrappers). If we can recover a same-address non-root tag
     // in the same allocation epoch, prefer it over the raw root to keep the borrow tree intact.
     if resolved_parent_tag != 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
-        let parent_is_root_raw = tag_store::get(resolved_parent_tag).as_ref().is_some_and(|meta| {
-            meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
-        });
+        let parent_is_root_raw = tag_store::get(resolved_parent_tag)
+            .as_ref()
+            .is_some_and(|meta| {
+                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
+            });
         if parent_is_root_raw {
             let repaired_parent = recover_parent_for_alloc_root(
                 pointee_addr,
@@ -3231,6 +3246,7 @@ pub extern "C" fn __record_ref_creation(
     if tmeta.alloc_epoch != 0 && tmeta.origin_known {
         tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
     }
+    tag_pruning::remember_live_tag(tag, &tmeta);
     if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
         rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
     }
@@ -3475,6 +3491,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     if tmeta.alloc_epoch != 0 && tmeta.origin_known {
         tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
     }
+    tag_pruning::remember_live_tag(tag, &tmeta);
     exact_parent_index::remember_non_root_tag(tag, &tmeta);
     lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
@@ -3515,6 +3532,7 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
     }
 
     if let Some(tmeta) = tag_store::mark_escaped(tag) {
+        tag_pruning::mark_tag_escaped(tag, &tmeta);
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,
