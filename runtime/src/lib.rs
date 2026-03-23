@@ -1967,6 +1967,7 @@ pub extern "C" fn __rz_reset_hook_profile() {
 
 #[no_mangle]
 pub extern "C" fn __rz_dump_hook_profile() {
+    let _runtime_guard = RzRuntimeGuard::enter();
     if !rz_profile_hooks_enabled() {
         eprintln!("[rusteze-runtime] hook profile: disabled (set RZ_PROFILE_HOOKS=1)");
         return;
