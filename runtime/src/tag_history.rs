@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TagHistoryState {
     Active,
+    HistoricalLive,
     DeadCompacted,
 }
 
@@ -38,6 +39,7 @@ struct TagHistoryBucket {
 pub(crate) struct TagHistoryStats {
     pub active_epoch_buckets: usize,
     pub active_tag_entries: usize,
+    pub historical_live_tag_entries: usize,
     pub dead_epoch_buckets: usize,
     pub dead_tag_entries: usize,
     pub shadowed_old_live_tag_candidates: usize,
@@ -65,9 +67,9 @@ fn tag_locations() -> &'static Mutex<HashMap<u64, TagLocation>> {
 }
 
 #[inline]
-pub(crate) fn remember_live_tag(tag: u64, tmeta: &TagMeta) {
+pub(crate) fn remember_live_tag(tag: u64, tmeta: &TagMeta) -> Option<EpochKey> {
     if tag == 0 || !tmeta.origin_known || tmeta.origin_base == 0 || tmeta.alloc_epoch == 0 {
-        return;
+        return None;
     }
 
     let entry = TagHistoryEntry {
@@ -81,6 +83,7 @@ pub(crate) fn remember_live_tag(tag: u64, tmeta: &TagMeta) {
         shadowed_candidate: false,
     };
     let key = (tmeta.origin_base, tmeta.alloc_epoch);
+    let mut reached_candidate_state = false;
 
     let mut active = active_history().lock().unwrap();
     let bucket = active.entry(key).or_default();
@@ -95,6 +98,7 @@ pub(crate) fn remember_live_tag(tag: u64, tmeta: &TagMeta) {
         {
             prev.shadowed_candidate = true;
             bucket.shadowed_candidate_count += 1;
+            reached_candidate_state = true;
         }
     }
     let new_idx = bucket.entries.len();
@@ -108,6 +112,11 @@ pub(crate) fn remember_live_tag(tag: u64, tmeta: &TagMeta) {
             state: TagHistoryState::Active,
         },
     );
+    if reached_candidate_state {
+        Some(key)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -120,7 +129,7 @@ pub(crate) fn mark_tag_escaped(tag: u64, tmeta: &TagMeta) {
     };
     let key = (location.origin_base, location.alloc_epoch);
     let history = match location.state {
-        TagHistoryState::Active => active_history(),
+        TagHistoryState::Active | TagHistoryState::HistoricalLive => active_history(),
         TagHistoryState::DeadCompacted => dead_history(),
     };
     let mut buckets = history.lock().unwrap();
@@ -137,6 +146,77 @@ pub(crate) fn mark_tag_escaped(tag: u64, tmeta: &TagMeta) {
             bucket.shadowed_candidate_count = bucket.shadowed_candidate_count.saturating_sub(1);
         }
     }
+}
+
+#[inline]
+pub(crate) fn note_live_tag_pruned(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let Some(location) = tag_locations().lock().unwrap().get(&tag).copied() else {
+        return;
+    };
+    if location.state != TagHistoryState::Active {
+        return;
+    }
+    let key = (location.origin_base, location.alloc_epoch);
+    let mut active = active_history().lock().unwrap();
+    let Some(bucket) = active.get_mut(&key) else {
+        return;
+    };
+    if let Some(entry) = bucket.entries.iter_mut().find(|entry| entry.tag == tag) {
+        if entry.shadowed_candidate {
+            entry.shadowed_candidate = false;
+            bucket.shadowed_candidate_count = bucket.shadowed_candidate_count.saturating_sub(1);
+        }
+        entry.state = TagHistoryState::HistoricalLive;
+    }
+    if let Some(loc) = tag_locations().lock().unwrap().get_mut(&tag) {
+        loc.state = TagHistoryState::HistoricalLive;
+    }
+}
+
+#[inline]
+pub(crate) fn drain_shadowed_candidates(
+    base_addr: usize,
+    alloc_epoch: u64,
+    limit: usize,
+) -> Vec<u64> {
+    if base_addr == 0 || alloc_epoch == 0 || limit == 0 {
+        return Vec::new();
+    }
+
+    let key = (base_addr, alloc_epoch);
+    let mut active = active_history().lock().unwrap();
+    let Some(bucket) = active.get_mut(&key) else {
+        return Vec::new();
+    };
+
+    let mut drained = Vec::new();
+    for entry in &mut bucket.entries {
+        if drained.len() >= limit {
+            break;
+        }
+        if entry.state == TagHistoryState::Active && entry.shadowed_candidate {
+            entry.shadowed_candidate = false;
+            bucket.shadowed_candidate_count = bucket.shadowed_candidate_count.saturating_sub(1);
+            drained.push(entry.tag);
+        }
+    }
+    drained
+}
+
+#[inline]
+pub(crate) fn shadowed_candidate_count(base_addr: usize, alloc_epoch: u64) -> usize {
+    if base_addr == 0 || alloc_epoch == 0 {
+        return 0;
+    }
+    let key = (base_addr, alloc_epoch);
+    active_history()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map_or(0, |bucket| bucket.shadowed_candidate_count)
 }
 
 #[inline]
@@ -170,7 +250,26 @@ pub(crate) fn stats() -> TagHistoryStats {
     let dead = dead_history().lock().unwrap();
     TagHistoryStats {
         active_epoch_buckets: active.len(),
-        active_tag_entries: active.values().map(|bucket| bucket.entries.len()).sum(),
+        active_tag_entries: active
+            .values()
+            .map(|bucket| {
+                bucket
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == TagHistoryState::Active)
+                    .count()
+            })
+            .sum(),
+        historical_live_tag_entries: active
+            .values()
+            .map(|bucket| {
+                bucket
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == TagHistoryState::HistoricalLive)
+                    .count()
+            })
+            .sum(),
         dead_epoch_buckets: dead.len(),
         dead_tag_entries: dead.values().map(|bucket| bucket.entries.len()).sum(),
         shadowed_old_live_tag_candidates: active

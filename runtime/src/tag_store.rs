@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 const TAG_SHARD_COUNT: usize = 64;
 
 #[derive(Copy, Clone)]
-struct DeadTagMeta {
+struct CompactTagMeta {
     pointee_addr: usize,
     kind: crate::PtrKind,
     alloc_epoch: u64,
@@ -23,7 +23,8 @@ struct TagShard {
 }
 
 static TAG_SHARDS: OnceLock<Vec<TagShard>> = OnceLock::new();
-static DEAD_TAGS: OnceLock<Mutex<HashMap<u64, DeadTagMeta>>> = OnceLock::new();
+static HISTORICAL_LIVE_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
+static DEAD_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
 static ALLOC_EPOCH_TAGS: OnceLock<Mutex<HashMap<(usize, u64), Vec<u64>>>> = OnceLock::new();
 
 #[inline]
@@ -41,7 +42,12 @@ fn shards() -> &'static [TagShard] {
 }
 
 #[inline]
-fn dead_tags() -> &'static Mutex<HashMap<u64, DeadTagMeta>> {
+fn historical_live_tags() -> &'static Mutex<HashMap<u64, CompactTagMeta>> {
+    HISTORICAL_LIVE_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn dead_tags() -> &'static Mutex<HashMap<u64, CompactTagMeta>> {
     DEAD_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -79,6 +85,23 @@ pub(crate) fn get(tag: u64) -> Option<TagMeta> {
     }
     if let Some(m) = meta {
         return Some(m);
+    }
+
+    if let Some(m) = historical_live_tags().lock().unwrap().get(&tag).copied() {
+        return Some(TagMeta {
+            pointee_addr: m.pointee_addr,
+            kind: m.kind,
+            parent: 0,
+            escaped: false,
+            alloc_epoch: m.alloc_epoch,
+            alloc_live_at_creation: m.alloc_live_at_creation,
+            alias_exempt: false,
+            lineage_hint: 0,
+            bounds_len: m.bounds_len,
+            origin_known: m.origin_known,
+            origin_base: m.origin_base,
+            origin_end: m.origin_end,
+        });
     }
 
     dead_tags().lock().unwrap().get(&tag).copied().map(|m| TagMeta {
@@ -136,6 +159,11 @@ pub(crate) fn dead_len() -> usize {
 }
 
 #[inline]
+pub(crate) fn historical_live_len() -> usize {
+    historical_live_tags().lock().unwrap().len()
+}
+
+#[inline]
 pub(crate) fn remember_alloc_epoch_tag(base_addr: usize, alloc_epoch: u64, tag: u64) {
     if base_addr == 0 || alloc_epoch == 0 || tag == 0 {
         return;
@@ -154,12 +182,13 @@ pub(crate) fn compact_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
     };
 
     let mut active = tags().lock().unwrap();
+    let mut historical_live = historical_live_tags().lock().unwrap();
     let mut dead = dead_tags().lock().unwrap();
     for tag in tags_for_epoch {
         if let Some(meta) = active.remove(&tag) {
             dead.insert(
                 tag,
-                DeadTagMeta {
+                CompactTagMeta {
                     pointee_addr: meta.pointee_addr,
                     kind: meta.kind,
                     alloc_epoch: meta.alloc_epoch,
@@ -175,6 +204,39 @@ pub(crate) fn compact_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
             if smap.remove(&tag).is_some() {
                 shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
             }
+        } else if let Some(meta) = historical_live.remove(&tag) {
+            dead.insert(tag, meta);
         }
     }
+}
+
+#[inline]
+pub(crate) fn compact_live_tag(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+
+    let Some(meta) = tags().lock().unwrap().remove(&tag) else {
+        return false;
+    };
+    historical_live_tags().lock().unwrap().insert(
+        tag,
+        CompactTagMeta {
+            pointee_addr: meta.pointee_addr,
+            kind: meta.kind,
+            alloc_epoch: meta.alloc_epoch,
+            alloc_live_at_creation: meta.alloc_live_at_creation,
+            bounds_len: meta.bounds_len,
+            origin_known: meta.origin_known,
+            origin_base: meta.origin_base,
+            origin_end: meta.origin_end,
+        },
+    );
+
+    let idx = shard_index(tag);
+    let mut smap = shards()[idx].map.lock().unwrap();
+    if smap.remove(&tag).is_some() {
+        shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
+    }
+    true
 }
