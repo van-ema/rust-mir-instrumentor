@@ -586,22 +586,42 @@ fn tb_lite_check(
             // - Reserved/Active activate to Active
             // - Frozen/Disabled cannot be written through
             (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
-                let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
-                    access_tag, addr, size, tmeta.kind, n.tag
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                if tb_has_usable_clean_unique_ancestor(
+                    &tree.nodes,
+                    n.tag,
+                    access_tag,
+                    addr,
+                    size,
+                ) {
+                    n.perm
+                } else {
+                    let mut msg = format!(
+                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
+                        access_tag, addr, size, tmeta.kind, n.tag
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
-                    access_tag, addr, size, tmeta.kind
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                if tb_has_usable_clean_unique_ancestor(
+                    &tree.nodes,
+                    n.tag,
+                    access_tag,
+                    addr,
+                    size,
+                ) {
+                    n.perm
+                } else {
+                    let mut msg = format!(
+                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
+                        access_tag, addr, size, tmeta.kind
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
             }
             (AliasAccessKind::Write, true, TbPerm::Disabled, _) => {
                 let mut msg = format!(
@@ -815,6 +835,49 @@ fn tb_is_ancestor(nodes: &HashMap<u64, TbNode>, ancestor: u64, mut tag: u64) -> 
             return true;
         }
         tag = n.parent;
+    }
+    false
+}
+
+fn tb_has_usable_clean_unique_ancestor(
+    nodes: &HashMap<u64, TbNode>,
+    conflicted_tag: u64,
+    access_tag: u64,
+    addr: usize,
+    size: usize,
+) -> bool {
+    let Some(conflicted) = nodes.get(&conflicted_tag) else {
+        return false;
+    };
+    let conflicted_end = conflicted.start.saturating_add(conflicted.len);
+    let access_end = addr.saturating_add(size);
+    let mut cur = access_tag;
+    while cur != 0 && cur != conflicted_tag {
+        let Some(node) = nodes.get(&cur) else {
+            return false;
+        };
+        let node_end = node.start.saturating_add(node.len);
+        if node.len != 0
+            && addr >= node.start
+            && access_end <= node_end
+            && node.start >= conflicted.start
+            && node_end <= conflicted_end
+            && matches!(node.kind, BorrowKind::Unique)
+            && !matches!(node.perm, TbPerm::Reserved { conflicted: true } | TbPerm::Disabled)
+        {
+            let has_foreign_overlap = nodes.values().any(|other| {
+                tb_is_live_node(other)
+                    && other.tag != node.tag
+                    && tb_ranges_overlap(addr, size, other.start, other.len)
+                    && !tb_is_ancestor(nodes, other.tag, node.tag)
+                    && !tb_is_ancestor(nodes, node.tag, other.tag)
+            });
+            if has_foreign_overlap {
+                return false;
+            }
+            return true;
+        }
+        cur = node.parent;
     }
     false
 }

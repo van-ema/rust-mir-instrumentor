@@ -383,6 +383,10 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
 
     // Plain wrappers.
     // Use suffix matching for `read`/`write` so we don't accidentally match `write_bytes`/`read_bytes`.
+    // `rkyv::place::Place<T>` is a write-capability wrapper around an internal raw pointer, not a
+    // normal shared-reference write target.
+    EffectRule::two(MatchKind::Contains, "rkyv::place::Place", MatchKind::EndsWith, "::write", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "rkyv::place::Place", MatchKind::EndsWith, "::write_unchecked", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::read_unaligned", CallEffect::Load),
     EffectRule::one(MatchKind::EndsWith, "::read", CallEffect::Load),
     EffectRule::one(MatchKind::Contains, "::ptr::write_unaligned", CallEffect::Store),
@@ -8741,6 +8745,14 @@ mod tests {
             MyOptimizationPass.classify_call_effect(
                 "decompress::Decompressor::is_done"
             ),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("rkyv::place::Place::<u32>::write"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("rkyv::place::Place::<u32>::write_unchecked"),
             CallEffect::Ignore
         );
     }
