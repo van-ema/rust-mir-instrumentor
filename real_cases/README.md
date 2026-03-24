@@ -10,3 +10,11 @@ Current cases:
 
 - `slice_ring_buffer_double_free`
 - `bumpalo_into_iter_uaf`
+
+Each case directory contains:
+
+- a standalone `Cargo.toml`
+- a minimal reproducer in `src/main.rs`
+- a case-specific `README.md`
+- an `artifacts/` directory with captured `baseline`, `miri`, and `rusteze`
+  outputs from the current environment

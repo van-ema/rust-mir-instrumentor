@@ -1,0 +1,7 @@
+pushed
+Dropping StructA with data at: 0x100599b00
+popped
+Dropping StructA with data at: 0x100599b00
+extended: [StructA("BBBB")]
+Dropping StructA with data at: 0x100599b00
+EXIT:133

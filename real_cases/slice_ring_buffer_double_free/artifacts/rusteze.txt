@@ -1,0 +1,8 @@
+
+================ RUSTEZE VIOLATION ================
+WILD_POINTER
+WRITE via tag=163 addr=0x102130000 size=24
+(no allocation contains this address) kind=RawMut parent=0 pointee=0x102130000
+===================================================
+
+EXIT:134

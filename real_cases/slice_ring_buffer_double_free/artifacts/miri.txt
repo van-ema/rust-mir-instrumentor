@@ -1,0 +1,27 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `/Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/bin/cargo-miri runner target/miri/aarch64-apple-darwin/debug/slice_ring_buffer_double_free`
+error: unsupported operation: extern static `vm_page_size` is not supported by Miri
+  --> /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/mirrored/macos.rs:33:14
+   |
+33 |     unsafe { mach::vm_page_size::vm_page_size as usize }
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsupported operation occurred here
+   |
+   = help: this is likely not a bug in the program; it indicates that the program performed an operation that Miri does not support
+   = note: BACKTRACE:
+   = note: inside `slice_ring_buffer::mirrored::macos::allocation_granularity` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/mirrored/macos.rs:33:14: 33:46
+   = note: inside `slice_ring_buffer::Buffer::<StructA>::uninitialized` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/mirrored/buffer.rs:135:41: 135:65
+   = note: inside `slice_ring_buffer::SliceRingBuffer::<StructA>::reserve_capacity` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/lib.rs:579:34: 579:73
+   = note: inside `slice_ring_buffer::SliceRingBuffer::<StructA>::try_reserve` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/lib.rs:550:9: 550:39
+   = note: inside `slice_ring_buffer::SliceRingBuffer::<StructA>::try_push_back` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/lib.rs:977:33: 977:52
+   = note: inside `slice_ring_buffer::SliceRingBuffer::<StructA>::push_back` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/slice-ring-buffer-0.3.4/src/lib.rs:1005:25: 1005:50
+note: inside `main`
+  --> src/main.rs:14:5
+   |
+14 |     dq1.push_back(StructA(String::from("AAAA")));
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
+EXIT:1

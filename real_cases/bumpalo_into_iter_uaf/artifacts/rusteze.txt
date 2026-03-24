@@ -1,0 +1,9 @@
+
+================ RUSTEZE VIOLATION ================
+USE_AFTER_DEAD
+READ via tag=15368 addr=0x102f38230 size=1
+alloc_base=0x102f38090 alloc_size=496 alloc_epoch=2 tag_epoch=2 kind=RawConst parent=15365
+pointee=0x102f38230
+===================================================
+
+EXIT:134

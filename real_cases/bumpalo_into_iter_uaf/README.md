@@ -22,6 +22,10 @@ The iterator still points into arena memory that has already been destroyed.
 
 ## Expected baseline behavior
 
+Captured artifact:
+
+- `real_cases/bumpalo_into_iter_uaf/artifacts/baseline.txt`
+
 Run:
 
 ```bash
@@ -43,6 +47,10 @@ EXIT:0
 
 ## Miri
 
+Captured artifact:
+
+- `real_cases/bumpalo_into_iter_uaf/artifacts/miri.txt`
+
 Run:
 
 ```bash
@@ -55,6 +63,10 @@ Observed:
 - the failing operation is iterator pointer arithmetic on freed arena memory
 
 ## Rusteze
+
+Captured artifact:
+
+- `real_cases/bumpalo_into_iter_uaf/artifacts/rusteze.txt`
 
 Build:
 

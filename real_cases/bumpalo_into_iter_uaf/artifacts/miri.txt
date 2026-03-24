@@ -1,0 +1,35 @@
+   Compiling bumpalo v3.11.0
+   Compiling bumpalo_into_iter_uaf v0.1.0 (/Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/bumpalo_into_iter_uaf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running `/Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/bin/cargo-miri runner target/miri/aarch64-apple-darwin/debug/bumpalo_into_iter_uaf`
+error: Undefined Behavior: in-bounds pointer arithmetic failed: alloc693 has been freed, so this pointer is dangling
+    --> /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bumpalo-3.11.0/src/collections/vec.rs:2300:28
+     |
+2300 |                 self.ptr = self.ptr.offset(1);
+     |                            ^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+     |
+     = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
+     = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
+help: alloc693 was allocated here:
+    --> src/main.rs:6:5
+     |
+   6 |     vec.extend([0x01u8; 32]);
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^
+help: alloc693 was deallocated here:
+    --> src/main.rs:8:5
+     |
+   8 |     drop(bump);
+     |     ^^^^^^^^^^
+     = note: BACKTRACE (of the first span):
+     = note: inside `<bumpalo::collections::vec::IntoIter<u8> as std::iter::Iterator>::next` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bumpalo-3.11.0/src/collections/vec.rs:2300:28: 2300:46
+note: inside `main`
+    --> src/main.rs:15:14
+     |
+  15 |     for x in into_iter {
+     |              ^^^^^^^^^
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
+EXIT:1

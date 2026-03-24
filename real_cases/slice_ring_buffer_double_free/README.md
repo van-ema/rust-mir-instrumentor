@@ -22,6 +22,10 @@ destruction of the same backing object.
 
 ## Expected baseline behavior
 
+Captured artifact:
+
+- `real_cases/slice_ring_buffer_double_free/artifacts/baseline.txt`
+
 Run:
 
 ```bash
@@ -47,6 +51,10 @@ EXIT:133
 
 ## Miri
 
+Captured artifact:
+
+- `real_cases/slice_ring_buffer_double_free/artifacts/miri.txt`
+
 Run:
 
 ```bash
@@ -63,6 +71,10 @@ So this case is useful precisely because Rusteze can run it natively while Miri
 is unavailable here.
 
 ## Rusteze
+
+Captured artifact:
+
+- `real_cases/slice_ring_buffer_double_free/artifacts/rusteze.txt`
 
 Build:
 
