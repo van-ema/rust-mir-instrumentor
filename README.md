@@ -283,7 +283,7 @@ Project-specific environment variables are grouped below by component/script.
 - `RUSTFLAGS`: wrapper appends `--mir-out` / `--runtime-path` forwarding flags here.
 
 ### AFL build/fuzz scripts (`scripts/afl_*.sh`)
-- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `simd_json_borrowed`/`simd-json-borrowed`, `simd_json_tape`/`simd-json-tape`, `zip`, `rkyv`, `hyper`).
+- `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `simd_json_borrowed`/`simd-json-borrowed`, `simd_json_tape`/`simd-json-tape`, `zip`, `rkyv`, `hyper`, `image`).
 - `PROFILE`: cargo profile (`debug` or `release`; default depends on script, usually `release`).
 - `HARNESS_TARGET_DIR`: target directory for AFL harness builds.
 - `RUNTIME_FEATURES`: extra features passed when building `runtime` in `afl_build.sh`.
@@ -307,6 +307,13 @@ Project-specific environment variables are grouped below by component/script.
 - `AFL_SKIP_CPUFREQ`: set to `1` by `afl_fuzz.sh`.
 - `AFL_NO_AFFINITY`: set to `1` by `afl_fuzz.sh`.
 - `ASAN_OPTIONS` / `ASAN_SYMBOLIZER_PATH`: explicitly unset in `afl_fuzz.sh`.
+- `RUSTEZE_FAILFAST`: defaults to `1` in `afl_fuzz.sh`.
+- `RZ_ABORT_ON_VIOLATION`: not set by `afl_fuzz.sh`; set it explicitly if you want `abort()` instead of panic-based fail-fast.
+- `FUZZ`: not used by `afl_fuzz.sh`; setting `FUZZ=1` is unnecessary.
+- `IN_DIR`: input corpus override for `scripts/afl_fuzz_asan.sh` (default `fuzz/corpus/<TARGET>`).
+- `OUT_DIR`: output dir override for `scripts/afl_fuzz_asan.sh` (default `fuzz/out-asan/<TARGET>`).
+- `ASAN_RUSTFLAGS`: sanitizer flags override for `scripts/afl_fuzz_asan.sh` (default `-Zsanitizer=address`).
+- `ASAN_OPTIONS`: defaults to `detect_leaks=0:abort_on_error=1:symbolize=0` in `scripts/afl_fuzz_asan.sh`.
 - `TRACE`: `afl_build.sh` shell tracing when `TRACE=1`.
 - `scripts/merge_unsafe_summaries.py`: offline fixed-point merge for unsafe-summary JSONL dumps.
   It supports per-file mode (`--input` / `--output`) and whole-build cross-crate mode
@@ -570,7 +577,7 @@ The repo includes an AFL++ harness crate with drivers:
 `afl_bytes_driver`, `afl_smallvec_driver`, `afl_serde_json_driver`,
 `afl_toml_driver`, `afl_base64_driver`, `afl_uuid_driver`,
 `afl_itoa_driver`, `afl_quick_xml_driver`, `afl_simd_json_driver`,
-`afl_zip_driver`, `afl_rkyv_driver`, and `afl_hyper_driver`.
+`afl_zip_driver`, `afl_rkyv_driver`, `afl_hyper_driver`, and `afl_image_driver`.
 
 Bootstrap third-party checkouts and env hints first:
 
@@ -592,18 +599,21 @@ TARGET=simd_json PROFILE=release ./scripts/afl_build.sh
 TARGET=zip PROFILE=release ./scripts/afl_build.sh
 TARGET=rkyv PROFILE=release ./scripts/afl_build.sh
 TARGET=hyper PROFILE=release ./scripts/afl_build.sh
+TARGET=image PROFILE=release ./scripts/afl_build.sh
 
 # Run AFL++
 TARGET=bytes PROFILE=release ./scripts/afl_fuzz.sh
 TARGET=serde_json PROFILE=release ./scripts/afl_fuzz.sh
 TARGET=simd_json PROFILE=release ./scripts/afl_fuzz.sh
 TARGET=hyper PROFILE=release ./scripts/afl_fuzz.sh
+TARGET=image PROFILE=release ./scripts/afl_fuzz.sh
 
 # Reproduce a single crash
 TARGET=bytes PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/bytes/default/crashes/id:...
 TARGET=serde_json PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/serde_json/default/crashes/id:...
 TARGET=simd_json PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/simd_json/default/crashes/id:...
 TARGET=hyper PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/hyper/default/crashes/id:...
+TARGET=image PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/image/default/crashes/id:...
 ```
 
 `scripts/afl_build.sh` includes a post-build hook check and prints:
@@ -614,6 +624,52 @@ For strict CI-style verification:
 ```bash
 RZ_VERIFY_HOOKS=1 RZ_VERIFY_HOOKS_STRICT=1 TARGET=bytes PROFILE=debug ./scripts/afl_build.sh
 ```
+
+**ASan harness fuzzing**
+
+Use `scripts/afl_fuzz_asan.sh` to fuzz the same harnesses without `rusteze`, using AddressSanitizer plus AFL sanitizer coverage:
+
+```bash
+AFL_PATH=/path/to/AFLplusplus \
+TARGET=image \
+PROFILE=release \
+./scripts/afl_fuzz_asan.sh
+```
+
+The script:
+- builds the matching `afl_harness` binary with `cargo +nightly` and `-Zsanitizer=address`
+- links `afl-compiler-rt.o`
+- writes output to `fuzz/out-asan/<TARGET>` by default
+- unsets `RUSTEZE_FAILFAST` and `RZ_ABORT_ON_VIOLATION`
+
+To compare `rusteze` vs ASan on the same fixed corpus, snapshot the queue from a previous `rusteze` run and reuse it as the ASan input corpus:
+
+```bash
+rm -rf /tmp/image-corpus-fixed
+mkdir -p /tmp/image-corpus-fixed
+find fuzz/out/image/default/queue -maxdepth 1 -type f -exec cp {} /tmp/image-corpus-fixed/ \;
+
+AFL_PATH=/path/to/AFLplusplus \
+IN_DIR=/tmp/image-corpus-fixed \
+OUT_DIR=fuzz/out-asan/image \
+TARGET=image \
+PROFILE=release \
+./scripts/afl_fuzz_asan.sh
+```
+
+For throughput and coverage-over-time plots, AFL writes time-series data to:
+- `fuzz/out/<target>/default/plot_data` for `rusteze`
+- `fuzz/out-asan/<target>/default/plot_data` for ASan
+
+Useful `plot_data` fields:
+- `execs_per_sec`: throughput over time
+- `map_size`: coverage proxy over time
+
+Useful `fuzzer_stats` fields:
+- `execs_per_sec`
+- `execs_done`
+- `saved_crashes`
+- `saved_hangs`
 
 **Docker (Linux container)**
 
