@@ -1,0 +1,87 @@
+Hello!
+
+thread 'main' panicked at src/main.rs:15:5:
+assertion failed: v.as_ptr_range().contains(&s.as_ptr())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'main' panicked at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:1061:9:
+unsafe precondition(s) violated: Vec::from_raw_parts_in requires that length <= capacity
+
+This indicates a bug in the program. This Undefined Behavior check is optional, and cannot be relied on for safety.
+stack backtrace:
+   0:        0x104ef79cc - std::backtrace_rs::backtrace::libunwind::trace::hfb4a307596059068
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/../../backtrace/src/backtrace/libunwind.rs:117:9
+   1:        0x104ef79cc - std::backtrace_rs::backtrace::trace_unsynchronized::h0543cd7dc356eda1
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/../../backtrace/src/backtrace/mod.rs:66:14
+   2:        0x104ef79cc - std::sys::backtrace::_print_fmt::h97f9f731b6ba4e4a
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/sys/backtrace.rs:66:9
+   3:        0x104ef79cc - <std::sys::backtrace::BacktraceLock::print::DisplayBacktrace as core::fmt::Display>::fmt::h68282a588e1f2b30
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/sys/backtrace.rs:39:26
+   4:        0x104f0afb4 - core::fmt::rt::Argument::fmt::h5384a60d1878c685
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/core/src/fmt/rt.rs:173:76
+   5:        0x104f0afb4 - core::fmt::write::h7db666b1868037c3
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/core/src/fmt/mod.rs:1468:25
+   6:        0x104ef5f00 - std::io::default_write_fmt::haf0560cc4388cfe5
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/io/mod.rs:639:11
+   7:        0x104ef5f00 - std::io::Write::write_fmt::h807123459fb7f9ea
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/io/mod.rs:1954:13
+   8:        0x104ef7880 - std::sys::backtrace::BacktraceLock::print::h34ec226221b70015
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/sys/backtrace.rs:42:9
+   9:        0x104ef886c - std::panicking::default_hook::{{closure}}::hc6910d1e4b6ea4ba
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:300:27
+  10:        0x104ef86c4 - std::panicking::default_hook::hf437e7363baf37ce
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:327:9
+  11:        0x104ef9244 - std::panicking::rust_panic_with_hook::h064cb6453c3579b1
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:833:13
+  12:        0x104ef8f00 - std::panicking::begin_panic_handler::{{closure}}::hd8459dcb20c2ceda
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:699:13
+  13:        0x104ef7e7c - std::sys::backtrace::__rust_end_short_backtrace::hc54b92df4b1c40e2
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/sys/backtrace.rs:174:18
+  14:        0x104ef8c04 - __rustc[b7f20edcb6d663c5]::rust_begin_unwind
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:697:5
+  15:        0x104f12a94 - core::panicking::panic_nounwind_fmt::runtime::h14319fee6410839d
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/core/src/panicking.rs:117:22
+  16:        0x104f12a94 - core::panicking::panic_nounwind_fmt::h690ace0dc84d2adc
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/core/src/intrinsics/mod.rs:2367:9
+  17:        0x104edd4ac - alloc::vec::Vec<T,A>::from_raw_parts_in::precondition_check::h0c90d6d043be28b8
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ub_checks.rs:72:21
+  18:        0x104eda794 - alloc::vec::Vec<T,A>::from_raw_parts_in::h0bc4ae0b3b99bf8c
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:1061:9
+  19:        0x104eda748 - alloc::vec::Vec<T>::from_raw_parts::h86c87d339c3e2fbd
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:623:18
+  20:        0x104edc090 - <smallvec::SmallVec<A> as core::ops::drop::Drop>::drop::h95f304c5d25bde85
+                               at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.6.0/src/lib.rs:1714:17
+  21:        0x104edbfe0 - core::ptr::drop_in_place<smallvec::SmallVec<[u8; 0]>>::h8f480d8a1e1b03a3
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:804:1
+  22:        0x104edcf24 - smallvec_insert_many_oob::main::h1fd59f90007b459f
+                               at /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/smallvec_insert_many_oob/src/main.rs:17:1
+  23:        0x104edbea8 - core::ops::function::FnOnce::call_once::hc37eebfee59a2fff
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:253:5
+  24:        0x104edcad0 - std::sys::backtrace::__rust_begin_short_backtrace::hecb1676f1831f879
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/sys/backtrace.rs:158:18
+  25:        0x104edbd80 - std::rt::lang_start::{{closure}}::h759da1d6cedcf021
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/rt.rs:206:18
+  26:        0x104ef39f4 - core::ops::function::impls::<impl core::ops::function::FnOnce<A> for &F>::call_once::h0f1ba1799a9c5edd
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/core/src/ops/function.rs:290:21
+  27:        0x104ef39f4 - std::panicking::catch_unwind::do_call::h920efb033d6e9e90
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:589:40
+  28:        0x104ef39f4 - std::panicking::catch_unwind::hcf4741d633e1d183
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:552:19
+  29:        0x104ef39f4 - std::panic::catch_unwind::h2c52ad9a993bdf82
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panic.rs:359:14
+  30:        0x104ef39f4 - std::rt::lang_start_internal::{{closure}}::h88f1b63387f44db4
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/rt.rs:175:24
+  31:        0x104ef39f4 - std::panicking::catch_unwind::do_call::he91180f5ba14bf0b
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:589:40
+  32:        0x104ef39f4 - std::panicking::catch_unwind::h501a060d835ce159
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panicking.rs:552:19
+  33:        0x104ef39f4 - std::panic::catch_unwind::h6139c9236958fa28
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/panic.rs:359:14
+  34:        0x104ef39f4 - std::rt::lang_start_internal::h0b16272d8b7420ef
+                               at /rustc/adcb3d3b4cd3b7c4cde642f3ed537037f293738e/library/std/src/rt.rs:171:5
+  35:        0x104edbd58 - std::rt::lang_start::hd33434ba38ce5b66
+                               at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/std/src/rt.rs:205:5
+  36:        0x104edd1fc - _main
+thread caused non-unwinding panic. aborting.
+
+EXIT:134

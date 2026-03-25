@@ -1,3 +1,31 @@
+//! Metadata-dataflow optimization for pointer tag plumbing.
+//!
+//! This pass runs after instrumentation points have been collected and before
+//! they are lowered into MIR statements/calls. Its job is narrow:
+//! - track abstract tag/ref-ancestor metadata for pointer locals
+//! - compute whether a scheduled `TagProp` is redundant
+//! - drop redundant copies of tag and ref-ancestor metadata
+//!
+//! In other words, this is not safety analysis for the target program. It is an
+//! optimization pass for Rusteze's own metadata propagation.
+//!
+//! The pass currently keeps only the sound subset of this optimization: remove
+//! dead ref-ancestor copies and redundant self-copies. Tag-copy elimination was
+//! experimented with earlier, but it is still too weak on some helper-heavy MIR
+//! shapes and can delete required provenance propagation.
+//!
+//! Missing optimization is acceptable; incorrect removal is not.
+//!
+//! Important caveat:
+//! the ordering of same-site insert points matters. If metadata propagation is
+//! analyzed as occurring after a consuming `PtrWrite`/`PtrRead`/`PtrUse`, the
+//! pass can incorrectly conclude that the propagation is dead and delete it.
+//! That turns concrete violations into `UNKNOWN_TAG` reports. When debugging
+//! provenance loss, compare behavior with `RZ_METADATA_DATAFLOW=0`.
+//!
+//! Because that optimization is not yet proven sound in all cases, it is gated
+//! behind an explicit opt-in flag today.
+
 use std::collections::{HashMap, HashSet};
 
 use rustc_middle::mir::{BasicBlock, Body, Local, START_BLOCK};
@@ -161,7 +189,7 @@ pub(super) fn apply_metadata_dataflow<'tcx>(
 fn metadata_dataflow_enabled() -> bool {
     std::env::var("RZ_METADATA_DATAFLOW")
         .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
 fn metadata_dataflow_stats_enabled() -> bool {
@@ -281,19 +309,12 @@ impl MetadataAnalysis {
                 keep_ref_ancestor: false,
             };
         }
-        let state = self.point_states.get(&idx);
-        let live_after = self.live_after.get(&idx);
-        let tag_redundant = state
-            .and_then(|s| Some(s.get(&dst)?.tag == s.get(&src)?.tag))
-            .unwrap_or(false)
-            || live_after.map_or(false, |live| !live.tag_live.contains(&dst));
-        let ref_redundant = state
-            .and_then(|s| Some(s.get(&dst)?.ref_ancestor == s.get(&src)?.ref_ancestor))
-            .unwrap_or(false)
-            || live_after.map_or(false, |live| !live.ref_live.contains(&dst));
         TagPropDecision {
-            keep_tag: !tag_redundant,
-            keep_ref_ancestor: !ref_redundant,
+            keep_tag: true,
+            keep_ref_ancestor: self
+                .live_after
+                .get(&idx)
+                .map_or(true, |live| live.ref_live.contains(&dst)),
         }
     }
 }
@@ -313,8 +334,8 @@ fn ordered_insert_points<'tcx>(
         (
             ip.bb.index(),
             ip.stmt_idx,
-            if ip.insert_before { 0_u8 } else { 1_u8 },
             instr_priority(&ip.kind),
+            if ip.insert_before { 0_u8 } else { 1_u8 },
             *idx,
         )
     });
@@ -599,11 +620,15 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         | InstrKind::FnExit { .. }
         | InstrKind::RetRoot { .. }
         | InstrKind::PtrDerive { .. } => 0,
+        // Metadata propagation must be ordered after tag-creating hooks but before
+        // access/usage hooks at the same program point. Otherwise liveness can
+        // incorrectly conclude that the copied tag is dead and delete the TagProp.
+        InstrKind::TagProp { .. } => 1,
         InstrKind::PtrRead { .. }
         | InstrKind::PtrWrite { .. }
         | InstrKind::PtrReadAllowUntagged { .. }
-        | InstrKind::PtrWriteAllowUntagged { .. } => 1,
-        InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 2,
-        _ => 3,
+        | InstrKind::PtrWriteAllowUntagged { .. } => 2,
+        InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+        _ => 4,
     }
 }

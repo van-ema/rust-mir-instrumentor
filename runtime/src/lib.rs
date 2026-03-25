@@ -1967,6 +1967,7 @@ pub extern "C" fn __rz_reset_hook_profile() {
 
 #[no_mangle]
 pub extern "C" fn __rz_dump_hook_profile() {
+    let _runtime_guard = RzRuntimeGuard::enter();
     if !rz_profile_hooks_enabled() {
         eprintln!("[rusteze-runtime] hook profile: disabled (set RZ_PROFILE_HOOKS=1)");
         return;
@@ -2018,6 +2019,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
         (amap.len(), live)
     };
     let tag_entries = tag_store::len();
+    let historical_live_tag_entries = tag_store::historical_live_len();
     let dead_tag_entries = tag_store::dead_len();
     let exact_parent_entries = exact_parent_index::len();
     let tag_history_stats = tag_pruning::stats();
@@ -2082,13 +2084,14 @@ pub extern "C" fn __rz_dump_hook_profile() {
         }
     );
     eprintln!(
-        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
-        alloc_entries, live_alloc_entries, tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
+        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
+        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
     );
     eprintln!(
-        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
+        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} historical_live_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
         tag_history_stats.active_epoch_buckets,
         tag_history_stats.active_tag_entries,
+        tag_history_stats.historical_live_tag_entries,
         tag_history_stats.dead_epoch_buckets,
         tag_history_stats.dead_tag_entries,
         tag_history_stats.shadowed_old_live_tag_candidates

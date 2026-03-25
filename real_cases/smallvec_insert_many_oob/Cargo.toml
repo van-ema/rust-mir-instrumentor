@@ -1,0 +1,9 @@
+[package]
+name = "smallvec_insert_many_oob"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smallvec = "=1.6.0"
+
+[workspace]

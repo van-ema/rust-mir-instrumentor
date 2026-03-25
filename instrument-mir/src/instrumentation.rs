@@ -362,6 +362,11 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
     EffectRule::two(MatchKind::Contains, "::vec::Vec", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
 
+    // SmallVec pointer extraction wrappers. These are thin wrappers over internal storage and
+    // should preserve provenance like Vec::{as_ptr,as_mut_ptr}.
+    EffectRule::two(MatchKind::Contains, "::SmallVec", MatchKind::EndsWith, "::as_ptr", CallEffect::PtrDerive),
+    EffectRule::two(MatchKind::Contains, "::SmallVec", MatchKind::EndsWith, "::as_mut_ptr", CallEffect::PtrDerive),
+
     // Transmute-style helpers returning pointers should preserve lineage.
     EffectRule::one(MatchKind::Contains, "::mem::transmute", CallEffect::PtrDerive),
     EffectRule::one(MatchKind::Contains, "::intrinsics::transmute", CallEffect::PtrDerive),
@@ -2938,6 +2943,32 @@ impl MyOptimizationPass {
         block_data: &BasicBlockData<'tcx>,
         place: Place<'tcx>,
     ) -> Option<Local> {
+        fn copy_source_local<'tcx>(
+            pass: &MyOptimizationPass,
+            body: &Body<'tcx>,
+            local: Local,
+            statements: &[Statement<'tcx>],
+        ) -> Option<Local> {
+            for stmt in statements.iter().rev() {
+                let StatementKind::Assign(box (dst, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                if dst.as_local() != Some(local) {
+                    continue;
+                }
+                let src_local = match rvalue {
+                    Rvalue::Use(op) => pass.place_from_operand(op).and_then(|p| p.as_local()),
+                    Rvalue::CopyForDeref(p) => p.as_local(),
+                    _ => None,
+                }?;
+                if pass.is_pointer_ty(body.local_decls[src_local].ty) {
+                    return Some(src_local);
+                }
+                return None;
+            }
+            None
+        }
+
         let place_ty = place.ty(&body.local_decls, tcx).ty;
         if !self.is_pointer_ty(place_ty) {
             return None;
@@ -2946,6 +2977,9 @@ impl MyOptimizationPass {
         if place.projection.is_empty() {
             let local = place.local;
             if self.is_pointer_ty(body.local_decls[local].ty) {
+                if let Some(src_local) = copy_source_local(self, body, local, &block_data.statements) {
+                    return Some(src_local);
+                }
                 return Some(local);
             }
             return None;
@@ -4349,6 +4383,41 @@ impl MyOptimizationPass {
         CallEffect::Unknown
     }
 
+    fn operand_base_adt_name<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+    ) -> Option<String> {
+        let mut ty = operand.ty(body, tcx);
+        loop {
+            match ty.kind() {
+                TyKind::Ref(_, inner, _) => ty = *inner,
+                TyKind::RawPtr(inner, _) => ty = *inner,
+                TyKind::Adt(adt, _) => return Some(tcx.def_path_str(adt.did())),
+                _ => return None,
+            }
+        }
+    }
+
+    fn classify_call_effect_from_receiver_type<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        def_path: &str,
+    ) -> Option<CallEffect> {
+        let receiver_name = self.operand_base_adt_name(tcx, body, &args.get(0)?.node)?;
+
+        if (def_path.ends_with("::as_ptr") || def_path.ends_with("::as_mut_ptr"))
+            && receiver_name.ends_with("SmallVec")
+        {
+            return Some(CallEffect::PtrDerive);
+        }
+
+        None
+    }
+
     /// Best-effort: compute byte size operand for memory ops given a pointer local and a count operand.
     ///
     /// Semantics: byte_len = count * size_of::<T>(), where `count` is in *elements*.
@@ -5254,7 +5323,17 @@ impl MyOptimizationPass {
         // 6a: Remove is_plain_store/is_plain_load computation.
 
         // Centralized effect classification for direct calls.
-        let mut call_effect_opt: Option<CallEffect> = callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+        let mut call_effect_opt: Option<CallEffect> =
+            callee_path_opt.as_deref().map(|p| self.classify_call_effect(p));
+        if matches!(call_effect_opt, None | Some(CallEffect::Unknown)) {
+            if let Some(def_path) = callee_path_opt.as_deref() {
+                if let Some(receiver_effect) =
+                    self.classify_call_effect_from_receiver_type(tcx, body, args, def_path)
+                {
+                    call_effect_opt = Some(receiver_effect);
+                }
+            }
+        }
         let unknown_call = !callee_instrumented
             && matches!(call_effect_opt, None | Some(CallEffect::Unknown));
 
@@ -5386,8 +5465,32 @@ impl MyOptimizationPass {
                             if let Some(ptr_local) =
                                 self.resolve_ptr_local_for_call_place(tcx, body, block_data, p0)
                             {
-                                classified_write_ptr_local = Some(ptr_local);
-                                ptr_locals_needing_tag.insert(ptr_local);
+                                let hook_ptr_local = if p0.projection.is_empty()
+                                    && self.is_pointer_ty(body.local_decls[p0.local].ty)
+                                {
+                                    if p0.local != ptr_local {
+                                        ptr_locals_needing_tag.insert(p0.local);
+                                        ptr_locals_needing_tag.insert(ptr_local);
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: block_data.statements.len(),
+                                            insert_before: false,
+                                            source_info: term.source_info,
+                                            place: p0,
+                                            kind: InstrKind::TagProp {
+                                                dst: p0.local,
+                                                src: ptr_local,
+                                                copy_tag: true,
+                                                copy_ref_ancestor: true,
+                                            },
+                                        });
+                                    }
+                                    p0.local
+                                } else {
+                                    ptr_local
+                                };
+                                classified_write_ptr_local = Some(hook_ptr_local);
+                                ptr_locals_needing_tag.insert(hook_ptr_local);
 
                                 let ty0 = p0.ty(&body.local_decls, tcx).ty;
                                 let size_op = match ty0.kind() {
@@ -5412,7 +5515,7 @@ impl MyOptimizationPass {
                                     source_info: term.source_info,
                                     place: p0,
                                     kind: InstrKind::PtrWrite {
-                                        ptr_local,
+                                        ptr_local: hook_ptr_local,
                                         size_op,
                                     },
                                 });
@@ -5428,8 +5531,32 @@ impl MyOptimizationPass {
                             if let Some(ptr_local) =
                                 self.resolve_ptr_local_for_call_place(tcx, body, block_data, p0)
                             {
-                                classified_read_ptr_local = Some(ptr_local);
-                                ptr_locals_needing_tag.insert(ptr_local);
+                                let hook_ptr_local = if p0.projection.is_empty()
+                                    && self.is_pointer_ty(body.local_decls[p0.local].ty)
+                                {
+                                    if p0.local != ptr_local {
+                                        ptr_locals_needing_tag.insert(p0.local);
+                                        ptr_locals_needing_tag.insert(ptr_local);
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: block_data.statements.len(),
+                                            insert_before: false,
+                                            source_info: term.source_info,
+                                            place: p0,
+                                            kind: InstrKind::TagProp {
+                                                dst: p0.local,
+                                                src: ptr_local,
+                                                copy_tag: true,
+                                                copy_ref_ancestor: true,
+                                            },
+                                        });
+                                    }
+                                    p0.local
+                                } else {
+                                    ptr_local
+                                };
+                                classified_read_ptr_local = Some(hook_ptr_local);
+                                ptr_locals_needing_tag.insert(hook_ptr_local);
 
                                 let ty0 = p0.ty(&body.local_decls, tcx).ty;
                                 let size_op = match ty0.kind() {
@@ -5454,7 +5581,7 @@ impl MyOptimizationPass {
                                     source_info: term.source_info,
                                     place: p0,
                                     kind: InstrKind::PtrRead {
-                                        ptr_local,
+                                        ptr_local: hook_ptr_local,
                                         size_op,
                                     },
                                 });
@@ -5465,38 +5592,41 @@ impl MyOptimizationPass {
 
                 CallEffect::PtrDerive => {
                     // Pointer-result handling for ptr-derivation wrappers (add/sub/offset/as_ptr...).
-                    // Only needed when the callee is not instrumented.
-                    if !callee_instrumented {
-                        if let Some(dst_local) = destination.as_local() {
-                            let dst_ty = body.local_decls[dst_local].ty;
-                            // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
-                            if self.is_pointer_ty(dst_ty) {
-                                let src_arg_index = callee_path_opt
-                                    .as_deref()
-                                    .map(|p| self.ptr_derive_source_arg_index(p))
-                                    .unwrap_or(0);
-                                if let Some(src_local) = self.call_arg_pointer_source_local(
-                                    tcx,
-                                    body,
+                    //
+                    // Even when the callee is instrumented, modeling these wrappers locally is
+                    // more robust than relying on call-boundary return tags alone. Tiny wrappers
+                    // like `as_mut_ptr` often return a projected pointer value, and if return-tag
+                    // recovery is skipped or the callee never materializes a precise return tag,
+                    // later dereferences degrade into UNKNOWN_TAG. A local PtrDerive keeps the
+                    // derived pointer connected to its base pointer provenance directly.
+                    if let Some(dst_local) = destination.as_local() {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
+                        if self.is_pointer_ty(dst_ty) {
+                            let src_arg_index = callee_path_opt
+                                .as_deref()
+                                .map(|p| self.ptr_derive_source_arg_index(p))
+                                .unwrap_or(0);
+                            if let Some(src_local) = self.call_arg_pointer_source_local(
+                                tcx,
+                                body,
+                                block_data,
+                                args,
+                                src_arg_index,
+                            ) {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                ptr_locals_needing_tag.insert(src_local);
+                                Self::push_ptr_derive_call(
+                                    bb,
                                     block_data,
-                                    args,
-                                    src_arg_index,
-                                )
-                                {
-                                    ptr_locals_needing_tag.insert(dst_local);
-                                    ptr_locals_needing_tag.insert(src_local);
-                                    Self::push_ptr_derive_call(
-                                        bb,
-                                        block_data,
-                                        term,
-                                        dst_local,
-                                        dst_ty,
-                                        src_local,
-                                        insert_points,
-                                        tagged_ptr_locals,
-                                        &mut classified_derive_ptr_local,
-                                    );
-                                }
+                                    term,
+                                    dst_local,
+                                    dst_ty,
+                                    src_local,
+                                    insert_points,
+                                    tagged_ptr_locals,
+                                    &mut classified_derive_ptr_local,
+                                );
                             }
                         }
                     }
@@ -5735,10 +5865,16 @@ impl MyOptimizationPass {
         }
 
         // Caller-side return-tag recovery for pointer returns.
+        //
+        // For simple pointer-derivation wrappers like `as_mut_ptr` or `ptr.add`, we prefer the
+        // local PtrDerive model over call-boundary return-tag recovery. This keeps provenance
+        // stable even when the callee is instrumented but returns a projected pointer value.
         if let Some(dst_local) = destination.as_local() {
             let dst_ty = body.local_decls[dst_local].ty;
             if self.supports_call_boundary_ret_tag_ty(tcx, body, dst_ty) {
-                if callee_instrumented {
+                if matches!(call_effect_opt, Some(CallEffect::PtrDerive)) {
+                    // Already modeled by the local PtrDerive insertion above.
+                } else if callee_instrumented {
                     if !ret_take_enabled {
                         let is_mut = match dst_ty.kind() {
                             TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
@@ -6242,12 +6378,15 @@ impl MyOptimizationPass {
                 | InstrKind::FnExit { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. } => 0,
+                // Tag propagation must execute after tag-creating hooks but before
+                // access/usage hooks at the same insertion site.
+                InstrKind::TagProp { .. } => 1,
                 InstrKind::PtrRead { .. }
                 | InstrKind::PtrWrite { .. }
                 | InstrKind::PtrReadAllowUntagged { .. }
-                | InstrKind::PtrWriteAllowUntagged { .. } => 1,
-                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 2,
-                _ => 3,
+                | InstrKind::PtrWriteAllowUntagged { .. } => 2,
+                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+                _ => 4,
             }
         }
 
@@ -6724,11 +6863,6 @@ impl MyOptimizationPass {
                 copy_ref_ancestor,
             } = creation_kind
             {
-                // println!(
-                //     "[instrument-mir] TAG PROPAGATION: dst_local={:?} src_local={:?}",
-                //     dst,
-                //     src
-                // );
                 let prop_stmt = if copy_tag {
                     let dst_tag = *tag_local_for_ptr_local
                         .get(&dst)
@@ -8709,6 +8843,14 @@ mod tests {
         );
         assert_eq!(
             effect_for("core::ptr::NonNull::<T>::as_ptr"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("smallvec::SmallVec::<A>::as_mut_ptr"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("smallvec::SmallVec::<A>::as_ptr"),
             CallEffect::PtrDerive
         );
         assert_eq!(

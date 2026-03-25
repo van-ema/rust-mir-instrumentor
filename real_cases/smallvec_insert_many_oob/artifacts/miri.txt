@@ -1,0 +1,32 @@
+   Compiling smallvec v1.6.0
+   Compiling smallvec_insert_many_oob v0.1.0 (/Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/smallvec_insert_many_oob)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running `/Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/bin/cargo-miri runner target/miri/aarch64-apple-darwin/debug/smallvec_insert_many_oob`
+Hello!
+error: Undefined Behavior: memory access failed: attempting to access 1 byte, but got alloc430+0x1 which is at or beyond the end of the allocation of size 1 byte
+    --> /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.6.0/src/lib.rs:1048:21
+     |
+1048 |                     ptr::copy(cur, cur.add(1), old_len - index);
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+     |
+     = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
+     = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
+help: alloc430 was allocated here:
+    --> src/main.rs:6:5
+     |
+   6 |     v.push(123);
+     |     ^^^^^^^^^^^
+     = note: BACKTRACE (of the first span):
+     = note: inside `smallvec::SmallVec::<[u8; 0]>::insert_many::<std::iter::Filter<std::ops::RangeInclusive<u8>, {closure@src/main.rs:10:35: 10:38}>>` at /Users/emanuelevannacci/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smallvec-1.6.0/src/lib.rs:1048:21: 1048:64
+note: inside `main`
+    --> src/main.rs:13:5
+     |
+  13 |     v.insert_many(0, iter);
+     |     ^^^^^^^^^^^^^^^^^^^^^^
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
+
+EXIT:1
