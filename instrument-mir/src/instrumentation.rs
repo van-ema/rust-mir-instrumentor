@@ -2701,6 +2701,49 @@ impl MyOptimizationPass {
         ty.visit_with(&mut v).is_break()
     }
 
+    fn mir_const_needs_normalization<'tcx>(
+        &self,
+        c: rustc_middle::mir::Const<'tcx>,
+    ) -> bool {
+        struct NeedsNormalizationVisitor;
+
+        impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for NeedsNormalizationVisitor {
+            type Result = ControlFlow<()>;
+
+            fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+                match ty.kind() {
+                    TyKind::Alias(..)
+                    | TyKind::Param(..)
+                    | TyKind::Bound(..)
+                    | TyKind::Placeholder(..)
+                    | TyKind::Infer(..)
+                    | TyKind::Error(..) => ControlFlow::Break(()),
+                    _ => ty.super_visit_with(self),
+                }
+            }
+
+            fn visit_const(&mut self, c: rustc_middle::ty::Const<'tcx>) -> Self::Result {
+                match c.kind() {
+                    TyConstKind::Param(..)
+                    | TyConstKind::Infer(..)
+                    | TyConstKind::Bound(..)
+                    | TyConstKind::Placeholder(..)
+                    | TyConstKind::Unevaluated(..)
+                    | TyConstKind::Expr(..)
+                    | TyConstKind::Error(..) => ControlFlow::Break(()),
+                    _ => c.super_visit_with(self),
+                }
+            }
+        }
+
+        if matches!(c, rustc_middle::mir::Const::Unevaluated(..)) {
+            return true;
+        }
+
+        let mut v = NeedsNormalizationVisitor;
+        c.visit_with(&mut v).is_break()
+    }
+
     // Resolve const/promoted pointers to their global allocation metadata (size + offset).
     fn const_alloc_info<'tcx>(
         &self,
@@ -2715,13 +2758,20 @@ impl MyOptimizationPass {
             || const_ty.has_placeholders()
             || const_ty.has_bound_vars()
             || self.type_needs_normalization(const_ty)
+            || self.mir_const_needs_normalization(c.const_)
         {
             return None;
         }
 
-        let scalar = c
-            .const_
-            .try_eval_scalar(tcx, TypingEnv::fully_monomorphized())?;
+        // Some dependency graphs (for example `mail-internals` via `object`) still trigger
+        // rustc normalization ICEs while evaluating pointer-valued MIR constants with
+        // projection-heavy associated types. Unknown const allocation info is acceptable for our
+        // instrumentation, so treat those consts conservatively instead of crashing the compiler.
+        let scalar = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.const_.try_eval_scalar(tcx, TypingEnv::fully_monomorphized())
+        }))
+        .ok()
+        .flatten()?;
         let ptr = scalar.to_pointer(&tcx).discard_err()?;
         let (prov_opt, offset) = ptr.into_raw_parts();
         let prov = prov_opt?;
@@ -2774,13 +2824,18 @@ impl MyOptimizationPass {
             || const_ty.has_placeholders()
             || const_ty.has_bound_vars()
             || self.type_needs_normalization(const_ty)
+            || self.mir_const_needs_normalization(c.const_)
         {
             return None;
         }
 
-        if let Some(scalar) =
+        let scalar = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             c.const_.try_eval_scalar(tcx, TypingEnv::fully_monomorphized())
-        {
+        }))
+        .ok()
+        .flatten();
+
+        if let Some(scalar) = scalar {
             if let Some(ptr) = scalar.to_pointer(&tcx).discard_err() {
                 let (prov_opt, _offset) = ptr.into_raw_parts();
                 if let Some(prov) = prov_opt {
