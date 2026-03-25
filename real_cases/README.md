@@ -12,6 +12,7 @@ Current cases:
 - `bumpalo_into_iter_uaf`
 - `smallvec_insert_many_oob`
 - `slab_get2_unchecked_mut_alias`
+- `mail_internals_vec_insert_bytes_uaf`
 
 Each case directory contains:
 

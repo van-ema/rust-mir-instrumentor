@@ -1,0 +1,30 @@
+[package]
+authors = ["Philipp Korber <p.korber@1aim.com>"]
+name = "mail-internals"
+description = "[mail-api] _internal_ parts for the mail-api crates"
+documentation = "https://docs.rs/mail-internals"
+keywords = ["mail-api"]
+categories = []
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/1aim/mail"
+version = "0.2.0"
+readme = "./README.md"
+
+[dependencies]
+failure = "0.1.1"
+nom = "3.1.0"
+chrono = "0.4.0"
+base64 = "0.6.0"
+quoted_printable = "0.4.0"
+idna = "0.1.4"
+percent-encoding = "1.0.0"
+quoted-string = "0.6"
+media-type-impl-utils = "0.3.0-unstable"
+soft-ascii-string = "1.0"
+vec1 = "1.0"
+media-type = { version="0.4.0-unstable", features=["expose-param-utils"] }
+
+
+[features]
+default = []
+traceing = []

@@ -1,0 +1,8 @@
+
+================ RUSTEZE VIOLATION ================
+TREE_BORROWS_VIOLATION
+WRITE via tag=14 addr=0x102e018f2 size=4 kind=RawMut
+reason=TB_LITE_FROZEN_WRITE
+===================================================
+
+EXIT:134

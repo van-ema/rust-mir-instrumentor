@@ -1,0 +1,9 @@
+[package]
+name = "mail_internals_vec_insert_bytes_uaf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mail-internals = { path = "vendor/mail-internals" }
+
+[workspace]
