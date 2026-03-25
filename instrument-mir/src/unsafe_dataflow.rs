@@ -1,3 +1,29 @@
+//! Interprocedural unsafe-dataflow analysis used by Rusteze pruning.
+//!
+//! This is the summary-based analysis behind the "3-phase interprocedural
+//! analysis" mode:
+//! 1. analyze functions and dump local summaries
+//! 2. merge summaries across crates / call edges
+//! 3. rebuild while consuming merged summaries
+//!
+//! User-facing activation:
+//! - `RZ_INTERPROC_UNSAFE_SUMMARIES=1`
+//!
+//! This pass is distinct from `instrumentation/metadata_dataflow.rs`:
+//! - `unsafe_dataflow.rs` answers "which pointer locals are semantically
+//!   relevant enough that we must keep certain dynamic checks?"
+//! - `metadata_dataflow.rs` answers "which metadata-copy hooks are redundant
+//!   once we have already decided to instrument this function?"
+//!
+//! The current supported pruning boundary is intentionally narrow and sound by
+//! default:
+//! - prune only raw-pointer access hooks proved irrelevant by the analysis
+//! - do not prune provenance/lineage-creating hooks by default
+//!
+//! This file therefore models pointer relevance, call effects, summaries, and
+//! unknown-boundary conservatism. Missing precision is acceptable; unsound
+//! pruning is not.
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;

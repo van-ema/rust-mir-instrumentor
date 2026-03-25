@@ -1,3 +1,31 @@
+//! Metadata-dataflow optimization for pointer tag plumbing.
+//!
+//! This pass runs after instrumentation points have been collected and before
+//! they are lowered into MIR statements/calls. Its job is narrow:
+//! - track abstract tag/ref-ancestor metadata for pointer locals
+//! - compute whether a scheduled `TagProp` is redundant
+//! - drop redundant copies of tag and ref-ancestor metadata
+//!
+//! In other words, this is not safety analysis for the target program. It is an
+//! optimization pass for Rusteze's own metadata propagation.
+//!
+//! The pass models only enough state to answer questions like:
+//! - does `dst` already hold the same tag state as `src`?
+//! - is `dst`'s tag or ref-ancestor ever read later by another hook?
+//!
+//! If the answer is "no", the corresponding `TagProp` field can be removed.
+//! Missing optimization is acceptable; incorrect removal is not.
+//!
+//! Important caveat:
+//! the ordering of same-site insert points matters. If metadata propagation is
+//! analyzed as occurring after a consuming `PtrWrite`/`PtrRead`/`PtrUse`, the
+//! pass can incorrectly conclude that the propagation is dead and delete it.
+//! That turns concrete violations into `UNKNOWN_TAG` reports. When debugging
+//! provenance loss, compare behavior with `RZ_METADATA_DATAFLOW=0`.
+//!
+//! Because that optimization is not yet proven sound in all cases, it is gated
+//! behind an explicit opt-in flag today.
+
 use std::collections::{HashMap, HashSet};
 
 use rustc_middle::mir::{BasicBlock, Body, Local, START_BLOCK};
@@ -161,7 +189,7 @@ pub(super) fn apply_metadata_dataflow<'tcx>(
 fn metadata_dataflow_enabled() -> bool {
     std::env::var("RZ_METADATA_DATAFLOW")
         .ok()
-        .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
 fn metadata_dataflow_stats_enabled() -> bool {
@@ -282,15 +310,12 @@ impl MetadataAnalysis {
             };
         }
         let state = self.point_states.get(&idx);
-        let live_after = self.live_after.get(&idx);
         let tag_redundant = state
             .and_then(|s| Some(s.get(&dst)?.tag == s.get(&src)?.tag))
-            .unwrap_or(false)
-            || live_after.map_or(false, |live| !live.tag_live.contains(&dst));
+            .unwrap_or(false);
         let ref_redundant = state
             .and_then(|s| Some(s.get(&dst)?.ref_ancestor == s.get(&src)?.ref_ancestor))
-            .unwrap_or(false)
-            || live_after.map_or(false, |live| !live.ref_live.contains(&dst));
+            .unwrap_or(false);
         TagPropDecision {
             keep_tag: !tag_redundant,
             keep_ref_ancestor: !ref_redundant,
@@ -599,11 +624,15 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         | InstrKind::FnExit { .. }
         | InstrKind::RetRoot { .. }
         | InstrKind::PtrDerive { .. } => 0,
+        // Metadata propagation must be ordered after tag-creating hooks but before
+        // access/usage hooks at the same program point. Otherwise liveness can
+        // incorrectly conclude that the copied tag is dead and delete the TagProp.
+        InstrKind::TagProp { .. } => 1,
         InstrKind::PtrRead { .. }
         | InstrKind::PtrWrite { .. }
         | InstrKind::PtrReadAllowUntagged { .. }
-        | InstrKind::PtrWriteAllowUntagged { .. } => 1,
-        InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 2,
-        _ => 3,
+        | InstrKind::PtrWriteAllowUntagged { .. } => 2,
+        InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+        _ => 4,
     }
 }

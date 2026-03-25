@@ -10,6 +10,7 @@ Current cases:
 
 - `slice_ring_buffer_double_free`
 - `bumpalo_into_iter_uaf`
+- `smallvec_insert_many_oob`
 
 Each case directory contains:
 

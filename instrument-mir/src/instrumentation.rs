@@ -6372,12 +6372,15 @@ impl MyOptimizationPass {
                 | InstrKind::FnExit { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. } => 0,
+                // Tag propagation must execute after tag-creating hooks but before
+                // access/usage hooks at the same insertion site.
+                InstrKind::TagProp { .. } => 1,
                 InstrKind::PtrRead { .. }
                 | InstrKind::PtrWrite { .. }
                 | InstrKind::PtrReadAllowUntagged { .. }
-                | InstrKind::PtrWriteAllowUntagged { .. } => 1,
-                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 2,
-                _ => 3,
+                | InstrKind::PtrWriteAllowUntagged { .. } => 2,
+                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+                _ => 4,
             }
         }
 
