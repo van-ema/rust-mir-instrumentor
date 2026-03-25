@@ -612,7 +612,7 @@ fn tb_lite_check(
                     access_tag,
                     addr,
                     size,
-                ) {
+                ) || tb_only_unique_ancestor_overlap(&tree.nodes, access_tag, addr, size) {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -880,4 +880,20 @@ fn tb_has_usable_clean_unique_ancestor(
         cur = node.parent;
     }
     false
+}
+
+fn tb_only_unique_ancestor_overlap(
+    nodes: &HashMap<u64, TbNode>,
+    access_tag: u64,
+    addr: usize,
+    size: usize,
+) -> bool {
+    nodes.values().all(|other| {
+        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+            return true;
+        }
+        tb_is_ancestor(nodes, other.tag, access_tag)
+            && matches!(other.kind, BorrowKind::Unique)
+            && !matches!(other.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
+    })
 }
