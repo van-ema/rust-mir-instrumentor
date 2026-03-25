@@ -9,11 +9,11 @@
 //! In other words, this is not safety analysis for the target program. It is an
 //! optimization pass for Rusteze's own metadata propagation.
 //!
-//! The pass models only enough state to answer questions like:
-//! - does `dst` already hold the same tag state as `src`?
-//! - is `dst`'s tag or ref-ancestor ever read later by another hook?
+//! The pass currently keeps only the sound subset of this optimization: remove
+//! dead ref-ancestor copies and redundant self-copies. Tag-copy elimination was
+//! experimented with earlier, but it is still too weak on some helper-heavy MIR
+//! shapes and can delete required provenance propagation.
 //!
-//! If the answer is "no", the corresponding `TagProp` field can be removed.
 //! Missing optimization is acceptable; incorrect removal is not.
 //!
 //! Important caveat:
@@ -309,16 +309,12 @@ impl MetadataAnalysis {
                 keep_ref_ancestor: false,
             };
         }
-        let state = self.point_states.get(&idx);
-        let tag_redundant = state
-            .and_then(|s| Some(s.get(&dst)?.tag == s.get(&src)?.tag))
-            .unwrap_or(false);
-        let ref_redundant = state
-            .and_then(|s| Some(s.get(&dst)?.ref_ancestor == s.get(&src)?.ref_ancestor))
-            .unwrap_or(false);
         TagPropDecision {
-            keep_tag: !tag_redundant,
-            keep_ref_ancestor: !ref_redundant,
+            keep_tag: true,
+            keep_ref_ancestor: self
+                .live_after
+                .get(&idx)
+                .map_or(true, |live| live.ref_live.contains(&dst)),
         }
     }
 }
@@ -338,8 +334,8 @@ fn ordered_insert_points<'tcx>(
         (
             ip.bb.index(),
             ip.stmt_idx,
-            if ip.insert_before { 0_u8 } else { 1_u8 },
             instr_priority(&ip.kind),
+            if ip.insert_before { 0_u8 } else { 1_u8 },
             *idx,
         )
     });
