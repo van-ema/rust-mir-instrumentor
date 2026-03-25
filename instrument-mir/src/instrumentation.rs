@@ -387,6 +387,12 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     // normal shared-reference write target.
     EffectRule::two(MatchKind::Contains, "rkyv::place::Place", MatchKind::EndsWith, "::write", CallEffect::Ignore),
     EffectRule::two(MatchKind::Contains, "rkyv::place::Place", MatchKind::EndsWith, "::write_unchecked", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "rkyv::place::<impl Place", MatchKind::EndsWith, "::write", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "rkyv::place::<impl Place", MatchKind::EndsWith, "::write_unchecked", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "place::Place", MatchKind::EndsWith, "::write", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "place::Place", MatchKind::EndsWith, "::write_unchecked", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "place::<impl Place", MatchKind::EndsWith, "::write", CallEffect::Ignore),
+    EffectRule::two(MatchKind::Contains, "place::<impl Place", MatchKind::EndsWith, "::write_unchecked", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::read_unaligned", CallEffect::Load),
     EffectRule::one(MatchKind::EndsWith, "::read", CallEffect::Load),
     EffectRule::one(MatchKind::Contains, "::ptr::write_unaligned", CallEffect::Store),
@@ -8753,6 +8759,30 @@ mod tests {
         );
         assert_eq!(
             effect_for("rkyv::place::Place::<u32>::write_unchecked"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("rkyv::place::<impl Place<u32>>::write"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("rkyv::place::<impl Place<u32>>::write_unchecked"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("place::Place::<u32>::write"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("place::Place::<u32>::write_unchecked"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("place::<impl Place<u32>>::write"),
+            CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("place::<impl Place<u32>>::write_unchecked"),
             CallEffect::Ignore
         );
     }
