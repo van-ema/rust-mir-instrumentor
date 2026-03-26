@@ -660,12 +660,22 @@ fn tb_lite_check(
                 .iter()
                 .any(|(t, next)| *t == protected.tag && *next == TbPerm::Disabled);
             if touched_protected {
-                let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
-                    access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                let tmap = tags().lock().unwrap();
+                if !tb_same_lineage_protected_conflict_ok(
+                    &tree.nodes,
+                    &tmap,
+                    protected.tag,
+                    access_tag,
+                    addr,
+                    size,
+                ) {
+                    let mut msg = format!(
+                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+                        access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
             }
         }
     }
@@ -839,6 +849,33 @@ fn tb_is_ancestor(nodes: &HashMap<u64, TbNode>, ancestor: u64, mut tag: u64) -> 
     false
 }
 
+fn tb_is_effective_ancestor(
+    nodes: &HashMap<u64, TbNode>,
+    tmap: &HashMap<u64, TagMeta>,
+    ancestor: u64,
+    mut tag: u64,
+) -> bool {
+    if tb_is_ancestor(nodes, ancestor, tag) {
+        return true;
+    }
+    if ancestor == tag {
+        return true;
+    }
+    for _ in 0..tmap.len().saturating_add(1) {
+        let Some(t) = tmap.get(&tag) else {
+            return false;
+        };
+        if t.parent == 0 {
+            return false;
+        }
+        if t.parent == ancestor {
+            return true;
+        }
+        tag = t.parent;
+    }
+    false
+}
+
 fn tb_has_usable_clean_unique_ancestor(
     nodes: &HashMap<u64, TbNode>,
     conflicted_tag: u64,
@@ -895,5 +932,25 @@ fn tb_only_unique_ancestor_overlap(
         tb_is_ancestor(nodes, other.tag, access_tag)
             && matches!(other.kind, BorrowKind::Unique)
             && !matches!(other.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
+    })
+}
+
+fn tb_same_lineage_protected_conflict_ok(
+    nodes: &HashMap<u64, TbNode>,
+    tmap: &HashMap<u64, TagMeta>,
+    protected_tag: u64,
+    access_tag: u64,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !tb_is_effective_ancestor(nodes, tmap, protected_tag, access_tag) {
+        return false;
+    }
+    nodes.values().all(|other| {
+        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+            return true;
+        }
+        tb_is_effective_ancestor(nodes, tmap, other.tag, access_tag)
+            || tb_is_effective_ancestor(nodes, tmap, access_tag, other.tag)
     })
 }
