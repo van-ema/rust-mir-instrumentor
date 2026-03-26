@@ -232,18 +232,30 @@ fn env_flag_enabled(name: &str) -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+fn warn_legacy_local_unsafe_dataflow_if_requested() {
+    static WARN_ONCE: OnceLock<()> = OnceLock::new();
+    if env_flag_enabled("RZ_UNSAFE_DATAFLOW") {
+        let _ = WARN_ONCE.get_or_init(|| {
+            eprintln!(
+                "[rusteze] warning: RZ_UNSAFE_DATAFLOW is no longer a supported activation path and is ignored; use RZ_INTERPROC_UNSAFE_SUMMARIES=1 or the analyze/use summary flags instead"
+            );
+        });
+    }
+}
+
 pub(crate) fn analyze_unsafe_summaries_enabled() -> bool {
     env_flag_enabled("RZ_ANALYZE_UNSAFE_SUMMARIES")
 }
 
 pub(crate) fn unsafe_dataflow_enabled() -> bool {
+    warn_legacy_local_unsafe_dataflow_if_requested();
+
     // Supported activation paths:
     //  - analyze-only summary generation
     //  - normal builds consuming merged summaries
     //
-    // Plain `RZ_UNSAFE_DATAFLOW=1` without summaries is intentionally no longer a
-    // pruning mode because the local-only path is not sound enough for the full
-    // example suite.
+    // Plain `RZ_UNSAFE_DATAFLOW=1` without summaries is intentionally ignored
+    // because the local-only path is not sound enough for the full example suite.
     analyze_unsafe_summaries_enabled() || use_loaded_unsafe_summaries_enabled()
 }
 

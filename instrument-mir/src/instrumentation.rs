@@ -1154,7 +1154,7 @@ impl MyOptimizationPass {
     /// - analyze-only summary generation (`RZ_ANALYZE_UNSAFE_SUMMARIES=1`)
     /// - final builds consuming merged summaries (`RZ_USE_UNSAFE_SUMMARIES=1`)
     ///
-    /// Plain local-only `RZ_UNSAFE_DATAFLOW=1` pruning is intentionally not supported as a
+    /// Plain local-only `RZ_UNSAFE_DATAFLOW=1` pruning is intentionally ignored as a
     /// user-facing mode because it is not sound enough for the full example suite.
     fn unsafe_dataflow_selective_enabled(&self) -> bool {
         unsafe_dataflow::unsafe_dataflow_enabled()
