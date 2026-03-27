@@ -1,13 +1,7 @@
 # Roadmap (Remaining Work Only)
 
-## Current focus
-- Phase 4 (Tree Borrows precision): in progress.
-- Phase 5 (ecosystem coverage): in progress.
-- Phase 6 (fuzzing + evaluation): in progress.
-- Phase 7 (wide/fat pointers): in progress.
-- Phase 8 (runtime performance): in progress.
 
-## Phase 4 - Tree Borrows precision (remaining work)
+## Tree Borrows precision (remaining work)
 Goal:
 - Improve `tb_lite` precision while preserving true-positive detection and fuzzing stability.
 
@@ -27,36 +21,7 @@ Validation gates:
 2. Short AFL smoke runs must start and mutate without immediate tool aborts.
 3. No regressions on known must-catch UB examples.
 
-## Phase 5 - Bigger crates and ecosystem coverage
-Goal:
-- Expand to maintained, popular crates with significant `unsafe` usage.
-
-Open tasks:
-1. Expand target matrix.
-- Keep and maintain current targets: `bytes`, `smallvec`, `serde_json`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`, `simd_json`, `zip`, `rkyv`, `hyper`.
-- Add additional high-value targets incrementally with pinned versions.
-2. Stabilize build/fuzz onboarding per target.
-- Ensure each target has build + repro + fuzz commands documented and reproducible.
-3. Keep false positives low.
-- Triage every new crash as real bug vs modeling issue before broad suppressions.
-
-## Phase 6 - Fuzzing and evaluation
-Goal:
-- Produce defensible results (engineering and research quality).
-
-Open tasks:
-1. Crash triage loop.
-- Reproduce with `scripts/afl_repro.sh`.
-- Minimize with `afl-tmin`.
-- Classify and convert stable findings into regressions or documented repros.
-2. Metrics and reporting.
-- Collect overhead (`baseline` vs `rusteze` vs `ASan`, optional `Miri`) using `scripts/bench_overhead.py`.
-- Track unique signature counts and violations/hour per target.
-3. Reproducibility.
-- Keep Docker/native workflows aligned.
-- Keep reports versioned under `reports/` with target, profile, and model metadata.
-
-## Phase 7 - Wide/Fat pointer support
+## Wide/Fat pointer support
 Goal:
 - Reduce blind spots on slices/str/dyn-trait pointer flows.
 
@@ -72,18 +37,75 @@ Exit criteria:
 1. No routine UNKNOWN_TAG/WILD_POINTER noise on normal slice/str operations in core targets.
 2. Wide-pointer regression examples remain stable across refactors.
 
-## Phase 8 - Runtime performance
+## Stdlib instrumentation and fuzzing
 Goal:
-- Reduce runtime overhead on parser-heavy ecosystem crates while preserving dynamic-checking behavior.
+- Move from stdlib-boundary checking to selective direct instrumentation of `core` / `alloc` / `std`,
+  then use that capability to fuzz stdlib-heavy code paths with Rusteze.
 
-Open tasks:
-1. Tune remaining high-overhead targets.
-- Focus on `toml`, `zip`, and other parser-heavy outliers.
-- Use profiling split to separate alias-model vs alloc-check costs.
-2. Improve interprocedural unsafe-sensitive pruning.
-- Keep the current two-phase summary pipeline (`analyze-only` -> merge -> instrumented build) sound and conservative.
-- Tighten backward call-boundary transfer so merged summaries remove more irrelevant creation/access hooks across dependencies.
-- Measure whole-build totals across dependencies, not only final harness crates.
-3. Validate and regressions.
-- Benchmark with and without alias model (`tb_lite` and `none`) using `scripts/bench_overhead.py`.
-- Ensure functional tests/fuzz smoke still pass after each optimization step.
+Why this matters:
+- Current `main` detects many stdlib-mediated bugs at the application boundary through wrapper
+  classification and allocator interception, but it still misses bugs that only become visible
+  inside stdlib bodies.
+- The rebased `feature/runtime-no-std` branch shows a viable architecture for this:
+  - `runtime_abi/` for a tiny `no_std` hook surface
+  - build-std aware driver plumbing
+  - configurable stdlib instrumentation modes
+
+Implementation order:
+1. Port architecture, not the whole branch.
+- Reuse ideas from `feature/runtime-no-std`, but do not merge it wholesale.
+- First candidates to port:
+  - `runtime_abi/`
+  - minimal `RZ_INSTRUMENT_STDLIB` mode plumbing
+  - build-std aware driver support
+  - bootstrap/support-crate skipping
+2. Add explicit stdlib modes.
+- Introduce:
+  - `RZ_INSTRUMENT_STDLIB=none|core|core_alloc|all`
+- Keep `none` as the default until the other modes are proven stable.
+3. Start with `core`.
+- First milestone:
+  - `-Z build-std=core`
+  - examples still green
+  - no compiler/runtime crashes
+4. Then extend to `core_alloc`.
+- This is the first practically useful mode for:
+  - `Vec`
+  - `String`
+  - slice/alloc-backed operations
+5. Only then enable `all`.
+- `all` should still skip clearly problematic support crates at first, such as:
+  - `compiler_builtins`
+  - `panic_*`
+  - `unwind`
+  - `rustc_std_workspace_*`
+  - `std_detect`
+
+Harness plan:
+1. Add a few small stdlib-focused harnesses first.
+- Examples:
+  - `vec_ops`
+  - `string_ops`
+  - `slice_ops`
+- These should decode bytes into operation sequences and stress stdlib internals through public APIs.
+2. After stdlib modes are stable, run a small set of real harnesses under stdlib instrumentation.
+- Initial candidates:
+  - `bytes`
+  - `smallvec`
+- Only expand further if the stdlib mode is stable enough to justify the extra build/debug cost.
+
+Validation gates:
+1. `python3 scripts/run_example_tests.py` must remain green in default mode.
+2. `RZ_INTERPROC_UNSAFE_SUMMARIES=1 CARGO_INCREMENTAL=0 python3 scripts/run_example_tests.py`
+   must remain green.
+3. Add stdlib-specific gates incrementally:
+  - `core`
+  - `core_alloc`
+  - `all`
+4. Add at least one stdlib fuzz-smoke gate before treating stdlib instrumentation as usable.
+
+Exit criteria:
+1. `RZ_INSTRUMENT_STDLIB=core` is reproducible and green.
+2. `RZ_INSTRUMENT_STDLIB=core_alloc` is reproducible and green.
+3. At least one stdlib-focused harness runs under fuzzing without immediate tool breakage.
+4. At least one real target (`bytes` or `smallvec`) runs successfully under stdlib instrumentation.
