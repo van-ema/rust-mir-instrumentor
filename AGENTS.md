@@ -63,6 +63,9 @@ The project has two main components:
 6. **Testing and commit gate**
 - Before every commit, run the relevant test coverage for the touched code.
 - Do not commit while any targeted test is failing.
+- Exception: commits that touch only the paper submodule `dynBorrowProposal/` do not require the
+  parent-repo example-suite gate. For those paper-only commits, rebuild the paper and verify
+  `dynBorrowProposal/main.pdf` updates successfully instead.
 - Before every commit, run the full example test suite, not only examples related to the touched
   code.
 - Before every commit, run the full example test suite in both supported modes:
