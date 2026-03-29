@@ -14,6 +14,7 @@ TIMEOUT_MS="${TIMEOUT_MS:-}"
 IN_DIR="${IN_DIR:-fuzz/corpus/${TARGET}}"
 OUT_DIR="${OUT_DIR:-fuzz/out-asan/${TARGET}}"
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-asan-${PROFILE}-${TARGET}}"
+BUILD_TARGET="${BUILD_TARGET:-}"
 ASAN_RUSTFLAGS="${ASAN_RUSTFLAGS:--Zsanitizer=address}"
 ASAN_OPTIONS_DEFAULT="detect_leaks=0:abort_on_error=1:symbolize=0"
 
@@ -43,10 +44,21 @@ canonical_path() {
   python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$p"
 }
 
+detect_build_target() {
+  rustc +nightly -vV 2>/dev/null | sed -n 's/^host: //p' | head -n1
+}
+
 HARNESS_TARGET_DIR="$(canonical_path "$HARNESS_TARGET_DIR")"
 IN_DIR="$(canonical_path "$IN_DIR")"
 OUT_DIR="$(canonical_path "$OUT_DIR")"
-BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
+if [[ -z "$BUILD_TARGET" ]]; then
+  BUILD_TARGET="$(detect_build_target)"
+fi
+if [[ -z "$BUILD_TARGET" ]]; then
+  echo "error: failed to detect cargo/rustc host target; set BUILD_TARGET explicitly." >&2
+  exit 2
+fi
+BIN_PATH="${HARNESS_TARGET_DIR}/${BUILD_TARGET}/${PROFILE}/${BIN}"
 
 mkdir -p "$IN_DIR" "$OUT_DIR"
 
@@ -78,7 +90,6 @@ build_asan_target() {
   unset RZ_INTERPROC_UNSAFE_SUMMARIES
   unset RZ_ALIAS_MODEL
   unset RZ_SB_LITE
-
   local afl_cov_flags=(
     "-Cpasses=sancov-module"
     "-Cllvm-args=-sanitizer-coverage-level=3"
@@ -87,13 +98,16 @@ build_asan_target() {
     "-Clink-arg=${AFL_COMPILER_RT}"
   )
   local cov_flags="${afl_cov_flags[*]}"
-  if [[ -n "${RUSTFLAGS:-}" ]]; then
-    export RUSTFLAGS="${RUSTFLAGS} ${ASAN_RUSTFLAGS} ${cov_flags}"
+  local target_var="CARGO_TARGET_${BUILD_TARGET^^}_RUSTFLAGS"
+  target_var="${target_var//-/_}"
+  if [[ -n "${!target_var:-}" ]]; then
+    export "${target_var}=${!target_var} ${ASAN_RUSTFLAGS} ${cov_flags}"
   else
-    export RUSTFLAGS="${ASAN_RUSTFLAGS} ${cov_flags}"
+    export "${target_var}=${ASAN_RUSTFLAGS} ${cov_flags}"
   fi
 
   local cmd=(cargo +nightly build -p afl_harness --features "$FEATURE" --bin "$BIN")
+  cmd+=(--target "$BUILD_TARGET")
   if [[ "$PROFILE" == "release" ]]; then
     cmd+=(--release)
   fi
