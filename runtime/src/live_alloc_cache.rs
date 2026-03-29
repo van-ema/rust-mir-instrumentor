@@ -28,6 +28,7 @@ const EMPTY_ALLOC_META: AllocMeta = AllocMeta {
     epoch: 0,
     size: 0,
     is_stack: false,
+    is_const: false,
 };
 
 const EMPTY_LIVE_ALLOC_CACHE_ENTRY: LiveAllocCacheEntry = LiveAllocCacheEntry {

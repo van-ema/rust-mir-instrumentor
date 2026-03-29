@@ -3002,6 +3002,54 @@ impl MyOptimizationPass {
         None
     }
 
+    /// For a pointer local `dst_local`, recover lineage from a same-block defining assignment
+    /// whose RHS is a projected pointer place such as:
+    ///   `_v = copy (((_agg as Some).0).1)`
+    ///
+    /// This is the shape seen in iterator-returned aggregates like `Option<(&K, &V)>`, where
+    /// the extracted pointer local would otherwise remain untagged and later be rooted at a call
+    /// boundary.
+    fn recover_projected_pointer_rhs_source_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        dst_local: Local,
+    ) -> Option<Local> {
+        let block_stmts = &body.basic_blocks[bb].statements;
+        let upto = stmt_idx.min(block_stmts.len());
+        for stmt in block_stmts[..upto].iter().rev() {
+            let StatementKind::Assign(box (dst, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if dst.as_local() != Some(dst_local) {
+                continue;
+            }
+            let src_place = match rvalue {
+                Rvalue::Use(op) => self.place_from_operand(op),
+                Rvalue::CopyForDeref(p) => Some(*p),
+                Rvalue::Cast(
+                    CastKind::PtrToPtr
+                    | CastKind::PointerCoercion(_, _)
+                    | CastKind::Transmute
+                    | CastKind::PointerWithExposedProvenance,
+                    op,
+                    _,
+                ) => self.place_from_operand(op),
+                _ => None,
+            }?;
+            let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+            if !self.is_pointer_ty(src_ty) || src_place.projection.is_empty() {
+                return None;
+            }
+            return self.recover_pointer_source_local_for_projected_place(
+                tcx, body, bb, upto, src_place, false,
+            );
+        }
+        None
+    }
+
     /// Backtrack a deref'ed pointer local to the base local it was borrowed from, if any.
     ///
     /// Goal: recover the *stack* local that actually owns storage when MIR takes an address
@@ -3355,6 +3403,13 @@ impl MyOptimizationPass {
                     bb,
                     src_place.local,
                 );
+            if src_local_opt.is_none() {
+                src_local_opt = self.backtrack_global_pointer_arg_call_result_source_local(
+                    tcx,
+                    body,
+                    src_place.local,
+                );
+            }
         }
 
         if src_local_opt.is_none()
@@ -4073,16 +4128,31 @@ impl MyOptimizationPass {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 // The destination local is initialized by this assignment.
                                 // Synthesize a root tag *after* the assignment so later uses
-                                // (including call operands) do not see UNKNOWN_TAG.
+                                // (including call operands) do not see UNKNOWN_TAG. Preserve
+                                // reference semantics for projected `&T` / `&mut T` copies;
+                                // rooting them as raw pointers loses ref-kind behavior and can
+                                // desynchronize later access metadata from the actual pointee.
                                 if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                     let is_mut = self.ptr_is_mut(dst_ty);
+                                    let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
                                     insert_points.push(InsertPoint {
                                         bb,
                                         stmt_idx: stmt_idx + 1,
                                         insert_before: false,
                                         source_info: stmt.source_info,
                                         place: Place::from(dst_local),
-                                        kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                                        kind: if is_ref {
+                                            InstrKind::RetRoot {
+                                                dst_local,
+                                                is_mut,
+                                                is_ref: true,
+                                            }
+                                        } else {
+                                            InstrKind::RawRoot {
+                                                ptr_local: dst_local,
+                                                is_mut,
+                                            }
+                                        },
                                     });
                                     tagged_ptr_locals.insert(dst_local);
                                 }
@@ -4716,6 +4786,67 @@ impl MyOptimizationPass {
                     args,
                     arg_index,
                 ) {
+                    ptr_sources.insert(src_local);
+                    if ptr_sources.len() > 1 {
+                        return None;
+                    }
+                }
+            }
+
+            let Some(src_local) = ptr_sources.into_iter().next() else {
+                return None;
+            };
+
+            match recovered {
+                Some(existing) if existing != src_local => return None,
+                Some(_) => {}
+                None => recovered = Some(src_local),
+            }
+        }
+
+        if matched_call { recovered } else { None }
+    }
+
+    /// Conservative global recovery for aggregate locals produced by a call result where the
+    /// callee has exactly one recoverable pointer source argument across all definitions.
+    ///
+    /// This is the fallback needed for patterns like:
+    /// - predecessor block: `_agg = iter.next()`
+    /// - successor block: `_val = copy (((_agg as Some).0).1)`
+    ///
+    /// The extraction block is not necessarily the direct call target, so
+    /// `backtrack_single_pointer_arg_call_result_source_local` can miss it.
+    fn backtrack_global_pointer_arg_call_result_source_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        agg_local: Local,
+    ) -> Option<Local> {
+        let mut recovered: Option<Local> = None;
+        let mut matched_call = false;
+
+        for block_data in body.basic_blocks.iter() {
+            let Some(term) = &block_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                args,
+                destination,
+                ..
+            } = &term.kind
+            else {
+                continue;
+            };
+            if destination.local != agg_local {
+                continue;
+            }
+            matched_call = true;
+
+            let mut ptr_sources = HashSet::new();
+            for arg_index in 0..args.len() {
+                if let Some(src_local) =
+                    self.call_arg_pointer_source_local(tcx, body, block_data, args, arg_index)
+                {
                     ptr_sources.insert(src_local);
                     if ptr_sources.len() > 1 {
                         return None;
@@ -5701,7 +5832,20 @@ impl MyOptimizationPass {
                 tagged_ptr_locals.insert(p.local);
                 ptr_locals_needing_tag.insert(p.local);
                 let derive_src = self
-                    .backtrack_pointer_source_local(body, p.local, &block_data.statements)
+                    .recover_projected_pointer_rhs_source_local(
+                        tcx,
+                        body,
+                        bb,
+                        block_data.statements.len(),
+                        p.local,
+                    )
+                    .or_else(|| {
+                        self.backtrack_pointer_source_local(
+                            body,
+                            p.local,
+                            &block_data.statements,
+                        )
+                    })
                     .filter(|src_local| *src_local != p.local && tagged_ptr_locals.contains(src_local));
                 if let Some(src_local) = derive_src {
                     ptr_locals_needing_tag.insert(src_local);
@@ -7301,11 +7445,19 @@ impl MyOptimizationPass {
                     } else {
                         // Fallback for projection-heavy deref accesses where static offset
                         // recovery failed (e.g., generic field layout):
-                        // materialize `&raw const <full place>` and expose that pointer.
+                        // materialize `&raw {const,mut} <full place>` and expose that pointer.
                         // Using only `place.local` here points at the base carrier and can
                         // turn valid projected accesses into false OOB/WILD reports.
                         let place_ty = place.ty(&body.local_decls, tcx).ty;
-                        let raw_ptr_ty = Ty::new_imm_ptr(tcx, place_ty);
+                        let is_write = matches!(
+                            creation_kind,
+                            InstrKind::PtrWrite { .. } | InstrKind::PtrWriteAllowUntagged { .. }
+                        );
+                        let raw_ptr_ty = if is_write {
+                            Ty::new_mut_ptr(tcx, place_ty)
+                        } else {
+                            Ty::new_imm_ptr(tcx, place_ty)
+                        };
                         if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
                             continue;
                         }
@@ -7316,7 +7468,14 @@ impl MyOptimizationPass {
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(tmp_ptr),
-                                Rvalue::RawPtr(RawPtrKind::Const, place),
+                                Rvalue::RawPtr(
+                                    if is_write {
+                                        RawPtrKind::Mut
+                                    } else {
+                                        RawPtrKind::Const
+                                    },
+                                    place,
+                                ),
                             ))),
                         );
                         match self.addr_stmts_for_place(
@@ -7482,7 +7641,9 @@ impl MyOptimizationPass {
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
                     let arg_size = self.const_usize(tcx, source_info.span, size);
-                    let arg_live = self.const_u8(tcx, source_info.span, 1);
+                    // __rz_record_alloc live bitfield:
+                    // bit0 = live, bit1 = stack, bit2 = global/promoted const
+                    let arg_live = self.const_u8(tcx, source_info.span, 0b101);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned { node: arg_addr, span: source_info.span },
