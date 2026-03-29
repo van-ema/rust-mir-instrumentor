@@ -505,7 +505,7 @@ fn tb_lite_check(
     if !tb_is_live_node(&node) {
         if matches!(tmeta.kind, PtrKind::RefMut) {
             if let Some(descendants) =
-                tb_lite_reactivatable_descendants(tree, access_tag, addr, size, tmeta.alloc_epoch)
+                tb_lite_reactivatable_same_lineage(tree, access_tag, addr, size, tmeta.alloc_epoch)
             {
                 for tag in descendants {
                     if let Some(n) = tree.nodes.get_mut(&tag) {
@@ -802,13 +802,17 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
     None
 }
 
-fn tb_lite_reactivatable_descendants(
+fn tb_lite_reactivatable_same_lineage(
     tree: &TbAllocState,
     access_tag: u64,
     addr: usize,
     size: usize,
     alloc_epoch: u64,
 ) -> Option<Vec<u64>> {
+    let access_node = tree.nodes.get(&access_tag)?;
+    if access_node.parent == 0 || !access_node.protected {
+        return None;
+    }
     let overlapping_live: Vec<u64> = tree
         .nodes
         .values()
@@ -820,13 +824,29 @@ fn tb_lite_reactivatable_descendants(
     if overlapping_live.is_empty() {
         return Some(Vec::new());
     }
-    if overlapping_live
-        .iter()
-        .all(|tag| *tag != access_tag && tb_is_ancestor(&tree.nodes, access_tag, *tag))
-    {
-        return Some(overlapping_live);
+    let mut descendants_to_disable = Vec::new();
+    for tag in overlapping_live {
+        if tag == access_tag {
+            return None;
+        }
+        let Some(node) = tree.nodes.get(&tag) else {
+            return None;
+        };
+        if tb_is_ancestor(&tree.nodes, tag, access_tag) {
+            if !matches!(node.kind, BorrowKind::Unique)
+                || matches!(node.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
+            {
+                return None;
+            }
+            continue;
+        }
+        if tb_is_ancestor(&tree.nodes, access_tag, tag) {
+            descendants_to_disable.push(tag);
+            continue;
+        }
+        return None;
     }
-    None
+    Some(descendants_to_disable)
 }
 
 #[inline]
