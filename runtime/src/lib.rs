@@ -883,6 +883,8 @@ pub struct AllocMeta {
     pub size: usize,
     /// Whether this allocation came from stack tracking.
     pub is_stack: bool,
+    /// Whether this allocation came from a global/promoted const pointer materialization.
+    pub is_const: bool,
 }
 
 /// Kind of pointer/tag we are tracking.
@@ -915,6 +917,7 @@ pub struct TagMeta {
     pub alias_exempt: bool,
     /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
     /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source.
+    /// bit5=internal runtime normalization for const refs materialized at alloc end.
     pub lineage_hint: u8,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
@@ -1592,6 +1595,65 @@ fn snapshot_tag_origin(pointee_addr: usize, parent_tag: u64) -> (bool, usize, us
     (false, 0, 0)
 }
 
+#[inline]
+fn normalize_const_end_ref_pointee(pointee_addr: usize, parent_tag: u64, bounds_len: usize) -> usize {
+    if parent_tag != 0 || pointee_addr == 0 {
+        return pointee_addr;
+    }
+    if lookup_alloc_snapshot(pointee_addr).is_some() {
+        return pointee_addr;
+    }
+    let Some((base, meta)) = lookup_alloc_origin_snapshot(pointee_addr) else {
+        return pointee_addr;
+    };
+    if !meta.is_const || meta.size == 0 {
+        return pointee_addr;
+    }
+    let end = base.saturating_add(meta.size);
+    if end == pointee_addr {
+        // Optimized MIR can materialize root refs to promoted/string literals at the
+        // allocation end instead of the true object start. For references, an exact
+        // alloc-end address is never semantically valid, so normalize it back to the
+        // allocation base even when we were not given an explicit bounds length.
+        base
+    } else {
+        pointee_addr
+    }
+}
+
+const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
+
+#[inline]
+fn normalize_const_end_ref_access_addr(tmeta: &TagMeta, addr: usize, size: usize) -> (usize, usize) {
+    if (tmeta.lineage_hint & LINEAGE_HINT_CONST_END_REF_NORMALIZED) == 0
+        && tmeta.parent == 0
+        && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+        && tmeta.origin_known
+        && tmeta.origin_end > tmeta.origin_base
+        && tmeta.pointee_addr == tmeta.origin_end
+    {
+        if let Some((_base, meta)) = alloc_from_origin_base(tmeta) {
+            if meta.is_const {
+                let shift = tmeta.origin_end - tmeta.origin_base;
+                if addr >= tmeta.pointee_addr {
+                    return (addr.saturating_sub(shift), size);
+                }
+            }
+        }
+    }
+    if (tmeta.lineage_hint & LINEAGE_HINT_CONST_END_REF_NORMALIZED) == 0 {
+        return (addr, size);
+    }
+    if tmeta.bounds_len == 0 {
+        return (addr, size);
+    }
+    let shifted_base = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
+    if addr < shifted_base {
+        return (addr, size);
+    }
+    (addr.saturating_sub(tmeta.bounds_len), size)
+}
+
 /// Record (or update) allocation metadata. The key is the base address.
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
@@ -1608,33 +1670,39 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         let new_live = (live & 0x1) != 0;
         let is_stack = (live & 0x2) != 0;
         rz_emit_alloc(format_args!(
-            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
-            base_addr, size, new_live, is_stack
+            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={} is_const={}",
+            base_addr, size, new_live, is_stack, (live & 0x4) != 0
         ));
     } else if rz_log_enabled(LogLevel::Trace) {
         // `live` bit 0: live/dead. bit 1: stack marker.
         let new_live = (live & 0x1) != 0;
         let is_stack = (live & 0x2) != 0;
         rz_trace!(
-            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={}",
+            "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={} is_const={}",
             base_addr,
             size,
             new_live,
-            is_stack
+            is_stack,
+            (live & 0x4) != 0
         );
     }
 
     let mut m = allocs().lock().unwrap();
     let is_stack = (live & 0x2) != 0;
+    let is_const = (live & 0x4) != 0;
     let entry = m.entry(base_addr).or_insert(AllocMeta {
         live: false,
         epoch: 0,
         size,
         is_stack,
+        is_const,
     });
 
     if is_stack {
         entry.is_stack = true;
+    }
+    if is_const {
+        entry.is_const = true;
     }
 
     let new_live = (live & 0x1) != 0;
@@ -2142,6 +2210,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
         active_alias_model().find_ref_ancestor_tag(&tmap, tag)
@@ -2583,6 +2652,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
         active_alias_model().find_ref_ancestor_tag(&tmap, tag)
@@ -3024,6 +3094,9 @@ pub extern "C" fn __record_ref_creation(
     } else {
         PtrKind::RefShared
     };
+    let normalized_const_end_ref = pointee_addr != 0
+        && pointee_addr != normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
+    let pointee_addr = normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
     // `alias_exempt` is a bitfield emitted by instrumentation:
     // - bit0: alias-exempt classification
     // - bit1: basic lineage-repair hint
@@ -3238,7 +3311,12 @@ pub extern "C" fn __record_ref_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: alias_exempt & 0b0000_1110,
+        lineage_hint: (alias_exempt & 0b0000_1110)
+            | if normalized_const_end_ref {
+                LINEAGE_HINT_CONST_END_REF_NORMALIZED
+            } else {
+                0
+            },
         bounds_len,
         origin_known,
         origin_base,
@@ -3300,7 +3378,20 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let kind = if is_mut != 0 {
+    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
+    let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
+    let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
+    // MIR and optimized std/alloc lowering often materialize administrative `*const`
+    // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
+    // and then write through them. Preserve the parent's effective write capability so
+    // these casts do not freeze an otherwise-valid unique/raw-mutable lineage.
+    let inherits_write_capability = derived_from != 0
+        && strong_projected_raw_hint
+        && tag_store::get(derived_from).is_some_and(|parent| {
+            matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut)
+        });
+    let kind = if is_mut != 0 || inherits_write_capability {
         PtrKind::RawMut
     } else {
         PtrKind::RawConst
@@ -3310,9 +3401,6 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
-    let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
