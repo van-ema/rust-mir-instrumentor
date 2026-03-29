@@ -1,0 +1,9 @@
+[package]
+name = "slab_get2_unchecked_mut_alias"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slab = { path = "vendor/slab" }
+
+[workspace]

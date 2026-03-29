@@ -1,0 +1,33 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
+     Running `/Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/bin/cargo-miri runner target/miri/miri/aarch64-apple-darwin/debug/slab_get2_unchecked_mut_alias`
+error: Undefined Behavior: trying to retag from <1164> for Unique permission at alloc612[0x0], but that tag does not exist in the borrow stack for this location
+   --> /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/slab_get2_unchecked_mut_alias/vendor/slab/src/lib.rs:835:16
+    |
+835 |         match (&mut *ptr1, &mut *ptr2) {
+    |                ^^^^^^^^^^ this error occurs as part of retag at alloc612[0x0..0x10]
+    |
+    = help: this indicates a potential bug in the program: it performed an invalid operation, but the Stacked Borrows rules it violated are still experimental
+    = help: see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md for further information
+help: <1164> was created by a SharedReadWrite retag at offsets [0x0..0x10]
+   --> /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/slab_get2_unchecked_mut_alias/vendor/slab/src/lib.rs:833:20
+    |
+833 |         let ptr1 = self.entries.get_unchecked_mut(key1) as *mut Entry<T>;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: <1164> was later invalidated at offsets [0x0..0x20] by a Unique retag
+   --> /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/slab_get2_unchecked_mut_alias/vendor/slab/src/lib.rs:834:20
+    |
+834 |         let ptr2 = self.entries.get_unchecked_mut(key2) as *mut Entry<T>;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: BACKTRACE (of the first span):
+    = note: inside `slab::Slab::<u64>::get2_unchecked_mut` at /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/slab_get2_unchecked_mut_alias/vendor/slab/src/lib.rs:835:16: 835:26
+note: inside `main`
+   --> src/main.rs:8:27
+    |
+  8 |     let (a, b) = unsafe { slab.get2_unchecked_mut(key1, key2) };
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
+EXIT:1

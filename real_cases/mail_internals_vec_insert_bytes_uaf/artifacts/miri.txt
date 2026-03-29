@@ -1,0 +1,461 @@
+warning: /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/mail_internals_vec_insert_bytes_uaf/vendor/mail-internals/Cargo.toml: no edition set: defaulting to the 2015 edition while the latest is 2024
+    Blocking waiting for file lock on package cache
+    Updating crates.io index
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling libc v0.2.183
+   Compiling unicode-ident v1.0.24
+   Compiling syn v1.0.109
+   Compiling autocfg v1.5.0
+   Compiling object v0.37.3
+   Compiling lazy_static v0.2.11
+   Compiling unicode-xid v0.2.6
+   Compiling gimli v0.32.3
+   Compiling tinyvec_macros v0.1.1
+   Compiling memchr v2.8.0
+   Compiling adler2 v2.0.1
+   Compiling num-traits v0.2.19
+   Compiling failure_derive v0.1.8
+   Compiling miniz_oxide v0.8.9
+   Compiling tinyvec v1.11.0
+   Compiling lut v0.1.0-unstable
+   Compiling core-foundation-sys v0.8.7
+   Compiling quoted-string v0.6.1
+   Compiling percent-encoding v1.0.1
+   Compiling cfg-if v1.0.4
+   Compiling rustc-demangle v0.1.27
+   Compiling media-type-impl-utils v0.3.0-unstable
+   Compiling iana-time-zone v0.1.65
+   Compiling unicode-normalization v0.1.25
+   Compiling byteorder v1.5.0
+   Compiling unicode-bidi v0.3.18
+   Compiling matches v0.1.10
+   Compiling safemem v0.2.0
+   Compiling base64 v0.6.0
+   Compiling idna v0.1.5
+   Compiling media-type v0.4.0-unstable
+   Compiling addr2line v0.25.1
+   Compiling quoted_printable v0.4.8
+   Compiling vec1 v1.12.1
+   Compiling soft-ascii-string v1.1.0
+   Compiling memchr v1.0.2
+   Compiling nom v3.2.1
+   Compiling chrono v0.4.44
+   Compiling synstructure v0.12.6
+   Compiling backtrace v0.3.76
+   Compiling failure v0.1.8
+   Compiling mail-internals v0.2.0 (/Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/mail_internals_vec_insert_bytes_uaf/vendor/mail-internals)
+warning: unused `#[macro_use]` import
+ --> vendor/mail-internals/src/lib.rs:3:1
+  |
+3 | #[macro_use]
+  | ^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: `...` range patterns are deprecated
+  --> vendor/mail-internals/src/grammar.rs:81:12
+   |
+81 |         '!'...'\'' |
+   |            ^^^ help: use `..=` for an inclusive range
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+   = note: `#[warn(ellipsis_inclusive_range_patterns)]` on by default
+
+warning: `...` range patterns are deprecated
+  --> vendor/mail-internals/src/grammar.rs:82:12
+   |
+82 |         '*'...'[' |
+   |            ^^^ help: use `..=` for an inclusive range
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+  --> vendor/mail-internals/src/grammar.rs:83:12
+   |
+83 |         ']'...'~' => true,
+   |            ^^^ help: use `..=` for an inclusive range
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:133:11
+    |
+133 |         33...90 |
+    |           ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:134:11
+    |
+134 |         94...126 => true,
+    |           ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:145:12
+    |
+145 |         '#'...'[' |
+    |            ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:147:12
+    |
+147 |         ']'...'~' => true,
+    |            ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:334:16
+    |
+334 |             '0'...'9' |
+    |                ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:335:16
+    |
+335 |             'a'...'z' |
+    |                ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/grammar.rs:336:16
+    |
+336 |             'A'...'Z' |
+    |                ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/bind/quoted_printable.rs:124:21
+    |
+124 |                 b'0'...b'9' |
+    |                     ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/bind/quoted_printable.rs:125:21
+    |
+125 |                 b'A'...b'Z' |
+    |                     ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: `...` range patterns are deprecated
+   --> vendor/mail-internals/src/bind/quoted_printable.rs:126:21
+    |
+126 |                 b'a'...b'z'  => {
+    |                     ^^^ help: use `..=` for an inclusive range
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:18:34
+   |
+18 |     fn boxed_clone(&self) -> Box<EncodableInHeader>;
+   |                                  ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+   = note: `#[warn(bare_trait_objects)]` on by default
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+18 |     fn boxed_clone(&self) -> Box<dyn EncodableInHeader>;
+   |                                  +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:27:6
+   |
+27 | impl EncodableInHeader {
+   |      ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+27 | impl dyn EncodableInHeader {
+   |      +++
+help: you might have intended to implement this trait for a given type
+   |
+27 | impl EncodableInHeader for /* Type */ {
+   |                        ++++++++++++++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:66:38
+   |
+66 | impl EncodableInHeaderBoxExt for Box<EncodableInHeader> {
+   |                                      ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+66 | impl EncodableInHeaderBoxExt for Box<dyn EncodableInHeader> {
+   |                                      +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:78:38
+   |
+78 | impl EncodableInHeaderBoxExt for Box<EncodableInHeader+Send> {
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+78 | impl EncodableInHeaderBoxExt for Box<dyn EncodableInHeader+Send> {
+   |                                      +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+   --> vendor/mail-internals/src/encoder/encodable.rs:165:34
+    |
+165 |     fn boxed_clone(&self) -> Box<EncodableInHeader> {
+    |                                  ^^^^^^^^^^^^^^^^^
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+    |
+165 |     fn boxed_clone(&self) -> Box<dyn EncodableInHeader> {
+    |                                  +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:54:20
+   |
+54 | impl Clone for Box<EncodableInHeader> {
+   |                    ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+54 | impl Clone for Box<dyn EncodableInHeader> {
+   |                    +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+   --> vendor/mail-internals/src/error.rs:154:32
+    |
+154 |     fn cause(&self) -> Option<&Fail> {
+    |                                ^^^^
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+    |
+154 |     fn cause(&self) -> Option<&dyn Fail> {
+    |                                +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+   --> vendor/mail-internals/src/encoder/encodable.rs:122:34
+    |
+122 |     fn boxed_clone(&self) -> Box<EncodableInHeader> {
+    |                                  ^^^^^^^^^^^^^^^^^
+    |
+    = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+    = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+    |
+122 |     fn boxed_clone(&self) -> Box<dyn EncodableInHeader> {
+    |                                  +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:38:47
+   |
+38 |             Some( unsafe { &*( self as *const EncodableInHeader as *const T) } )
+   |                                               ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+38 |             Some( unsafe { &*( self as *const dyn EncodableInHeader as *const T) } )
+   |                                               +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:47:49
+   |
+47 |             Some( unsafe { &mut *( self as *mut EncodableInHeader as *mut T) } )
+   |                                                 ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+47 |             Some( unsafe { &mut *( self as *mut dyn EncodableInHeader as *mut T) } )
+   |                                                 +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:69:12
+   |
+69 |         if EncodableInHeader::is::<T>(&*self) {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+69 |         if <dyn EncodableInHeader>::is::<T>(&*self) {
+   |            ++++                  +
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:70:27
+   |
+70 |             let ptr: *mut EncodableInHeader = Box::into_raw(self);
+   |                           ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+70 |             let ptr: *mut dyn EncodableInHeader = Box::into_raw(self);
+   |                           +++
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:81:12
+   |
+81 |         if EncodableInHeader::is::<T>(&*self) {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+81 |         if <dyn EncodableInHeader>::is::<T>(&*self) {
+   |            ++++                  +
+
+warning: trait objects without an explicit `dyn` are deprecated
+  --> vendor/mail-internals/src/encoder/encodable.rs:82:27
+   |
+82 |             let ptr: *mut EncodableInHeader = Box::into_raw(self);
+   |                           ^^^^^^^^^^^^^^^^^
+   |
+   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2021!
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/warnings-promoted-to-error.html>
+help: if this is a dyn-compatible trait, use `dyn`
+   |
+82 |             let ptr: *mut dyn EncodableInHeader = Box::into_raw(self);
+   |                           +++
+
+warning: non-local `impl` definition, `impl` blocks should be written at the same level as their item
+  --> vendor/mail-internals/src/error.rs:12:30
+   |
+12 | #[derive(Copy, Clone, Debug, Fail, PartialEq, Eq, Hash)]
+   |                              ^---
+   |                              |
+   |                              `Fail` is not local
+   |                              move the `impl` block outside of this constant `_DERIVE_failure_Fail_FOR_EncodingErrorKind`
+13 | pub enum EncodingErrorKind {
+   |          ----------------- `EncodingErrorKind` is not local
+   |
+   = note: the derive macro `Fail` defines the non-local `impl`, and may need to be changed
+   = note: the derive macro `Fail` may come from an old version of the `failure_derive` crate, try updating your dependency with `cargo update -p failure_derive`
+   = note: an `impl` is never scoped, even when it is nested inside an item, as it may impact type checking outside of that item, which can be the case if neither the trait or the self type are at the same nesting level as the `impl`
+   = note: items in an anonymous const item (`const _: () = { ... }`) are treated as in the same scope as the anonymous const's declaration for the purpose of this lint
+   = note: `#[warn(non_local_definitions)]` on by default
+   = note: this warning originates in the derive macro `Fail` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: non-local `impl` definition, `impl` blocks should be written at the same level as their item
+  --> vendor/mail-internals/src/error.rs:12:30
+   |
+12 | #[derive(Copy, Clone, Debug, Fail, PartialEq, Eq, Hash)]
+   |                              ^---
+   |                              |
+   |                              `Display` is not local
+   |                              move the `impl` block outside of this constant `_DERIVE_failure_core_fmt_Display_FOR_EncodingErrorKind`
+13 | pub enum EncodingErrorKind {
+   |          ----------------- `EncodingErrorKind` is not local
+   |
+   = note: the derive macro `Fail` defines the non-local `impl`, and may need to be changed
+   = note: the derive macro `Fail` may come from an old version of the `failure_derive` crate, try updating your dependency with `cargo update -p failure_derive`
+   = note: an `impl` is never scoped, even when it is nested inside an item, as it may impact type checking outside of that item, which can be the case if neither the trait or the self type are at the same nesting level as the `impl`
+   = note: items in an anonymous const item (`const _: () = { ... }`) are treated as in the same scope as the anonymous const's declaration for the purpose of this lint
+   = note: this warning originates in the derive macro `Fail` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> vendor/mail-internals/src/encoder/mod.rs:79:19
+   |
+79 |     pub fn writer(&mut self) -> EncodingWriter {
+   |                   ^^^^^^^^^     -------------- the same lifetime is hidden here
+   |                   |
+   |                   the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+79 |     pub fn writer(&mut self) -> EncodingWriter<'_> {
+   |                                               ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/mail-internals/src/encoder/mod.rs:160:28
+    |
+160 |     pub fn to_string_lossy(&self) -> Cow<str> {
+    |                            ^^^^^     -------- the same lifetime is hidden here
+    |                            |
+    |                            the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+160 |     pub fn to_string_lossy(&self) -> Cow<'_, str> {
+    |                                          +++
+
+warning: `mail-internals` (lib) generated 32 warnings (run `cargo fix --lib -p mail-internals` to apply 27 suggestions)
+   Compiling mail_internals_vec_insert_bytes_uaf v0.1.0 (/Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/mail_internals_vec_insert_bytes_uaf)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: lut v0.1.0-unstable, nom v3.2.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `/Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/bin/cargo-miri runner target/miri/miri/aarch64-apple-darwin/debug/mail_internals_vec_insert_bytes_uaf`
+error: Undefined Behavior: deallocating while item [SharedReadOnly for <904>] is strongly protected
+   --> /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/raw_vec/mod.rs:781:13
+    |
+781 |             alloc.grow(ptr, old_layout, new_layout)
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+    |
+    = help: this indicates a potential bug in the program: it performed an invalid operation, but the Stacked Borrows rules it violated are still experimental
+    = help: see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md for further information
+    = note: BACKTRACE:
+    = note: inside `alloc::raw_vec::finish_grow::<std::alloc::Global>` at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/raw_vec/mod.rs:781:13: 781:52
+    = note: inside `alloc::raw_vec::RawVecInner::grow_amortized` at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/raw_vec/mod.rs:664:19: 664:93
+    = note: inside `alloc::raw_vec::RawVecInner::<A>::reserve::do_reserve_and_handle::<std::alloc::Global>` at /Users/emanuelevannacci/.rustup/toolchains/nightly-2025-08-01-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/raw_vec/mod.rs:557:31: 557:79
+note: inside `mail_internals::utils::vec_insert_bytes`
+   --> /Users/emanuelevannacci/github/rust-mir-instrumentor/real_cases/mail_internals_vec_insert_bytes_uaf/vendor/mail-internals/src/utils/mod.rs:126:5
+    |
+126 |     target.reserve(insertion_len);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: inside `main`
+   --> src/main.rs:8:5
+    |
+  8 |     vec_insert_bytes(&mut buf, 2, src);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error
+
+EXIT:1

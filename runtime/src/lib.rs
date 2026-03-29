@@ -1721,9 +1721,11 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         entry.epoch = entry.epoch.wrapping_add(1);
     }
 
+    let was_live = entry.live;
+
     // Reuse/birth transition: dead to live at an address we've seen before.
     // If we already had a nonzero epoch, bump it so this is a fresh instance.
-    if new_live && !entry.live {
+    if new_live && !was_live {
         if entry.epoch != 0 {
             entry.epoch = entry.epoch.wrapping_add(1);
         }
@@ -1737,9 +1739,18 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         entry.epoch = 1;
     }
 
-    // Keep the largest known size if size changes.
+    // Size is tracked per allocation instance, not monotonically across address reuse.
+    //
+    // On a dead -> live transition, reset to the newly observed size so a fresh allocation
+    // instance cannot inherit a stale larger range from an older epoch at the same base.
+    // Within the same live epoch we still keep the maximum known size, since some hooks only
+    // discover partial size information before a later hook reports the full extent.
     if size != 0 {
-        entry.size = entry.size.max(size);
+        if new_live && !was_live {
+            entry.size = size;
+        } else {
+            entry.size = entry.size.max(size);
+        }
     }
 
     let entry_snapshot = *entry;

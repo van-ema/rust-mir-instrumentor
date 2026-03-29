@@ -56,7 +56,7 @@ make run EXAMPLE=hello PROFILE=release
 
 ## Running with dataflow analysis
 
-There are three distinct analysis modes.
+There are two supported analysis modes.
 
 ### 1. Metadata-local dataflow only
 
@@ -73,27 +73,7 @@ TARGET=bytes PROFILE=release \
 
 Add `RZ_METADATA_DATAFLOW_STATS=1` to print pruning totals during compilation.
 
-### 2. Local backward unsafe-sensitive analysis
-
-This was the original local backward hook-gating analysis. It starts from
-unsafe-sensitive sinks in each MIR body, propagates relevance backward, and
-prunes hooks for pointer locals that cannot reach those sinks inside the current
-function.
-
-```bash
-CARGO_INCREMENTAL=0 \
-RZ_INSTRUMENT_ALL_DEPS=1 \
-RZ_UNSAFE_DATAFLOW=1 \
-RZ_UNSAFE_DATAFLOW_STATS=1 \
-TARGET=bytes PROFILE=release \
-./scripts/afl_build.sh
-```
-
-This local-only mode is no longer the supported user-facing path because it is
-not sound enough for the full example suite. The supported unsafe-sensitive
-analysis mode is the interprocedural flow below.
-
-### 3. Interprocedural unsafe-sensitive analysis
+### 2. Interprocedural unsafe-sensitive analysis
 
 This is the current cross-crate path. It runs in three phases:
 
@@ -237,14 +217,16 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_DEBUG_MATCH`: if set, runs `debug_classify_call_effect` for that symbol and exits.
 - `RZ_DEBUG_SYMBOL_LOOKUP`: non-zero enables verbose runtime-hook symbol lookup logs.
 - `RZ_TRACE_PASS`: non-zero enables pass-level tracing.
-- `RZ_METADATA_DATAFLOW`: enables the metadata-local dataflow optimization pass (`1` default, set
-  `0` to disable). This pass only prunes redundant metadata propagation such as `TagProp`; it does
-  not rewrite semantic hooks like `PtrRead` / `PtrWrite`.
+- `RZ_METADATA_DATAFLOW`: opt-in toggle for the metadata-local dataflow optimization pass. This
+  pass is disabled by default; set `RZ_METADATA_DATAFLOW=1` to enable it. It only prunes redundant
+  metadata propagation such as `TagProp`; it does not rewrite semantic hooks like `PtrRead` /
+  `PtrWrite`.
 - `RZ_METADATA_DATAFLOW_STATS`: non-zero prints metadata-dataflow pruning stats during
   instrumentation.
-- `RZ_UNSAFE_DATAFLOW`: legacy local-only unsafe-dataflow toggle. This is no longer the supported
-  user-facing pruning mode. The supported path is `RZ_INTERPROC_UNSAFE_SUMMARIES=1`, while
-  summary generation/consumption still uses the underlying unsafe-dataflow machinery internally.
+- `RZ_UNSAFE_DATAFLOW`: legacy local-only unsafe-dataflow toggle. It is no longer a supported
+  user-facing pruning mode and is ignored if set directly. The supported path is
+  `RZ_INTERPROC_UNSAFE_SUMMARIES=1`, while summary generation/consumption still uses the
+  underlying unsafe-dataflow machinery internally.
 - `RZ_UNSAFE_DATAFLOW_STATS`: non-zero prints unsafe-dataflow hook-pruning totals during
   instrumentation.
 - `RZ_UNSAFE_DATAFLOW_SUMMARY_STATS`: non-zero prints per-function unsafe-summary statistics,
