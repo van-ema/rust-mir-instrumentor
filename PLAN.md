@@ -26,16 +26,27 @@ Goal:
 - Reduce blind spots on slices/str/dyn-trait pointer flows.
 
 Open tasks:
-1. Better sizing for unsized accesses.
-- Use slice/str metadata for dynamic access-size calculation where available.
-2. Bulk memory operation coverage.
+1. Finish the transition from partial support to first-class DST coverage.
+- Current support is strongest for slice/str wide pointers via data-pointer extraction and metadata-aware sizing.
+- Remaining gap: `dyn Trait` and other DST metadata forms are still handled conservatively.
+2. Better sizing for unsized accesses.
+- Use slice/str metadata for dynamic access-size calculation wherever a read/write is driven by wide-pointer metadata.
+- Audit helper-heavy MIR paths so size metadata survives through wrappers and temporary copies.
+3. Bulk memory operation coverage.
 - Improve metadata-aware sizing for copy/move/set operations on wide pointers.
-3. Regression coverage.
+- Add explicit overlap/length handling where a wide-pointer operation lowers to bulk memory movement.
+4. First-class metadata plumbing.
+- Preserve both the data pointer and relevant metadata across more retag/derivation/call-boundary paths instead of relying only on wrapper classification.
+- Decide which runtime hooks need direct metadata operands for full DST support.
+5. Regression coverage.
 - Add focused examples for wide-pointer derivation, read/write, and UAF/OOB behavior.
+- Keep the existing known-gap examples for slice-length OOB cases until they are upgraded to must-catch tests.
 
 Exit criteria:
 1. No routine UNKNOWN_TAG/WILD_POINTER noise on normal slice/str operations in core targets.
-2. Wide-pointer regression examples remain stable across refactors.
+2. Slice/str regressions remain stable across refactors.
+3. The current slice-length OOB gaps are either closed or explicitly classified as deferred non-goals.
+4. `dyn Trait`/general DST handling is no longer documented as conservative-by-default.
 
 ## Stdlib instrumentation and fuzzing
 Goal:
