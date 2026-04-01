@@ -16,6 +16,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
+RUNTIME_PROFILE="${RUNTIME_PROFILE:-release}"
 TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
@@ -76,7 +77,7 @@ HARNESS_TARGET_DIR="$(canonical_path "$HARNESS_TARGET_DIR")"
 # `cargo build -p runtime` places `libruntime.rlib` in `${target_dir}/${profile}/deps/`.
 # If we point `--runtime-path` at `${profile}/`, a stale `${profile}/libruntime.rlib` can be
 # picked up and cause E0460 "found possibly newer version of crate `runtime`".
-RUNTIME_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/deps"
+RUNTIME_PATH="${HARNESS_TARGET_DIR}/${RUNTIME_PROFILE}/deps"
 
 export CARGO_INCREMENTAL=0
 export RZ_INSTRUMENT_ALL_DEPS=1
@@ -138,22 +139,28 @@ find_runtime_rlib() {
 build_tools_and_runtime() {
   if [[ "$PROFILE" == "release" ]]; then
     cargo build -p instrument-mir --release --bins
-    # Build runtime *after* instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
-    cargo build -p runtime --release ${RUNTIME_FEATURES}
     PROFILE_FLAG="--release"
   else
     cargo build -p instrument-mir --bins
-    cargo build -p runtime ${RUNTIME_FEATURES}
     PROFILE_FLAG=""
+  fi
+
+  # Build runtime after instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
+  if [[ "$RUNTIME_PROFILE" == "release" ]]; then
+    cargo build -p runtime --release ${RUNTIME_FEATURES}
+  else
+    cargo build -p runtime ${RUNTIME_FEATURES}
   fi
 }
 
-# Build rusteze toolchain + runtime in the chosen profile.
+# Build rusteze toolchain + runtime. The target/harness uses PROFILE while the
+# runtime can be optimized independently via RUNTIME_PROFILE.
 RUNTIME_FEATURES="${RUNTIME_FEATURES:-}"
 build_tools_and_runtime
 
 # Avoid accidental linking against a stale top-level `libruntime.rlib` if one exists.
 rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
+rm -f "${HARNESS_TARGET_DIR}/${RUNTIME_PROFILE}/libruntime.rlib" 2>/dev/null || true
 
 TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
 if [[ ! -x "$TOOL" ]]; then
@@ -179,6 +186,7 @@ current_stamp="$(
     echo "instrumentor=$(hash_file "${INSTRUMENT_BIN}")"
     echo "runtime=$(hash_file "${runtime_rlib}")"
     echo "profile=${PROFILE}"
+    echo "runtime_profile=${RUNTIME_PROFILE}"
     echo "runtime_features=${RUNTIME_FEATURES}"
     echo "instrument_all_deps=${RZ_INSTRUMENT_ALL_DEPS:-}"
     echo "instrumented_crates=${RZ_INSTRUMENTED_CRATES:-}"
@@ -203,6 +211,7 @@ if [[ "${clean_needed}" == "1" ]]; then
   cargo clean --target-dir "${HARNESS_TARGET_DIR}"
   build_tools_and_runtime
   rm -f "${HARNESS_TARGET_DIR}/${PROFILE}/libruntime.rlib" 2>/dev/null || true
+  rm -f "${HARNESS_TARGET_DIR}/${RUNTIME_PROFILE}/libruntime.rlib" 2>/dev/null || true
 
   TOOL="${HARNESS_TARGET_DIR}/${PROFILE}/cargo-instrument-mir"
   if [[ ! -x "$TOOL" ]]; then
@@ -227,6 +236,7 @@ if [[ "${clean_needed}" == "1" ]]; then
       echo "instrumentor=$(hash_file "${INSTRUMENT_BIN}")"
       echo "runtime=$(hash_file "${runtime_rlib}")"
       echo "profile=${PROFILE}"
+      echo "runtime_profile=${RUNTIME_PROFILE}"
       echo "runtime_features=${RUNTIME_FEATURES}"
     } | tr '\n' ';'
   )"
