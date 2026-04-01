@@ -97,3 +97,25 @@ exclude = [
 
 # Optional but recommended for reproducibility:
 resolver = "2"
+
+[workspace.package]
+repository = "https://github.com/toml-rs/toml"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.85"
+include = [
+    "build.rs",
+    "src/**/*",
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE*",
+    "README.md",
+    "examples/**/*",
+]
+
+[workspace.lints.rust]
+
+[workspace.lints.clippy]
+
+[patch.crates-io]
+toml_parser = { path = "third_party/toml/crates/toml_parser" }
