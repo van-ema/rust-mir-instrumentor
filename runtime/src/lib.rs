@@ -1645,6 +1645,16 @@ fn normalize_const_end_ref_access_addr(tmeta: &TagMeta, addr: usize, size: usize
         return (addr, size);
     }
     if tmeta.bounds_len == 0 {
+        if tmeta.parent == 0
+            && tmeta.origin_known
+            && tmeta.origin_end > tmeta.origin_base
+            && addr == tmeta.origin_end
+        {
+            let origin_size = tmeta.origin_end - tmeta.origin_base;
+            if size != 0 && size <= origin_size {
+                return (addr.saturating_sub(size), size);
+            }
+        }
         return (addr, size);
     }
     let shifted_base = tmeta.pointee_addr.saturating_add(tmeta.bounds_len);
