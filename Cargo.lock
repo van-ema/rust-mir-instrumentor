@@ -755,6 +755,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
+ "pin-utils",
  "pretty_env_logger",
  "serde 1.0.228 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 1.0.149 (registry+https://github.com/rust-lang/crates.io-index)",

@@ -93,6 +93,10 @@ members = [
 ]
 exclude = [
     "third_party/serde",
+    "paper_examples/lineage_opt_away",
+    "paper_examples/lineage_field_proj",
+    "paper_examples/lineage_generic_exempt",
+    "paper_examples/lineage_uninstr_ret",
 ]
 
 # Optional but recommended for reproducibility:
