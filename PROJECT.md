@@ -58,6 +58,11 @@ The project has two main components:
   use `RUSTEZE_FAILFAST=1` and `RZ_ABORT_ON_VIOLATION=1` by default.
 - Do not silently suppress violations just to keep fuzzing running; prefer fixing root-cause
   false positives in instrumentation/runtime and keep high-confidence crashes actionable.
+- Harness-construction policy: for the main fuzzing harnesses in this repository, the primary
+  goal is to find memory-safety bugs and alias-model violations. Do not require a semantic
+  oracle or reference-model cross-check unless it is specifically needed for a target. If an
+  oracle materially reduces throughput or creates harness-side noise, omit it and prefer a
+  simpler stateful harness, as in the current `bytes` harness.
 
 6. **Testing and commit gate**
 - Before every commit, run the relevant test coverage for the touched code.
@@ -65,12 +70,19 @@ The project has two main components:
 - Exception: commits that touch only the paper submodule `dynBorrowProposal/` do not require the
   parent-repo example-suite gate. For those paper-only commits, rebuild the paper and verify
   `dynBorrowProposal/main.pdf` updates successfully instead.
-- Before every commit, run the full example test suite, not only examples related to the touched
-  code.
-- Before every commit, run the full example test suite in both supported modes:
+- Before committing changes that touch instrumentation or runtime correctness code, run the full
+  example test suite, not only examples related to the touched code. This applies to changes
+  under:
+  - `instrument-mir/`
+  - `runtime/`
+- For those instrumentation/runtime commits, run the full example suite in both supported modes:
   - default:
     - `python3 scripts/run_example_tests.py`
-- Do not commit while any example is failing in either mode: both suites must pass before
-  committing.
-- After each commit, re-run the full example test suite in both supported modes and verify both
-  are still fully green on the committed revision.
+  - interprocedural summaries:
+    - `RZ_INTERPROC_UNSAFE_SUMMARIES=1 CARGO_INCREMENTAL=0 python3 scripts/run_example_tests.py`
+- Do not commit instrumentation/runtime changes while any example is failing in either mode:
+  both suites must pass before committing.
+- After each instrumentation/runtime commit, re-run the full example suite in both supported
+  modes and verify both are still fully green on the committed revision.
+- For commits that do not touch `instrument-mir/` or `runtime/`, run the relevant targeted tests
+  for the changed code, but the full example-suite gate is not required.
