@@ -617,6 +617,8 @@ enum InstrKind<'tcx> {
     ShadowStore { src_local: Local },
     /// Copy tag metadata between memory slots.
     ShadowCopySlot { src_place: Place<'tcx> },
+    /// Copy tag metadata across a byte range between memory locations.
+    ShadowCopyRange { src_place: Place<'tcx>, size_op: SizeOperand<'tcx> },
     /// Clear pointer-shadow metadata for a written memory range.
     ShadowKill { size_op: SizeOperand<'tcx> },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
@@ -686,6 +688,7 @@ struct Hooks {
     def_id_shadow_load_ref_ancestor: DefId,
     def_id_shadow_kill_range: DefId,
     def_id_shadow_copy_slot: DefId,
+    def_id_shadow_copy_range: DefId,
 }
 
 impl MyOptimizationPass {
@@ -806,7 +809,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
-        self.is_pointer_ty(ty) && self.is_thin_ptr_ty(tcx, body, ty)
+        matches!(ty.kind(), TyKind::RawPtr(..)) && self.is_thin_ptr_ty(tcx, body, ty)
     }
 
     /// Best-effort detection of "vtable-like" structs: all fields are function pointers.
@@ -2744,6 +2747,10 @@ impl MyOptimizationPass {
             .unwrap_or(0)
     }
 
+    fn is_one_byte_sized_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        self.layout_size_bytes(tcx, ty) == 1
+    }
+
     fn type_needs_normalization<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         struct NeedsNormalizationVisitor;
 
@@ -3814,6 +3821,7 @@ impl MyOptimizationPass {
         stmt_idx: usize,
         stmt: &Statement<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
+        byte_copy_src_for_local: &mut HashMap<Local, Place<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
@@ -3824,6 +3832,7 @@ impl MyOptimizationPass {
         // Stack allocation lifetime: StorageLive/StorageDead.
         match stmt.kind {
             StatementKind::StorageDead(local) => {
+                byte_copy_src_for_local.remove(&local);
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
@@ -3899,6 +3908,23 @@ impl MyOptimizationPass {
                 }
             }
             _ => {}
+        }
+
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+            if let Some(dst_local) = dst_place.as_local() {
+                byte_copy_src_for_local.remove(&dst_local);
+                let dst_ty = body.local_decls[dst_local].ty;
+                if self.is_one_byte_sized_ty(tcx, dst_ty) {
+                    if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
+                        let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                        if self.is_one_byte_sized_ty(tcx, src_ty)
+                            && self.place_contains_deref(src_place)
+                        {
+                            byte_copy_src_for_local.insert(dst_local, src_place);
+                        }
+                    }
+                }
+            }
         }
 
         // Pointer read: plain deref load in a statement, e.g. `_dst = copy (*p)` or `_dst = move (*p)`.
@@ -4050,7 +4076,6 @@ impl MyOptimizationPass {
                         if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
                             let src_ty = src_place.ty(&body.local_decls, tcx).ty;
                             if !src_place.projection.is_empty()
-                                && self.place_contains_deref(src_place)
                                 && self.is_shadowable_ptr_ty(tcx, body, src_ty)
                             {
                                 ptr_locals_needing_tag.insert(dst_local);
@@ -4375,6 +4400,39 @@ impl MyOptimizationPass {
             let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
 
             if !lhs_place.projection.is_empty() {
+                if self.place_contains_deref(lhs_place.clone()) && self.is_one_byte_sized_ty(tcx, lhs_ty) {
+                    let byte_copy_src = match rvalue {
+                        Rvalue::Use(Operand::Copy(src_place)) | Rvalue::Use(Operand::Move(src_place)) => {
+                            src_place.as_local().and_then(|src_local| {
+                                byte_copy_src_for_local.get(&src_local).copied()
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(src_place) = byte_copy_src {
+                        rz_pass_trace!(
+                            self,
+                            "[rusteze][ptr-shadow] ShadowCopyRange dst={:?} src={:?} size=1",
+                            lhs_place,
+                            src_place
+                        );
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            insert_before: false,
+                            source_info: stmt.source_info,
+                            place: lhs_place.clone(),
+                            kind: InstrKind::ShadowCopyRange {
+                                src_place,
+                                size_op: SizeOperand::Const(
+                                    self.const_usize(tcx, stmt.source_info.span, 1),
+                                ),
+                            },
+                        });
+                        return;
+                    }
+                }
+
                 if self.is_shadowable_ptr_ty(tcx, body, lhs_ty) {
                     if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
                         let src_ty = src_place.ty(&body.local_decls, tcx).ty;
@@ -5627,6 +5685,23 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrWrite { ptr_local: dst, size_op },
                     });
                 }
+                if let (Some(src_place), Some(dst_place)) = (src_place, dst_place) {
+                    let size_op = if let Some(src) = src_local {
+                        size_op_for(src)
+                    } else if let Some(dst) = dst_local {
+                        size_op_for(dst)
+                    } else {
+                        SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0))
+                    };
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: dst_place,
+                        kind: InstrKind::ShadowCopyRange { src_place, size_op },
+                    });
+                }
             }
         } else if is_memset {
             // Signature convention:
@@ -5649,6 +5724,24 @@ impl MyOptimizationPass {
                         place: dst_place.unwrap_or(Place::from(dst)),
                         kind: InstrKind::PtrWrite { ptr_local: dst, size_op },
                     });
+                    if let Some(dst_place) = dst_place {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: dst_place,
+                            kind: InstrKind::ShadowKill {
+                                size_op: self.memop_size_bytes(
+                                    tcx,
+                                    body,
+                                    dst,
+                                    count_op,
+                                    term.source_info.span,
+                                ),
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -6663,6 +6756,7 @@ impl MyOptimizationPass {
         let mut return_sites: Vec<(BasicBlock, SourceInfo, usize)> = Vec::new();
 
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            let mut byte_copy_src_for_local: HashMap<Local, Place<'tcx>> = HashMap::new();
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 self.scan_statement(
                     tcx,
@@ -6672,6 +6766,7 @@ impl MyOptimizationPass {
                     stmt_idx,
                     stmt,
                     &mut insert_points,
+                    &mut byte_copy_src_for_local,
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
                     &ptr_locals_with_tag_sources,
@@ -6923,6 +7018,7 @@ impl MyOptimizationPass {
             InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
             InstrKind::ShadowCopySlot { .. } => hooks.def_id_shadow_copy_slot,
+            InstrKind::ShadowCopyRange { .. } => hooks.def_id_shadow_copy_range,
             InstrKind::ShadowKill { .. } => hooks.def_id_shadow_kill_range,
             InstrKind::TagProp { .. } => hooks.def_id_use, // should never become a call (handled as a plain Assign)
             InstrKind::PtrDerive { is_ref, .. } => {
@@ -6964,7 +7060,9 @@ impl MyOptimizationPass {
                 | InstrKind::PtrReadAllowUntagged { .. }
                 | InstrKind::PtrWriteAllowUntagged { .. }
                 | InstrKind::ShadowKill { .. } => 2,
-                InstrKind::ShadowStore { .. } | InstrKind::ShadowCopySlot { .. } => 3,
+                InstrKind::ShadowStore { .. }
+                | InstrKind::ShadowCopySlot { .. }
+                | InstrKind::ShadowCopyRange { .. } => 3,
                 InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
                 _ => 4,
             }
@@ -7197,6 +7295,109 @@ impl MyOptimizationPass {
                     bd.statements.push(dst_addr_stmt2);
                     bd.statements.push(src_addr_stmt1);
                     bd.statements.push(src_addr_stmt2);
+                    bd.terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: copy_func,
+                            args: copy_args,
+                            destination: Place::from(tmp_unit),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
+            if let InstrKind::ShadowCopyRange { src_place, size_op } = creation_kind.clone() {
+                let dst_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let src_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((dst_addr_stmt1, dst_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    dst_addr_local,
+                    true,
+                ) else {
+                    continue;
+                };
+                let Some((src_addr_stmt1, src_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    src_place,
+                    src_addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+
+                let (arg_size, mut size_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let copy_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_shadow_copy_range,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let copy_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(dst_addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(src_addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_size,
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let len = bd.statements.len();
+                    let split_at = if stmt_idx >= len {
+                        len
+                    } else if ip.insert_before {
+                        stmt_idx
+                    } else {
+                        stmt_idx + 1
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(dst_addr_stmt1);
+                    bd.statements.push(dst_addr_stmt2);
+                    bd.statements.push(src_addr_stmt1);
+                    bd.statements.push(src_addr_stmt2);
+                    bd.statements.append(&mut size_stmts);
                     bd.terminator = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Call {
@@ -9456,6 +9657,9 @@ impl MyOptimizationPass {
         let def_id_shadow_copy_slot = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_copy_slot", 2)
             .expect("missing '__rz_shadow_copy_slot' definition");
+        let def_id_shadow_copy_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_copy_range", 3)
+            .expect("missing '__rz_shadow_copy_range' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -9476,6 +9680,7 @@ impl MyOptimizationPass {
             def_id_shadow_load_ref_ancestor,
             def_id_shadow_kill_range,
             def_id_shadow_copy_slot,
+            def_id_shadow_copy_range,
         };
 
         let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(

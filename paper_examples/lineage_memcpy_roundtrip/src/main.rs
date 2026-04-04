@@ -3,23 +3,26 @@
 //
 // This is inspired by Miri's provenance tests in `tests/pass/provenance.rs`,
 // especially the bytewise memcpy cases. Miri preserves the provenance of a
-// pointer value when it is copied through memory byte-by-byte. Rusteze does
-// not currently carry provenance through such memory-resident pointer copies.
+// pointer value when it is copied through memory byte-by-byte.
 //
 // Here the raw pointer is first stored inside `Slot`, then the entire `Slot`
-// object is copied bytewise into `dst`. The later field loads `dst.ptr` should
-// recover the same pointer provenance as `src.ptr`, but today they do not.
-// Without pointer-shadow memory, the reloaded pointers lose their common
-// ancestor and TB-Lite misses the sibling invalidation.
+// object is copied bytewise into `dst`. The later field loads `dst.ptr` must
+// recover the same pointer provenance as `src.ptr`; otherwise the reloaded
+// pointers lose their common ancestor and TB-Lite misses the sibling
+// invalidation.
 //
-// Expected in --release: ok (TB-Lite false negative — provenance lost through
-// bytewise memory copy of a pointer-carrying object)
+// Expected in --release: TREE_BORROWS_VIOLATION|WRITE|RawMut|1
 
 use std::mem::MaybeUninit;
 
 #[derive(Copy, Clone)]
 struct Slot {
     ptr: *mut u8,
+}
+
+#[inline(never)]
+fn read_ref(x: &mut u8) -> u8 {
+    *x
 }
 
 unsafe fn memcpy<T>(to: *mut T, from: *const T) {
@@ -44,11 +47,11 @@ fn main() {
     let s: &mut u8 = unsafe { &mut *q };
 
     // Miri: the memcpy preserves pointer provenance, so `r` and `s` are
-    // siblings in the same tree and `s` invalidates `r`.
-    // Rusteze today: the pointer is copied through memory without shadow
-    // provenance, so both field loads become detached/root-like and the read
-    // through `r` succeeds silently.
-    let _val = *r;
-    let _ = s;
+    // sibling mutable borrows in the same tree and the write through `s`
+    // invalidates `r`.
+    // Without shadow provenance surviving the bytewise copy, both field loads
+    // detach from that tree and the final read through `r` succeeds silently.
+    unsafe { std::ptr::write_volatile(s, 1) };
+    let _val = read_ref(r);
     println!("val={_val}");
 }

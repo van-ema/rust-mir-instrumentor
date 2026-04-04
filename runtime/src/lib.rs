@@ -1835,6 +1835,18 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
     ptr_shadow::copy_slot(dst_slot_addr, src_slot_addr);
 }
 
+#[no_mangle]
+pub extern "C" fn __rz_shadow_copy_range(dst_addr: usize, src_addr: usize, size: usize) {
+    let _g = RzRuntimeGuard::enter();
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] copy_range dst=0x{:x} src=0x{:x} size={}",
+            dst_addr, src_addr, size
+        );
+    }
+    ptr_shadow::copy_range(dst_addr, src_addr, size);
+}
+
 // === allocation event ring buffer (no-alloc, best-effort) ===================
 
 #[cfg(feature = "rz_alloc_dump")]
