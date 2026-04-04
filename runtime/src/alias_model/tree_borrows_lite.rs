@@ -493,6 +493,7 @@ fn tb_lite_check(
         // Best-effort: missing node means missing model metadata, not definite UB.
         return None;
     };
+    let access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
     if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
         // Tag metadata and TB node disagree on epoch; treat as stale model state and skip.
         return None;
@@ -554,7 +555,7 @@ fn tb_lite_check(
         let Some(n) = tree.nodes.get(&tag).cloned() else {
             continue;
         };
-        let child = tb_is_ancestor(&tree.nodes, n.tag, access_tag);
+        let child = tb_lineage_contains(&access_lineage, n.tag);
 
         let next = match (access, child, n.perm, n.protected) {
             // Child/local read: everything except Disabled is unchanged.
@@ -589,7 +590,7 @@ fn tb_lite_check(
                 if tb_has_usable_clean_unique_ancestor(
                     &tree.nodes,
                     n.tag,
-                    access_tag,
+                    &access_lineage,
                     addr,
                     size,
                 ) {
@@ -609,10 +610,10 @@ fn tb_lite_check(
                 if tb_has_usable_clean_unique_ancestor(
                     &tree.nodes,
                     n.tag,
-                    access_tag,
+                    &access_lineage,
                     addr,
                     size,
-                ) || tb_only_unique_ancestor_overlap(&tree.nodes, access_tag, addr, size) {
+                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size) {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -770,6 +771,26 @@ fn tb_disable_node(n: &mut TbNode) {
     n.alive = false;
 }
 
+fn tb_collect_lineage(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> Vec<u64> {
+    let mut lineage = Vec::new();
+    for _ in 0..nodes.len().saturating_add(1) {
+        let Some(node) = nodes.get(&tag) else {
+            break;
+        };
+        lineage.push(tag);
+        if node.parent == 0 {
+            break;
+        }
+        tag = node.parent;
+    }
+    lineage
+}
+
+#[inline]
+fn tb_lineage_contains(lineage: &[u64], tag: u64) -> bool {
+    lineage.contains(&tag)
+}
+
 fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
         let t = tmap.get(&tag)?;
@@ -899,7 +920,7 @@ fn tb_is_effective_ancestor(
 fn tb_has_usable_clean_unique_ancestor(
     nodes: &HashMap<u64, TbNode>,
     conflicted_tag: u64,
-    access_tag: u64,
+    access_lineage: &[u64],
     addr: usize,
     size: usize,
 ) -> bool {
@@ -908,8 +929,10 @@ fn tb_has_usable_clean_unique_ancestor(
     };
     let conflicted_end = conflicted.start.saturating_add(conflicted.len);
     let access_end = addr.saturating_add(size);
-    let mut cur = access_tag;
-    while cur != 0 && cur != conflicted_tag {
+    for &cur in access_lineage {
+        if cur == conflicted_tag {
+            break;
+        }
         let Some(node) = nodes.get(&cur) else {
             return false;
         };
@@ -934,14 +957,13 @@ fn tb_has_usable_clean_unique_ancestor(
             }
             return true;
         }
-        cur = node.parent;
     }
     false
 }
 
 fn tb_only_unique_ancestor_overlap(
     nodes: &HashMap<u64, TbNode>,
-    access_tag: u64,
+    access_lineage: &[u64],
     addr: usize,
     size: usize,
 ) -> bool {
@@ -949,7 +971,7 @@ fn tb_only_unique_ancestor_overlap(
         if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
             return true;
         }
-        tb_is_ancestor(nodes, other.tag, access_tag)
+        tb_lineage_contains(access_lineage, other.tag)
             && matches!(other.kind, BorrowKind::Unique)
             && !matches!(other.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
     })
