@@ -611,6 +611,14 @@ enum InstrKind<'tcx> {
     /// Coarse pointer-use tracking: a pointer-typed local appears in a call argument.
     /// This is treated as an escape event at call boundaries.
     PtrUse { ptr_local: Local },
+    /// Restore tag metadata for a pointer local loaded from a memory slot.
+    ShadowLoad { dst_local: Local },
+    /// Store tag metadata for a pointer local into a memory slot.
+    ShadowStore { src_local: Local },
+    /// Copy tag metadata between memory slots.
+    ShadowCopySlot { src_place: Place<'tcx> },
+    /// Clear pointer-shadow metadata for a written memory range.
+    ShadowKill { size_op: SizeOperand<'tcx> },
     /// Propagate tags across pointer-to-pointer casts and plain copies/moves of pointer locals.
     /// This is a local tag assignment, not a runtime hook.
     TagProp {
@@ -673,6 +681,11 @@ struct Hooks {
     def_id_push_ret_tag: DefId,
     def_id_take_ret_tag_or_root: DefId,
     def_id_exit_fn: DefId,
+    def_id_shadow_store_ptr: DefId,
+    def_id_shadow_load_tag: DefId,
+    def_id_shadow_load_ref_ancestor: DefId,
+    def_id_shadow_kill_range: DefId,
+    def_id_shadow_copy_slot: DefId,
 }
 
 impl MyOptimizationPass {
@@ -785,6 +798,15 @@ impl MyOptimizationPass {
 
     fn is_raw_pointer_ty<'tcx>(&self, ty: Ty<'tcx>) -> bool {
         matches!(ty.kind(), TyKind::RawPtr(..))
+    }
+
+    fn is_shadowable_ptr_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        self.is_pointer_ty(ty) && self.is_thin_ptr_ty(tcx, body, ty)
     }
 
     /// Best-effort detection of "vtable-like" structs: all fields are function pointers.
@@ -1094,6 +1116,63 @@ impl MyOptimizationPass {
         );
 
         Some((Some(data_ptr_stmt), addr_stmt))
+    }
+
+    fn slot_addr_stmts_for_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        place: Place<'tcx>,
+        addr_local: Local,
+        is_mut: bool,
+    ) -> Option<(Statement<'tcx>, Statement<'tcx>)> {
+        let place_ty = place.ty(&body.local_decls, tcx).ty;
+        if !place_ty.is_sized(tcx, body.typing_env(tcx)) {
+            return None;
+        }
+
+        let raw_ptr_ty = if is_mut {
+            Ty::new_mut_ptr(tcx, place_ty)
+        } else {
+            Ty::new_imm_ptr(tcx, place_ty)
+        };
+        if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
+            return None;
+        }
+
+        let slot_ptr_local = body
+            .local_decls
+            .push(LocalDecl::new(raw_ptr_ty, source_info.span));
+
+        let slot_ptr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(slot_ptr_local),
+                Rvalue::RawPtr(
+                    if is_mut {
+                        RawPtrKind::Mut
+                    } else {
+                        RawPtrKind::Const
+                    },
+                    place,
+                ),
+            ))),
+        );
+
+        let addr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(addr_local),
+                Rvalue::Cast(
+                    CastKind::PointerExposeProvenance,
+                    Operand::Copy(Place::from(slot_ptr_local)),
+                    tcx.types.usize,
+                ),
+            ))),
+        );
+
+        Some((slot_ptr_stmt, addr_stmt))
     }
 
     /// Whether to warn about unknown (unclassified) direct calls that may read/write memory via pointers.
@@ -3967,6 +4046,34 @@ impl MyOptimizationPass {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if self.is_pointer_ty(dst_ty) {
+                    if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
+                        if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
+                            let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                            if !src_place.projection.is_empty()
+                                && self.place_contains_deref(src_place)
+                                && self.is_shadowable_ptr_ty(tcx, body, src_ty)
+                            {
+                                ptr_locals_needing_tag.insert(dst_local);
+                                tagged_ptr_locals.insert(dst_local);
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][ptr-shadow] ShadowLoad dst={:?} src={:?}",
+                                    dst_local,
+                                    src_place
+                                );
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: src_place,
+                                    kind: InstrKind::ShadowLoad { dst_local },
+                                });
+                                return;
+                            }
+                        }
+                    }
+
                     let mut skip_tag_prop = false;
 
                     // Casts to raw pointers should create a fresh raw tag with parent lineage,
@@ -4263,6 +4370,146 @@ impl MyOptimizationPass {
             }
         }
 
+        // Pointer-shadow maintenance for memory-resident pointer slots.
+        if let StatementKind::Assign(box (lhs_place, rvalue)) = &stmt.kind {
+            let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+
+            if !lhs_place.projection.is_empty() {
+                if self.is_shadowable_ptr_ty(tcx, body, lhs_ty) {
+                    if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
+                        let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                        if self.is_shadowable_ptr_ty(tcx, body, src_ty) {
+                            if src_place.projection.is_empty() {
+                                ptr_locals_needing_tag.insert(src_place.local);
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][ptr-shadow] ShadowStore dst={:?} src_local={:?}",
+                                    lhs_place,
+                                    src_place.local
+                                );
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: lhs_place.clone(),
+                                    kind: InstrKind::ShadowStore {
+                                        src_local: src_place.local,
+                                    },
+                                });
+                            } else {
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][ptr-shadow] ShadowCopySlot dst={:?} src={:?}",
+                                    lhs_place,
+                                    src_place
+                                );
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: lhs_place.clone(),
+                                    kind: InstrKind::ShadowCopySlot { src_place },
+                                });
+                            }
+                        } else {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: lhs_place.clone(),
+                                kind: InstrKind::ShadowKill {
+                                    size_op: self.size_operand_for_ty(
+                                        tcx,
+                                        body,
+                                        lhs_ty,
+                                        stmt.source_info.span,
+                                    ),
+                                },
+                            });
+                        }
+                    } else {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx,
+                            insert_before: false,
+                            source_info: stmt.source_info,
+                            place: lhs_place.clone(),
+                            kind: InstrKind::ShadowKill {
+                                size_op: self.size_operand_for_ty(
+                                    tcx,
+                                    body,
+                                    lhs_ty,
+                                    stmt.source_info.span,
+                                ),
+                            },
+                        });
+                    }
+                } else if lhs_ty.is_sized(tcx, body.typing_env(tcx)) {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: lhs_place.clone(),
+                        kind: InstrKind::ShadowKill {
+                            size_op: self.size_operand_for_ty(
+                                tcx,
+                                body,
+                                lhs_ty,
+                                stmt.source_info.span,
+                            ),
+                        },
+                    });
+                }
+            } else if let Some(dst_local) = lhs_place.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                match rvalue {
+                    Rvalue::Aggregate(_kind, ops) => {
+                        let ops_vec: Vec<Operand<'tcx>> = ops.iter().cloned().collect();
+                        self.emit_aggregate_shadow_ops(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            stmt.source_info,
+                            dst_local,
+                            dst_ty,
+                            &ops_vec,
+                            insert_points,
+                            ptr_locals_needing_tag,
+                        );
+                    }
+                    Rvalue::Use(Operand::Copy(src_place)) | Rvalue::Use(Operand::Move(src_place))
+                        if src_place.ty(&body.local_decls, tcx).ty == dst_ty =>
+                    {
+                        if let Some(field_tys) = self.aggregate_field_tys(tcx, dst_ty) {
+                            for (field_idx, field_ty) in field_tys.into_iter().enumerate() {
+                        if !self.is_shadowable_ptr_ty(tcx, body, field_ty) {
+                            continue;
+                        }
+                                let dst_field =
+                                    self.pointer_field_place(tcx, dst_local, field_idx, field_ty);
+                                let src_field =
+                                    self.pointer_field_place(tcx, src_place.local, field_idx, field_ty);
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: dst_field,
+                                    kind: InstrKind::ShadowCopySlot { src_place: src_field },
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Handle pointer constants embedded in aggregate/field assignments where the destination
         // is not a pointer local we can tag. We still want to record the backing global allocation
         // so later derefs (e.g., vtable loads) do not report WILD_POINTER.
@@ -4541,6 +4788,133 @@ impl MyOptimizationPass {
         }
 
         None
+    }
+
+    fn pointer_place_from_rvalue<'tcx>(
+        &self,
+        rvalue: &Rvalue<'tcx>,
+    ) -> Option<Place<'tcx>> {
+        match rvalue {
+            Rvalue::Use(Operand::Copy(place)) | Rvalue::Use(Operand::Move(place)) => Some(*place),
+            Rvalue::CopyForDeref(place) => Some(*place),
+            _ => None,
+        }
+    }
+
+    fn place_contains_deref<'tcx>(&self, place: Place<'tcx>) -> bool {
+        place.projection
+            .iter()
+            .any(|proj| matches!(proj, ProjectionElem::Deref))
+    }
+
+    fn pointer_field_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        base_local: Local,
+        field_idx: usize,
+        field_ty: Ty<'tcx>,
+    ) -> Place<'tcx> {
+        Place::from(base_local).project_deeper(
+            &[PlaceElem::Field(FieldIdx::from_usize(field_idx), field_ty)],
+            tcx,
+        )
+    }
+
+    fn aggregate_field_tys<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        dst_ty: Ty<'tcx>,
+    ) -> Option<Vec<Ty<'tcx>>> {
+        match dst_ty.kind() {
+            TyKind::Tuple(field_tys) => Some(field_tys.iter().collect()),
+            TyKind::Adt(adt, args) if adt.is_struct() => Some(
+                adt.non_enum_variant()
+                    .fields
+                    .iter()
+                    .map(|field| field.ty(tcx, args))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn emit_aggregate_shadow_ops<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+        ops: &[Operand<'tcx>],
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        ptr_locals_needing_tag: &mut HashSet<Local>,
+    ) {
+        let Some(field_tys) = self.aggregate_field_tys(tcx, dst_ty) else {
+            return;
+        };
+
+        for (field_idx, field_ty) in field_tys.into_iter().enumerate() {
+            if !self.is_shadowable_ptr_ty(tcx, body, field_ty) {
+                continue;
+            }
+            let Some(op) = ops.get(field_idx) else {
+                continue;
+            };
+            let field_place = self.pointer_field_place(tcx, dst_local, field_idx, field_ty);
+            if let Some(src_place) = self.place_from_operand(op) {
+                let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                    if self.is_shadowable_ptr_ty(tcx, body, src_ty) {
+                        if src_place.projection.is_empty() {
+                            ptr_locals_needing_tag.insert(src_place.local);
+                            rz_pass_trace!(
+                                self,
+                                "[rusteze][ptr-shadow] Aggregate ShadowStore dst_field={:?} src_local={:?}",
+                                field_place,
+                                src_place.local
+                            );
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                            insert_before: false,
+                            source_info,
+                            place: field_place,
+                            kind: InstrKind::ShadowStore {
+                                src_local: src_place.local,
+                            },
+                        });
+                        } else {
+                            rz_pass_trace!(
+                                self,
+                                "[rusteze][ptr-shadow] Aggregate ShadowCopySlot dst_field={:?} src={:?}",
+                                field_place,
+                                src_place
+                            );
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                            insert_before: false,
+                            source_info,
+                            place: field_place,
+                            kind: InstrKind::ShadowCopySlot { src_place },
+                        });
+                    }
+                    continue;
+                }
+            }
+
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx,
+                insert_before: false,
+                source_info,
+                place: field_place,
+                kind: InstrKind::ShadowKill {
+                    size_op: self.size_operand_for_ty(tcx, body, field_ty, source_info.span),
+                },
+            });
+        }
     }
 
     /// Best-effort: compute byte size operand for memory ops given a pointer local and a count operand.
@@ -6546,6 +6920,10 @@ impl MyOptimizationPass {
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrReadAllowUntagged { .. } => hooks.def_id_read_allow_untagged,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
+            InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
+            InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
+            InstrKind::ShadowCopySlot { .. } => hooks.def_id_shadow_copy_slot,
+            InstrKind::ShadowKill { .. } => hooks.def_id_shadow_kill_range,
             InstrKind::TagProp { .. } => hooks.def_id_use, // should never become a call (handled as a plain Assign)
             InstrKind::PtrDerive { is_ref, .. } => {
                 if *is_ref { hooks.def_id_ref } else { hooks.def_id_raw }
@@ -6580,10 +6958,13 @@ impl MyOptimizationPass {
                 // Tag propagation must execute after tag-creating hooks but before
                 // access/usage hooks at the same insertion site.
                 InstrKind::TagProp { .. } => 1,
+                InstrKind::ShadowLoad { .. } => 1,
                 InstrKind::PtrRead { .. }
                 | InstrKind::PtrWrite { .. }
                 | InstrKind::PtrReadAllowUntagged { .. }
-                | InstrKind::PtrWriteAllowUntagged { .. } => 2,
+                | InstrKind::PtrWriteAllowUntagged { .. }
+                | InstrKind::ShadowKill { .. } => 2,
+                InstrKind::ShadowStore { .. } | InstrKind::ShadowCopySlot { .. } => 3,
                 InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
                 _ => 4,
             }
@@ -6632,6 +7013,209 @@ impl MyOptimizationPass {
                 if matches!(ptr_ty.kind(), TyKind::RawPtr(..)) {
                     continue;
                 }
+            }
+
+            if let InstrKind::ShadowLoad { dst_local } = creation_kind.clone() {
+                let dst_tag_local = *tag_local_for_ptr_local
+                    .get(&dst_local)
+                    .expect("missing tag local for ShadowLoad dst");
+                let dst_ref_ancestor_local = *ref_ancestor_local_for_ptr_local
+                    .get(&dst_local)
+                    .expect("missing ref-ancestor local for ShadowLoad dst");
+
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((slot_addr_stmt1, slot_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                let ref_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(None, is_cleanup));
+
+                let tag_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_shadow_load_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let tag_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: Operand::Copy(Place::from(addr_local)),
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+
+                let ref_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_shadow_load_ref_ancestor,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: Operand::Copy(Place::from(addr_local)),
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+
+                body.basic_blocks_mut()[ref_block].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: ref_func,
+                        args: ref_args,
+                        destination: Place::from(dst_ref_ancestor_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                });
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let len = bd.statements.len();
+                    let split_at = if stmt_idx >= len {
+                        len
+                    } else if ip.insert_before {
+                        stmt_idx
+                    } else {
+                        stmt_idx + 1
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(slot_addr_stmt1);
+                    bd.statements.push(slot_addr_stmt2);
+                    bd.terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: tag_func,
+                            args: tag_args,
+                            destination: Place::from(dst_tag_local),
+                            target: Some(ref_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
+            if let InstrKind::ShadowCopySlot { src_place } = creation_kind.clone() {
+                let dst_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let src_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((dst_addr_stmt1, dst_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    dst_addr_local,
+                    true,
+                ) else {
+                    continue;
+                };
+                let Some((src_addr_stmt1, src_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    src_place,
+                    src_addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let copy_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_shadow_copy_slot,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let copy_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(dst_addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(src_addr_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let len = bd.statements.len();
+                    let split_at = if stmt_idx >= len {
+                        len
+                    } else if ip.insert_before {
+                        stmt_idx
+                    } else {
+                        stmt_idx + 1
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(dst_addr_stmt1);
+                    bd.statements.push(dst_addr_stmt2);
+                    bd.statements.push(src_addr_stmt1);
+                    bd.statements.push(src_addr_stmt2);
+                    bd.terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: copy_func,
+                            args: copy_args,
+                            destination: Place::from(tmp_unit),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
             }
 
             // workaround for pointers produced from NonNull/Unique via Transmute
@@ -7550,6 +8134,20 @@ impl MyOptimizationPass {
                         }
                     }
                 }
+                InstrKind::ShadowStore { .. } | InstrKind::ShadowKill { .. } => {
+                    let is_mut = matches!(creation_kind, InstrKind::ShadowStore { .. } | InstrKind::ShadowKill { .. });
+                    let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        place,
+                        addr_local,
+                        is_mut,
+                    ) else {
+                        continue;
+                    };
+                    (Some(slot_stmt1), slot_stmt2)
+                }
                 _ => {
                     match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
                         Some(stmts) => stmts,
@@ -7809,6 +8407,52 @@ impl MyOptimizationPass {
                     ]
                     .into_boxed_slice();
 
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::ShadowStore { src_local } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let tag_op: Operand<'tcx> = if let Some(tl) = tag_local_for_ptr_local.get(&src_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+                    let ref_ancestor_op: Operand<'tcx> =
+                        if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src_local) {
+                            Operand::Copy(Place::from(*tl))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        };
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: tag_op, span: source_info.span },
+                        Spanned {
+                            node: ref_ancestor_op,
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::ShadowKill { ref size_op } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let (arg_size, mut size_stmts) = self.materialize_size_operand(
+                        tcx,
+                        body,
+                        source_info,
+                        size_op,
+                    );
+                    extra_stmts.append(&mut size_stmts);
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned { node: arg_addr, span: source_info.span },
+                        Spanned { node: arg_size, span: source_info.span },
+                    ]
+                    .into_boxed_slice();
                     (args, Place::from(tmp_unit))
                 }
 
@@ -8797,6 +9441,21 @@ impl MyOptimizationPass {
         let def_id_exit_fn = self
             .find_runtime_fn_def_id(tcx, "__rz_exit_fn", 1)
             .expect("missing '__rz_exit_fn' definition");
+        let def_id_shadow_store_ptr = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr", 3)
+            .expect("missing '__rz_shadow_store_ptr' definition");
+        let def_id_shadow_load_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_tag", 1)
+            .expect("missing '__rz_shadow_load_tag' definition");
+        let def_id_shadow_load_ref_ancestor = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_ref_ancestor", 1)
+            .expect("missing '__rz_shadow_load_ref_ancestor' definition");
+        let def_id_shadow_kill_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_kill_range", 2)
+            .expect("missing '__rz_shadow_kill_range' definition");
+        let def_id_shadow_copy_slot = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_copy_slot", 2)
+            .expect("missing '__rz_shadow_copy_slot' definition");
 
         let hooks = Hooks {
             def_id_ref,
@@ -8812,6 +9471,11 @@ impl MyOptimizationPass {
             def_id_push_ret_tag,
             def_id_take_ret_tag_or_root,
             def_id_exit_fn,
+            def_id_shadow_store_ptr,
+            def_id_shadow_load_tag,
+            def_id_shadow_load_ref_ancestor,
+            def_id_shadow_kill_range,
+            def_id_shadow_copy_slot,
         };
 
         let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(

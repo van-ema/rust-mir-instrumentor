@@ -19,6 +19,7 @@ mod dead_epoch_cleanup;
 mod exact_parent_index;
 mod lineage_cache;
 mod live_alloc_cache;
+mod ptr_shadow;
 mod tag_history;
 mod tag_lookup_cache;
 mod tag_pruning;
@@ -1053,7 +1054,7 @@ fn find_alloc_origin_candidate<'a>(
 }
 
 #[inline]
-fn lookup_alloc_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
+pub(crate) fn lookup_alloc_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
     live_alloc_cache::lookup_containing(addr).or_else(|| {
         let amap = allocs().lock().unwrap();
         find_alloc_containing(&amap, addr).map(|(base, meta)| (base, *meta))
@@ -1770,6 +1771,68 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     if let Some(dead_epoch) = compact_dead_epoch {
         dead_epoch_cleanup::reclaim_alloc_epoch(base_addr, dead_epoch);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor: u64) {
+    let _g = RzRuntimeGuard::enter();
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] store slot=0x{:x} tag={} ref_ancestor={}",
+            slot_addr, tag, ref_ancestor
+        );
+    }
+    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let tag = ptr_shadow::load_tag(slot_addr);
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] load_tag slot=0x{:x} -> {}",
+            slot_addr, tag
+        );
+    }
+    tag
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] load_ref_ancestor slot=0x{:x} -> {}",
+            slot_addr, ref_ancestor
+        );
+    }
+    ref_ancestor
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
+    let _g = RzRuntimeGuard::enter();
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] kill slot=0x{:x} size={}",
+            slot_addr, size
+        );
+    }
+    ptr_shadow::kill_range(slot_addr, size);
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usize) {
+    let _g = RzRuntimeGuard::enter();
+    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] copy dst=0x{:x} src=0x{:x}",
+            dst_slot_addr, src_slot_addr
+        );
+    }
+    ptr_shadow::copy_slot(dst_slot_addr, src_slot_addr);
 }
 
 // === allocation event ring buffer (no-alloc, best-effort) ===================
