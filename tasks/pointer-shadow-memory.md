@@ -20,7 +20,16 @@ Representative examples already in this repository:
 - `paper_examples/lineage_memcpy_roundtrip`
 - `paper_examples/lineage_static_smuggle`
 
-These all currently behave as false negatives in instrumented `--release` mode.
+Current status on `main`:
+- `paper_examples/lineage_static_smuggle`
+  - fixed by phase 1
+  - now reports `TREE_BORROWS_VIOLATION|WRITE|RawMut|1`
+- `paper_examples/lineage_memcpy_roundtrip`
+  - fixed by phase 2
+  - now reports `TREE_BORROWS_VIOLATION|WRITE|RawMut|1`
+- `paper_examples/lineage_field_proj`
+  - still a `--release` false negative
+  - the remaining gap is field/projection-heavy reload paths whose lineage is still not materialized early enough for later ref/raw creation
 
 ## Goal
 
@@ -218,60 +227,81 @@ This feature should be orthogonal to the alias model:
 - pointer shadow restores provenance
 - `tb_lite` then uses that restored provenance to build/check the tree
 
-## Representative Cases This Should Fix
+## Implemented Phases
+
+### Phase 1: typed pointer slots
+
+Committed in:
+- `db059f8` `runtime: add phase-1 pointer shadow provenance`
+
+Delivered:
+- shadow store/load for thin raw pointer slots
+- shadow kill on overlapping writes
+- cleanup on allocation death and epoch removal
+- enough coverage to fix the static-smuggling case
+
+### Phase 2: bytewise copy propagation
+
+Committed in:
+- `61e3ad7` `runtime: propagate pointer shadow through bytewise copies`
+
+Delivered:
+- `shadow_copy_range` runtime support
+- MIR emission for memcpy-like wrappers and one-byte copy patterns
+- partial-slot assembly so bytewise pointer reconstruction reconstitutes full shadow entries
+- enough coverage to fix bytewise pointer copies such as `lineage_memcpy_roundtrip`
+
+## Representative Cases
 
 ### 1. Field projection reload
 
 `paper_examples/lineage_field_proj`
 
-Problem today:
-- pointer stored in `Wrapper.ptr`
-- later field load returns only pointer bits
-- release-mode instrumentation loses common parent lineage
+Current status:
+- still a false negative in `--release`
 
-With pointer shadow:
-- storing `buf.as_mut_ptr()` into `Wrapper.ptr` also stores its provenance
-- loading `self.ptr` restores that provenance
-- sibling refs built from repeated loads share the correct ancestor
+What remains:
+- make projection-heavy reload paths restore the stored slot provenance before later ref/raw creation sites lose the common ancestor
 
 ### 2. Bytewise memory copy of pointer-carrying object
 
 `paper_examples/lineage_memcpy_roundtrip`
 
-Problem today:
-- `Slot { ptr }` copied bytewise into a second object
-- later loads from `dst.ptr` lose provenance
+Current status:
+- fixed by phase 2
 
-With pointer shadow:
+Delivered behavior:
 - shadow copy mirrors the bytewise copy
 - `dst.ptr` reload restores the same provenance as `src.ptr`
+- the later conflicting write is now reported as `TREE_BORROWS_VIOLATION|WRITE|RawMut|1`
 
 ### 3. Static memory smuggling
 
 `paper_examples/lineage_static_smuggle`
 
-Problem today:
-- raw pointer stored in `static mut PTR`
-- later reload loses lineage
+Current status:
+- fixed by phase 1
 
-With pointer shadow:
-- the static slot carries provenance shadow too
-- reloaded pointer remains connected to the original borrow tree
+Delivered behavior:
+- the static slot carries provenance shadow
+- the reloaded pointer remains connected to the original borrow tree
+- the later conflicting write is now reported as `TREE_BORROWS_VIOLATION|WRITE|RawMut|1`
 
-## Scope for Phase 1
+## Remaining Scope
 
-Keep the first implementation intentionally narrow:
+The current implementation is still intentionally narrow:
 
 - thin pointers only
 - exact typed loads/stores of pointer-sized values
-- bytewise copy propagation for memcpy/memmove
+- bytewise copy propagation for memcpy/memmove-style transport
 - overlapping non-pointer writes conservatively kill shadow
 
-Do **not** start with:
+Still out of scope:
 - wide pointers / DST metadata
 - partial pointer-byte provenance
 - integer round-trips
-- opaque/native shared-memory cases
+- helper/wrapper reload shapes that do not currently materialize as direct shadowable loads
+- SSA-only ancestry that never touched memory
 
 Those can come later.
 
@@ -299,10 +329,8 @@ This may still miss bugs, but it should not fabricate lineage that is not justif
 
 ## Success Criteria
 
-At minimum, after this work:
+At minimum, after the next round of work:
 - `paper_examples/lineage_field_proj` should stop being `ok` in `--release`
-- `paper_examples/lineage_memcpy_roundtrip` should stop being `ok` in `--release`
-- `paper_examples/lineage_static_smuggle` should stop being `ok` in `--release`
 
 And:
 - existing default/interprocedural example suites must stay green
