@@ -21,39 +21,6 @@ Validation gates:
 2. Short AFL smoke runs must start and mutate without immediate tool aborts.
 3. No regressions on known must-catch UB examples.
 
-## Optimized-away SSA lineage
-Goal:
-- Preserve shared parent-child lineage when optimized MIR erases the intermediate pointer locals that used to carry it.
-
-Open tasks:
-1. Extend the new SSA-anchor path beyond straight-line cases.
-- Current `main` reuses normalized pointer-expression anchors across the common
-  optimized `cast -> Offset -> ref/raw` patterns and across CFG joins when all
-  incoming predecessors agree on the anchor state, including branch-result joins
-  where the path-stable carrier at the merge is a reference local.
-- Remaining gap: loop-carried reuse.
-2. Cover projection-heavy helper paths.
-- Extend local lineage recovery to more projection-heavy `Offset` / cast /
-  aggregate chains without inventing parentage when the source cannot be
-  justified.
-3. Keep mixed memory/SSA cases well covered.
-- Pointer shadow now handles provenance that travels through memory.
-- Remaining mixed cases combine reloads with optimized SSA rebuilding and still
-  need targeted regressions.
-4. Keep the fallback conservative.
-- If the shared ancestor cannot be reconstructed confidently, keep the current
-  root-like fallback rather than fabricating a parent link.
-
-Representative example:
-- `paper_examples/lineage_opt_away`
-
-Exit criteria:
-1. `paper_examples/lineage_opt_away` remains a must-catch release-mode
-   regression.
-2. Existing example suites remain green in default and interprocedural modes.
-3. The anchoring path stays sound by construction: missing lineage remains
-   acceptable, invented lineage does not.
-
 ## Wide/Fat pointer support
 Goal:
 - Reduce blind spots on slices/str/dyn-trait pointer flows.

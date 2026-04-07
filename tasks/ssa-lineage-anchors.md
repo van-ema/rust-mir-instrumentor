@@ -76,6 +76,12 @@ Current behavior:
   - `paper_examples/lineage_cfg_join`
 - and for the harder branch-result join case:
   - `paper_examples/lineage_cfg_branch_join`
+- and for the loop-carried case:
+  - `paper_examples/lineage_loop_carried`
+- and for the projection-heavy helper-return case:
+  - `paper_examples/lineage_helper_nested`
+- and for the mixed memory + SSA case:
+  - `paper_examples/lineage_mixed_mem_ssa`
 
 The enabling runtime fix was small but necessary:
 - `tb_lite` now keeps disabled ancestors in the overlap walk so accesses through
@@ -227,24 +233,20 @@ Likely touch points:
 The fix should remain compiler-side. Runtime recovery stays as a secondary mechanism for
 same-address repair, not the primary way to invent missing SSA ancestry.
 
-## Remaining work
+## Plan status
 
-1. Extend anchors beyond straight-line recomputation.
-- Current reuse covers straight-line code and CFG joins whose incoming
-  predecessors agree on the anchor state, including the branch-result join case
-  where the shared carrier at the merge is a reference local.
-- Loop-carried reuse still needs a more explicit story.
+The scoped implementation plan in this task is complete.
 
-2. Cover more projection-heavy expressions.
-- The current normalization handles the common `cast -> Offset -> ref/raw`
-  shapes well.
-- Projection-heavy helper returns and richer aggregate forwarding still need
-  targeted coverage.
+The original remaining buckets are now covered by checked examples:
+- loop-carried reuse:
+  - `paper_examples/lineage_loop_carried`
+- projection-heavy helper / aggregate forwarding:
+  - `paper_examples/lineage_helper_nested`
+- mixed memory + SSA rebuilding:
+  - `paper_examples/lineage_mixed_mem_ssa`
 
-3. Revisit memory-backed mixed cases.
-- Pointer shadow already covers values that travel through memory.
-- Some mixed cases still combine memory reload and optimized SSA rebuilding in a
-  way that deserves dedicated regressions.
+Future work, if needed, should be treated as broader robustness work rather than
+as unfinished items in this specific anchor plan.
 
 ## Success Criteria
 

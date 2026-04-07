@@ -101,6 +101,9 @@ exclude = [
     "paper_examples/lineage_static_smuggle",
     "paper_examples/lineage_cfg_join",
     "paper_examples/lineage_cfg_branch_join",
+    "paper_examples/lineage_loop_carried",
+    "paper_examples/lineage_helper_nested",
+    "paper_examples/lineage_mixed_mem_ssa",
 ]
 
 # Optional but recommended for reproducibility:

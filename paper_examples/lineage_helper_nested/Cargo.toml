@@ -1,0 +1,6 @@
+[package]
+name = "lineage_helper_nested"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
