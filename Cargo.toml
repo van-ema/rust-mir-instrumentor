@@ -100,6 +100,7 @@ exclude = [
     "paper_examples/lineage_memcpy_roundtrip",
     "paper_examples/lineage_static_smuggle",
     "paper_examples/lineage_cfg_join",
+    "paper_examples/lineage_cfg_branch_join",
 ]
 
 # Optional but recommended for reproducibility:

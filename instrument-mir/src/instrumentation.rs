@@ -26,7 +26,20 @@ use rustc_span::{source_map::Spanned, Span};
 
 pub(crate) struct MyOptimizationPass;
 
-type SsaAnchorMap = HashMap<String, (Local, Vec<Local>)>;
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SsaAnchorSource {
+    Tag,
+    RefAncestor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SsaAnchorState {
+    local: Local,
+    deps: Vec<Local>,
+    source: SsaAnchorSource,
+}
+
+type SsaAnchorMap = HashMap<String, SsaAnchorState>;
 
 trait FunctionDefId {
     fn func_def_id(&self) -> DefId;
@@ -632,6 +645,10 @@ enum InstrKind<'tcx> {
         copy_tag: bool,
         copy_ref_ancestor: bool,
     },
+    /// Propagate both tag channels from the source ref-ancestor slot.
+    /// Used when a stable SSA anchor is represented by a ref local whose
+    /// semantic common parent is stored in `ref_ancestor`.
+    TagPropFromRefAncestor { dst: Local, src: Local },
     /// Fresh tag for a derived pointer value (pointer arithmetic like add/sub/offset).
     /// Emits either ref/raw creation based on destination kind, with `parent=tag(src)`.
     PtrDerive { dst: Local, src: Local, is_mut: bool, is_ref: bool },
@@ -3422,7 +3439,62 @@ impl MyOptimizationPass {
         ssa_anchor_for_expr: &mut SsaAnchorMap,
         local: Local,
     ) {
-        ssa_anchor_for_expr.retain(|_, (_anchor_local, deps)| !deps.contains(&local));
+        ssa_anchor_for_expr.retain(|_, state| !state.deps.contains(&local));
+    }
+
+    fn rebind_ssa_anchors_for_copy(
+        &self,
+        ssa_anchor_for_expr: &mut SsaAnchorMap,
+        src: Local,
+        dst: Local,
+    ) {
+        let rebound: Vec<(String, SsaAnchorState)> = ssa_anchor_for_expr
+            .iter()
+            .filter_map(|(key, state)| {
+                if state.local == src {
+                    Some((
+                        key.clone(),
+                        SsaAnchorState {
+                            local: dst,
+                            deps: state.deps.clone(),
+                            source: state.source,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (key, state) in rebound {
+            ssa_anchor_for_expr.insert(key, state);
+        }
+    }
+
+    fn reusable_ssa_anchor_for_expr<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        ssa_anchor_for_expr: &SsaAnchorMap,
+        key: &str,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+    ) -> Option<SsaAnchorState> {
+        let state = ssa_anchor_for_expr.get(key)?;
+        if state.local == dst_local {
+            return None;
+        }
+        match state.source {
+            SsaAnchorSource::Tag => {
+                if body.local_decls[state.local].ty != dst_ty {
+                    return None;
+                }
+            }
+            SsaAnchorSource::RefAncestor => {
+                if matches!(dst_ty.kind(), TyKind::Ref(..)) {
+                    return None;
+                }
+            }
+        }
+        Some(state.clone())
     }
 
     fn invalidate_ssa_anchors_for_call<'tcx>(
@@ -3442,9 +3514,8 @@ impl MyOptimizationPass {
             }
         }
         let before = ssa_anchor_for_expr.len();
-        ssa_anchor_for_expr.retain(|_, (_anchor_local, deps)| {
-            deps.iter().all(|dep| !touched_locals.contains(dep))
-        });
+        ssa_anchor_for_expr
+            .retain(|_, state| state.deps.iter().all(|dep| !touched_locals.contains(dep)));
         if trace_ssa_anchor && before != ssa_anchor_for_expr.len() && self.log_enabled(PassLogLevel::Trace) {
             rz_pass_trace!(
                 self,
@@ -3564,6 +3635,33 @@ impl MyOptimizationPass {
         let key = self.normalized_ptr_rvalue_key(
             body,
             rvalue,
+            statements,
+            upto,
+            16,
+            &mut visited,
+            &mut deps,
+        )?;
+        let mut deps_vec: Vec<Local> = deps.into_iter().collect();
+        deps_vec.sort_by_key(|local| local.index());
+        Some((key, deps_vec))
+    }
+
+    fn normalized_ptr_expr_key_for_ref_source_place<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+    ) -> Option<(String, Vec<Local>)> {
+        let ptr_local = src_place.local;
+        if !self.is_pointer_ty(body.local_decls[ptr_local].ty) {
+            return None;
+        }
+        let mut visited: HashSet<Local> = HashSet::new();
+        let mut deps: HashSet<Local> = HashSet::new();
+        let key = self.normalized_ptr_local_key(
+            body,
+            ptr_local,
             statements,
             upto,
             16,
@@ -4549,24 +4647,23 @@ impl MyOptimizationPass {
                                 &block_data.statements,
                                 stmt_idx,
                             );
-                            let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
-                                ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
-                                    if *anchor_local != dst_local
-                                        && body.local_decls[*anchor_local].ty == dst_ty
-                                    {
-                                        Some(*anchor_local)
-                                    } else {
-                                        None
-                                    }
-                                })
+                            let reused_anchor_state = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                self.reusable_ssa_anchor_for_expr(
+                                    body,
+                                    ssa_anchor_for_expr,
+                                    key,
+                                    dst_local,
+                                    dst_ty,
+                                )
                             });
-                            if let Some(anchor_local) = reused_anchor_local {
+                            if let Some(anchor_state) = reused_anchor_state {
                                 if trace_ssa_anchor {
                                     rz_pass_trace!(
                                         self,
-                                        "[rusteze][ssa-anchor] reuse root-cast dst={:?} anchor={:?} key={}",
+                                        "[rusteze][ssa-anchor] reuse root-cast dst={:?} anchor={:?} source={:?} key={}",
                                         dst_local,
-                                        anchor_local,
+                                        anchor_state.local,
+                                        anchor_state.source,
                                         anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
                                     );
                                 }
@@ -4576,11 +4673,19 @@ impl MyOptimizationPass {
                                     insert_before: false,
                                     source_info: stmt.source_info,
                                     place: Place::from(dst_local),
-                                    kind: InstrKind::TagProp {
-                                        dst: dst_local,
-                                        src: anchor_local,
-                                        copy_tag: true,
-                                        copy_ref_ancestor: true,
+                                    kind: match anchor_state.source {
+                                        SsaAnchorSource::Tag => InstrKind::TagProp {
+                                            dst: dst_local,
+                                            src: anchor_state.local,
+                                            copy_tag: true,
+                                            copy_ref_ancestor: true,
+                                        },
+                                        SsaAnchorSource::RefAncestor => {
+                                            InstrKind::TagPropFromRefAncestor {
+                                                dst: dst_local,
+                                                src: anchor_state.local,
+                                            }
+                                        }
                                     },
                                 });
                             } else {
@@ -4601,7 +4706,14 @@ impl MyOptimizationPass {
                                     kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
                                 });
                                 if let Some((key, deps)) = anchor_key {
-                                    ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                    ssa_anchor_for_expr.insert(
+                                        key,
+                                        SsaAnchorState {
+                                            local: dst_local,
+                                            deps,
+                                            source: SsaAnchorSource::Tag,
+                                        },
+                                    );
                                 }
                             }
                             skip_tag_prop = true;
@@ -4701,25 +4813,24 @@ impl MyOptimizationPass {
                                         &block_data.statements,
                                         stmt_idx,
                                     );
-                                    let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
-                                        ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
-                                            if *anchor_local != dst_local
-                                                && body.local_decls[*anchor_local].ty == dst_ty
-                                            {
-                                                Some(*anchor_local)
-                                            } else {
-                                                None
-                                            }
-                                        })
+                                    let reused_anchor_state = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                        self.reusable_ssa_anchor_for_expr(
+                                            body,
+                                            ssa_anchor_for_expr,
+                                            key,
+                                            dst_local,
+                                            dst_ty,
+                                        )
                                     });
 
-                                    if let Some(anchor_local) = reused_anchor_local {
+                                    if let Some(anchor_state) = reused_anchor_state {
                                         if trace_ssa_anchor {
                                             rz_pass_trace!(
                                                 self,
-                                                "[rusteze][ssa-anchor] reuse ptr-derive dst={:?} anchor={:?} key={}",
+                                                "[rusteze][ssa-anchor] reuse ptr-derive dst={:?} anchor={:?} source={:?} key={}",
                                                 dst_local,
-                                                anchor_local,
+                                                anchor_state.local,
+                                                anchor_state.source,
                                                 anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
                                             );
                                         }
@@ -4729,11 +4840,19 @@ impl MyOptimizationPass {
                                             insert_before: false,
                                             source_info: stmt.source_info,
                                             place: Place::from(dst_local),
-                                            kind: InstrKind::TagProp {
-                                                dst: dst_local,
-                                                src: anchor_local,
-                                                copy_tag: true,
-                                                copy_ref_ancestor: true,
+                                            kind: match anchor_state.source {
+                                                SsaAnchorSource::Tag => InstrKind::TagProp {
+                                                    dst: dst_local,
+                                                    src: anchor_state.local,
+                                                    copy_tag: true,
+                                                    copy_ref_ancestor: true,
+                                                },
+                                                SsaAnchorSource::RefAncestor => {
+                                                    InstrKind::TagPropFromRefAncestor {
+                                                        dst: dst_local,
+                                                        src: anchor_state.local,
+                                                    }
+                                                }
                                             },
                                         });
                                     } else {
@@ -4759,7 +4878,14 @@ impl MyOptimizationPass {
                                             },
                                         });
                                         if let Some((key, deps)) = anchor_key {
-                                            ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                            ssa_anchor_for_expr.insert(
+                                                key,
+                                                SsaAnchorState {
+                                                    local: dst_local,
+                                                    deps,
+                                                    source: SsaAnchorSource::Tag,
+                                                },
+                                            );
                                         }
                                     }
                                 } else {
@@ -4776,6 +4902,11 @@ impl MyOptimizationPass {
                                             copy_ref_ancestor: true,
                                         },
                                     });
+                                    self.rebind_ssa_anchors_for_copy(
+                                        ssa_anchor_for_expr,
+                                        src_local,
+                                        dst_local,
+                                    );
                                 }
                                 tagged_ptr_locals.insert(dst_local);
                             }
@@ -4826,24 +4957,23 @@ impl MyOptimizationPass {
                                         &block_data.statements,
                                         stmt_idx,
                                     );
-                                    let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
-                                        ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
-                                            if *anchor_local != dst_local
-                                                && body.local_decls[*anchor_local].ty == dst_ty
-                                            {
-                                                Some(*anchor_local)
-                                            } else {
-                                                None
-                                            }
-                                        })
+                                    let reused_anchor_state = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                        self.reusable_ssa_anchor_for_expr(
+                                            body,
+                                            ssa_anchor_for_expr,
+                                            key,
+                                            dst_local,
+                                            dst_ty,
+                                        )
                                     });
-                                    if let Some(anchor_local) = reused_anchor_local {
+                                    if let Some(anchor_state) = reused_anchor_state {
                                         if trace_ssa_anchor {
                                             rz_pass_trace!(
                                                 self,
-                                                "[rusteze][ssa-anchor] reuse projected-root dst={:?} anchor={:?} key={}",
+                                                "[rusteze][ssa-anchor] reuse projected-root dst={:?} anchor={:?} source={:?} key={}",
                                                 dst_local,
-                                                anchor_local,
+                                                anchor_state.local,
+                                                anchor_state.source,
                                                 anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
                                             );
                                         }
@@ -4853,11 +4983,19 @@ impl MyOptimizationPass {
                                             insert_before: false,
                                             source_info: stmt.source_info,
                                             place: Place::from(dst_local),
-                                            kind: InstrKind::TagProp {
-                                                dst: dst_local,
-                                                src: anchor_local,
-                                                copy_tag: true,
-                                                copy_ref_ancestor: true,
+                                            kind: match anchor_state.source {
+                                                SsaAnchorSource::Tag => InstrKind::TagProp {
+                                                    dst: dst_local,
+                                                    src: anchor_state.local,
+                                                    copy_tag: true,
+                                                    copy_ref_ancestor: true,
+                                                },
+                                                SsaAnchorSource::RefAncestor => {
+                                                    InstrKind::TagPropFromRefAncestor {
+                                                        dst: dst_local,
+                                                        src: anchor_state.local,
+                                                    }
+                                                }
                                             },
                                         });
                                     } else {
@@ -4889,7 +5027,14 @@ impl MyOptimizationPass {
                                             },
                                         });
                                         if let Some((key, deps)) = anchor_key {
-                                            ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                            ssa_anchor_for_expr.insert(
+                                                key,
+                                                SsaAnchorState {
+                                                    local: dst_local,
+                                                    deps,
+                                                    source: SsaAnchorSource::Tag,
+                                                },
+                                            );
                                         }
                                     }
                                     tagged_ptr_locals.insert(dst_local);
@@ -5315,6 +5460,29 @@ impl MyOptimizationPass {
                         place: place.clone(),
                         kind: InstrKind::Ref { bk: *bk, src: src_place.clone() },
                     });
+                    if let Some((key, deps)) = self.normalized_ptr_expr_key_for_ref_source_place(
+                        body,
+                        *src_place,
+                        &block_data.statements,
+                        stmt_idx,
+                    ) {
+                        if trace_ssa_anchor {
+                            rz_pass_trace!(
+                                self,
+                                "[rusteze][ssa-anchor] store ref-ancestor dst={:?} key={}",
+                                lhs_local,
+                                key
+                            );
+                        }
+                        ssa_anchor_for_expr.insert(
+                            key,
+                            SsaAnchorState {
+                                local: lhs_local,
+                                deps,
+                                source: SsaAnchorSource::RefAncestor,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -7617,7 +7785,9 @@ impl MyOptimizationPass {
             InstrKind::ShadowCopySlot { .. } => hooks.def_id_shadow_copy_slot,
             InstrKind::ShadowCopyRange { .. } => hooks.def_id_shadow_copy_range,
             InstrKind::ShadowKill { .. } => hooks.def_id_shadow_kill_range,
-            InstrKind::TagProp { .. } => hooks.def_id_use, // should never become a call (handled as a plain Assign)
+            InstrKind::TagProp { .. } | InstrKind::TagPropFromRefAncestor { .. } => {
+                hooks.def_id_use // should never become a call (handled as a plain Assign)
+            }
             InstrKind::PtrDerive { is_ref, .. } => {
                 if *is_ref { hooks.def_id_ref } else { hooks.def_id_raw }
             }
@@ -7650,7 +7820,7 @@ impl MyOptimizationPass {
                 | InstrKind::PtrDerive { .. } => 0,
                 // Tag propagation must execute after tag-creating hooks but before
                 // access/usage hooks at the same insertion site.
-                InstrKind::TagProp { .. } => 1,
+                InstrKind::TagProp { .. } | InstrKind::TagPropFromRefAncestor { .. } => 1,
                 InstrKind::ShadowLoad { .. } => 1,
                 InstrKind::PtrRead { .. }
                 | InstrKind::PtrWrite { .. }
@@ -8501,6 +8671,46 @@ impl MyOptimizationPass {
                 if let Some(prop_ref_ancestor_stmt) = prop_ref_ancestor_stmt {
                     bd.statements.insert(next_insert, prop_ref_ancestor_stmt);
                 }
+                continue;
+            }
+
+            if let InstrKind::TagPropFromRefAncestor { dst, src } = creation_kind {
+                let dst_tag = *tag_local_for_ptr_local
+                    .get(&dst)
+                    .expect("missing tag local for TagPropFromRefAncestor dst");
+                let dst_ref_ancestor = *ref_ancestor_local_for_ptr_local
+                    .get(&dst)
+                    .expect("missing ref-ancestor local for TagPropFromRefAncestor dst");
+                let src_ref_ancestor_op: Operand<'tcx> =
+                    if let Some(src_ref_ancestor) = ref_ancestor_local_for_ptr_local.get(&src) {
+                        Operand::Copy(Place::from(*src_ref_ancestor))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+
+                let tag_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(dst_tag),
+                        Rvalue::Use(src_ref_ancestor_op.clone()),
+                    ))),
+                );
+                let ref_ancestor_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(dst_ref_ancestor),
+                        Rvalue::Use(src_ref_ancestor_op),
+                    ))),
+                );
+
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                let insert_at = if stmt_idx >= bd.statements.len() {
+                    bd.statements.len()
+                } else {
+                    stmt_idx + 1
+                };
+                bd.statements
+                    .splice(insert_at..insert_at, [tag_stmt, ref_ancestor_stmt]);
                 continue;
             }
 
@@ -9593,17 +9803,27 @@ impl MyOptimizationPass {
             }
 
             let ref_ancestor_init_stmt_opt: Option<Statement<'tcx>> = match &creation_kind {
-                InstrKind::Ref { .. } => {
+                InstrKind::Ref { src, .. } => {
                     if let Some(dst_local) = place.as_local() {
-                        if let (Some(dst_ref_ancestor_local), Some(dst_tag_local)) = (
-                            ref_ancestor_local_for_ptr_local.get(&dst_local).copied(),
-                            tag_local_for_ptr_local.get(&dst_local).copied(),
-                        ) {
+                        if let Some(dst_ref_ancestor_local) =
+                            ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
+                        {
+                            let parent_op = self.parent_tag_operand_for_src_place(
+                                tcx,
+                                body,
+                                bb,
+                                stmt_idx,
+                                source_info,
+                                *src,
+                                tag_local_for_ptr_local,
+                                ref_ancestor_local_for_ptr_local,
+                                false,
+                            );
                             Some(Statement::new(
                                 source_info,
                                 StatementKind::Assign(Box::new((
                                     Place::from(dst_ref_ancestor_local),
-                                    Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                    Rvalue::Use(parent_op),
                                 ))),
                             ))
                         } else {
@@ -9690,15 +9910,23 @@ impl MyOptimizationPass {
                         ref_ancestor_local_for_ptr_local.get(dst).copied()
                     {
                         if *is_ref {
-                            tag_local_for_ptr_local.get(dst).copied().map(|dst_tag_local| {
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(dst_ref_ancestor_local),
-                                        Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
-                                    ))),
-                                )
-                            })
+                            let src_parent_op: Operand<'tcx> =
+                                if let Some(src_tag_local) = tag_local_for_ptr_local.get(src) {
+                                    Operand::Copy(Place::from(*src_tag_local))
+                                } else if let Some(src_ref_ancestor_local) =
+                                    ref_ancestor_local_for_ptr_local.get(src)
+                                {
+                                    Operand::Copy(Place::from(*src_ref_ancestor_local))
+                                } else {
+                                    self.const_u64(tcx, source_info.span, 0)
+                                };
+                            Some(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_ref_ancestor_local),
+                                    Rvalue::Use(src_parent_op),
+                                ))),
+                            ))
                         } else {
                             let src_ref_ancestor_op: Operand<'tcx> =
                                 if let Some(src_ref_ancestor_local) =

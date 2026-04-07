@@ -57,6 +57,10 @@ Implemented on `main`:
 - per-block SSA anchor reuse keyed by that normalized shape
 - predecessor-meet propagation so anchors survive CFG joins when all incoming
   paths carry the same anchor state
+- anchor rebinding through plain pointer copies, so semantic keys survive
+  `if`-expression result locals and other forwarding temporaries
+- ref-backed anchor reuse through the ref-ancestor channel when the only
+  path-stable carrier at a join is a reference local rather than a raw local
 - conservative invalidation when the dependent locals are reassigned or a call
   may clobber the cached expression
 
@@ -70,10 +74,19 @@ Current behavior:
   - `TREE_BORROWS_VIOLATION|READ|RefMut|1`
 - the same now holds for the join-heavy case:
   - `paper_examples/lineage_cfg_join`
+- and for the harder branch-result join case:
+  - `paper_examples/lineage_cfg_branch_join`
 
 The enabling runtime fix was small but necessary:
 - `tb_lite` now keeps disabled ancestors in the overlap walk so accesses through
   descendants of an invalidated borrow report `TB_LITE_DISABLED_ANCESTOR`
+
+One important instrumentation detail changed to make the harder join case work:
+- for local `Rvalue::Ref` creation and ref-valued `PtrDerive`, the
+  `ref_ancestor` metadata now carries the creation parent rather than the
+  newly-created ref tag itself
+- this lets a merged reference local preserve the shared raw ancestor needed by
+  later recomputation after the CFG join
 
 ## Target Example
 
@@ -218,8 +231,9 @@ same-address repair, not the primary way to invent missing SSA ancestry.
 
 1. Extend anchors beyond straight-line recomputation.
 - Current reuse covers straight-line code and CFG joins whose incoming
-  predecessors agree on the anchor state.
-- Loop-carried reuse and richer join shapes still need a more explicit story.
+  predecessors agree on the anchor state, including the branch-result join case
+  where the shared carrier at the merge is a reference local.
+- Loop-carried reuse still needs a more explicit story.
 
 2. Cover more projection-heavy expressions.
 - The current normalization handles the common `cast -> Offset -> ref/raw`
