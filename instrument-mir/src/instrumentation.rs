@@ -17,6 +17,7 @@ use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::mir::*;
 use rustc_middle::mir::{Const, ConstOperand, ConstValue};
+use rustc_middle::mir::traversal;
 use rustc_middle::mir::visit::{MutatingUseContext, NonUseContext, PlaceContext, Visitor};
 use rustc_middle::ty::{ConstKind as TyConstKind, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
 use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
@@ -24,6 +25,8 @@ use rustc_middle::ty::TyKind;
 use rustc_span::{source_map::Spanned, Span};
 
 pub(crate) struct MyOptimizationPass;
+
+type SsaAnchorMap = HashMap<String, (Local, Vec<Local>)>;
 
 trait FunctionDefId {
     fn func_def_id(&self) -> DefId;
@@ -1962,7 +1965,7 @@ impl MyOptimizationPass {
     ) -> HashMap<Local, LocalRefUseStats> {
         let mut stats: HashMap<Local, LocalRefUseStats> = HashMap::new();
 
-        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+        for (bb, block_data) in traversal::preorder(body) {
             for stmt in &block_data.statements {
                 if let StatementKind::Assign(box (place, _)) = &stmt.kind {
                     if let Some(local) = place.as_local() {
@@ -3414,6 +3417,293 @@ impl MyOptimizationPass {
         }
     }
 
+    fn invalidate_ssa_anchors_for_local(
+        &self,
+        ssa_anchor_for_expr: &mut SsaAnchorMap,
+        local: Local,
+    ) {
+        ssa_anchor_for_expr.retain(|_, (_anchor_local, deps)| !deps.contains(&local));
+    }
+
+    fn invalidate_ssa_anchors_for_call<'tcx>(
+        &self,
+        ssa_anchor_for_expr: &mut SsaAnchorMap,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        destination: &Place<'tcx>,
+    ) {
+        let mut touched_locals: HashSet<Local> = HashSet::new();
+        if let Some(dst_local) = destination.as_local() {
+            touched_locals.insert(dst_local);
+        }
+        for arg in args.iter() {
+            if let Some(place) = self.place_from_operand(&arg.node) {
+                touched_locals.insert(place.local);
+            }
+        }
+        let before = ssa_anchor_for_expr.len();
+        ssa_anchor_for_expr.retain(|_, (_anchor_local, deps)| {
+            deps.iter().all(|dep| !touched_locals.contains(dep))
+        });
+        if before != ssa_anchor_for_expr.len() && self.log_enabled(PassLogLevel::Trace) {
+            rz_pass_trace!(
+                self,
+                "[rusteze][ssa-anchor] invalidate-call touched={:?} kept={} dropped={}",
+                touched_locals,
+                ssa_anchor_for_expr.len(),
+                before.saturating_sub(ssa_anchor_for_expr.len()),
+            );
+        }
+    }
+
+    fn normalized_ptr_expr_key_for_rvalue<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+    ) -> Option<(String, Vec<Local>)> {
+        let mut visited: HashSet<Local> = HashSet::new();
+        let mut deps: HashSet<Local> = HashSet::new();
+        let key = self.normalized_ptr_rvalue_key(
+            body,
+            rvalue,
+            statements,
+            upto,
+            16,
+            &mut visited,
+            &mut deps,
+        )?;
+        let mut deps_vec: Vec<Local> = deps.into_iter().collect();
+        deps_vec.sort_by_key(|local| local.index());
+        Some((key, deps_vec))
+    }
+
+    fn normalized_ptr_rvalue_key<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+        fuel: usize,
+        visited: &mut HashSet<Local>,
+        deps: &mut HashSet<Local>,
+    ) -> Option<String> {
+        if fuel == 0 {
+            return None;
+        }
+
+        match rvalue {
+            Rvalue::Use(op) => {
+                let op_key = self.normalized_ptr_operand_key(
+                    body,
+                    op,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("use({op_key})"))
+            }
+            Rvalue::CopyForDeref(place) => {
+                let place_key = self.normalized_ptr_place_key(
+                    body,
+                    *place,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("copyderef({place_key})"))
+            }
+            Rvalue::Cast(
+                CastKind::PtrToPtr
+                | CastKind::PointerCoercion(_, _)
+                | CastKind::Transmute
+                | CastKind::PointerWithExposedProvenance,
+                op,
+                _,
+            ) => {
+                let op_key = self.normalized_ptr_operand_key(
+                    body,
+                    op,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("cast({op_key})"))
+            }
+            Rvalue::BinaryOp(op, box (lhs, rhs))
+                if matches!(*op, BinOp::Offset | BinOp::Add | BinOp::Sub) =>
+            {
+                let lhs_key = self.normalized_ptr_operand_key(
+                    body,
+                    lhs,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                let rhs_key = self.normalized_ptr_operand_key(
+                    body,
+                    rhs,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("binop({op:?},{lhs_key},{rhs_key})"))
+            }
+            Rvalue::Ref(_, _, src_place) => {
+                let place_key = self.normalized_ptr_place_key(
+                    body,
+                    *src_place,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("ref({place_key})"))
+            }
+            Rvalue::RawPtr(_, src_place) => {
+                let place_key = self.normalized_ptr_place_key(
+                    body,
+                    *src_place,
+                    statements,
+                    upto,
+                    fuel - 1,
+                    visited,
+                    deps,
+                )?;
+                Some(format!("raw({place_key})"))
+            }
+            Rvalue::Aggregate(_, ops) => {
+                let mut parts = Vec::new();
+                for op in ops.iter() {
+                    parts.push(self.normalized_ptr_operand_key(
+                        body,
+                        op,
+                        statements,
+                        upto,
+                        fuel - 1,
+                        visited,
+                        deps,
+                    )?);
+                }
+                Some(format!("agg({})", parts.join(",")))
+            }
+            _ => None,
+        }
+    }
+
+    fn normalized_ptr_operand_key<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        operand: &Operand<'tcx>,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+        fuel: usize,
+        visited: &mut HashSet<Local>,
+        deps: &mut HashSet<Local>,
+    ) -> Option<String> {
+        if fuel == 0 {
+            return None;
+        }
+
+        match operand {
+            Operand::Copy(place) | Operand::Move(place) => self.normalized_ptr_place_key(
+                body,
+                *place,
+                statements,
+                upto,
+                fuel - 1,
+                visited,
+                deps,
+            ),
+            Operand::Constant(c) => Some(format!("const({:?})", c.const_)),
+        }
+    }
+
+    fn normalized_ptr_place_key<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        place: Place<'tcx>,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+        fuel: usize,
+        visited: &mut HashSet<Local>,
+        deps: &mut HashSet<Local>,
+    ) -> Option<String> {
+        if fuel == 0 {
+            return None;
+        }
+
+        let base_key = self.normalized_ptr_local_key(
+            body,
+            place.local,
+            statements,
+            upto,
+            fuel - 1,
+            visited,
+            deps,
+        )?;
+
+        if place.projection.is_empty() {
+            Some(base_key)
+        } else {
+            Some(format!("{base_key}{:?}", place.projection))
+        }
+    }
+
+    fn normalized_ptr_local_key<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        local: Local,
+        statements: &[Statement<'tcx>],
+        upto: usize,
+        fuel: usize,
+        visited: &mut HashSet<Local>,
+        deps: &mut HashSet<Local>,
+    ) -> Option<String> {
+        if fuel == 0 {
+            return None;
+        }
+        if !visited.insert(local) {
+            return None;
+        }
+
+        for (idx, stmt) in statements[..upto].iter().enumerate().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if place.as_local() != Some(local) {
+                continue;
+            }
+
+            let result = self.normalized_ptr_rvalue_key(
+                body,
+                rvalue,
+                statements,
+                idx,
+                fuel - 1,
+                visited,
+                deps,
+            );
+            visited.remove(&local);
+            return result;
+        }
+
+        deps.insert(local);
+        visited.remove(&local);
+        Some(format!("L{}", local.index()))
+    }
+
     /// Resolve the best parent-tag operand for ref/raw creation from `src_place`.
     ///
     /// We first try the nearest ref-ancestor tag local, then the normal pointer tag local.
@@ -3822,6 +4112,7 @@ impl MyOptimizationPass {
         stmt: &Statement<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         byte_copy_src_for_local: &mut HashMap<Local, Place<'tcx>>,
+        ssa_anchor_for_expr: &mut SsaAnchorMap,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
@@ -3833,6 +4124,7 @@ impl MyOptimizationPass {
         match stmt.kind {
             StatementKind::StorageDead(local) => {
                 byte_copy_src_for_local.remove(&local);
+                self.invalidate_ssa_anchors_for_local(ssa_anchor_for_expr, local);
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
@@ -3913,6 +4205,7 @@ impl MyOptimizationPass {
         if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
             if let Some(dst_local) = dst_place.as_local() {
                 byte_copy_src_for_local.remove(&dst_local);
+                self.invalidate_ssa_anchors_for_local(ssa_anchor_for_expr, dst_local);
                 let dst_ty = body.local_decls[dst_local].ty;
                 if self.is_one_byte_sized_ty(tcx, dst_ty) {
                     if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
@@ -4152,14 +4445,63 @@ impl MyOptimizationPass {
                             let is_mut = self.ptr_is_mut(dst_ty);
                             ptr_locals_needing_tag.insert(dst_local);
                             tagged_ptr_locals.insert(dst_local);
-                            insert_points.push(InsertPoint {
-                                bb,
+                            let anchor_key = self.normalized_ptr_expr_key_for_rvalue(
+                                body,
+                                rvalue,
+                                &block_data.statements,
                                 stmt_idx,
-                                insert_before: false,
-                                source_info: stmt.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                            );
+                            let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
+                                    if *anchor_local != dst_local
+                                        && body.local_decls[*anchor_local].ty == dst_ty
+                                    {
+                                        Some(*anchor_local)
+                                    } else {
+                                        None
+                                    }
+                                })
                             });
+                            if let Some(anchor_local) = reused_anchor_local {
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][ssa-anchor] reuse root-cast dst={:?} anchor={:?} key={}",
+                                    dst_local,
+                                    anchor_local,
+                                    anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                );
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::TagProp {
+                                        dst: dst_local,
+                                        src: anchor_local,
+                                        copy_tag: true,
+                                        copy_ref_ancestor: true,
+                                    },
+                                });
+                            } else {
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][ssa-anchor] store root-cast dst={:?} key={}",
+                                    dst_local,
+                                    anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                );
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx,
+                                    insert_before: false,
+                                    source_info: stmt.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::RawRoot { ptr_local: dst_local, is_mut },
+                                });
+                                if let Some((key, deps)) = anchor_key {
+                                    ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                }
+                            }
                             skip_tag_prop = true;
                         }
                     }
@@ -4251,19 +4593,69 @@ impl MyOptimizationPass {
                                 };
 
                                 if rhs_requires_retag {
-                                    insert_points.push(InsertPoint {
-                                        bb,
+                                    let anchor_key = self.normalized_ptr_expr_key_for_rvalue(
+                                        body,
+                                        rvalue,
+                                        &block_data.statements,
                                         stmt_idx,
-                                        insert_before: false,
-                                        source_info: stmt.source_info,
-                                        place: Place::from(dst_local),
-                                        kind: InstrKind::PtrDerive {
-                                            dst: dst_local,
-                                            src: src_local,
-                                            is_mut: self.ptr_is_mut(dst_ty),
-                                            is_ref: matches!(dst_ty.kind(), TyKind::Ref(..)),
-                                        },
+                                    );
+                                    let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                        ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
+                                            if *anchor_local != dst_local
+                                                && body.local_decls[*anchor_local].ty == dst_ty
+                                            {
+                                                Some(*anchor_local)
+                                            } else {
+                                                None
+                                            }
+                                        })
                                     });
+
+                                    if let Some(anchor_local) = reused_anchor_local {
+                                        rz_pass_trace!(
+                                            self,
+                                            "[rusteze][ssa-anchor] reuse ptr-derive dst={:?} anchor={:?} key={}",
+                                            dst_local,
+                                            anchor_local,
+                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                        );
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::TagProp {
+                                                dst: dst_local,
+                                                src: anchor_local,
+                                                copy_tag: true,
+                                                copy_ref_ancestor: true,
+                                            },
+                                        });
+                                    } else {
+                                        rz_pass_trace!(
+                                            self,
+                                            "[rusteze][ssa-anchor] store ptr-derive dst={:?} key={}",
+                                            dst_local,
+                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                        );
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::PtrDerive {
+                                                dst: dst_local,
+                                                src: src_local,
+                                                is_mut: self.ptr_is_mut(dst_ty),
+                                                is_ref: matches!(dst_ty.kind(), TyKind::Ref(..)),
+                                            },
+                                        });
+                                        if let Some((key, deps)) = anchor_key {
+                                            ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                        }
+                                    }
                                 } else {
                                     insert_points.push(InsertPoint {
                                         bb,
@@ -4322,25 +4714,74 @@ impl MyOptimizationPass {
                                 if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                     let is_mut = self.ptr_is_mut(dst_ty);
                                     let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-                                    insert_points.push(InsertPoint {
-                                        bb,
-                                        stmt_idx: stmt_idx + 1,
-                                        insert_before: false,
-                                        source_info: stmt.source_info,
-                                        place: Place::from(dst_local),
-                                        kind: if is_ref {
-                                            InstrKind::RetRoot {
-                                                dst_local,
-                                                is_mut,
-                                                is_ref: true,
+                                    let anchor_key = self.normalized_ptr_expr_key_for_rvalue(
+                                        body,
+                                        rvalue,
+                                        &block_data.statements,
+                                        stmt_idx,
+                                    );
+                                    let reused_anchor_local = anchor_key.as_ref().and_then(|(key, _deps)| {
+                                        ssa_anchor_for_expr.get(key).and_then(|(anchor_local, _)| {
+                                            if *anchor_local != dst_local
+                                                && body.local_decls[*anchor_local].ty == dst_ty
+                                            {
+                                                Some(*anchor_local)
+                                            } else {
+                                                None
                                             }
-                                        } else {
-                                            InstrKind::RawRoot {
-                                                ptr_local: dst_local,
-                                                is_mut,
-                                            }
-                                        },
+                                        })
                                     });
+                                    if let Some(anchor_local) = reused_anchor_local {
+                                        rz_pass_trace!(
+                                            self,
+                                            "[rusteze][ssa-anchor] reuse projected-root dst={:?} anchor={:?} key={}",
+                                            dst_local,
+                                            anchor_local,
+                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                        );
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: stmt_idx + 1,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::TagProp {
+                                                dst: dst_local,
+                                                src: anchor_local,
+                                                copy_tag: true,
+                                                copy_ref_ancestor: true,
+                                            },
+                                        });
+                                    } else {
+                                        rz_pass_trace!(
+                                            self,
+                                            "[rusteze][ssa-anchor] store projected-root dst={:?} key={}",
+                                            dst_local,
+                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                        );
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx: stmt_idx + 1,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: if is_ref {
+                                                InstrKind::RetRoot {
+                                                    dst_local,
+                                                    is_mut,
+                                                    is_ref: true,
+                                                }
+                                            } else {
+                                                InstrKind::RawRoot {
+                                                    ptr_local: dst_local,
+                                                    is_mut,
+                                                }
+                                            },
+                                        });
+                                        if let Some((key, deps)) = anchor_key {
+                                            ssa_anchor_for_expr.insert(key, (dst_local, deps));
+                                        }
+                                    }
                                     tagged_ptr_locals.insert(dst_local);
                                 }
                             } else {
@@ -6771,9 +7212,33 @@ impl MyOptimizationPass {
         );
 
         let mut return_sites: Vec<(BasicBlock, SourceInfo, usize)> = Vec::new();
+        let predecessors = body.basic_blocks.predecessors();
+        let mut ssa_anchor_exit_by_bb: HashMap<BasicBlock, SsaAnchorMap> = HashMap::new();
 
-        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+        for (bb, block_data) in traversal::preorder(body) {
             let mut byte_copy_src_for_local: HashMap<Local, Place<'tcx>> = HashMap::new();
+            let mut ssa_anchor_for_expr: SsaAnchorMap = if predecessors[bb].len() == 1 {
+                ssa_anchor_exit_by_bb
+                    .get(&predecessors[bb][0])
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+            if self.log_enabled(PassLogLevel::Trace) {
+                rz_pass_trace!(
+                    self,
+                    "[rusteze][ssa-anchor] enter bb={:?} pred_count={} inherited_from={:?} anchor_count={}",
+                    bb,
+                    predecessors[bb].len(),
+                    if predecessors[bb].len() == 1 {
+                        Some(predecessors[bb][0])
+                    } else {
+                        None
+                    },
+                    ssa_anchor_for_expr.len(),
+                );
+            }
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 self.scan_statement(
                     tcx,
@@ -6784,6 +7249,7 @@ impl MyOptimizationPass {
                     stmt,
                     &mut insert_points,
                     &mut byte_copy_src_for_local,
+                    &mut ssa_anchor_for_expr,
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
                     &ptr_locals_with_tag_sources,
@@ -6807,6 +7273,11 @@ impl MyOptimizationPass {
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
                         &mut tagged_ptr_locals,
+                    );
+                    self.invalidate_ssa_anchors_for_call(
+                        &mut ssa_anchor_for_expr,
+                        args,
+                        destination,
                     );
                 }
 
@@ -6836,6 +7307,8 @@ impl MyOptimizationPass {
                     return_sites.push((bb, term.source_info, block_data.statements.len()));
                 }
             }
+
+            ssa_anchor_exit_by_bb.insert(bb, ssa_anchor_for_expr);
         }
 
         // IMPORTANT ORDERING NOTE:

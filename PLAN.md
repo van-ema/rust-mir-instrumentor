@@ -26,23 +26,31 @@ Goal:
 - Preserve shared parent-child lineage when optimized MIR erases the intermediate pointer locals that used to carry it.
 
 Open tasks:
-1. Add compiler-side anchor synthesis for shared pointer expressions.
-- When a pointer-valued expression such as `v.as_mut_ptr().add(i)` feeds multiple later ref/raw creations, materialize one hidden anchor local and one hidden tag local.
-- Make later uses derive from that anchor instead of falling back to separate root-like tags.
-2. Cover aggregate and tuple forwarding.
-- If the same pointer expression populates multiple fields or return values, preserve one shared ancestor rather than reconstructing each use independently.
-3. Tighten backtracking over optimized expressions.
-- Extend local lineage recovery to projection-heavy `Offset` / cast / aggregate chains without inventing parentage when the source cannot be justified.
+1. Extend the new SSA-anchor path beyond straight-line cases.
+- Current `main` reuses normalized pointer-expression anchors across the common
+  optimized `cast -> Offset -> ref/raw` patterns.
+- Remaining gap: richer CFG joins and loop-carried reuse.
+2. Cover projection-heavy helper paths.
+- Extend local lineage recovery to more projection-heavy `Offset` / cast /
+  aggregate chains without inventing parentage when the source cannot be
+  justified.
+3. Keep mixed memory/SSA cases well covered.
+- Pointer shadow now handles provenance that travels through memory.
+- Remaining mixed cases combine reloads with optimized SSA rebuilding and still
+  need targeted regressions.
 4. Keep the fallback conservative.
-- If the shared ancestor cannot be reconstructed confidently, keep the current root-like fallback rather than fabricating a parent link.
+- If the shared ancestor cannot be reconstructed confidently, keep the current
+  root-like fallback rather than fabricating a parent link.
 
 Representative example:
 - `paper_examples/lineage_opt_away`
 
 Exit criteria:
-1. `paper_examples/lineage_opt_away` stops being `ok` in `--release`.
+1. `paper_examples/lineage_opt_away` remains a must-catch release-mode
+   regression.
 2. Existing example suites remain green in default and interprocedural modes.
-3. The new anchoring path preserves soundness by construction: missing lineage remains acceptable, invented lineage does not.
+3. The anchoring path stays sound by construction: missing lineage remains
+   acceptable, invented lineage does not.
 
 ## Wide/Fat pointer support
 Goal:

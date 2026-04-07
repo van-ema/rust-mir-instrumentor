@@ -539,7 +539,12 @@ fn tb_lite_check(
     let overlapping_tags: Vec<u64> = tree
         .nodes
         .values()
-        .filter(|n| tb_is_live_node(n))
+        .filter(|n| {
+            tb_is_live_node(n)
+                || (matches!(n.perm, TbPerm::Disabled)
+                    && matches!(n.kind, BorrowKind::Unique)
+                    && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
+        })
         .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
         .filter(|n| {
             if tmeta.alloc_epoch != 0 && n.alloc_epoch != 0 && n.alloc_epoch != tmeta.alloc_epoch {

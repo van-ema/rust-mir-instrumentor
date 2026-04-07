@@ -50,6 +50,27 @@ So the remaining problem is not "pointer moved through memory and lost provenanc
 It is "the shared ancestor was optimized away before instrumentation could attach a
 stable tag local to it."
 
+## Current status
+
+Implemented on `main`:
+- structural normalization of pointer-valued MIR expressions
+- per-block SSA anchor reuse keyed by that normalized shape
+- conservative invalidation when the dependent locals are reassigned or a call
+  may clobber the cached expression
+
+Current regression target:
+- `paper_examples/lineage_opt_away`
+
+Current behavior:
+- in `--release`, the two `&mut` creation sites now reuse one shared raw
+  ancestor instead of independently rebuilding root-like lineage
+- the later read reports:
+  - `TREE_BORROWS_VIOLATION|READ|RefMut|1`
+
+The enabling runtime fix was small but necessary:
+- `tb_lite` now keeps disabled ancestors in the overlap walk so accesses through
+  descendants of an invalidated borrow report `TB_LITE_DISABLED_ANCESTOR`
+
 ## Target Example
 
 `paper_examples/lineage_opt_away`
@@ -189,9 +210,26 @@ Likely touch points:
 The fix should remain compiler-side. Runtime recovery stays as a secondary mechanism for
 same-address repair, not the primary way to invent missing SSA ancestry.
 
+## Remaining work
+
+1. Extend anchors beyond straight-line recomputation.
+- Current reuse is intentionally local and dominance-based.
+- Loops and richer CFG joins still need a more explicit join story.
+
+2. Cover more projection-heavy expressions.
+- The current normalization handles the common `cast -> Offset -> ref/raw`
+  shapes well.
+- Projection-heavy helper returns and richer aggregate forwarding still need
+  targeted coverage.
+
+3. Revisit memory-backed mixed cases.
+- Pointer shadow already covers values that travel through memory.
+- Some mixed cases still combine memory reload and optimized SSA rebuilding in a
+  way that deserves dedicated regressions.
+
 ## Success Criteria
 
-1. `paper_examples/lineage_opt_away` stops being `ok` in `--release`.
+1. `paper_examples/lineage_opt_away` reports a violation in `--release`.
 2. The resulting tags for the two later borrows are siblings under one shared anchor.
 3. Default and interprocedural example suites remain green.
 4. No new invented-parent false positives appear in the existing examples.
