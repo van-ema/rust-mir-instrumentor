@@ -97,6 +97,8 @@ exclude = [
     "paper_examples/lineage_field_proj",
     "paper_examples/lineage_generic_exempt",
     "paper_examples/lineage_uninstr_ret",
+    "paper_examples/lineage_memcpy_roundtrip",
+    "paper_examples/lineage_static_smuggle",
 ]
 
 # Optional but recommended for reproducibility:
