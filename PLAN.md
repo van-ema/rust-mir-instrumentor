@@ -28,8 +28,9 @@ Goal:
 Open tasks:
 1. Extend the new SSA-anchor path beyond straight-line cases.
 - Current `main` reuses normalized pointer-expression anchors across the common
-  optimized `cast -> Offset -> ref/raw` patterns.
-- Remaining gap: richer CFG joins and loop-carried reuse.
+  optimized `cast -> Offset -> ref/raw` patterns and across CFG joins when all
+  incoming predecessors agree on the anchor state.
+- Remaining gap: loop-carried reuse and richer join shapes.
 2. Cover projection-heavy helper paths.
 - Extend local lineage recovery to more projection-heavy `Offset` / cast /
   aggregate chains without inventing parentage when the source cannot be

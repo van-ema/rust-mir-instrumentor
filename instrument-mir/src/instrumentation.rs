@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::ops::ControlFlow;
@@ -3430,6 +3430,7 @@ impl MyOptimizationPass {
         ssa_anchor_for_expr: &mut SsaAnchorMap,
         args: &Box<[Spanned<Operand<'tcx>>]>,
         destination: &Place<'tcx>,
+        trace_ssa_anchor: bool,
     ) {
         let mut touched_locals: HashSet<Local> = HashSet::new();
         if let Some(dst_local) = destination.as_local() {
@@ -3444,7 +3445,7 @@ impl MyOptimizationPass {
         ssa_anchor_for_expr.retain(|_, (_anchor_local, deps)| {
             deps.iter().all(|dep| !touched_locals.contains(dep))
         });
-        if before != ssa_anchor_for_expr.len() && self.log_enabled(PassLogLevel::Trace) {
+        if trace_ssa_anchor && before != ssa_anchor_for_expr.len() && self.log_enabled(PassLogLevel::Trace) {
             rz_pass_trace!(
                 self,
                 "[rusteze][ssa-anchor] invalidate-call touched={:?} kept={} dropped={}",
@@ -3453,6 +3454,102 @@ impl MyOptimizationPass {
                 before.saturating_sub(ssa_anchor_for_expr.len()),
             );
         }
+    }
+
+    fn meet_ssa_anchor_maps<'a>(
+        &self,
+        pred_maps: impl IntoIterator<Item = &'a SsaAnchorMap>,
+    ) -> SsaAnchorMap {
+        let pred_maps: Vec<&SsaAnchorMap> = pred_maps.into_iter().collect();
+        let Some(first) = pred_maps.first() else {
+            return HashMap::new();
+        };
+        let mut merged = (*first).clone();
+        merged.retain(|key, value| pred_maps.iter().all(|map| map.get(key) == Some(value)));
+        merged
+    }
+
+    fn analyze_ssa_anchor_entry_maps<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_locals_with_tag_sources: &HashSet<Local>,
+        summary_elidable_shared_call_ref_locals: &HashSet<Local>,
+        interesting_stack_locals: &HashSet<Local>,
+        track_all_stack_allocs: bool,
+    ) -> HashMap<BasicBlock, SsaAnchorMap> {
+        let predecessors = body.basic_blocks.predecessors();
+        let mut entry_by_bb: HashMap<BasicBlock, SsaAnchorMap> = HashMap::new();
+        let mut exit_by_bb: HashMap<BasicBlock, SsaAnchorMap> = HashMap::new();
+        let mut worklist: VecDeque<BasicBlock> =
+            traversal::preorder(body).map(|(bb, _)| bb).collect();
+        let mut queued: HashSet<BasicBlock> = worklist.iter().copied().collect();
+
+        while let Some(bb) = worklist.pop_front() {
+            queued.remove(&bb);
+            let block_data = &body.basic_blocks[bb];
+
+            let entry = if predecessors[bb].is_empty() {
+                HashMap::new()
+            } else {
+                self.meet_ssa_anchor_maps(
+                    predecessors[bb]
+                        .iter()
+                        .filter_map(|pred| exit_by_bb.get(pred)),
+                )
+            };
+
+            let mut exit = entry.clone();
+            let mut dummy_insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
+            let mut byte_copy_src_for_local: HashMap<Local, Place<'tcx>> = HashMap::new();
+            let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
+            let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
+
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                self.scan_statement(
+                    tcx,
+                    body,
+                    bb,
+                    block_data,
+                    stmt_idx,
+                    stmt,
+                    &mut dummy_insert_points,
+                    &mut byte_copy_src_for_local,
+                    &mut exit,
+                    &mut ptr_locals_needing_tag,
+                    &mut tagged_ptr_locals,
+                    ptr_locals_with_tag_sources,
+                    summary_elidable_shared_call_ref_locals,
+                    interesting_stack_locals,
+                    track_all_stack_allocs,
+                    false,
+                );
+            }
+
+            if let Some(term) = &block_data.terminator {
+                if let TerminatorKind::Call { args, destination, .. } = &term.kind {
+                    self.invalidate_ssa_anchors_for_call(&mut exit, args, destination, false);
+                }
+            }
+
+            let entry_changed = entry_by_bb.get(&bb) != Some(&entry);
+            let exit_changed = exit_by_bb.get(&bb) != Some(&exit);
+            if entry_changed {
+                entry_by_bb.insert(bb, entry);
+            }
+            if exit_changed {
+                exit_by_bb.insert(bb, exit);
+                if let Some(term) = &block_data.terminator {
+                    for succ in term.successors() {
+                        if queued.insert(succ) {
+                            worklist.push_back(succ);
+                        }
+                    }
+                }
+            }
+        }
+
+        entry_by_bb
     }
 
     fn normalized_ptr_expr_key_for_rvalue<'tcx>(
@@ -4119,6 +4216,7 @@ impl MyOptimizationPass {
         summary_elidable_shared_call_ref_locals: &HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
         track_all_stack_allocs: bool,
+        trace_ssa_anchor: bool,
     ) {
         // Stack allocation lifetime: StorageLive/StorageDead.
         match stmt.kind {
@@ -4463,13 +4561,15 @@ impl MyOptimizationPass {
                                 })
                             });
                             if let Some(anchor_local) = reused_anchor_local {
-                                rz_pass_trace!(
-                                    self,
-                                    "[rusteze][ssa-anchor] reuse root-cast dst={:?} anchor={:?} key={}",
-                                    dst_local,
-                                    anchor_local,
-                                    anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                );
+                                if trace_ssa_anchor {
+                                    rz_pass_trace!(
+                                        self,
+                                        "[rusteze][ssa-anchor] reuse root-cast dst={:?} anchor={:?} key={}",
+                                        dst_local,
+                                        anchor_local,
+                                        anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                    );
+                                }
                                 insert_points.push(InsertPoint {
                                     bb,
                                     stmt_idx,
@@ -4484,12 +4584,14 @@ impl MyOptimizationPass {
                                     },
                                 });
                             } else {
-                                rz_pass_trace!(
-                                    self,
-                                    "[rusteze][ssa-anchor] store root-cast dst={:?} key={}",
-                                    dst_local,
-                                    anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                );
+                                if trace_ssa_anchor {
+                                    rz_pass_trace!(
+                                        self,
+                                        "[rusteze][ssa-anchor] store root-cast dst={:?} key={}",
+                                        dst_local,
+                                        anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                    );
+                                }
                                 insert_points.push(InsertPoint {
                                     bb,
                                     stmt_idx,
@@ -4612,13 +4714,15 @@ impl MyOptimizationPass {
                                     });
 
                                     if let Some(anchor_local) = reused_anchor_local {
-                                        rz_pass_trace!(
-                                            self,
-                                            "[rusteze][ssa-anchor] reuse ptr-derive dst={:?} anchor={:?} key={}",
-                                            dst_local,
-                                            anchor_local,
-                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                        );
+                                        if trace_ssa_anchor {
+                                            rz_pass_trace!(
+                                                self,
+                                                "[rusteze][ssa-anchor] reuse ptr-derive dst={:?} anchor={:?} key={}",
+                                                dst_local,
+                                                anchor_local,
+                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                            );
+                                        }
                                         insert_points.push(InsertPoint {
                                             bb,
                                             stmt_idx,
@@ -4633,12 +4737,14 @@ impl MyOptimizationPass {
                                             },
                                         });
                                     } else {
-                                        rz_pass_trace!(
-                                            self,
-                                            "[rusteze][ssa-anchor] store ptr-derive dst={:?} key={}",
-                                            dst_local,
-                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                        );
+                                        if trace_ssa_anchor {
+                                            rz_pass_trace!(
+                                                self,
+                                                "[rusteze][ssa-anchor] store ptr-derive dst={:?} key={}",
+                                                dst_local,
+                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                            );
+                                        }
                                         insert_points.push(InsertPoint {
                                             bb,
                                             stmt_idx,
@@ -4732,13 +4838,15 @@ impl MyOptimizationPass {
                                         })
                                     });
                                     if let Some(anchor_local) = reused_anchor_local {
-                                        rz_pass_trace!(
-                                            self,
-                                            "[rusteze][ssa-anchor] reuse projected-root dst={:?} anchor={:?} key={}",
-                                            dst_local,
-                                            anchor_local,
-                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                        );
+                                        if trace_ssa_anchor {
+                                            rz_pass_trace!(
+                                                self,
+                                                "[rusteze][ssa-anchor] reuse projected-root dst={:?} anchor={:?} key={}",
+                                                dst_local,
+                                                anchor_local,
+                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                            );
+                                        }
                                         insert_points.push(InsertPoint {
                                             bb,
                                             stmt_idx: stmt_idx + 1,
@@ -4753,12 +4861,14 @@ impl MyOptimizationPass {
                                             },
                                         });
                                     } else {
-                                        rz_pass_trace!(
-                                            self,
-                                            "[rusteze][ssa-anchor] store projected-root dst={:?} key={}",
-                                            dst_local,
-                                            anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
-                                        );
+                                        if trace_ssa_anchor {
+                                            rz_pass_trace!(
+                                                self,
+                                                "[rusteze][ssa-anchor] store projected-root dst={:?} key={}",
+                                                dst_local,
+                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                            );
+                                        }
                                         insert_points.push(InsertPoint {
                                             bb,
                                             stmt_idx: stmt_idx + 1,
@@ -7213,29 +7323,25 @@ impl MyOptimizationPass {
 
         let mut return_sites: Vec<(BasicBlock, SourceInfo, usize)> = Vec::new();
         let predecessors = body.basic_blocks.predecessors();
-        let mut ssa_anchor_exit_by_bb: HashMap<BasicBlock, SsaAnchorMap> = HashMap::new();
+        let ssa_anchor_entry_by_bb = self.analyze_ssa_anchor_entry_maps(
+            tcx,
+            body,
+            &ptr_locals_with_tag_sources,
+            &summary_elidable_shared_call_ref_locals,
+            &interesting_stack_locals,
+            track_all_stack_allocs,
+        );
 
         for (bb, block_data) in traversal::preorder(body) {
             let mut byte_copy_src_for_local: HashMap<Local, Place<'tcx>> = HashMap::new();
-            let mut ssa_anchor_for_expr: SsaAnchorMap = if predecessors[bb].len() == 1 {
-                ssa_anchor_exit_by_bb
-                    .get(&predecessors[bb][0])
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
+            let mut ssa_anchor_for_expr: SsaAnchorMap =
+                ssa_anchor_entry_by_bb.get(&bb).cloned().unwrap_or_default();
             if self.log_enabled(PassLogLevel::Trace) {
                 rz_pass_trace!(
                     self,
-                    "[rusteze][ssa-anchor] enter bb={:?} pred_count={} inherited_from={:?} anchor_count={}",
+                    "[rusteze][ssa-anchor] enter bb={:?} pred_count={} anchor_count={}",
                     bb,
                     predecessors[bb].len(),
-                    if predecessors[bb].len() == 1 {
-                        Some(predecessors[bb][0])
-                    } else {
-                        None
-                    },
                     ssa_anchor_for_expr.len(),
                 );
             }
@@ -7256,6 +7362,7 @@ impl MyOptimizationPass {
                     &summary_elidable_shared_call_ref_locals,
                     &interesting_stack_locals,
                     track_all_stack_allocs,
+                    true,
                 );
             }
 
@@ -7278,6 +7385,7 @@ impl MyOptimizationPass {
                         &mut ssa_anchor_for_expr,
                         args,
                         destination,
+                        true,
                     );
                 }
 
@@ -7308,7 +7416,6 @@ impl MyOptimizationPass {
                 }
             }
 
-            ssa_anchor_exit_by_bb.insert(bb, ssa_anchor_for_expr);
         }
 
         // IMPORTANT ORDERING NOTE:

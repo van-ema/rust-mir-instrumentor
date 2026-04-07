@@ -55,6 +55,8 @@ stable tag local to it."
 Implemented on `main`:
 - structural normalization of pointer-valued MIR expressions
 - per-block SSA anchor reuse keyed by that normalized shape
+- predecessor-meet propagation so anchors survive CFG joins when all incoming
+  paths carry the same anchor state
 - conservative invalidation when the dependent locals are reassigned or a call
   may clobber the cached expression
 
@@ -66,6 +68,8 @@ Current behavior:
   ancestor instead of independently rebuilding root-like lineage
 - the later read reports:
   - `TREE_BORROWS_VIOLATION|READ|RefMut|1`
+- the same now holds for the join-heavy case:
+  - `paper_examples/lineage_cfg_join`
 
 The enabling runtime fix was small but necessary:
 - `tb_lite` now keeps disabled ancestors in the overlap walk so accesses through
@@ -213,8 +217,9 @@ same-address repair, not the primary way to invent missing SSA ancestry.
 ## Remaining work
 
 1. Extend anchors beyond straight-line recomputation.
-- Current reuse is intentionally local and dominance-based.
-- Loops and richer CFG joins still need a more explicit join story.
+- Current reuse covers straight-line code and CFG joins whose incoming
+  predecessors agree on the anchor state.
+- Loop-carried reuse and richer join shapes still need a more explicit story.
 
 2. Cover more projection-heavy expressions.
 - The current normalization handles the common `cast -> Offset -> ref/raw`
