@@ -4550,8 +4550,12 @@ impl MyOptimizationPass {
                         }
                                 let dst_field =
                                     self.pointer_field_place(tcx, dst_local, field_idx, field_ty);
-                                let src_field =
-                                    self.pointer_field_place(tcx, src_place.local, field_idx, field_ty);
+                                let src_field = self.pointer_field_place_from_place(
+                                    tcx,
+                                    *src_place,
+                                    field_idx,
+                                    field_ty,
+                                );
                                 insert_points.push(InsertPoint {
                                     bb,
                                     stmt_idx,
@@ -4873,6 +4877,19 @@ impl MyOptimizationPass {
         field_ty: Ty<'tcx>,
     ) -> Place<'tcx> {
         Place::from(base_local).project_deeper(
+            &[PlaceElem::Field(FieldIdx::from_usize(field_idx), field_ty)],
+            tcx,
+        )
+    }
+
+    fn pointer_field_place_from_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        base_place: Place<'tcx>,
+        field_idx: usize,
+        field_ty: Ty<'tcx>,
+    ) -> Place<'tcx> {
+        base_place.project_deeper(
             &[PlaceElem::Field(FieldIdx::from_usize(field_idx), field_ty)],
             tcx,
         )
