@@ -1,0 +1,6 @@
+[package]
+name = "tb_aliasing_mut3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

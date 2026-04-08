@@ -104,6 +104,12 @@ exclude = [
     "paper_examples/lineage_loop_carried",
     "paper_examples/lineage_helper_nested",
     "paper_examples/lineage_mixed_mem_ssa",
+    "paper_examples/tb_fnentry_invalidation",
+    "paper_examples/tb_outside_range",
+    "paper_examples/tb_aliasing_mut3",
+    "paper_examples/tb_shr_frozen_violation1",
+    "paper_examples/provenance_chunked_copy",
+    "paper_examples/provenance_reading_half_pointer",
 ]
 
 # Optional but recommended for reproducibility:
