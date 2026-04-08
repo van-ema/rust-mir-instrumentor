@@ -6,12 +6,11 @@
 // pointer invalidates the earlier mutable reference created from the other.
 //
 // Miri preserves that lineage because pointer provenance survives through the
-// field store/load. Rusteze still loses it in this pattern under `--release`:
-// the field-loaded raw pointers become detached from the original tree, so the
-// final read through `r` succeeds silently.
+// field store/load. Rusteze now restores the slot provenance and also recovers
+// the source-level `&mut` binding that optimized MIR coalesces onto `p`, so
+// the later write through `q` invalidates the earlier mutable borrow.
 //
-// Expected in --release: ok (TB-Lite false negative — lineage lost through
-// field-loaded raw-pointer provenance)
+// Expected in --release: TREE_BORROWS_VIOLATION|WRITE|RawMut|1
 
 struct Wrapper {
     ptr: *mut u8,
@@ -34,10 +33,8 @@ fn main() {
     let r: &mut u8 = unsafe { &mut *p };
     unsafe { std::ptr::write_volatile(q, 1) };
 
-    // Miri: `q` and `r` share the buffer provenance, so the write through `q`
-    // invalidates the earlier mutable borrow `r`.
-    // Rusteze today: the field loads still detach that provenance in release,
-    // so the final read through `r` is a false negative.
+    // `q` and `r` share the recovered buffer provenance, so the write through
+    // `q` invalidates the earlier mutable borrow `r`.
     let _val = *r;
     println!("val={_val}");
 }

@@ -165,7 +165,9 @@ pub(super) fn apply_metadata_dataflow<'tcx>(
 
     if metadata_dataflow_stats_enabled() || pass.log_enabled(PassLogLevel::Info) {
         let tag_props_dropped = stats.tag_props_before.saturating_sub(stats.tag_props_after);
-        let tag_copies_dropped = stats.tag_copies_before.saturating_sub(stats.tag_copies_after);
+        let tag_copies_dropped = stats
+            .tag_copies_before
+            .saturating_sub(stats.tag_copies_after);
         let ref_copies_dropped = stats
             .ref_ancestor_copies_before
             .saturating_sub(stats.ref_ancestor_copies_after);
@@ -238,7 +240,10 @@ impl MetadataAnalysis {
         let mut worklist: Vec<BasicBlock> = body.basic_blocks.indices().collect();
         while let Some(bb) = worklist.pop() {
             let in_state = if bb == START_BLOCK {
-                in_states.get(&bb).cloned().unwrap_or_else(|| zero_state.clone())
+                in_states
+                    .get(&bb)
+                    .cloned()
+                    .unwrap_or_else(|| zero_state.clone())
             } else {
                 merge_block_states(&pointer_locals, predecessors.get(&bb), &out_states)
             };
@@ -261,7 +266,10 @@ impl MetadataAnalysis {
 
         let mut point_states = HashMap::new();
         for (bb, points) in ordered_points.iter() {
-            let mut state = in_states.get(bb).cloned().unwrap_or_else(|| zero_state.clone());
+            let mut state = in_states
+                .get(bb)
+                .cloned()
+                .unwrap_or_else(|| zero_state.clone());
             for point in points {
                 point_states.insert(point.idx, state.clone());
                 apply_insert_point(point.idx, &point.kind, point.place_local, body, &mut state);
@@ -415,9 +423,7 @@ fn merge_block_liveness(
     for succ in succs {
         if let Some(succ_live) = live_in.get(succ) {
             merged.tag_live.extend(succ_live.tag_live.iter().copied());
-            merged
-                .ref_live
-                .extend(succ_live.ref_live.iter().copied());
+            merged.ref_live.extend(succ_live.ref_live.iter().copied());
         }
     }
     merged
@@ -525,7 +531,11 @@ fn apply_insert_point(
                 },
             );
         }
-        InstrKind::RetRoot { dst_local: dst, is_ref, .. } => {
+        InstrKind::RetRoot {
+            dst_local: dst,
+            is_ref,
+            ..
+        } => {
             let tag = MetaState::Fresh(MetaSymbol::Tag(idx));
             state.insert(
                 dst,
@@ -535,7 +545,9 @@ fn apply_insert_point(
                 },
             );
         }
-        InstrKind::PtrDerive { dst, src, is_ref, .. } => {
+        InstrKind::PtrDerive {
+            dst, src, is_ref, ..
+        } => {
             let src_ref = state
                 .get(&src)
                 .copied()
@@ -592,8 +604,7 @@ fn apply_liveness_for_point(
             live.use_tag(src.local);
             live.use_ref(src.local);
         }
-        InstrKind::RawRoot { ptr_local, .. }
-        | InstrKind::ArgRetag { ptr_local, .. } => {
+        InstrKind::RawRoot { ptr_local, .. } | InstrKind::ArgRetag { ptr_local, .. } => {
             live.kill_tag(*ptr_local);
             live.kill_ref(*ptr_local);
         }

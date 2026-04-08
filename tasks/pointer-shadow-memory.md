@@ -258,10 +258,12 @@ Delivered:
 `paper_examples/lineage_field_proj`
 
 Current status:
-- still a false negative in `--release`
+- fixed
 
-What remains:
-- make projection-heavy reload paths restore the stored slot provenance before later ref/raw creation sites lose the common ancestor
+Delivered behavior:
+- the pointer field store/load restores slot provenance
+- the optimized-away source-level `&mut` binding is recovered by the compiler pass
+- the later conflicting write is now reported as `TREE_BORROWS_VIOLATION|WRITE|RawMut|1`
 
 ### 2. Bytewise memory copy of pointer-carrying object
 
@@ -329,9 +331,6 @@ This may still miss bugs, but it should not fabricate lineage that is not justif
 
 ## Success Criteria
 
-At minimum, after the next round of work:
-- `paper_examples/lineage_field_proj` should stop being `ok` in `--release`
-
-And:
+At minimum:
 - existing default/interprocedural example suites must stay green
 - the feature should remain sound by default or be gated behind an opt-in flag until proven safe
