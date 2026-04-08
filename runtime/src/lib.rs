@@ -183,6 +183,16 @@ fn rz_dump_hook_profile_at_exit_enabled() -> bool {
 }
 
 #[inline]
+fn rz_runtime_lineage_repair_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("RZ_DISABLE_RUNTIME_LINEAGE_REPAIR")
+            .ok()
+            .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    })
+}
+
+#[inline]
 fn rz_profile_add_elapsed(counter: &AtomicU64, start: Instant) {
     let nanos = start.elapsed().as_nanos();
     let clipped = nanos.min(u64::MAX as u128) as u64;
@@ -1082,7 +1092,7 @@ fn recover_parent_for_alloc_root(
     alloc_epoch: u64,
     require_mut_parent: bool,
 ) -> u64 {
-    if alloc_epoch == 0 || pointee_addr == 0 {
+    if !rz_runtime_lineage_repair_enabled() || alloc_epoch == 0 || pointee_addr == 0 {
         return 0;
     }
 
