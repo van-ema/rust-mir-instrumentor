@@ -565,12 +565,27 @@ fn tb_lite_check(
         let next = match (access, child, n.perm, n.protected) {
             // Child/local read: everything except Disabled is unchanged.
             (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
-                let mut msg = format!(
-                    "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
-                    access_tag, addr, size, tmeta.kind, n.tag
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                if tb_has_live_unique_lineage_ancestor(&tree.nodes, &access_lineage, addr, size)
+                    || tb_has_usable_clean_unique_ancestor(
+                        &tree.nodes,
+                        n.tag,
+                        &access_lineage,
+                        addr,
+                        size,
+                    )
+                    || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                    || (matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst)
+                        && tb_only_same_family_overlap(&tree.nodes, &access_lineage, addr, size))
+                {
+                    n.perm
+                } else {
+                    let mut msg = format!(
+                        "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
+                        access_tag, addr, size, tmeta.kind, n.tag
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
             }
             (AliasAccessKind::Read, true, perm, _) => perm,
 
@@ -618,7 +633,8 @@ fn tb_lite_check(
                     &access_lineage,
                     addr,
                     size,
-                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size) {
+                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -630,12 +646,23 @@ fn tb_lite_check(
                 }
             }
             (AliasAccessKind::Write, true, TbPerm::Disabled, _) => {
-                let mut msg = format!(
-                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_WRITE",
-                    access_tag, addr, size, tmeta.kind
-                );
-                msg.push_str(&dump);
-                return Some(msg);
+                if tb_has_usable_clean_unique_ancestor(
+                    &tree.nodes,
+                    n.tag,
+                    &access_lineage,
+                    addr,
+                    size,
+                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                {
+                    n.perm
+                } else {
+                    let mut msg = format!(
+                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_WRITE",
+                        access_tag, addr, size, tmeta.kind
+                    );
+                    msg.push_str(&dump);
+                    return Some(msg);
+                }
             }
 
             // Foreign write: disable.
@@ -860,7 +887,10 @@ fn tb_lite_reactivatable_same_lineage(
         };
         if tb_is_ancestor(&tree.nodes, tag, access_tag) {
             if !matches!(node.kind, BorrowKind::Unique)
-                || matches!(node.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
+                || matches!(
+                    node.perm,
+                    TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
+                )
             {
                 return None;
             }
@@ -948,7 +978,10 @@ fn tb_has_usable_clean_unique_ancestor(
             && node.start >= conflicted.start
             && node_end <= conflicted_end
             && matches!(node.kind, BorrowKind::Unique)
-            && !matches!(node.perm, TbPerm::Reserved { conflicted: true } | TbPerm::Disabled)
+            && !matches!(
+                node.perm,
+                TbPerm::Reserved { conflicted: true } | TbPerm::Disabled
+            )
         {
             let has_foreign_overlap = nodes.values().any(|other| {
                 tb_is_live_node(other)
@@ -978,8 +1011,51 @@ fn tb_only_unique_ancestor_overlap(
         }
         tb_lineage_contains(access_lineage, other.tag)
             && matches!(other.kind, BorrowKind::Unique)
-            && !matches!(other.perm, TbPerm::Disabled | TbPerm::Reserved { conflicted: true })
+            && !matches!(
+                other.perm,
+                TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
+            )
     })
+}
+
+fn tb_only_same_family_overlap(
+    nodes: &HashMap<u64, TbNode>,
+    access_lineage: &[u64],
+    addr: usize,
+    size: usize,
+) -> bool {
+    nodes.values().all(|other| {
+        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+            return true;
+        }
+        tb_lineage_contains(access_lineage, other.tag)
+            || access_lineage
+                .iter()
+                .copied()
+                .any(|ancestor| tb_is_ancestor(nodes, ancestor, other.tag))
+    })
+}
+
+fn tb_has_live_unique_lineage_ancestor(
+    nodes: &HashMap<u64, TbNode>,
+    access_lineage: &[u64],
+    addr: usize,
+    size: usize,
+) -> bool {
+    let access_end = addr.saturating_add(size);
+    for &tag in access_lineage {
+        let Some(node) = nodes.get(&tag) else {
+            return false;
+        };
+        if !tb_is_live_node(node) || !matches!(node.kind, BorrowKind::Unique) {
+            continue;
+        }
+        let node_end = node.start.saturating_add(node.len);
+        if node.len != 0 && addr >= node.start && access_end <= node_end {
+            return true;
+        }
+    }
+    false
 }
 
 fn tb_same_lineage_protected_conflict_ok(

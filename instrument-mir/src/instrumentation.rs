@@ -2025,15 +2025,41 @@ impl MyOptimizationPass {
         }
 
         let is_mut = self.ptr_is_mut(ptr_ty);
+        let is_ref = matches!(ptr_ty.kind(), TyKind::Ref(..));
+        let projected_src =
+            self.recover_projected_pointer_rhs_source(tcx, body, bb, stmt_idx, ptr_local);
         tagged_ptr_locals.insert(ptr_local);
         ptr_locals_needing_tag.insert(ptr_local);
         insert_points.push(InsertPoint {
-            bb,
-            stmt_idx,
-            insert_before: true,
+            bb: projected_src.map_or(bb, |(def_bb, _, _)| def_bb),
+            stmt_idx: projected_src.map_or(stmt_idx, |(_, def_stmt_idx, _)| def_stmt_idx),
+            insert_before: projected_src.is_none(),
             source_info,
             place: Place::from(ptr_local),
-            kind: InstrKind::RawRoot { ptr_local, is_mut },
+            kind: if let Some((_def_bb, _def_stmt_idx, src_place)) = projected_src {
+                if is_ref {
+                    let bk = match ptr_ty.kind() {
+                        TyKind::Ref(_, _, Mutability::Mut) => BorrowKind::Mut {
+                            kind: MutBorrowKind::Default,
+                        },
+                        _ => BorrowKind::Shared,
+                    };
+                    InstrKind::Ref { bk, src: src_place }
+                } else {
+                    InstrKind::Raw {
+                        is_mut,
+                        src: src_place,
+                    }
+                }
+            } else if is_ref {
+                InstrKind::RetRoot {
+                    dst_local: ptr_local,
+                    is_mut,
+                    is_ref: true,
+                }
+            } else {
+                InstrKind::RawRoot { ptr_local, is_mut }
+            },
         });
     }
 
@@ -3253,7 +3279,9 @@ impl MyOptimizationPass {
         if !tcx.hir_body_owner_kind(local_def_id).is_fn_or_closure() {
             return Vec::new();
         }
-        let hir_body = tcx.hir_body_owned_by(local_def_id);
+        let Some(hir_body) = tcx.hir_maybe_body_owned_by(local_def_id) else {
+            return Vec::new();
+        };
         let typeck = tcx.typeck(local_def_id);
         let mut collector = HirRefBindingCollector {
             typeck,
@@ -4430,6 +4458,61 @@ impl MyOptimizationPass {
             );
         }
         None
+    }
+
+    fn recover_projected_pointer_rhs_source<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        dst_local: Local,
+    ) -> Option<(BasicBlock, usize, Place<'tcx>)> {
+        let predecessors = body.basic_blocks.predecessors();
+        let mut cur_bb = bb;
+        let mut upto = stmt_idx.min(body.basic_blocks[cur_bb].statements.len());
+        let mut visited: HashSet<BasicBlock> = HashSet::new();
+
+        loop {
+            let block_stmts = &body.basic_blocks[cur_bb].statements;
+            for (def_stmt_idx, stmt) in block_stmts[..upto].iter().enumerate().rev() {
+                let StatementKind::Assign(box (dst, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                if dst.as_local() != Some(dst_local) {
+                    continue;
+                }
+                let src_place = match rvalue {
+                    Rvalue::Use(op) => self.place_from_operand(op),
+                    Rvalue::CopyForDeref(p) => Some(*p),
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion(_, _)
+                        | CastKind::Transmute
+                        | CastKind::PointerWithExposedProvenance,
+                        op,
+                        _,
+                    ) => self.place_from_operand(op),
+                    _ => None,
+                }?;
+                let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                if self.is_pointer_ty(src_ty) && !src_place.projection.is_empty() {
+                    return Some((cur_bb, def_stmt_idx, src_place));
+                }
+                return None;
+            }
+
+            let preds = &predecessors[cur_bb];
+            if preds.len() != 1 {
+                return None;
+            }
+            let pred_bb = preds[0];
+            if !visited.insert(pred_bb) {
+                return None;
+            }
+            cur_bb = pred_bb;
+            upto = body.basic_blocks[cur_bb].statements.len();
+        }
     }
 
     /// Backtrack a deref'ed pointer local to the base local it was borrowed from, if any.
@@ -5826,6 +5909,65 @@ impl MyOptimizationPass {
 
                     let mut skip_tag_prop = false;
 
+                    // Preserve lineage for direct projected pointer/reference copies like
+                    // `_dst = copy (_agg.1: &mut T)`. Recovering only a base local here is often
+                    // too coarse and can leave the destination untagged until first use.
+                    let direct_projected_src_place = match rvalue {
+                        Rvalue::Use(op) => self.place_from_operand(op),
+                        Rvalue::CopyForDeref(p) => Some(*p),
+                        Rvalue::Cast(
+                            CastKind::PtrToPtr
+                            | CastKind::PointerCoercion(_, _)
+                            | CastKind::Transmute
+                            | CastKind::PointerWithExposedProvenance,
+                            op,
+                            _,
+                        ) => self.place_from_operand(op),
+                        _ => None,
+                    };
+                    if let Some(src_place) = direct_projected_src_place {
+                        let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                        if !src_place.projection.is_empty()
+                            && self.is_pointer_ty(src_ty)
+                            && self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
+                        {
+                            if self.log_enabled(PassLogLevel::Trace) {
+                                rz_pass_trace!(
+                                    self,
+                                    "[rusteze][projected-src] dst={:?} src={:?} dst_ty={:?}",
+                                    dst_local,
+                                    src_place,
+                                    dst_ty
+                                );
+                            }
+                            let is_mut = self.ptr_is_mut(dst_ty);
+                            ptr_locals_needing_tag.insert(dst_local);
+                            tagged_ptr_locals.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: if matches!(dst_ty.kind(), TyKind::Ref(..)) {
+                                    let bk = match dst_ty.kind() {
+                                        TyKind::Ref(_, _, Mutability::Mut) => BorrowKind::Mut {
+                                            kind: MutBorrowKind::Default,
+                                        },
+                                        _ => BorrowKind::Shared,
+                                    };
+                                    InstrKind::Ref { bk, src: src_place }
+                                } else {
+                                    InstrKind::Raw {
+                                        is_mut,
+                                        src: src_place,
+                                    }
+                                },
+                            });
+                            skip_tag_prop = true;
+                        }
+                    }
+
                     // Casts to raw pointers should create a fresh raw tag with parent lineage,
                     // rather than copying the source tag directly.
                     if let Rvalue::Cast(
@@ -6011,6 +6153,7 @@ impl MyOptimizationPass {
                     }
 
                     if !skip_tag_prop {
+                        let mut handled_ptr_tag = false;
                         if let Some(src_local) = src_local_opt {
                             let src_ty = body.local_decls[src_local].ty;
                             if self.is_pointer_ty(src_ty) {
@@ -6151,8 +6294,10 @@ impl MyOptimizationPass {
                                     );
                                 }
                                 tagged_ptr_locals.insert(dst_local);
+                                handled_ptr_tag = true;
                             }
-                        } else {
+                        }
+                        if !handled_ptr_tag {
                             // If the RHS is a projected place, there may be no pointer local we can
                             // propagate from, but the destination still needs a tag for later derefs.
                             // Synthesize a fresh root tag so the runtime does not see UNKNOWN_TAG.
@@ -6195,6 +6340,19 @@ impl MyOptimizationPass {
                                 if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
                                     let is_mut = self.ptr_is_mut(dst_ty);
                                     let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+                                    let projected_src_place = match rvalue {
+                                        Rvalue::Use(op) => self.place_from_operand(op),
+                                        Rvalue::CopyForDeref(p) => Some(*p),
+                                        Rvalue::Cast(
+                                            CastKind::PtrToPtr
+                                            | CastKind::PointerCoercion(_, _)
+                                            | CastKind::Transmute
+                                            | CastKind::PointerWithExposedProvenance,
+                                            op,
+                                            _,
+                                        ) => self.place_from_operand(op),
+                                        _ => None,
+                                    };
                                     let anchor_key = self.normalized_ptr_expr_key_for_rvalue(
                                         body,
                                         rvalue,
@@ -6224,7 +6382,7 @@ impl MyOptimizationPass {
                                         }
                                         insert_points.push(InsertPoint {
                                             bb,
-                                            stmt_idx: stmt_idx + 1,
+                                            stmt_idx,
                                             insert_before: false,
                                             source_info: stmt.source_info,
                                             place: Place::from(dst_local),
@@ -6254,11 +6412,28 @@ impl MyOptimizationPass {
                                         }
                                         insert_points.push(InsertPoint {
                                             bb,
-                                            stmt_idx: stmt_idx + 1,
+                                            stmt_idx,
                                             insert_before: false,
                                             source_info: stmt.source_info,
                                             place: Place::from(dst_local),
-                                            kind: if is_ref {
+                                            kind: if let Some(src_place) = projected_src_place {
+                                                if is_ref {
+                                                    let bk = match dst_ty.kind() {
+                                                        TyKind::Ref(_, _, Mutability::Mut) => {
+                                                            BorrowKind::Mut {
+                                                                kind: MutBorrowKind::Default,
+                                                            }
+                                                        }
+                                                        _ => BorrowKind::Shared,
+                                                    };
+                                                    InstrKind::Ref { bk, src: src_place }
+                                                } else {
+                                                    InstrKind::Raw {
+                                                        is_mut,
+                                                        src: src_place,
+                                                    }
+                                                }
+                                            } else if is_ref {
                                                 InstrKind::RetRoot {
                                                     dst_local,
                                                     is_mut,
@@ -6496,10 +6671,7 @@ impl MyOptimizationPass {
                                 let dst_field =
                                     self.pointer_field_place(tcx, dst_local, field_idx, field_ty);
                                 let src_field = self.pointer_field_place_from_place(
-                                    tcx,
-                                    *src_place,
-                                    field_idx,
-                                    field_ty,
+                                    tcx, *src_place, field_idx, field_ty,
                                 );
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -9513,6 +9685,7 @@ impl MyOptimizationPass {
                 if !self.is_pointer_ty(ptr_ty) {
                     continue;
                 }
+                let raw_root_is_ref = matches!(ptr_ty.kind(), TyKind::Ref(..));
                 let dst_tag = *tag_local_for_ptr_local
                     .get(&ptr_local)
                     .expect("missing tag local for RawRoot");
@@ -9592,13 +9765,17 @@ impl MyOptimizationPass {
                         .append(&mut bounds_len_stmts);
                 }
 
-                let raw_func = Operand::function_handle(
+                let root_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_raw,
+                    if raw_root_is_ref {
+                        hooks.def_id_ref
+                    } else {
+                        hooks.def_id_raw
+                    },
                     std::iter::empty(),
                     source_info.span,
                 );
-                let args_raw: Box<[Spanned<Operand<'tcx>>]> = vec![
+                let args_root: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
                         span: source_info.span,
@@ -9629,8 +9806,8 @@ impl MyOptimizationPass {
                 body.basic_blocks_mut()[call_bb].terminator = Some(Terminator {
                     source_info,
                     kind: TerminatorKind::Call {
-                        func: raw_func,
-                        args: args_raw,
+                        func: root_func,
+                        args: args_root,
                         destination: Place::from(dst_tag),
                         target: Some(cont_bb),
                         unwind: UnwindAction::Continue,
@@ -9648,7 +9825,11 @@ impl MyOptimizationPass {
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(dst_ref_ancestor_local),
-                                Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                                Rvalue::Use(if raw_root_is_ref {
+                                    Operand::Copy(Place::from(dst_tag))
+                                } else {
+                                    self.const_u64(tcx, source_info.span, 0)
+                                }),
                             ))),
                         ),
                     );

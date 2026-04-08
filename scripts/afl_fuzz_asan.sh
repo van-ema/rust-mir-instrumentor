@@ -9,7 +9,7 @@ AFL_FUZZ="${AFL_FUZZ:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown
 TIMEOUT_MS="${TIMEOUT_MS:-}"
 IN_DIR="${IN_DIR:-fuzz/corpus/${TARGET}}"
 OUT_DIR="${OUT_DIR:-fuzz/out-asan/${TARGET}}"
@@ -32,7 +32,8 @@ case "$TARGET" in
   rkyv) BIN="afl_rkyv_driver"; FEATURE="rkyv_driver" ;;
   hyper) BIN="afl_hyper_driver"; FEATURE="hyper_driver" ;;
   image) BIN="afl_image_driver"; FEATURE="image_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image)" >&2; exit 2 ;;
+  hashbrown) BIN="afl_hashbrown_driver"; FEATURE="hashbrown_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown)" >&2; exit 2 ;;
 esac
 
 canonical_path() {
