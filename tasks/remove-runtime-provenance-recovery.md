@@ -167,6 +167,8 @@ The desired rule is:
     - `exact_parent_index`
     - `lineage_cache`
     are no longer performed during normal ref/raw tag creation
+- runtime repair is compile-time disabled in the normal build
+  - opt back in with the `runtime_lineage_repair` feature on the `runtime` crate
 - `Phase 4` is still pending:
   - the runtime repair code remains present and should be deleted only after we are satisfied
     with the profiling and stability story

@@ -16,7 +16,9 @@ use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
 mod dead_epoch_cleanup;
+#[cfg(feature = "runtime_lineage_repair")]
 mod exact_parent_index;
+#[cfg(feature = "runtime_lineage_repair")]
 mod lineage_cache;
 mod live_alloc_cache;
 mod ptr_shadow;
@@ -24,6 +26,51 @@ mod tag_history;
 mod tag_lookup_cache;
 mod tag_pruning;
 mod tag_store;
+
+#[cfg(not(feature = "runtime_lineage_repair"))]
+mod exact_parent_index {
+    use crate::TagMeta;
+
+    #[inline]
+    pub(crate) fn lookup(
+        _addr: usize,
+        _alloc_epoch: u64,
+        _require_mut_parent: bool,
+    ) -> Option<u64> {
+        None
+    }
+
+    #[inline]
+    pub(crate) fn remove_alloc_epoch(_base_addr: usize, _alloc_epoch: u64) {}
+
+    #[inline]
+    pub(crate) fn len() -> usize {
+        0
+    }
+
+    #[inline]
+    pub(crate) fn remember_non_root_tag(_tag: u64, _meta: &TagMeta) {}
+}
+
+#[cfg(not(feature = "runtime_lineage_repair"))]
+mod lineage_cache {
+    use crate::TagMeta;
+
+    #[inline]
+    pub(crate) fn lookup_repaired_parent(
+        _addr: usize,
+        _alloc_epoch: u64,
+        _require_mut_parent: bool,
+    ) -> Option<u64> {
+        None
+    }
+
+    #[inline]
+    pub(crate) fn note_dead_epoch(_base_addr: usize, _alloc_epoch: u64) {}
+
+    #[inline]
+    pub(crate) fn remember_non_root_tag(_tag: u64, _meta: &TagMeta) {}
+}
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -182,6 +229,7 @@ fn rz_dump_hook_profile_at_exit_enabled() -> bool {
     })
 }
 
+#[cfg(feature = "runtime_lineage_repair")]
 #[inline]
 fn rz_runtime_lineage_repair_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -190,6 +238,12 @@ fn rz_runtime_lineage_repair_enabled() -> bool {
             .ok()
             .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
     })
+}
+
+#[cfg(not(feature = "runtime_lineage_repair"))]
+#[inline(always)]
+fn rz_runtime_lineage_repair_enabled() -> bool {
+    false
 }
 
 #[inline]
