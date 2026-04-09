@@ -3437,16 +3437,6 @@ pub extern "C" fn __record_ref_creation(
     if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
         rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
     }
-    let exact_parent_update_start = profile.map(|_| Instant::now());
-    exact_parent_index::remember_non_root_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, exact_parent_update_start) {
-        rz_profile_add_elapsed(&p.ref_create_exact_parent_update_ns, start);
-    }
-    let lineage_cache_update_start = profile.map(|_| Instant::now());
-    lineage_cache::remember_non_root_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, lineage_cache_update_start) {
-        rz_profile_add_elapsed(&p.ref_create_lineage_cache_update_ns, start);
-    }
     let alias_on_tag_created_start = profile.map(|_| Instant::now());
     active_alias_model().on_tag_created(tag, &tmeta);
     if let (Some(p), Some(start)) = (profile, alias_on_tag_created_start) {
@@ -3469,6 +3459,23 @@ pub extern "C" fn __record_ref_creation(
         kind_str
     );
     tag
+}
+
+#[no_mangle]
+pub extern "C" fn __record_debug_ref_creation(
+    pointee_addr: usize,
+    is_mut: u8,
+    raw_tag: u64,
+    ref_ancestor: u64,
+    alias_exempt: u8,
+    bounds_len: usize,
+) -> u64 {
+    let parent_tag = if ref_ancestor != 0 {
+        ref_ancestor
+    } else {
+        raw_tag
+    };
+    __record_ref_creation(pointee_addr, is_mut, parent_tag, alias_exempt, bounds_len)
 }
 
 #[no_mangle]
@@ -3689,8 +3696,6 @@ pub extern "C" fn __record_raw_ptr_creation(
         tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
     }
     tag_pruning::remember_live_tag(tag, &tmeta);
-    exact_parent_index::remember_non_root_tag(tag, &tmeta);
-    lineage_cache::remember_non_root_tag(tag, &tmeta);
     active_alias_model().on_tag_created(tag, &tmeta);
 
     let kind_str = match kind {

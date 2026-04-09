@@ -149,6 +149,28 @@ The desired rule is:
 
 ## Phased Plan
 
+## Current Status
+
+- `Phase 0` completed:
+  - `RZ_DISABLE_RUNTIME_LINEAGE_REPAIR=1` bypasses `recover_parent_for_alloc_root(...)`
+- `Phase 1` completed:
+  - kill-switch audit is green on:
+    - all `paper_examples`
+    - `bytes` seed smoke run
+    - `smallvec` seed smoke run
+- `Phase 2` completed for the remaining known dependency:
+  - `paper_examples/lineage_field_proj`
+  - the missing lineage now comes from compiler-side debug-ref activation at the raw local's
+    defining assignment, using carried `ref_ancestor` metadata when present
+- `Phase 3` completed:
+  - hot-path updates to:
+    - `exact_parent_index`
+    - `lineage_cache`
+    are no longer performed during normal ref/raw tag creation
+- `Phase 4` is still pending:
+  - the runtime repair code remains present and should be deleted only after we are satisfied
+    with the profiling and stability story
+
 ### Phase 0: Add an opt-in kill switch
 
 Introduce a temporary flag such as:

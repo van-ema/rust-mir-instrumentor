@@ -1719,6 +1719,7 @@ struct ConstAllocInfo {
 #[derive(Copy, Clone, Debug)]
 struct Hooks {
     def_id_ref: DefId,
+    def_id_debug_ref: DefId,
     def_id_raw: DefId,
     def_id_alloc: DefId,
     def_id_write: DefId,
@@ -3401,6 +3402,33 @@ impl MyOptimizationPass {
                 out.push((bb, stmt_idx, source_info));
             }
         }
+        out
+    }
+
+    fn debug_ref_activation_locations<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        scope: SourceScope,
+        raw_local: Local,
+    ) -> Vec<(BasicBlock, usize, SourceInfo)> {
+        let mut out = Vec::new();
+        for (bb, entry_stmt_idx, entry_source_info) in self.scope_entry_locations(body, scope) {
+            let block = &body.basic_blocks[bb];
+            let mut activation = None;
+            for (stmt_idx, stmt) in block.statements[..entry_stmt_idx].iter().enumerate().rev() {
+                let StatementKind::Assign(box (dst_place, _)) = &stmt.kind else {
+                    continue;
+                };
+                if dst_place.as_local() != Some(raw_local) {
+                    continue;
+                }
+                activation = Some((bb, stmt_idx, stmt.source_info));
+                break;
+            }
+            out.push(activation.unwrap_or((bb, entry_stmt_idx, entry_source_info)));
+        }
+        out.sort_unstable_by_key(|(bb, stmt_idx, _)| (bb.index(), *stmt_idx));
+        out.dedup_by_key(|(bb, stmt_idx, _)| (bb.index(), *stmt_idx));
         out
     }
 
@@ -9251,7 +9279,7 @@ impl MyOptimizationPass {
     ) -> Operand<'tcx> {
         let def_id = match kind {
             InstrKind::Ref { .. } => hooks.def_id_ref,
-            InstrKind::DebugRefActivate { .. } => hooks.def_id_ref,
+            InstrKind::DebugRefActivate { .. } => hooks.def_id_debug_ref,
             InstrKind::Raw { .. } => hooks.def_id_raw,
             InstrKind::RawRoot { .. } => hooks.def_id_raw,
             InstrKind::RetRoot { is_ref, .. } => {
@@ -9309,7 +9337,6 @@ impl MyOptimizationPass {
                 InstrKind::Ref { .. }
                 | InstrKind::Raw { .. }
                 | InstrKind::RawRoot { .. }
-                | InstrKind::DebugRefActivate { .. }
                 | InstrKind::ArgRetag { .. }
                 | InstrKind::FnExit { .. }
                 | InstrKind::RetRoot { .. }
@@ -9318,6 +9345,9 @@ impl MyOptimizationPass {
                 // access/usage hooks at the same insertion site.
                 InstrKind::TagProp { .. } | InstrKind::TagPropFromRefAncestor { .. } => 1,
                 InstrKind::ShadowLoad { .. } => 1,
+                // Debug ref activation may need the restored tag/ref_ancestor emitted by
+                // ShadowLoad or TagProp at the same definition site.
+                InstrKind::DebugRefActivate { .. } => 2,
                 InstrKind::PtrRead { .. }
                 | InstrKind::PtrWrite { .. }
                 | InstrKind::PtrReadAllowUntagged { .. }
@@ -11019,7 +11049,14 @@ impl MyOptimizationPass {
                     tag_local,
                     is_mut,
                 } => {
-                    let parent_tag_op = if let Some(tl) = tag_local_for_ptr_local.get(&raw_local) {
+                    let raw_tag_op = if let Some(tl) = tag_local_for_ptr_local.get(&raw_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+                    let ref_ancestor_op = if let Some(tl) =
+                        ref_ancestor_local_for_ptr_local.get(&raw_local)
+                    {
                         Operand::Copy(Place::from(*tl))
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
@@ -11049,7 +11086,11 @@ impl MyOptimizationPass {
                             span: source_info.span,
                         },
                         Spanned {
-                            node: parent_tag_op,
+                            node: raw_tag_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: ref_ancestor_op,
                             span: source_info.span,
                         },
                         Spanned {
@@ -12135,6 +12176,9 @@ impl MyOptimizationPass {
         let def_id_ref = self
             .find_runtime_fn_def_id(tcx, "__record_ref_creation", 5)
             .expect("missing '__record_ref_creation' definition");
+        let def_id_debug_ref = self
+            .find_runtime_fn_def_id(tcx, "__record_debug_ref_creation", 6)
+            .expect("missing '__record_debug_ref_creation' definition");
         let def_id_raw = self
             .find_runtime_fn_def_id(tcx, "__record_raw_ptr_creation", 5)
             .expect("missing '__record_raw_ptr_creation' definition");
@@ -12192,6 +12236,7 @@ impl MyOptimizationPass {
 
         let hooks = Hooks {
             def_id_ref,
+            def_id_debug_ref,
             def_id_raw,
             def_id_alloc,
             def_id_write,
@@ -12261,14 +12306,15 @@ impl MyOptimizationPass {
                 },
             );
         }
-
         let mut insert_points = scan.insert_points;
         for binding in debug_ref_bindings.values() {
-            for (bb, stmt_idx, source_info) in self.scope_entry_locations(body, binding.key.scope) {
+            let activation_locs =
+                self.debug_ref_activation_locations(body, binding.key.scope, binding.key.raw_local);
+            for (bb, stmt_idx, source_info) in activation_locs {
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx,
-                    insert_before: true,
+                    insert_before: false,
                     source_info,
                     place: Place::from(binding.key.raw_local),
                     kind: InstrKind::DebugRefActivate {
