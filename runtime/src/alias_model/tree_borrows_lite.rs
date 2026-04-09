@@ -543,6 +543,8 @@ fn tb_lite_check(
             tb_is_live_node(n)
                 || (matches!(n.perm, TbPerm::Disabled)
                     && matches!(n.kind, BorrowKind::Unique)
+                    && !(matches!(access, AliasAccessKind::Read)
+                        && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
                     && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
         })
         .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
@@ -565,17 +567,36 @@ fn tb_lite_check(
         let next = match (access, child, n.perm, n.protected) {
             // Child/local read: everything except Disabled is unchanged.
             (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
-                if tb_has_live_unique_lineage_ancestor(&tree.nodes, &access_lineage, addr, size)
+                if tb_has_live_unique_lineage_ancestor(
+                    &tree.nodes,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                )
                     || tb_has_usable_clean_unique_ancestor(
                         &tree.nodes,
                         n.tag,
                         &access_lineage,
                         addr,
                         size,
+                        tmeta.alloc_epoch,
                     )
-                    || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                    || tb_only_unique_ancestor_overlap(
+                        &tree.nodes,
+                        &access_lineage,
+                        addr,
+                        size,
+                        tmeta.alloc_epoch,
+                    )
                     || (matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst)
-                        && tb_only_same_family_overlap(&tree.nodes, &access_lineage, addr, size))
+                        && tb_only_same_family_overlap(
+                            &tree.nodes,
+                            &access_lineage,
+                            addr,
+                            size,
+                            tmeta.alloc_epoch,
+                        ))
                 {
                     n.perm
                 } else {
@@ -613,6 +634,7 @@ fn tb_lite_check(
                     &access_lineage,
                     addr,
                     size,
+                    tmeta.alloc_epoch,
                 ) {
                     n.perm
                 } else {
@@ -633,7 +655,14 @@ fn tb_lite_check(
                     &access_lineage,
                     addr,
                     size,
-                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                    tmeta.alloc_epoch,
+                ) || tb_only_unique_ancestor_overlap(
+                    &tree.nodes,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                )
                 {
                     n.perm
                 } else {
@@ -652,7 +681,14 @@ fn tb_lite_check(
                     &access_lineage,
                     addr,
                     size,
-                ) || tb_only_unique_ancestor_overlap(&tree.nodes, &access_lineage, addr, size)
+                    tmeta.alloc_epoch,
+                ) || tb_only_unique_ancestor_overlap(
+                    &tree.nodes,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                )
                 {
                     n.perm
                 } else {
@@ -958,6 +994,7 @@ fn tb_has_usable_clean_unique_ancestor(
     access_lineage: &[u64],
     addr: usize,
     size: usize,
+    access_epoch: u64,
 ) -> bool {
     let Some(conflicted) = nodes.get(&conflicted_tag) else {
         return false;
@@ -977,6 +1014,7 @@ fn tb_has_usable_clean_unique_ancestor(
             && access_end <= node_end
             && node.start >= conflicted.start
             && node_end <= conflicted_end
+            && (access_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == access_epoch)
             && matches!(node.kind, BorrowKind::Unique)
             && !matches!(
                 node.perm,
@@ -986,6 +1024,9 @@ fn tb_has_usable_clean_unique_ancestor(
             let has_foreign_overlap = nodes.values().any(|other| {
                 tb_is_live_node(other)
                     && other.tag != node.tag
+                    && (access_epoch == 0
+                        || other.alloc_epoch == 0
+                        || other.alloc_epoch == access_epoch)
                     && tb_ranges_overlap(addr, size, other.start, other.len)
                     && !tb_is_ancestor(nodes, other.tag, node.tag)
                     && !tb_is_ancestor(nodes, node.tag, other.tag)
@@ -1004,9 +1045,13 @@ fn tb_only_unique_ancestor_overlap(
     access_lineage: &[u64],
     addr: usize,
     size: usize,
+    access_epoch: u64,
 ) -> bool {
     nodes.values().all(|other| {
         if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+            return true;
+        }
+        if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
             return true;
         }
         tb_lineage_contains(access_lineage, other.tag)
@@ -1023,9 +1068,13 @@ fn tb_only_same_family_overlap(
     access_lineage: &[u64],
     addr: usize,
     size: usize,
+    access_epoch: u64,
 ) -> bool {
     nodes.values().all(|other| {
         if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+            return true;
+        }
+        if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
             return true;
         }
         tb_lineage_contains(access_lineage, other.tag)
@@ -1033,7 +1082,33 @@ fn tb_only_same_family_overlap(
                 .iter()
                 .copied()
                 .any(|ancestor| tb_is_ancestor(nodes, ancestor, other.tag))
+            || access_lineage
+                .iter()
+                .copied()
+                .any(|ancestor| ancestor != 0 && tb_is_ancestor(nodes, ancestor, other.tag))
+            || tb_shares_nonroot_ancestor(nodes, access_lineage, other.tag)
     })
+}
+
+fn tb_shares_nonroot_ancestor(
+    nodes: &HashMap<u64, TbNode>,
+    access_lineage: &[u64],
+    other_tag: u64,
+) -> bool {
+    let mut cur = other_tag;
+    for _ in 0..nodes.len().saturating_add(1) {
+        if cur == 0 {
+            return false;
+        }
+        if access_lineage.iter().copied().any(|ancestor| ancestor == cur && ancestor != 0) {
+            return true;
+        }
+        let Some(node) = nodes.get(&cur) else {
+            return false;
+        };
+        cur = node.parent;
+    }
+    false
 }
 
 fn tb_has_live_unique_lineage_ancestor(
@@ -1041,12 +1116,16 @@ fn tb_has_live_unique_lineage_ancestor(
     access_lineage: &[u64],
     addr: usize,
     size: usize,
+    access_epoch: u64,
 ) -> bool {
     let access_end = addr.saturating_add(size);
     for &tag in access_lineage {
         let Some(node) = nodes.get(&tag) else {
             return false;
         };
+        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
+            continue;
+        }
         if !tb_is_live_node(node) || !matches!(node.kind, BorrowKind::Unique) {
             continue;
         }
