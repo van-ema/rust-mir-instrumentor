@@ -601,6 +601,16 @@ TARGET=image PROFILE=release ./scripts/afl_repro.sh --input fuzz/out/image/defau
 `scripts/afl_build.sh` includes a post-build hook check and prints:
 `[rusteze] hook check: found rusteze hooks (__rz_*) ...` when instrumentation hooks are present.
 
+You can also verify a built binary manually with `nm`:
+
+```bash
+BIN=target/afl-release-bytes/release/afl_bytes_driver
+nm -C "$BIN" | rg '__rz_(ptr_read|ptr_write|record_ref_creation|record_raw_ptr_creation|take_call_arg_tag|push_call_arg_tag|take_ret_tag_or_root|push_ret_tag)'
+```
+
+If that command prints matching `__rz_*` symbols, the binary contains `rusteze`
+instrumentation hooks.
+
 For strict CI-style verification:
 
 ```bash

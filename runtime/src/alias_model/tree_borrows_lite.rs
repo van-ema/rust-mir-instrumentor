@@ -76,6 +76,23 @@ fn rz_tb_dump_enabled() -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+#[cfg(feature = "runtime_lineage_repair")]
+#[inline]
+fn rz_tb_runtime_lineage_repair_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("RZ_DISABLE_RUNTIME_LINEAGE_REPAIR")
+            .ok()
+            .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    })
+}
+
+#[cfg(not(feature = "runtime_lineage_repair"))]
+#[inline(always)]
+fn rz_tb_runtime_lineage_repair_enabled() -> bool {
+    false
+}
+
 impl AliasModel for TreeBorrowsLiteModel {
     fn name(&self) -> &'static str {
         "tb_lite"
@@ -483,17 +500,17 @@ fn tb_lite_check(
 
     // Use the original tag when TB tracked it (notably raw tags); otherwise fall back to
     // the nearest-ref tag used by the generic fast path.
-    let access_tag = if tree.nodes.contains_key(&orig_tag) {
+    let mut access_tag = if tree.nodes.contains_key(&orig_tag) {
         orig_tag
     } else {
         sb_tag
     };
 
-    let Some(node) = tree.nodes.get(&access_tag).cloned() else {
+    let Some(mut node) = tree.nodes.get(&access_tag).cloned() else {
         // Best-effort: missing node means missing model metadata, not definite UB.
         return None;
     };
-    let access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
+    let mut access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
     if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
         // Tag metadata and TB node disagree on epoch; treat as stale model state and skip.
         return None;
@@ -503,6 +520,24 @@ fn tb_lite_check(
     } else {
         String::new()
     };
+    if !tb_is_live_node(&node) {
+        if rz_tb_runtime_lineage_repair_enabled() {
+            if let Some(recovered_tag) = tb_lite_recover_same_place_live_sibling(
+                tree,
+                access_tag,
+                &node,
+                addr,
+                size,
+                tmeta.alloc_epoch,
+            ) {
+                access_tag = recovered_tag;
+                if let Some(recovered_node) = tree.nodes.get(&access_tag).cloned() {
+                    node = recovered_node;
+                    access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
+                }
+            }
+        }
+    }
     if !tb_is_live_node(&node) {
         if matches!(tmeta.kind, PtrKind::RefMut) {
             if let Some(descendants) =
@@ -757,6 +792,34 @@ fn tb_lite_check(
     }
 
     None
+}
+
+fn tb_lite_recover_same_place_live_sibling(
+    tree: &TbAllocState,
+    dead_tag: u64,
+    dead_node: &TbNode,
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) -> Option<u64> {
+    if !rz_tb_runtime_lineage_repair_enabled() {
+        return None;
+    }
+
+    let access_len = tb_effective_len(size);
+    tree.nodes
+        .values()
+        .filter(|n| n.tag != dead_tag)
+        .filter(|n| tb_is_live_node(n))
+        .filter(|n| n.kind == dead_node.kind)
+        .filter(|n| n.parent == dead_node.parent)
+        .filter(|n| n.start == dead_node.start && n.len == dead_node.len)
+        .filter(|n| n.start == addr && n.len == access_len)
+        .filter(|n| {
+            alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch
+        })
+        .map(|n| n.tag)
+        .max()
 }
 
 #[inline]

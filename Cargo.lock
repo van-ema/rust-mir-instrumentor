@@ -13,6 +13,7 @@ name = "afl_harness"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bumpalo",
  "bytes 1.11.0",
  "hashbrown 0.16.1",
  "http-body-util",

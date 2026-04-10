@@ -19,6 +19,7 @@ rkyv_driver = ["dep:rkyv"]
 hyper_driver = ["dep:hyper", "dep:tokio", "dep:http-body-util"]
 image_driver = ["dep:image"]
 hashbrown_driver = ["dep:hashbrown"]
+bumpalo_driver = ["dep:bumpalo"]
 
 [dependencies]
 bytes = { path = "../third_party/bytes", optional = true }
@@ -38,6 +39,7 @@ http-body-util = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"], optional = true }
 image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png"], optional = true }
 hashbrown = { version = "0.16.1", optional = true }
+bumpalo = { version = "3.19.1", features = ["collections"], optional = true }
 
 [[bin]]
 name = "afl_bytes_driver"
@@ -108,6 +110,11 @@ required-features = ["image_driver"]
 name = "afl_hashbrown_driver"
 path = "src/bin/afl_hashbrown_driver.rs"
 required-features = ["hashbrown_driver"]
+
+[[bin]]
+name = "afl_bumpalo_driver"
+path = "src/bin/afl_bumpalo_driver.rs"
+required-features = ["bumpalo_driver"]
 
 [[bin]]
 name = "repro_smallvec_oracle_append_fp"

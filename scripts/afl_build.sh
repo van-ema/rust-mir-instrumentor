@@ -17,7 +17,7 @@ AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
 RUNTIME_PROFILE="${RUNTIME_PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
 RZ_INTERPROC_UNSAFE_SUMMARIES="${RZ_INTERPROC_UNSAFE_SUMMARIES:-0}"
@@ -37,7 +37,8 @@ case "$TARGET" in
   hyper) BIN="afl_hyper_driver"; FEATURE="hyper_driver" ;;
   image) BIN="afl_image_driver"; FEATURE="image_driver" ;;
   hashbrown) BIN="afl_hashbrown_driver"; FEATURE="hashbrown_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown)" >&2; exit 2 ;;
+  bumpalo) BIN="afl_bumpalo_driver"; FEATURE="bumpalo_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo)" >&2; exit 2 ;;
 esac
 
 if [[ "${RZ_INTERPROC_UNSAFE_SUMMARIES}" == "1" && "${RZ_INTERPROC_STAGE:-0}" != "1" ]]; then
@@ -148,15 +149,19 @@ build_tools_and_runtime() {
 
   # Build runtime after instrument-mir so the final rlib in deps reflects RUNTIME_FEATURES.
   if [[ "$RUNTIME_PROFILE" == "release" ]]; then
-    cargo build -p runtime --release ${RUNTIME_FEATURES}
+    cargo build -p runtime --release "${runtime_feature_args[@]}"
   else
-    cargo build -p runtime ${RUNTIME_FEATURES}
+    cargo build -p runtime "${runtime_feature_args[@]}"
   fi
 }
 
 # Build rusteze toolchain + runtime. The target/harness uses PROFILE while the
 # runtime can be optimized independently via RUNTIME_PROFILE.
 RUNTIME_FEATURES="${RUNTIME_FEATURES:-}"
+runtime_feature_args=()
+if [[ -n "${RUNTIME_FEATURES}" ]]; then
+  runtime_feature_args=(--features "${RUNTIME_FEATURES}")
+fi
 build_tools_and_runtime
 
 # Avoid accidental linking against a stale top-level `libruntime.rlib` if one exists.
