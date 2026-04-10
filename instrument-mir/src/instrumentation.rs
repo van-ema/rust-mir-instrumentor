@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 mod metadata_dataflow;
+mod config;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
@@ -1852,14 +1853,6 @@ impl MyOptimizationPass {
         }
         None
     }
-    /// Whether we should suppress coarse PtrUse hooks originating from std/core/alloc.
-    /// Default: enabled. Set `RZ_FILTER_STDLIB_USES=0` to disable.
-    fn filter_stdlib_uses_enabled(&self) -> bool {
-        std::env::var("RZ_FILTER_STDLIB_USES")
-            .ok()
-            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
     /// Best-effort check: does this span come from the Rust std/core/alloc sources?
     /// This is used to suppress noisy PtrUse hooks for std wrappers (e.g. println!).
     fn span_is_stdlib<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span) -> bool {
@@ -2323,110 +2316,6 @@ impl MyOptimizationPass {
         );
 
         Some((slot_ptr_stmt, addr_stmt))
-    }
-
-    /// Whether to warn about unknown (unclassified) direct calls that may read/write memory via pointers.
-    /// Default: enabled. Set `RZ_WARN_UNKNOWN_CALLS=0` to disable.
-    fn warn_unknown_calls_enabled(&self) -> bool {
-        std::env::var("RZ_WARN_UNKNOWN_CALLS")
-            .ok()
-            .map_or(true, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    /// If true, emit MIR-based heap alloc/free hooks (`HeapAlloc` / `__rz_record_alloc`).
-    /// Default: false (we rely on the runtime's global allocator wrapper in `runtime/src/lib.rs`).
-    /// Set `RZ_HEAP_ALLOCS_FROM_MIR=1` to force the old behavior.
-    fn heap_allocs_from_mir_enabled(&self) -> bool {
-        std::env::var("RZ_HEAP_ALLOCS_FROM_MIR")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    /// Caller-side return-tag recovery is always enabled.
-    ///
-    /// We keep this as a helper to make call-boundary policy explicit in one place.
-    fn ret_take_enabled(&self) -> bool {
-        true
-    }
-
-    /// Callee-side return-tag push is always enabled.
-    ///
-    /// Together with `ret_take_enabled`, this keeps return-pointer provenance connected
-    /// across instrumented call boundaries by default.
-    fn ret_push_enabled(&self) -> bool {
-        true
-    }
-
-    /// Whether to emit stack-dead events on `StorageDead`.
-    ///
-    /// Default: disabled, because optimized MIR can place `StorageDead` before
-    /// a final use through outstanding references. Enable for experiments with:
-    /// `RZ_USE_STORAGE_DEAD=1`.
-    fn use_storage_dead_enabled(&self) -> bool {
-        std::env::var("RZ_USE_STORAGE_DEAD")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    /// Print every emitted stack allocation/deallocation hook.
-    ///
-    /// Default: disabled. Enable with `RZ_TRACE_STACK_ALLOCS=1`.
-    fn trace_stack_allocs_enabled(&self) -> bool {
-        std::env::var("RZ_TRACE_STACK_ALLOCS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    /// Enable crate-local unsafe-influence dataflow gating for pointer access hooks.
-    ///
-    /// Supported modes:
-    /// - analyze-only summary generation (`RZ_ANALYZE_UNSAFE_SUMMARIES=1`)
-    /// - final builds consuming merged summaries (`RZ_USE_UNSAFE_SUMMARIES=1`)
-    ///
-    /// Plain local-only `RZ_UNSAFE_DATAFLOW=1` pruning is intentionally ignored as a
-    /// user-facing mode because it is not sound enough for the full example suite.
-    fn unsafe_dataflow_selective_enabled(&self) -> bool {
-        unsafe_dataflow::unsafe_dataflow_enabled()
-    }
-
-    fn unsafe_dataflow_stats_enabled(&self) -> bool {
-        std::env::var("RZ_UNSAFE_DATAFLOW_STATS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    fn unsafe_dataflow_summary_stats_enabled(&self) -> bool {
-        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_STATS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    fn unsafe_dataflow_summary_dump_enabled(&self) -> bool {
-        std::env::var("RZ_UNSAFE_DATAFLOW_SUMMARY_DUMP")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    fn unsafe_dataflow_call_stats_enabled(&self) -> bool {
-        std::env::var("RZ_UNSAFE_DATAFLOW_CALL_STATS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    fn unsafe_dataflow_unknown_callee_stats_enabled(&self) -> bool {
-        std::env::var("RZ_UNSAFE_DATAFLOW_UNKNOWN_CALLEE_STATS")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-    }
-
-    fn analyze_unsafe_summaries_only_enabled(&self) -> bool {
-        unsafe_dataflow::analyze_unsafe_summaries_enabled()
-    }
-
-    fn trace_unsafe_dataflow_enabled(&self) -> bool {
-        std::env::var("RZ_TRACE_UNSAFE_DATAFLOW")
-            .ok()
-            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
     fn unsafe_dataflow_gated_local<'tcx>(
