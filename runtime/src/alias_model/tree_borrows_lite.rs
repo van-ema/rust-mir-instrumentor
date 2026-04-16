@@ -608,30 +608,27 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                )
-                    || tb_has_usable_clean_unique_ancestor(
+                ) || tb_has_usable_clean_unique_ancestor(
+                    &tree.nodes,
+                    n.tag,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                ) || tb_only_unique_ancestor_overlap(
+                    &tree.nodes,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                ) || (matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst)
+                    && tb_only_same_family_overlap(
                         &tree.nodes,
-                        n.tag,
                         &access_lineage,
                         addr,
                         size,
                         tmeta.alloc_epoch,
-                    )
-                    || tb_only_unique_ancestor_overlap(
-                        &tree.nodes,
-                        &access_lineage,
-                        addr,
-                        size,
-                        tmeta.alloc_epoch,
-                    )
-                    || (matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst)
-                        && tb_only_same_family_overlap(
-                            &tree.nodes,
-                            &access_lineage,
-                            addr,
-                            size,
-                            tmeta.alloc_epoch,
-                        ))
+                    ))
                 {
                     n.perm
                 } else {
@@ -697,8 +694,13 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                )
-                {
+                ) || tb_only_same_family_overlap(
+                    &tree.nodes,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                ) {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -723,8 +725,7 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                )
-                {
+                ) {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -815,9 +816,7 @@ fn tb_lite_recover_same_place_live_sibling(
         .filter(|n| n.parent == dead_node.parent)
         .filter(|n| n.start == dead_node.start && n.len == dead_node.len)
         .filter(|n| n.start == addr && n.len == access_len)
-        .filter(|n| {
-            alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch
-        })
+        .filter(|n| alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
         .map(|n| n.tag)
         .max()
 }
@@ -1163,7 +1162,11 @@ fn tb_shares_nonroot_ancestor(
         if cur == 0 {
             return false;
         }
-        if access_lineage.iter().copied().any(|ancestor| ancestor == cur && ancestor != 0) {
+        if access_lineage
+            .iter()
+            .copied()
+            .any(|ancestor| ancestor == cur && ancestor != 0)
+        {
             return true;
         }
         let Some(node) = nodes.get(&cur) else {

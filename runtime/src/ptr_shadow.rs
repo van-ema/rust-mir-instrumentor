@@ -57,8 +57,14 @@ fn abs_ptr_shadow_partial() -> &'static Mutex<BTreeMap<usize, PartialPtrShadowEn
 
 #[derive(Copy, Clone, Debug)]
 enum SlotLoc {
-    Alloc { base: usize, epoch: u64, offset: usize },
-    Abs { addr: usize },
+    Alloc {
+        base: usize,
+        epoch: u64,
+        offset: usize,
+    },
+    Abs {
+        addr: usize,
+    },
 }
 
 #[inline]
@@ -123,10 +129,7 @@ fn overlapping_partial_offsets(
 }
 
 #[inline]
-fn kill_partial_byte_in_map(
-    slots: &mut BTreeMap<usize, PartialPtrShadowEntry>,
-    byte_addr: usize,
-) {
+fn kill_partial_byte_in_map(slots: &mut BTreeMap<usize, PartialPtrShadowEntry>, byte_addr: usize) {
     let scan_start = byte_addr.saturating_sub(PTR_SLOT_BYTES.saturating_sub(1));
     let keys: Vec<usize> = slots
         .range(scan_start..=byte_addr)
@@ -186,7 +189,11 @@ pub(crate) fn kill_range(addr: usize, size: usize) {
     }
 
     match slot_loc(addr) {
-        SlotLoc::Alloc { base, epoch, offset } => {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => {
             let mut shadow = alloc_ptr_shadow().lock().unwrap();
             if let Some(slots) = shadow.get_mut(&(base, epoch)) {
                 let doomed = overlapping_offsets(slots, offset, size);
@@ -241,7 +248,11 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
     }
 
     match slot_loc(addr) {
-        SlotLoc::Alloc { base, epoch, offset } => {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => {
             let entry = PtrShadowEntry {
                 tag,
                 ref_ancestor,
@@ -287,7 +298,11 @@ fn load_entry(addr: usize) -> Option<PtrShadowEntry> {
     }
 
     match slot_loc(addr) {
-        SlotLoc::Alloc { base, epoch, offset } => {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => {
             let primary = alloc_ptr_shadow()
                 .lock()
                 .unwrap()
@@ -318,7 +333,11 @@ fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
     }
 
     match slot_loc(addr) {
-        SlotLoc::Alloc { base, epoch, offset } => alloc_ptr_shadow()
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => alloc_ptr_shadow()
             .lock()
             .unwrap()
             .get(&(base, epoch))
@@ -329,9 +348,7 @@ fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
                     .lock()
                     .unwrap()
                     .pipe_ref(|slots| covering_entry(slots, addr))
-                    .filter(|(slot_start, entry, _)| {
-                        abs_entry_matches(*slot_start, *entry)
-                    })
+                    .filter(|(slot_start, entry, _)| abs_entry_matches(*slot_start, *entry))
                     .map(|(_slot_start, entry, byte_off)| (entry, byte_off))
             }),
         SlotLoc::Abs { addr } => abs_ptr_shadow()
@@ -385,7 +402,11 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
         .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false");
 
     match slot_loc(addr) {
-        SlotLoc::Alloc { base, epoch, offset } => {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => {
             let Some(slot_start) = offset.checked_sub(src_byte_off) else {
                 return;
             };
@@ -398,12 +419,14 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
             let mut shadow = alloc_ptr_shadow().lock().unwrap();
             let abs_slot_start = base.saturating_add(slot_start);
             let mut partial = abs_ptr_shadow_partial().lock().unwrap();
-            let slot = partial.entry(abs_slot_start).or_insert(PartialPtrShadowEntry {
-                tag: src_entry.tag,
-                ref_ancestor: src_entry.ref_ancestor,
-                valid_mask: 0,
-                poisoned: false,
-            });
+            let slot = partial
+                .entry(abs_slot_start)
+                .or_insert(PartialPtrShadowEntry {
+                    tag: src_entry.tag,
+                    ref_ancestor: src_entry.ref_ancestor,
+                    valid_mask: 0,
+                    poisoned: false,
+                });
             if !slot.poisoned
                 && (slot.tag != src_entry.tag || slot.ref_ancestor != src_entry.ref_ancestor)
             {
@@ -439,7 +462,10 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                         base, epoch, slot_start, full.tag, full.ref_ancestor
                     );
                 }
-                shadow.entry((base, epoch)).or_default().insert(slot_start, full);
+                shadow
+                    .entry((base, epoch))
+                    .or_default()
+                    .insert(slot_start, full);
                 abs_ptr_shadow()
                     .lock()
                     .unwrap()
@@ -526,7 +552,11 @@ pub(crate) fn copy_range(dst_addr: usize, src_addr: usize, size: usize) {
             break;
         };
         match slot_loc(dst_byte_addr) {
-            SlotLoc::Alloc { base, epoch, offset } => {
+            SlotLoc::Alloc {
+                base,
+                epoch,
+                offset,
+            } => {
                 let mut shadow = alloc_ptr_shadow().lock().unwrap();
                 if let Some(slots) = shadow.get_mut(&(base, epoch)) {
                     let doomed = overlapping_offsets(slots, offset, 1);
@@ -578,7 +608,8 @@ pub(crate) fn remove_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
         .lock()
         .unwrap()
         .remove(&(base_addr, alloc_epoch));
-    abs_ptr_shadow().lock().unwrap().retain(|_, entry| {
-        !(entry.alloc_base == base_addr && entry.alloc_epoch == alloc_epoch)
-    });
+    abs_ptr_shadow()
+        .lock()
+        .unwrap()
+        .retain(|_, entry| !(entry.alloc_base == base_addr && entry.alloc_epoch == alloc_epoch));
 }

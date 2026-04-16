@@ -78,14 +78,20 @@ mod os {
 
             for _ in 0..header.ncmds {
                 let lc = unsafe { &*(cmd_ptr as *const LoadCommand) };
-                if lc.cmd == LC_SEGMENT_64 && lc.cmdsize as usize >= mem::size_of::<SegmentCommand64>() {
+                if lc.cmd == LC_SEGMENT_64
+                    && lc.cmdsize as usize >= mem::size_of::<SegmentCommand64>()
+                {
                     let seg = unsafe { &*(cmd_ptr as *const SegmentCommand64) };
                     if seg.vmsize != 0 {
                         let start = (seg.vmaddr as isize).wrapping_add(slide) as usize;
                         let end = start.saturating_add(seg.vmsize as usize);
                         let writable = (seg.initprot & VM_PROT_WRITE) != 0;
                         if end > start {
-                            ranges.push(StaticRange { start, end, writable });
+                            ranges.push(StaticRange {
+                                start,
+                                end,
+                                writable,
+                            });
                         }
                     }
                 }
@@ -156,7 +162,11 @@ mod os {
                 let end = start.saturating_add(ph.p_memsz as usize);
                 let writable = (ph.p_flags & PF_W) != 0;
                 if end > start {
-                    ranges.push(StaticRange { start, end, writable });
+                    ranges.push(StaticRange {
+                        start,
+                        end,
+                        writable,
+                    });
                 }
             }
             0

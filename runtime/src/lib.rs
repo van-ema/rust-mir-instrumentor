@@ -1661,7 +1661,11 @@ fn snapshot_tag_origin(pointee_addr: usize, parent_tag: u64) -> (bool, usize, us
 }
 
 #[inline]
-fn normalize_const_end_ref_pointee(pointee_addr: usize, parent_tag: u64, bounds_len: usize) -> usize {
+fn normalize_const_end_ref_pointee(
+    pointee_addr: usize,
+    parent_tag: u64,
+    bounds_len: usize,
+) -> usize {
     if parent_tag != 0 || pointee_addr == 0 {
         return pointee_addr;
     }
@@ -1689,7 +1693,11 @@ fn normalize_const_end_ref_pointee(pointee_addr: usize, parent_tag: u64, bounds_
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
 
 #[inline]
-fn normalize_const_end_ref_access_addr(tmeta: &TagMeta, addr: usize, size: usize) -> (usize, usize) {
+fn normalize_const_end_ref_access_addr(
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> (usize, usize) {
     if (tmeta.lineage_hint & LINEAGE_HINT_CONST_END_REF_NORMALIZED) == 0
         && tmeta.parent == 0
         && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
@@ -1746,7 +1754,11 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
         let is_stack = (live & 0x2) != 0;
         rz_emit_alloc(format_args!(
             "[rusteze-runtime] record_alloc base=0x{:x} size={} live={} is_stack={} is_const={}",
-            base_addr, size, new_live, is_stack, (live & 0x4) != 0
+            base_addr,
+            size,
+            new_live,
+            is_stack,
+            (live & 0x4) != 0
         ));
     } else if rz_log_enabled(LogLevel::Trace) {
         // `live` bit 0: live/dead. bit 1: stack marker.
@@ -1840,7 +1852,10 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
 #[no_mangle]
 pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor: u64) {
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] store slot=0x{:x} tag={} ref_ancestor={}",
             slot_addr, tag, ref_ancestor
@@ -1853,7 +1868,10 @@ pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_tag slot=0x{:x} -> {}",
             slot_addr, tag
@@ -1866,7 +1884,10 @@ pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
 pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_ref_ancestor slot=0x{:x} -> {}",
             slot_addr, ref_ancestor
@@ -1878,7 +1899,10 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
 #[no_mangle]
 pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] kill slot=0x{:x} size={}",
             slot_addr, size
@@ -1890,7 +1914,10 @@ pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
 #[no_mangle]
 pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] copy dst=0x{:x} src=0x{:x}",
             dst_slot_addr, src_slot_addr
@@ -1902,7 +1929,10 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
 #[no_mangle]
 pub extern "C" fn __rz_shadow_copy_range(dst_addr: usize, src_addr: usize, size: usize) {
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW").ok().is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false") {
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] copy_range dst=0x{:x} src=0x{:x} size={}",
             dst_addr, src_addr, size
@@ -3567,9 +3597,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     // these casts do not freeze an otherwise-valid unique/raw-mutable lineage.
     let inherits_write_capability = derived_from != 0
         && strong_projected_raw_hint
-        && tag_store::get(derived_from).is_some_and(|parent| {
-            matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut)
-        });
+        && tag_store::get(derived_from)
+            .is_some_and(|parent| matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut));
     let kind = if is_mut != 0 || inherits_write_capability {
         PtrKind::RawMut
     } else {

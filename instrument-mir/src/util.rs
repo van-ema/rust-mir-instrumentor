@@ -3,9 +3,8 @@ pub(crate) fn prefixed_path(base: &str, prefix: &str) -> String {
 
     let p = expand_tilde(base);
     let base_str = p.to_string_lossy();
-    let ends_with_sep = base.ends_with(std::path::MAIN_SEPARATOR)
-        || base.ends_with('/')
-        || base.ends_with('\\');
+    let ends_with_sep =
+        base.ends_with(std::path::MAIN_SEPARATOR) || base.ends_with('/') || base.ends_with('\\');
     let is_dir = ends_with_sep || p.is_dir();
 
     let (parent, file_name) = if is_dir {

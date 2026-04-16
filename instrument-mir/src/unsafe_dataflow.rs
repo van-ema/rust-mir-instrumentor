@@ -29,13 +29,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Serialize};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::mir::{
     BasicBlockData, Body, CastKind, Local, Operand, Place, ProjectionElem, Rvalue, Statement,
     StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
 };
 use rustc_middle::ty::{GenericArgsRef, Instance, TyCtxt, TyKind};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 pub(crate) struct UnsafeInfluence {
@@ -115,7 +115,6 @@ pub(crate) struct UnsafeUnknownCalleeStats {
     pub(crate) seed_arg_unknown_boundary: usize,
     pub(crate) backward_dst_unknown_boundary: usize,
 }
-
 
 impl UnsafeInfluence {
     pub(crate) fn disabled() -> Self {
@@ -325,7 +324,8 @@ fn loaded_unsafe_summaries() -> &'static HashMap<(String, String), UnsafeFunctio
                 map.insert((crate_name.clone(), function_key), summary.clone());
                 if !record.trait_function_hash.is_empty() {
                     merge_summary(
-                        map.entry((crate_name, record.trait_function_hash)).or_default(),
+                        map.entry((crate_name, record.trait_function_hash))
+                            .or_default(),
                         &summary,
                     );
                 }
@@ -340,7 +340,11 @@ fn merge_summary(dst: &mut UnsafeFunctionSummary, src: &UnsafeFunctionSummary) {
     dst.calls_unknown_boundary_direct |= src.calls_unknown_boundary_direct;
     dst.calls_unknown_boundary_inherited |= src.calls_unknown_boundary_inherited;
     for src_arg in &src.ptr_args {
-        match dst.ptr_args.iter_mut().find(|arg| arg.arg_index == src_arg.arg_index) {
+        match dst
+            .ptr_args
+            .iter_mut()
+            .find(|arg| arg.arg_index == src_arg.arg_index)
+        {
             Some(dst_arg) => {
                 dst_arg.direct_sink_mask |= src_arg.direct_sink_mask;
                 dst_arg.propagation_mask |= src_arg.propagation_mask;
@@ -412,23 +416,25 @@ fn rvalue_tainted<'tcx>(
         Rvalue::Use(op) | Rvalue::Repeat(op, _) => operand_tainted(op, tainted_value_locals),
         Rvalue::RawPtr(_, p) => {
             // Raw pointer construction is an unsafe-influence root.
-            tainted_value_locals.contains(&p.local) || is_pointer_ty(p.ty(&body.local_decls, tcx).ty)
+            tainted_value_locals.contains(&p.local)
+                || is_pointer_ty(p.ty(&body.local_decls, tcx).ty)
         }
         Rvalue::Ref(_, _, p) | Rvalue::CopyForDeref(p) => tainted_value_locals.contains(&p.local),
-        Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => operand_tainted(op, tainted_value_locals),
+        Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => {
+            operand_tainted(op, tainted_value_locals)
+        }
         Rvalue::BinaryOp(_, ops) => {
             operand_tainted(&ops.0, tainted_value_locals)
                 || operand_tainted(&ops.1, tainted_value_locals)
         }
-        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_tainted(op, tainted_value_locals)),
+        Rvalue::Aggregate(_, ops) => ops
+            .iter()
+            .any(|op| operand_tainted(op, tainted_value_locals)),
         _ => false,
     }
 }
 
-fn rvalue_is_unsafe_root<'tcx>(
-    body: &Body<'tcx>,
-    rv: &Rvalue<'tcx>,
-) -> bool {
+fn rvalue_is_unsafe_root<'tcx>(body: &Body<'tcx>, rv: &Rvalue<'tcx>) -> bool {
     match rv {
         Rvalue::RawPtr(..) => true,
         Rvalue::Cast(CastKind::PointerWithExposedProvenance, _, to_ty) => is_pointer_ty(*to_ty),
@@ -513,7 +519,9 @@ fn resolve_callee_def_id<'tcx>(
         args: GenericArgsRef<'tcx>,
     ) -> DefId {
         let typing_env = body.typing_env(tcx);
-        let normalized_args = tcx.try_normalize_erasing_regions(typing_env, args).unwrap_or(args);
+        let normalized_args = tcx
+            .try_normalize_erasing_regions(typing_env, args)
+            .unwrap_or(args);
         Instance::try_resolve(tcx, typing_env, def_id, normalized_args)
             .ok()
             .flatten()
@@ -751,11 +759,7 @@ pub(crate) fn summary_for_def_id<'tcx>(
     }
 }
 
-fn trace_local_summary_missing<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    func: &Operand<'tcx>,
-) {
+fn trace_local_summary_missing<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, func: &Operand<'tcx>) {
     if !trace_local_summary_missing_enabled() || !use_loaded_unsafe_summaries_enabled() {
         return;
     }
@@ -947,8 +951,7 @@ fn apply_terminator<'tcx>(
         let unknown_boundary =
             !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
         let conservative_local_fallback = !unknown_boundary
-            && resolve_callee_def_id(tcx, body, func)
-                .is_some_and(|did| did.krate == LOCAL_CRATE)
+            && resolve_callee_def_id(tcx, body, func).is_some_and(|did| did.krate == LOCAL_CRATE)
             && callee_summary.is_none();
 
         if unknown_boundary {
@@ -963,7 +966,8 @@ fn apply_terminator<'tcx>(
                     .iter()
                     .find(|entry| entry.arg_index() == arg_index)
                 {
-                    if arg_summary.reaches_direct_sink() || arg_summary.escapes_to_unknown_boundary()
+                    if arg_summary.reaches_direct_sink()
+                        || arg_summary.escapes_to_unknown_boundary()
                     {
                         changed |= taint_value_local(local, tainted_value_locals);
                         changed |= taint_local(local, tainted_ptr_locals);
@@ -1044,7 +1048,8 @@ fn stmt_direct_sink_mask<'tcx>(
                 }
             }
         }
-        if rvalue_is_unsafe_root(body, rhs) && rvalue_tainted(tcx, body, rhs, tainted_value_locals) {
+        if rvalue_is_unsafe_root(body, rhs) && rvalue_tainted(tcx, body, rhs, tainted_value_locals)
+        {
             return match rhs {
                 Rvalue::RawPtr(..) => UnsafeArgSummary::DIRECT_RAW_CREATION,
                 Rvalue::Cast(CastKind::PointerWithExposedProvenance, ..)
@@ -1180,13 +1185,9 @@ fn compute_function_summary<'tcx>(
                         place_from_operand(&arg.node).is_some_and(|p| {
                             let local = p.local;
                             tainted_value_locals.contains(&local)
-                                && callee
-                                    .ptr_args()
-                                    .iter()
-                                    .any(|entry| {
-                                        entry.arg_index() == arg_index
-                                            && entry.reaches_direct_sink()
-                                    })
+                                && callee.ptr_args().iter().any(|entry| {
+                                    entry.arg_index() == arg_index && entry.reaches_direct_sink()
+                                })
                         })
                     });
                 }
@@ -1198,28 +1199,21 @@ fn compute_function_summary<'tcx>(
         if is_pointer_ty(body.local_decls[arg_local].ty) {
             summary
                 .ptr_args
-                .push(summarize_arg_effects(
-                    tcx,
-                    body,
-                    arg_local,
-                    arg_index,
-                ));
+                .push(summarize_arg_effects(tcx, body, arg_local, arg_index));
         }
     }
 
     summary
 }
 
-fn collect_callsites<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-) -> Vec<UnsafeCallsiteSummary> {
+fn collect_callsites<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Vec<UnsafeCallsiteSummary> {
     let arg_index_by_local: HashMap<Local, usize> = body
         .args_iter()
         .enumerate()
         .map(|(arg_index, local)| (local, arg_index))
         .collect();
-    let (forward_copy_edges, arg_origins) = compute_local_copy_flows(tcx, body, &arg_index_by_local);
+    let (forward_copy_edges, arg_origins) =
+        compute_local_copy_flows(tcx, body, &arg_index_by_local);
 
     let mut out = Vec::new();
     for block_data in body.basic_blocks.iter() {
@@ -1231,7 +1225,8 @@ fn collect_callsites<'tcx>(
             args,
             destination,
             ..
-        } = &term.kind else {
+        } = &term.kind
+        else {
             continue;
         };
         let Some(did) = resolve_callee_def_id(tcx, body, func) else {
@@ -1284,7 +1279,10 @@ fn compute_local_copy_flows<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     arg_index_by_local: &HashMap<Local, usize>,
-) -> (HashMap<Local, HashSet<Local>>, HashMap<Local, HashSet<usize>>) {
+) -> (
+    HashMap<Local, HashSet<Local>>,
+    HashMap<Local, HashSet<usize>>,
+) {
     let mut forward_copy_edges: HashMap<Local, HashSet<Local>> = HashMap::new();
     for block_data in body.basic_blocks.iter() {
         for stmt in block_data.statements.iter() {
@@ -1303,7 +1301,10 @@ fn compute_local_copy_flows<'tcx>(
             if !is_pointer_ty(body.local_decls[src_local].ty) {
                 continue;
             }
-            forward_copy_edges.entry(src_local).or_default().insert(dst_local);
+            forward_copy_edges
+                .entry(src_local)
+                .or_default()
+                .insert(dst_local);
         }
     }
 
@@ -1442,13 +1443,7 @@ fn apply_block<'tcx>(
         changed |= apply_statement(tcx, body, stmt, tainted_value_locals, tainted_ptr_locals);
     }
     if let Some(term) = block_data.terminator.as_ref() {
-        changed |= apply_terminator(
-            tcx,
-            body,
-            term,
-            tainted_value_locals,
-            tainted_ptr_locals,
-        );
+        changed |= apply_terminator(tcx, body, term, tainted_value_locals, tainted_ptr_locals);
     }
     changed
 }
@@ -1509,13 +1504,13 @@ fn seed_terminator_sink_relevance<'tcx>(
         args,
         destination,
         ..
-    } = &term.kind else {
+    } = &term.kind
+    else {
         return;
     };
 
     let callee_summary = callee_summary(tcx, body, func);
-    let unknown_boundary =
-        !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
+    let unknown_boundary = !instrumented_call_boundary(tcx, body, func) && callee_summary.is_none();
     let local_summary_missing = resolve_callee_def_id(tcx, body, func)
         .is_some_and(|did| did.krate == LOCAL_CRATE)
         && callee_summary.is_none();
@@ -1541,8 +1536,11 @@ fn seed_terminator_sink_relevance<'tcx>(
             call_stats.seed_arg_local_summary_missing += 1;
             true
         } else if let Some(summary) = callee_summary.as_ref() {
-            summary.ptr_args().iter().find(|entry| entry.arg_index() == arg_index).is_some_and(
-                |entry| {
+            summary
+                .ptr_args()
+                .iter()
+                .find(|entry| entry.arg_index() == arg_index)
+                .is_some_and(|entry| {
                     let mut relevant = false;
                     if entry.reaches_direct_sink() {
                         call_stats.seed_arg_summary_direct_sink += 1;
@@ -1557,8 +1555,7 @@ fn seed_terminator_sink_relevance<'tcx>(
                         relevant = true;
                     }
                     relevant
-                },
-            )
+                })
         } else {
             // If an instrumented non-local callee has no summary available, keep raw-pointer
             // arguments conservative. Once a summary exists, only actual sink/escape effects
@@ -1597,13 +1594,8 @@ fn backward_apply_block<'tcx>(
         );
     }
     for stmt in block_data.statements.iter().rev() {
-        changed |= backward_apply_statement(
-            tcx,
-            body,
-            stmt,
-            relevant_value_locals,
-            relevant_ptr_locals,
-        );
+        changed |=
+            backward_apply_statement(tcx, body, stmt, relevant_value_locals, relevant_ptr_locals);
     }
     changed
 }
@@ -1685,7 +1677,8 @@ fn backward_apply_terminator<'tcx>(
         args,
         destination,
         ..
-    } = &term.kind else {
+    } = &term.kind
+    else {
         return false;
     };
 

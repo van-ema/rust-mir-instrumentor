@@ -15,7 +15,8 @@ struct ExactParentShard {
 }
 
 static EXACT_PARENT_SHARDS: OnceLock<Vec<ExactParentShard>> = OnceLock::new();
-static EXACT_PARENT_EPOCH_KEYS: OnceLock<Mutex<HashMap<(usize, u64), Vec<usize>>>> = OnceLock::new();
+static EXACT_PARENT_EPOCH_KEYS: OnceLock<Mutex<HashMap<(usize, u64), Vec<usize>>>> =
+    OnceLock::new();
 
 #[inline]
 fn shards() -> &'static [ExactParentShard] {
@@ -146,7 +147,11 @@ pub(crate) fn remove_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
     if base_addr == 0 || alloc_epoch == 0 {
         return;
     }
-    let Some(pointee_addrs) = epoch_keys().lock().unwrap().remove(&(base_addr, alloc_epoch)) else {
+    let Some(pointee_addrs) = epoch_keys()
+        .lock()
+        .unwrap()
+        .remove(&(base_addr, alloc_epoch))
+    else {
         return;
     };
 

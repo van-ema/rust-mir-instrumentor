@@ -8,7 +8,10 @@ fn main() -> Result<(), i32> {
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     {
-        eprintln!("[rusteze][trace] cargo-instrument-mir driver={}", driver.display());
+        eprintln!(
+            "[rusteze][trace] cargo-instrument-mir driver={}",
+            driver.display()
+        );
     }
 
     // Collect all extra arguments passed after "cargo instrument-mir"

@@ -104,20 +104,25 @@ pub(crate) fn get(tag: u64) -> Option<TagMeta> {
         });
     }
 
-    dead_tags().lock().unwrap().get(&tag).copied().map(|m| TagMeta {
-        pointee_addr: m.pointee_addr,
-        kind: m.kind,
-        parent: 0,
-        escaped: false,
-        alloc_epoch: m.alloc_epoch,
-        alloc_live_at_creation: m.alloc_live_at_creation,
-        alias_exempt: false,
-        lineage_hint: 0,
-        bounds_len: m.bounds_len,
-        origin_known: m.origin_known,
-        origin_base: m.origin_base,
-        origin_end: m.origin_end,
-    })
+    dead_tags()
+        .lock()
+        .unwrap()
+        .get(&tag)
+        .copied()
+        .map(|m| TagMeta {
+            pointee_addr: m.pointee_addr,
+            kind: m.kind,
+            parent: 0,
+            escaped: false,
+            alloc_epoch: m.alloc_epoch,
+            alloc_live_at_creation: m.alloc_live_at_creation,
+            alias_exempt: false,
+            lineage_hint: 0,
+            bounds_len: m.bounds_len,
+            origin_known: m.origin_known,
+            origin_base: m.origin_base,
+            origin_end: m.origin_end,
+        })
 }
 
 #[inline]
@@ -177,7 +182,11 @@ pub(crate) fn compact_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
     if base_addr == 0 || alloc_epoch == 0 {
         return;
     }
-    let Some(tags_for_epoch) = alloc_epoch_tags().lock().unwrap().remove(&(base_addr, alloc_epoch)) else {
+    let Some(tags_for_epoch) = alloc_epoch_tags()
+        .lock()
+        .unwrap()
+        .remove(&(base_addr, alloc_epoch))
+    else {
         return;
     };
 

@@ -83,9 +83,9 @@ fn main() {
 
         // Cargo probes the compiler before building. Those invocations won't carry our
         // custom flags, so we must not require them.
-        let is_query_probe = args.iter().any(|a| {
-            a == "-vV" || a == "-V" || a == "--version" || a.starts_with("--print")
-        });
+        let is_query_probe = args
+            .iter()
+            .any(|a| a == "-vV" || a == "-V" || a == "--version" || a.starts_with("--print"));
 
         if let Some(runtime_path) = runtime_path {
             args.push("-Zunstable-options".to_string());

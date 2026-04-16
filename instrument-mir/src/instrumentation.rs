@@ -1659,11 +1659,30 @@ enum InstrKind<'tcx> {
         anchor_local: Local,
         src_ptr_local: Local,
     },
+    /// Seed a non-pointer local's exact-place reborrow anchor from a recovered lineage source.
+    ReborrowAnchorSeed {
+        dst_local: Local,
+        src_local: Local,
+    },
+    /// Snapshot a parent lineage tag for a projected/non-local source place before a call.
+    /// Used when the returned pointer value should derive from a call argument place, but the
+    /// target block cannot reconstruct that parent from the call-site MIR anymore.
+    ParentTagSnapshot {
+        dst_local: Local,
+        src: Place<'tcx>,
+        is_raw_creation: bool,
+    },
     /// Fresh tag for a derived pointer value (pointer arithmetic like add/sub/offset).
     /// Emits either ref/raw creation based on destination kind, with `parent=tag(src)`.
     PtrDerive {
         dst: Local,
         src: Local,
+        is_mut: bool,
+        is_ref: bool,
+    },
+    /// Fresh tag for a derived pointer value using an explicit pre-call parent snapshot.
+    PtrDeriveParent {
+        dst: Local,
         is_mut: bool,
         is_ref: bool,
     },
@@ -1678,6 +1697,12 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         ptr_local: Local,
+    },
+    /// Callee-side lineage anchor initialization for non-pointer by-value arguments.
+    ArgAnchorTake {
+        callee_id: u64,
+        arg_index: u64,
+        local: Local,
     },
     /// Callee-side: push the tag for a returned pointer right before `Return`.
     RetPush {
@@ -1902,20 +1927,14 @@ impl MyOptimizationPass {
                 let place_ty = place.ty(&body.local_decls, tcx).ty;
                 if self.is_pointer_ty(place_ty) {
                     return self.normalized_ptr_expr_key_for_ref_source_place(
-                        body,
-                        *place,
-                        statements,
-                        upto,
+                        body, *place, statements, upto,
                     );
                 }
                 None
             }
-            Rvalue::CopyForDeref(place) => self.normalized_ptr_expr_key_for_ref_source_place(
-                body,
-                *place,
-                statements,
-                upto,
-            ),
+            Rvalue::CopyForDeref(place) => {
+                self.normalized_ptr_expr_key_for_ref_source_place(body, *place, statements, upto)
+            }
             _ => self.normalized_ptr_expr_key_for_rvalue(body, rvalue, statements, upto),
         }
     }
@@ -5036,13 +5055,7 @@ impl MyOptimizationPass {
                     args, destination, ..
                 } = &term.kind
                 {
-                    self.invalidate_ssa_anchors_for_call(
-                        body,
-                        &mut exit,
-                        args,
-                        destination,
-                        false,
-                    );
+                    self.invalidate_ssa_anchors_for_call(body, &mut exit, args, destination, false);
                 }
             }
 
@@ -5141,9 +5154,8 @@ impl MyOptimizationPass {
             return false;
         }
 
-        deps.iter().all(|dep| {
-            self.projected_reborrow_anchor_dep_ok(body.local_decls[*dep].ty)
-        })
+        deps.iter()
+            .all(|dep| self.projected_reborrow_anchor_dep_ok(body.local_decls[*dep].ty))
     }
 
     fn maybe_projected_reborrow_anchor_key<'tcx>(
@@ -5602,8 +5614,9 @@ impl MyOptimizationPass {
         is_raw_creation: bool,
     ) -> Operand<'tcx> {
         if src_place.projection.is_empty() {
-            if let Some(anchor_local) =
-                reborrow_anchor_local_for_stack_local.get(&src_place.local).copied()
+            if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
+                .get(&src_place.local)
+                .copied()
             {
                 return Operand::Copy(Place::from(anchor_local));
             }
@@ -5655,6 +5668,148 @@ impl MyOptimizationPass {
         self.const_u64(tcx, source_info.span, 0)
     }
 
+    fn materialize_projected_reborrow_parent_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        src_place: Place<'tcx>,
+        projected_reborrow_anchor_key: Option<&String>,
+        projected_reborrow_anchor_local_for_key: &HashMap<String, Local>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        extra_stmts: &mut Vec<Statement<'tcx>>,
+    ) -> Option<Local> {
+        let anchor_local = projected_reborrow_anchor_key
+            .and_then(|key| projected_reborrow_anchor_local_for_key.get(key))
+            .copied()?;
+        let fallback_parent = self.parent_tag_operand_for_src_place(
+            tcx,
+            body,
+            bb,
+            stmt_idx,
+            source_info,
+            src_place,
+            tag_local_for_ptr_local,
+            ref_ancestor_local_for_ptr_local,
+            reborrow_anchor_local_for_stack_local,
+            false,
+        );
+
+        let fallback_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let anchor_is_zero_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.bool, source_info.span));
+        let anchor_is_zero_u64_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let anchor_is_set_u64_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let anchor_part_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let fallback_part_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let selected_parent_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+        extra_stmts.extend([
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(fallback_local),
+                    Rvalue::Use(fallback_parent),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(anchor_is_zero_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Box::new((
+                            Operand::Copy(Place::from(anchor_local)),
+                            self.const_u64(tcx, source_info.span, 0),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(anchor_is_zero_u64_local),
+                    Rvalue::Cast(
+                        CastKind::IntToInt,
+                        Operand::Copy(Place::from(anchor_is_zero_local)),
+                        tcx.types.u64,
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(anchor_is_set_u64_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Sub,
+                        Box::new((
+                            self.const_u64(tcx, source_info.span, 1),
+                            Operand::Copy(Place::from(anchor_is_zero_u64_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(anchor_part_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        Box::new((
+                            Operand::Copy(Place::from(anchor_local)),
+                            Operand::Copy(Place::from(anchor_is_set_u64_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(fallback_part_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        Box::new((
+                            Operand::Copy(Place::from(fallback_local)),
+                            Operand::Copy(Place::from(anchor_is_zero_u64_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(selected_parent_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        Box::new((
+                            Operand::Copy(Place::from(anchor_part_local)),
+                            Operand::Copy(Place::from(fallback_part_local)),
+                        )),
+                    ),
+                ))),
+            ),
+        ]);
+
+        Some(selected_parent_local)
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
     /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
@@ -5673,6 +5828,11 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
     ) -> HashSet<Local> {
         let mut interesting: HashSet<Local> = HashSet::new();
+        for arg_local in body.args_iter() {
+            if !self.is_pointer_ty(body.local_decls[arg_local].ty) {
+                interesting.insert(arg_local);
+            }
+        }
         for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 if let StatementKind::Assign(box (_dst, rv)) = &stmt.kind {
@@ -5720,6 +5880,32 @@ impl MyOptimizationPass {
             }
             if let Some(term) = &block_data.terminator {
                 match &term.kind {
+                    TerminatorKind::Call {
+                        args, destination, ..
+                    } => {
+                        let dst_local = destination.local;
+                        if !self.is_pointer_ty(body.local_decls[dst_local].ty) {
+                            let mut recovered_src: Option<Local> = None;
+                            let mut ambiguous = false;
+                            for arg_index in 0..args.len() {
+                                if let Some(src_local) = self.call_arg_lineage_source_local(
+                                    tcx, body, block_data, args, arg_index,
+                                ) {
+                                    match recovered_src {
+                                        Some(existing) if existing != src_local => {
+                                            ambiguous = true;
+                                            break;
+                                        }
+                                        Some(_) => {}
+                                        None => recovered_src = Some(src_local),
+                                    }
+                                }
+                            }
+                            if !ambiguous && recovered_src.is_some() {
+                                interesting.insert(dst_local);
+                            }
+                        }
+                    }
                     TerminatorKind::Drop { place, .. } => {
                         // Drop glue implicitly takes `&place` even if MIR has no explicit ref/raw.
                         // Treat Drop as an implicit address-of so stack slots are tracked.
@@ -5730,6 +5916,48 @@ impl MyOptimizationPass {
                 }
             }
         }
+
+        // Carry exact-place anchors across plain local moves/copies of non-pointer carriers.
+        // This is the compiler-side replacement for runtime same-address repair in shapes like:
+        //   _2 = into_iter(move _1);
+        //   _11 = move _9;
+        //   _13 = &mut _11;
+        // Once the source local is interesting, the move/copy destination must also keep an
+        // anchor local so later borrows stay in the same family instead of rooting at parent=0.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
+                for stmt in block_data.statements.iter() {
+                    let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind else {
+                        continue;
+                    };
+                    let Some(dst_local) = dst_place.as_local() else {
+                        continue;
+                    };
+                    if self.is_pointer_ty(body.local_decls[dst_local].ty) {
+                        continue;
+                    }
+                    let src_local = match rvalue {
+                        Rvalue::Use(Operand::Copy(src_place))
+                        | Rvalue::Use(Operand::Move(src_place)) => {
+                            if src_place.projection.is_empty() {
+                                Some(src_place.local)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(src_local) = src_local {
+                        if interesting.contains(&src_local) && interesting.insert(dst_local) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
         interesting
     }
 
@@ -5756,6 +5984,7 @@ impl MyOptimizationPass {
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
+        interesting_stack_locals: &HashSet<Local>,
         entry_stmt_idx: usize,
     ) {
         let entry_bb = START_BLOCK;
@@ -5782,6 +6011,19 @@ impl MyOptimizationPass {
                         callee_id,
                         arg_index: arg_index as u64,
                         ptr_local: arg_local,
+                    },
+                });
+            } else if interesting_stack_locals.contains(&arg_local) {
+                insert_points.push(InsertPoint {
+                    bb: entry_bb,
+                    stmt_idx: entry_stmt_idx,
+                    insert_before: false,
+                    source_info: entry_source_info,
+                    place: Place::from(arg_local),
+                    kind: InstrKind::ArgAnchorTake {
+                        callee_id,
+                        arg_index: arg_index as u64,
+                        local: arg_local,
                     },
                 });
             }
@@ -6949,8 +7191,7 @@ impl MyOptimizationPass {
                         let is_nonnull_like = match src_ty.kind() {
                             TyKind::Adt(adt, _) => {
                                 let name = tcx.def_path_str(adt.did());
-                                name.contains("::NonNull")
-                                    || name.contains("::Unique")
+                                name.contains("::NonNull") || name.contains("::Unique")
                             }
                             _ => false,
                         };
@@ -6962,18 +7203,35 @@ impl MyOptimizationPass {
                                 _ => false,
                             };
                             let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-                            let src_local_opt = self
-                                .place_from_operand(op)
-                                .and_then(|p| p.as_local())
-                                .and_then(|src_local| {
-                                    if self.is_pointer_ty(body.local_decls[src_local].ty) {
-                                        Some(src_local)
+                            let src_place_opt = self.place_from_operand(op);
+                            let src_local_opt = src_place_opt
+                                .and_then(|src_place| {
+                                    if let Some(src_local) = src_place.as_local() {
+                                        if self.is_pointer_ty(body.local_decls[src_local].ty) {
+                                            Some(src_local)
+                                        } else {
+                                            self.backtrack_pointer_source_local(
+                                                body,
+                                                src_local,
+                                                &block_data.statements[..stmt_idx],
+                                            )
+                                        }
                                     } else {
-                                        self.backtrack_pointer_source_local(
-                                            body,
-                                            src_local,
-                                            &block_data.statements[..stmt_idx],
-                                        )
+                                        None
+                                    }
+                                })
+                                .and_then(|src_local| {
+                                    let Some(src_place) = src_place_opt else {
+                                        return Some(src_local);
+                                    };
+                                    let src_place_ty = src_place.ty(&body.local_decls, tcx).ty;
+                                    let projected_carrier_load = !self.is_pointer_ty(src_place_ty)
+                                        && !src_place.projection.is_empty()
+                                        && src_local == src_place.local;
+                                    if projected_carrier_load {
+                                        None
+                                    } else {
+                                        Some(src_local)
                                     }
                                 });
 
@@ -7096,13 +7354,12 @@ impl MyOptimizationPass {
                         .as_ref()
                         .map(|anchor_state| Place::from(anchor_state.local))
                         .unwrap_or(*src_place);
-                    let projected_reborrow_anchor_key =
-                        self.maybe_projected_reborrow_anchor_key(
-                            body,
-                            *src_place,
-                            anchor_key.as_ref(),
-                            projected_reborrow_anchor_specs,
-                        );
+                    let projected_reborrow_anchor_key = self.maybe_projected_reborrow_anchor_key(
+                        body,
+                        *src_place,
+                        anchor_key.as_ref(),
+                        projected_reborrow_anchor_specs,
+                    );
 
                     ptr_locals_needing_tag.insert(lhs_local);
                     tagged_ptr_locals.insert(lhs_local);
@@ -7621,6 +7878,29 @@ impl MyOptimizationPass {
         }
     }
 
+    fn call_arg_lineage_source_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        block_data: &BasicBlockData<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        arg_index: usize,
+    ) -> Option<Local> {
+        if let Some(src_local) =
+            self.call_arg_pointer_source_local(tcx, body, block_data, args, arg_index)
+        {
+            return Some(src_local);
+        }
+
+        let first = args.get(arg_index)?;
+        let arg_place = self.place_from_operand(&first.node)?;
+        if arg_place.projection.is_empty() {
+            Some(arg_place.local)
+        } else {
+            None
+        }
+    }
+
     /// Recover a pointer lineage source when a call writes an aggregate result into `agg_local`
     /// and a successor block later extracts a pointer field from that aggregate.
     ///
@@ -7828,6 +8108,56 @@ impl MyOptimizationPass {
                 kind: InstrKind::PtrDerive {
                     dst: dst_local,
                     src: src_local,
+                    is_mut,
+                    is_ref,
+                },
+            });
+        }
+    }
+
+    fn push_ptr_derive_parent_call<'tcx>(
+        bb: BasicBlock,
+        block_data: &BasicBlockData<'tcx>,
+        term: &Terminator<'tcx>,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        tagged_ptr_locals: &mut HashSet<Local>,
+    ) {
+        let is_mut = match dst_ty.kind() {
+            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
+            _ => false,
+        };
+        let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
+        let call_target_bb: Option<BasicBlock> = match &term.kind {
+            TerminatorKind::Call { target, .. } => *target,
+            _ => None,
+        };
+
+        tagged_ptr_locals.insert(dst_local);
+        if let Some(tgt_bb) = call_target_bb {
+            insert_points.push(InsertPoint {
+                bb: tgt_bb,
+                stmt_idx: 0,
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::PtrDeriveParent {
+                    dst: dst_local,
+                    is_mut,
+                    is_ref,
+                },
+            });
+        } else {
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: Place::from(dst_local),
+                kind: InstrKind::PtrDeriveParent {
+                    dst: dst_local,
                     is_mut,
                     is_ref,
                 },
@@ -8366,6 +8696,7 @@ impl MyOptimizationPass {
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
+        interesting_stack_locals: &HashSet<Local>,
     ) {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
@@ -8674,7 +9005,44 @@ impl MyOptimizationPass {
                                 .as_deref()
                                 .map(|p| self.ptr_derive_source_arg_index(p))
                                 .unwrap_or(0);
-                            if let Some(src_local) = self.call_arg_pointer_source_local(
+                            let src_arg_place = args
+                                .get(src_arg_index)
+                                .and_then(|arg| self.place_from_operand(&arg.node));
+                            let prefer_parent_snapshot = src_arg_place.is_some_and(|src_place| {
+                                let src_place_ty = src_place.ty(&body.local_decls, tcx).ty;
+                                !src_place.projection.is_empty()
+                                    || !self.is_pointer_ty(src_place_ty)
+                            });
+                            if prefer_parent_snapshot {
+                                if let Some(src_place) = src_arg_place {
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx: block_data.statements.len(),
+                                        insert_before: false,
+                                        source_info: term.source_info,
+                                        place: src_place,
+                                        kind: InstrKind::ParentTagSnapshot {
+                                            dst_local,
+                                            src: src_place,
+                                            is_raw_creation: !matches!(
+                                                dst_ty.kind(),
+                                                TyKind::Ref(..)
+                                            ),
+                                        },
+                                    });
+                                    Self::push_ptr_derive_parent_call(
+                                        bb,
+                                        block_data,
+                                        term,
+                                        dst_local,
+                                        dst_ty,
+                                        insert_points,
+                                        tagged_ptr_locals,
+                                    );
+                                    local_ptr_derive_emitted = true;
+                                }
+                            } else if let Some(src_local) = self.call_arg_pointer_source_local(
                                 tcx,
                                 body,
                                 block_data,
@@ -8916,6 +9284,74 @@ impl MyOptimizationPass {
             });
         }
 
+        if callee_instrumented {
+            if let Some(callee_id) = callee_id_opt {
+                for (arg_index, a) in args.iter().enumerate() {
+                    let Some(p) = self.place_from_operand(&a.node) else {
+                        continue;
+                    };
+                    let ty = body.local_decls[p.local].ty;
+                    if self.is_pointer_ty(ty) {
+                        continue;
+                    }
+                    if !interesting_stack_locals.contains(&p.local) {
+                        continue;
+                    }
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind: InstrKind::CallArgPush {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            ptr_local: p.local,
+                        },
+                    });
+                }
+            }
+        }
+
+        if let Some(tgt_bb) = call_target_bb {
+            if let Some(dst_local) = destination.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if !self.is_pointer_ty(dst_ty) && interesting_stack_locals.contains(&dst_local) {
+                    let mut recovered_src: Option<Local> = None;
+                    let mut ambiguous = false;
+                    for arg_index in 0..args.len() {
+                        if let Some(src_local) = self
+                            .call_arg_lineage_source_local(tcx, body, block_data, args, arg_index)
+                        {
+                            match recovered_src {
+                                Some(existing) if existing != src_local => {
+                                    ambiguous = true;
+                                    break;
+                                }
+                                Some(_) => {}
+                                None => recovered_src = Some(src_local),
+                            }
+                        }
+                    }
+                    if !ambiguous {
+                        if let Some(src_local) = recovered_src {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::ReborrowAnchorSeed {
+                                    dst_local,
+                                    src_local,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Caller-side writeback retag:
         // At call return, re-seed tags for pointer locals that may have been rewritten through
         // `&mut` pointer arguments. This keeps subsequent accesses tied to the updated pointer
@@ -9029,12 +9465,11 @@ impl MyOptimizationPass {
                                 | AllocShimKind::Realloc
                         ))
                     );
-                    let mut return_tagged_by_effect = matches!(
-                        call_effect_opt,
-                        Some(CallEffect::BoxIntoRaw)
-                    ) || (matches!(call_effect_opt, Some(CallEffect::PtrDerive))
-                        && local_ptr_derive_emitted)
-                        || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
+                    let mut return_tagged_by_effect =
+                        matches!(call_effect_opt, Some(CallEffect::BoxIntoRaw))
+                            || (matches!(call_effect_opt, Some(CallEffect::PtrDerive))
+                                && local_ptr_derive_emitted)
+                            || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
 
                     // `core::intrinsics::read_via_copy` is classified as `Load`: when it returns
                     // a pointer value, that return is derived from arg0's pointer provenance.
@@ -9181,6 +9616,7 @@ impl MyOptimizationPass {
             &mut insert_points,
             &mut ptr_locals_needing_tag,
             &mut tagged_ptr_locals,
+            &interesting_stack_locals,
             entry_insert_at,
         );
 
@@ -9256,6 +9692,7 @@ impl MyOptimizationPass {
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
                         &mut tagged_ptr_locals,
+                        &interesting_stack_locals,
                     );
                     self.invalidate_ssa_anchors_for_call(
                         body,
@@ -9430,7 +9867,9 @@ impl MyOptimizationPass {
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 let source_info = stmt.source_info;
                 let touched_local = match stmt.kind {
-                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => Some(local),
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        Some(local)
+                    }
                     StatementKind::Assign(box (place, _)) => place.as_local(),
                     _ => None,
                 };
@@ -9449,7 +9888,8 @@ impl MyOptimizationPass {
                     }
                     for (key, deps) in reborrow_anchor_specs.iter() {
                         if deps.contains(&local) {
-                            if let Some(anchor_local) = reborrow_anchor_local_for_key.get(key).copied()
+                            if let Some(anchor_local) =
+                                reborrow_anchor_local_for_key.get(key).copied()
                             {
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -9463,6 +9903,58 @@ impl MyOptimizationPass {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn schedule_reborrow_anchor_propagation<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+    ) {
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
+                let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                let Some(dst_local) = dst_place.as_local() else {
+                    continue;
+                };
+                if !reborrow_anchor_local_for_stack_local.contains_key(&dst_local) {
+                    continue;
+                }
+                let src_local = match rvalue {
+                    Rvalue::Use(Operand::Copy(src_place))
+                    | Rvalue::Use(Operand::Move(src_place)) => {
+                        if src_place.projection.is_empty() {
+                            Some(src_place.local)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(src_local) = src_local else {
+                    continue;
+                };
+                if src_local == dst_local {
+                    continue;
+                }
+                if !reborrow_anchor_local_for_stack_local.contains_key(&src_local) {
+                    continue;
+                }
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx,
+                    insert_before: false,
+                    source_info: stmt.source_info,
+                    place: Place::from(dst_local),
+                    kind: InstrKind::ReborrowAnchorSeed {
+                        dst_local,
+                        src_local,
+                    },
+                });
             }
         }
     }
@@ -9602,10 +10094,13 @@ impl MyOptimizationPass {
             InstrKind::TagProp { .. } | InstrKind::TagPropFromRefAncestor { .. } => {
                 hooks.def_id_use // should never become a call (handled as a plain Assign)
             }
-            InstrKind::ReborrowAnchorZero { .. } | InstrKind::ReborrowAnchorSet { .. } => {
+            InstrKind::ReborrowAnchorZero { .. }
+            | InstrKind::ReborrowAnchorSet { .. }
+            | InstrKind::ReborrowAnchorSeed { .. }
+            | InstrKind::ParentTagSnapshot { .. } => {
                 hooks.def_id_use // should never become a call (handled as a plain Assign)
             }
-            InstrKind::PtrDerive { is_ref, .. } => {
+            InstrKind::PtrDerive { is_ref, .. } | InstrKind::PtrDeriveParent { is_ref, .. } => {
                 if *is_ref {
                     hooks.def_id_ref
                 } else {
@@ -9613,7 +10108,9 @@ impl MyOptimizationPass {
                 }
             }
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
-            InstrKind::ArgRetag { .. } => hooks.def_id_take_call_arg_tag,
+            InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
+                hooks.def_id_take_call_arg_tag
+            }
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
             InstrKind::FnExit { .. } => hooks.def_id_exit_fn,
@@ -9639,15 +10136,19 @@ impl MyOptimizationPass {
                 | InstrKind::Raw { .. }
                 | InstrKind::RawRoot { .. }
                 | InstrKind::ArgRetag { .. }
+                | InstrKind::ArgAnchorTake { .. }
                 | InstrKind::FnExit { .. }
                 | InstrKind::RetRoot { .. }
-                | InstrKind::PtrDerive { .. } => 0,
+                | InstrKind::PtrDerive { .. }
+                | InstrKind::PtrDeriveParent { .. } => 0,
                 // Tag propagation must execute after tag-creating hooks but before
                 // access/usage hooks at the same insertion site.
                 InstrKind::TagProp { .. }
                 | InstrKind::TagPropFromRefAncestor { .. }
                 | InstrKind::ReborrowAnchorSet { .. }
-                | InstrKind::ReborrowAnchorZero { .. } => 1,
+                | InstrKind::ReborrowAnchorSeed { .. }
+                | InstrKind::ReborrowAnchorZero { .. }
+                | InstrKind::ParentTagSnapshot { .. } => 1,
                 InstrKind::ShadowLoad { .. } => 1,
                 // Debug ref activation may need the restored tag/ref_ancestor emitted by
                 // ShadowLoad or TagProp at the same definition site.
@@ -9665,13 +10166,16 @@ impl MyOptimizationPass {
             }
         }
 
-        // ArgRetag must run at function entry before any ptr reads/writes in the callee.
+        // Entry-side arg retag/anchor initialization must run before any ptr reads/writes.
         // We split it out so we can enforce ordering independent of stmt_idx sorting.
         let mut arg_retag_points: Vec<(usize, InsertPoint<'tcx>)> = Vec::new();
         let mut other_points: Vec<(usize, InsertPoint<'tcx>)> = Vec::new();
 
         for (idx, ip) in insert_points.into_iter().enumerate() {
-            if matches!(ip.kind, InstrKind::ArgRetag { .. }) {
+            if matches!(
+                ip.kind,
+                InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. }
+            ) {
                 arg_retag_points.push((idx, ip));
             } else {
                 other_points.push((idx, ip));
@@ -10577,17 +11081,30 @@ impl MyOptimizationPass {
                 src_ptr_local,
             } = creation_kind
             {
-                let src_tag_local = *tag_local_for_ptr_local
+                let src_tag_operand = if let Some(src_tag_local) =
+                    tag_local_for_ptr_local.get(&src_ptr_local).copied()
+                {
+                    Operand::Copy(Place::from(src_tag_local))
+                } else if let Some(src_anchor_local) = reborrow_anchor_local_for_stack_local
                     .get(&src_ptr_local)
-                    .expect("missing tag local for ReborrowAnchorSet src");
-                let anchor_is_zero_local =
-                    body.local_decls.push(LocalDecl::new(tcx.types.bool, source_info.span));
-                let anchor_should_init_local =
-                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
-                let anchor_new_part_local =
-                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
-                let anchor_selected_local =
-                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    .copied()
+                {
+                    Operand::Copy(Place::from(src_anchor_local))
+                } else {
+                    panic!("missing lineage source for ReborrowAnchorSet src");
+                };
+                let anchor_is_zero_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                let anchor_should_init_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                let anchor_new_part_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                let anchor_selected_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
 
                 let anchor_is_zero_stmt = Statement::new(
                     source_info,
@@ -10621,7 +11138,7 @@ impl MyOptimizationPass {
                             BinOp::Mul,
                             Box::new((
                                 Operand::Copy(Place::from(anchor_should_init_local)),
-                                Operand::Copy(Place::from(src_tag_local)),
+                                src_tag_operand,
                             )),
                         ),
                     ))),
@@ -10662,6 +11179,148 @@ impl MyOptimizationPass {
                         set_stmt,
                     ],
                 );
+                continue;
+            }
+
+            if let InstrKind::ReborrowAnchorSeed {
+                dst_local,
+                src_local,
+            } = creation_kind
+            {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&dst_local)
+                    .expect("missing anchor local for ReborrowAnchorSeed dst");
+                let Some(src_tag_operand) = (if let Some(src_tag_local) =
+                    tag_local_for_ptr_local.get(&src_local).copied()
+                {
+                    Some(Operand::Copy(Place::from(src_tag_local)))
+                } else if let Some(src_anchor_local) = reborrow_anchor_local_for_stack_local
+                    .get(&src_local)
+                    .copied()
+                {
+                    Some(Operand::Copy(Place::from(src_anchor_local)))
+                } else {
+                    None
+                }) else {
+                    continue;
+                };
+                let anchor_is_zero_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                let anchor_should_init_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                let anchor_new_part_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                let anchor_selected_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                let insert_at = if stmt_idx >= bd.statements.len() {
+                    bd.statements.len()
+                } else {
+                    stmt_idx + 1
+                };
+                bd.statements.splice(
+                    insert_at..insert_at,
+                    [
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_is_zero_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Eq,
+                                    Box::new((
+                                        Operand::Copy(Place::from(anchor_local)),
+                                        self.const_u64(tcx, source_info.span, 0),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_should_init_local),
+                                Rvalue::Cast(
+                                    CastKind::IntToInt,
+                                    Operand::Copy(Place::from(anchor_is_zero_local)),
+                                    tcx.types.u64,
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_new_part_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Mul,
+                                    Box::new((
+                                        Operand::Copy(Place::from(anchor_should_init_local)),
+                                        src_tag_operand,
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_selected_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Add,
+                                    Box::new((
+                                        Operand::Copy(Place::from(anchor_local)),
+                                        Operand::Copy(Place::from(anchor_new_part_local)),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_local),
+                                Rvalue::Use(Operand::Copy(Place::from(anchor_selected_local))),
+                            ))),
+                        ),
+                    ],
+                );
+                continue;
+            }
+
+            if let InstrKind::ParentTagSnapshot {
+                dst_local,
+                src,
+                is_raw_creation,
+            } = creation_kind
+            {
+                let parent_local = *ref_ancestor_local_for_ptr_local
+                    .get(&dst_local)
+                    .expect("missing ref-ancestor local for ParentTagSnapshot dst");
+                let parent_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(parent_local),
+                        Rvalue::Use(self.parent_tag_operand_for_src_place(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            source_info,
+                            src,
+                            tag_local_for_ptr_local,
+                            ref_ancestor_local_for_ptr_local,
+                            reborrow_anchor_local_for_stack_local,
+                            is_raw_creation,
+                        )),
+                    ))),
+                );
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                let insert_at = if stmt_idx >= bd.statements.len() {
+                    bd.statements.len()
+                } else {
+                    stmt_idx + 1
+                };
+                bd.statements.insert(insert_at, parent_stmt);
                 continue;
             }
 
@@ -10878,6 +11537,98 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if let InstrKind::ArgAnchorTake {
+                callee_id,
+                arg_index,
+                local,
+            } = creation_kind
+            {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&local)
+                    .expect("missing anchor local for ArgAnchorTake");
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let (addr_stmt1_opt, addr_stmt2) = self
+                    .addr_stmts_for_place(tcx, body, source_info, Place::from(local), addr_local)
+                    .expect("ArgAnchorTake on unsupported local");
+                let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, arg_index),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+                let cont_block = {
+                    let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    body.basic_blocks_mut().push(cont_data)
+                };
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_take_call_arg_tag,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, callee_id),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, arg_index),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: Operand::Copy(Place::from(addr_local)),
+                                span: source_info.span,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        destination: Place::from(anchor_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    if let Some(addr_stmt1) = addr_stmt1_opt {
+                        bd.statements.push(addr_stmt1);
+                    }
+                    bd.statements.push(addr_stmt2);
+                    bd.terminator = Some(take_term);
+                    rem
+                };
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
             if let InstrKind::FnExit { callee_id } = creation_kind {
                 let exit_func = Operand::function_handle(
                     tcx,
@@ -10940,7 +11691,7 @@ impl MyOptimizationPass {
                         .get(&dst_local)
                         .expect("missing preallocated tag local for RetRoot destination"),
                 ),
-                InstrKind::PtrDerive { dst, .. } => Some(
+                InstrKind::PtrDerive { dst, .. } | InstrKind::PtrDeriveParent { dst, .. } => Some(
                     *tag_local_for_ptr_local
                         .get(&dst)
                         .expect("missing preallocated tag local for PtrDerive destination"),
@@ -11165,6 +11916,28 @@ impl MyOptimizationPass {
             if !addr_extra_stmts.is_empty() {
                 extra_stmts.extend(addr_extra_stmts);
             }
+            let projected_ref_parent_local = match &creation_kind {
+                InstrKind::Ref {
+                    src,
+                    projected_reborrow_anchor_key,
+                    ..
+                } if !src.projection.is_empty() => self
+                    .materialize_projected_reborrow_parent_local(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        source_info,
+                        *src,
+                        projected_reborrow_anchor_key.as_ref(),
+                        projected_reborrow_anchor_local_for_key,
+                        tag_local_for_ptr_local,
+                        ref_ancestor_local_for_ptr_local,
+                        reborrow_anchor_local_for_stack_local,
+                        &mut extra_stmts,
+                    ),
+                _ => None,
+            };
 
             let (args, dest_place) = match creation_kind {
                 InstrKind::PtrRead {
@@ -11370,7 +12143,9 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
 
-                    let tag_op: Operand<'tcx> = if place.projection.is_empty() {
+                    let tag_op: Operand<'tcx> = if place.projection.is_empty()
+                        && self.is_pointer_ty(body.local_decls[ptr_local].ty)
+                    {
                         if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local) {
                             Operand::Copy(Place::from(*tl))
                         } else {
@@ -11470,13 +12245,12 @@ impl MyOptimizationPass {
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
                     };
-                    let ref_ancestor_op = if let Some(tl) =
-                        ref_ancestor_local_for_ptr_local.get(&raw_local)
-                    {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        self.const_u64(tcx, source_info.span, 0)
-                    };
+                    let ref_ancestor_op =
+                        if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&raw_local) {
+                            Operand::Copy(Place::from(*tl))
+                        } else {
+                            self.const_u64(tcx, source_info.span, 0)
+                        };
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let alias_exempt =
                         self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[raw_local].ty);
@@ -11655,6 +12429,60 @@ impl MyOptimizationPass {
 
                     (args, Place::from(dst_tag))
                 }
+                InstrKind::PtrDeriveParent {
+                    dst,
+                    is_mut,
+                    is_ref,
+                } => {
+                    let dst_tag = *tag_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing tag local for PtrDeriveParent dst");
+                    let parent_local = *ref_ancestor_local_for_ptr_local
+                        .get(&dst)
+                        .expect("missing ref-ancestor local for PtrDeriveParent dst");
+
+                    let parent_tag_op: Operand<'tcx> = Operand::Copy(Place::from(parent_local));
+
+                    let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
+                    let dst_ty = body.local_decls[dst].ty;
+                    let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
+                    let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
+                    if !is_ref {
+                        alias_flags |= 0b10 | 0b100;
+                    }
+                    let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
+                    let bounds_len_op =
+                        self.bounds_len_operand_for_ptr_local(tcx, body, dst, source_info.span);
+                    let (arg_bounds_len, mut bounds_len_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
+                    extra_stmts.append(&mut bounds_len_stmts);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_mut,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: parent_tag_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_alias,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_bounds_len,
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(dst_tag))
+                }
                 _ => {
                     let is_mut_u8: u8 = match creation_kind {
                         InstrKind::Ref {
@@ -11683,18 +12511,8 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref {
-                            src,
-                            projected_reborrow_anchor_key,
-                            ..
-                        } => {
-                            if let Some(anchor_local) = projected_reborrow_anchor_key
-                                .as_ref()
-                                .and_then(|key| projected_reborrow_anchor_local_for_key.get(key))
-                                .copied()
-                            {
-                                Operand::Copy(Place::from(anchor_local))
-                            } else {
+                        InstrKind::Ref { src, .. } => projected_ref_parent_local.map_or_else(
+                            || {
                                 self.parent_tag_operand_for_src_place(
                                     tcx,
                                     body,
@@ -11707,8 +12525,9 @@ impl MyOptimizationPass {
                                     reborrow_anchor_local_for_stack_local,
                                     false,
                                 )
-                            }
-                        }
+                            },
+                            |local| Operand::Copy(Place::from(local)),
+                        ),
                         InstrKind::Raw { src, .. } => {
                             let src_local = src.local;
                             let src_is_plain_ref_deref = src.projection.len() == 1
@@ -11975,35 +12794,28 @@ impl MyOptimizationPass {
             }
 
             let ref_ancestor_init_stmt_opt: Option<Statement<'tcx>> = match &creation_kind {
-                InstrKind::Ref {
-                    src,
-                    projected_reborrow_anchor_key,
-                    ..
-                } => {
+                InstrKind::Ref { src, .. } => {
                     if let Some(dst_local) = place.as_local() {
                         if let Some(dst_ref_ancestor_local) =
                             ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                         {
-                            let parent_op = if let Some(anchor_local) = projected_reborrow_anchor_key
-                                .as_ref()
-                                .and_then(|key| projected_reborrow_anchor_local_for_key.get(key))
-                                .copied()
-                            {
-                                Operand::Copy(Place::from(anchor_local))
-                            } else {
-                                self.parent_tag_operand_for_src_place(
-                                    tcx,
-                                    body,
-                                    bb,
-                                    stmt_idx,
-                                    source_info,
-                                    *src,
-                                    tag_local_for_ptr_local,
-                                    ref_ancestor_local_for_ptr_local,
-                                    reborrow_anchor_local_for_stack_local,
-                                    false,
-                                )
-                            };
+                            let parent_op = projected_ref_parent_local.map_or_else(
+                                || {
+                                    self.parent_tag_operand_for_src_place(
+                                        tcx,
+                                        body,
+                                        bb,
+                                        stmt_idx,
+                                        source_info,
+                                        *src,
+                                        tag_local_for_ptr_local,
+                                        ref_ancestor_local_for_ptr_local,
+                                        reborrow_anchor_local_for_stack_local,
+                                        false,
+                                    )
+                                },
+                                |local| Operand::Copy(Place::from(local)),
+                            );
                             Some(Statement::new(
                                 source_info,
                                 StatementKind::Assign(Box::new((
@@ -12149,23 +12961,29 @@ impl MyOptimizationPass {
                             .copied()
                             .or_else(|| {
                                 if src.projection.is_empty() {
-                                    reborrow_anchor_local_for_stack_local.get(&src.local).copied()
+                                    reborrow_anchor_local_for_stack_local
+                                        .get(&src.local)
+                                        .copied()
                                 } else {
                                     None
                                 }
                             });
                         if let Some(anchor_local) = anchor_local_opt {
-                            if let Some(dst_tag_local) =
-                                tag_local_for_ptr_local.get(&dst_local).copied()
+                            if let Some(anchor_source_local) = projected_ref_parent_local
+                                .or_else(|| tag_local_for_ptr_local.get(&dst_local).copied())
                             {
-                                let anchor_is_zero_local =
-                                    body.local_decls.push(LocalDecl::new(tcx.types.bool, source_info.span));
-                                let anchor_should_init_local =
-                                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
-                                let anchor_new_part_local =
-                                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
-                                let anchor_selected_local =
-                                    body.local_decls.push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                let anchor_is_zero_local = body
+                                    .local_decls
+                                    .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                                let anchor_should_init_local = body
+                                    .local_decls
+                                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                let anchor_new_part_local = body
+                                    .local_decls
+                                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                let anchor_selected_local = body
+                                    .local_decls
+                                    .push(LocalDecl::new(tcx.types.u64, source_info.span));
 
                                 vec![
                                     Statement::new(
@@ -12199,8 +13017,10 @@ impl MyOptimizationPass {
                                             Rvalue::BinaryOp(
                                                 BinOp::Mul,
                                                 Box::new((
-                                                    Operand::Copy(Place::from(anchor_should_init_local)),
-                                                    Operand::Copy(Place::from(dst_tag_local)),
+                                                    Operand::Copy(Place::from(
+                                                        anchor_should_init_local,
+                                                    )),
+                                                    Operand::Copy(Place::from(anchor_source_local)),
                                                 )),
                                             ),
                                         ))),
@@ -12213,7 +13033,9 @@ impl MyOptimizationPass {
                                                 BinOp::Add,
                                                 Box::new((
                                                     Operand::Copy(Place::from(anchor_local)),
-                                                    Operand::Copy(Place::from(anchor_new_part_local)),
+                                                    Operand::Copy(Place::from(
+                                                        anchor_new_part_local,
+                                                    )),
                                                 )),
                                             ),
                                         ))),
@@ -12222,7 +13044,9 @@ impl MyOptimizationPass {
                                         source_info,
                                         StatementKind::Assign(Box::new((
                                             Place::from(anchor_local),
-                                            Rvalue::Use(Operand::Copy(Place::from(anchor_selected_local))),
+                                            Rvalue::Use(Operand::Copy(Place::from(
+                                                anchor_selected_local,
+                                            ))),
                                         ))),
                                     ),
                                 ]
@@ -12934,6 +13758,11 @@ impl MyOptimizationPass {
             &reborrow_anchor_local_for_stack_local,
             &scan.projected_reborrow_anchor_specs,
             &projected_reborrow_anchor_local_for_key,
+            &mut insert_points,
+        );
+        self.schedule_reborrow_anchor_propagation(
+            body,
+            &reborrow_anchor_local_for_stack_local,
             &mut insert_points,
         );
 

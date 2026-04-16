@@ -265,8 +265,8 @@ fn sb_lite_validate_ref_creation(
                 } else {
                     false
                 };
-                let same_range = pointee_addr == top_tm.pointee_addr
-                    && bounds_len == top_tm.bounds_len;
+                let same_range =
+                    pointee_addr == top_tm.pointee_addr && bounds_len == top_tm.bounds_len;
                 // Missing-parent fallback is intentionally conservative to limit false positives
                 // when lineage is incomplete (e.g., wrapper types like NonNull). If roots differ,
                 // report only on exact-range duplicates; partial overlaps are too noisy.
@@ -531,9 +531,9 @@ fn sb_lite_check(
             if matches!(tmeta.kind, PtrKind::RefMut) && !stack.is_empty() {
                 let can_reactivate_missing_parent = {
                     let tmap = tags().lock().unwrap();
-                    stack.iter().all(|e| {
-                        sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag)
-                    })
+                    stack
+                        .iter()
+                        .all(|e| sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag))
                 };
                 if can_reactivate_missing_parent {
                     stack.clear();
@@ -571,12 +571,7 @@ fn sb_lite_check(
                                 stack[idx + 1..]
                                     .iter()
                                     .filter(|e| {
-                                        ranges_overlap(
-                                            e.start,
-                                            e.end,
-                                            access_start,
-                                            access_end,
-                                        )
+                                        ranges_overlap(e.start, e.end, access_start, access_end)
                                     })
                                     .all(|e| sb_lite_tag_is_descendant_of(&tmap, e.tag, sb_tag))
                             };
