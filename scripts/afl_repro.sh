@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo | indexmap | bootc_kcmdline | abacus_apportionment | kvm_bindings
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${OUT_DIR:-fuzz/out/${TARGET}}"
 ONLY=""
@@ -54,7 +54,13 @@ case "$TARGET" in
   rkyv) BIN="afl_rkyv_driver" ;;
   hyper) BIN="afl_hyper_driver" ;;
   image) BIN="afl_image_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image)" >&2; exit 2 ;;
+  hashbrown) BIN="afl_hashbrown_driver" ;;
+  bumpalo) BIN="afl_bumpalo_driver" ;;
+  indexmap) BIN="afl_indexmap_driver" ;;
+  bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline) BIN="afl_bootc_kcmdline_driver" ;;
+  abacus_apportionment|abacus-apportionment) BIN="afl_abacus_apportionment_driver" ;;
+  kvm_bindings|kvm-bindings) BIN="afl_kvm_bindings_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo|indexmap|bootc_kcmdline|abacus_apportionment|kvm_bindings)" >&2; exit 2 ;;
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"

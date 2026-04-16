@@ -9,7 +9,7 @@ AFL_FUZZ="${AFL_FUZZ:-}"
 AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo | indexmap | bootc_kcmdline | abacus_apportionment | kvm_bindings
 TIMEOUT_MS="${TIMEOUT_MS:-}"
 IN_DIR="${IN_DIR:-fuzz/corpus/${TARGET}}"
 OUT_DIR="${OUT_DIR:-fuzz/out-asan/${TARGET}}"
@@ -17,6 +17,7 @@ HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-asan-${PROFILE}-${TARGET}
 BUILD_TARGET="${BUILD_TARGET:-}"
 ASAN_RUSTFLAGS="${ASAN_RUSTFLAGS:--Zsanitizer=address}"
 ASAN_OPTIONS_DEFAULT="detect_leaks=0:abort_on_error=1:symbolize=0"
+RUSTUP_TOOLCHAIN_OVERRIDE="${RUSTUP_TOOLCHAIN_OVERRIDE:-}"
 
 case "$TARGET" in
   bytes) BIN="afl_bytes_driver"; FEATURE="bytes_driver" ;;
@@ -34,7 +35,11 @@ case "$TARGET" in
   image) BIN="afl_image_driver"; FEATURE="image_driver" ;;
   hashbrown) BIN="afl_hashbrown_driver"; FEATURE="hashbrown_driver" ;;
   bumpalo) BIN="afl_bumpalo_driver"; FEATURE="bumpalo_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo)" >&2; exit 2 ;;
+  indexmap) BIN="afl_indexmap_driver"; FEATURE="indexmap_driver" ;;
+  bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline) BIN="afl_bootc_kcmdline_driver"; FEATURE="bootc_kcmdline_driver" ;;
+  abacus_apportionment|abacus-apportionment) BIN="afl_abacus_apportionment_driver"; FEATURE="abacus_apportionment_driver" ;;
+  kvm_bindings|kvm-bindings) BIN="afl_kvm_bindings_driver"; FEATURE="kvm_bindings_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo|indexmap|bootc_kcmdline|abacus_apportionment|kvm_bindings)" >&2; exit 2 ;;
 esac
 
 canonical_path() {
@@ -47,7 +52,11 @@ canonical_path() {
 }
 
 detect_build_target() {
-  rustc +nightly -vV 2>/dev/null | sed -n 's/^host: //p' | head -n1
+  if [[ -n "$RUSTUP_TOOLCHAIN_OVERRIDE" ]]; then
+    rustc "+${RUSTUP_TOOLCHAIN_OVERRIDE}" -vV 2>/dev/null | sed -n 's/^host: //p' | head -n1
+  else
+    rustc -vV 2>/dev/null | sed -n 's/^host: //p' | head -n1
+  fi
 }
 
 HARNESS_TARGET_DIR="$(canonical_path "$HARNESS_TARGET_DIR")"
@@ -108,7 +117,11 @@ build_asan_target() {
     export "${target_var}=${ASAN_RUSTFLAGS} ${cov_flags}"
   fi
 
-  local cmd=(cargo +nightly build -p afl_harness --features "$FEATURE" --bin "$BIN")
+  local cmd=(cargo)
+  if [[ -n "$RUSTUP_TOOLCHAIN_OVERRIDE" ]]; then
+    cmd+=("+${RUSTUP_TOOLCHAIN_OVERRIDE}")
+  fi
+  cmd+=(build -p afl_harness --features "$FEATURE" --bin "$BIN")
   cmd+=(--target "$BUILD_TARGET")
   if [[ "$PROFILE" == "release" ]]; then
     cmd+=(--release)

@@ -20,6 +20,10 @@ hyper_driver = ["dep:hyper", "dep:tokio", "dep:http-body-util"]
 image_driver = ["dep:image"]
 hashbrown_driver = ["dep:hashbrown"]
 bumpalo_driver = ["dep:bumpalo"]
+indexmap_driver = ["dep:indexmap"]
+bootc_kcmdline_driver = ["dep:bootc-kernel-cmdline"]
+abacus_apportionment_driver = ["dep:apportionment"]
+kvm_bindings_driver = ["dep:kvm-bindings"]
 
 [dependencies]
 bytes = { path = "../third_party/bytes", optional = true }
@@ -40,6 +44,10 @@ tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "
 image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png"], optional = true }
 hashbrown = { version = "0.16.1", optional = true }
 bumpalo = { version = "3.19.1", features = ["collections"], optional = true }
+indexmap = { version = "2.13.0", optional = true }
+bootc-kernel-cmdline = { path = "../third_party/bootc-kernel-cmdline", optional = true }
+apportionment = { path = "../third_party/abacus/backend/apportionment", optional = true }
+kvm-bindings = { path = "../third_party/kvm/kvm-bindings", features = ["fam-wrappers"], optional = true }
 
 [[bin]]
 name = "afl_bytes_driver"
@@ -115,6 +123,26 @@ required-features = ["hashbrown_driver"]
 name = "afl_bumpalo_driver"
 path = "src/bin/afl_bumpalo_driver.rs"
 required-features = ["bumpalo_driver"]
+
+[[bin]]
+name = "afl_indexmap_driver"
+path = "src/bin/afl_indexmap_driver.rs"
+required-features = ["indexmap_driver"]
+
+[[bin]]
+name = "afl_bootc_kcmdline_driver"
+path = "src/bin/afl_bootc_kcmdline_driver.rs"
+required-features = ["bootc_kcmdline_driver"]
+
+[[bin]]
+name = "afl_abacus_apportionment_driver"
+path = "src/bin/afl_abacus_apportionment_driver.rs"
+required-features = ["abacus_apportionment_driver"]
+
+[[bin]]
+name = "afl_kvm_bindings_driver"
+path = "src/bin/afl_kvm_bindings_driver.rs"
+required-features = ["kvm_bindings_driver"]
 
 [[bin]]
 name = "repro_smallvec_oracle_append_fp"

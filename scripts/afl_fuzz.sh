@@ -8,7 +8,7 @@ AFL_PATH="${AFL_PATH:-}"
 AFL_FUZZ="${AFL_FUZZ:-}"
 
 PROFILE="${PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo | indexmap | bootc_kcmdline | abacus_apportionment | kvm_bindings
 TIMEOUT_MS="${TIMEOUT_MS:-}" # optional, forwarded to AFL++ via -t
 
 case "$TARGET" in
@@ -27,7 +27,11 @@ case "$TARGET" in
   image) BIN="afl_image_driver" ;;
   hashbrown) BIN="afl_hashbrown_driver" ;;
   bumpalo) BIN="afl_bumpalo_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo)" >&2; exit 2 ;;
+  indexmap) BIN="afl_indexmap_driver" ;;
+  bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline) BIN="afl_bootc_kcmdline_driver" ;;
+  abacus_apportionment|abacus-apportionment) BIN="afl_abacus_apportionment_driver" ;;
+  kvm_bindings|kvm-bindings) BIN="afl_kvm_bindings_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo|indexmap|bootc_kcmdline|abacus_apportionment|kvm_bindings)" >&2; exit 2 ;;
 esac
 
 HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
@@ -52,6 +56,9 @@ if ! find "$IN_DIR" -maxdepth 1 -type f -print -quit | grep -q .; then
         ;;
       image)
         cp benchmarks/eco_bench/data/eco_image_input.png "${IN_DIR}/seed0"
+        ;;
+      bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline)
+        printf 'quiet rd.break console=ttyS0 root=/dev/vda1\n' > "${IN_DIR}/seed0"
         ;;
       *)
         printf '\x00' > "${IN_DIR}/seed0"

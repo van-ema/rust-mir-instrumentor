@@ -17,7 +17,7 @@ AFL_COMPILER_RT="${AFL_COMPILER_RT:-}"
 
 PROFILE="${PROFILE:-release}"
 RUNTIME_PROFILE="${RUNTIME_PROFILE:-release}"
-TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo | indexmap | bootc_kcmdline | abacus_apportionment | kvm_bindings
 RZ_VERIFY_HOOKS="${RZ_VERIFY_HOOKS:-1}"
 RZ_VERIFY_HOOKS_STRICT="${RZ_VERIFY_HOOKS_STRICT:-0}"
 RZ_INTERPROC_UNSAFE_SUMMARIES="${RZ_INTERPROC_UNSAFE_SUMMARIES:-0}"
@@ -38,7 +38,11 @@ case "$TARGET" in
   image) BIN="afl_image_driver"; FEATURE="image_driver" ;;
   hashbrown) BIN="afl_hashbrown_driver"; FEATURE="hashbrown_driver" ;;
   bumpalo) BIN="afl_bumpalo_driver"; FEATURE="bumpalo_driver" ;;
-  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo)" >&2; exit 2 ;;
+  indexmap) BIN="afl_indexmap_driver"; FEATURE="indexmap_driver" ;;
+  bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline) BIN="afl_bootc_kcmdline_driver"; FEATURE="bootc_kcmdline_driver" ;;
+  abacus_apportionment|abacus-apportionment) BIN="afl_abacus_apportionment_driver"; FEATURE="abacus_apportionment_driver" ;;
+  kvm_bindings|kvm-bindings) BIN="afl_kvm_bindings_driver"; FEATURE="kvm_bindings_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo|indexmap|bootc_kcmdline|abacus_apportionment|kvm_bindings)" >&2; exit 2 ;;
 esac
 
 if [[ "${RZ_INTERPROC_UNSAFE_SUMMARIES}" == "1" && "${RZ_INTERPROC_STAGE:-0}" != "1" ]]; then
