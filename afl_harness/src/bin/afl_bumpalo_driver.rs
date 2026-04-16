@@ -12,6 +12,8 @@ const MAX_TEXT_LEN: usize = 96;
 const MAX_ARENA_CAPACITY: usize = 1024;
 const MAX_ALLOC_LEN: usize = 128;
 const MAX_TEMP_OPS: usize = 24;
+const MAX_ARENA_LIVE_BYTES: usize = 64 * 1024;
+const MAX_ARENA_CHUNK_CAPACITY: usize = 64 * 1024;
 
 struct Cursor<'a> {
     data: &'a [u8],
@@ -185,25 +187,26 @@ fn direct_alloc_ops(bump: &Bump, blob: &[u8], text: &str, cursor: &mut Cursor<'_
         0 => {
             let fill = cursor.byte();
             let bytes = bump.alloc([fill; 32]);
-            let idx = cursor.bounded_usize(bytes.len());
+            let idx = cursor.bounded_usize(32);
             bytes[idx] ^= cursor.byte();
             black_box(bytes.as_ptr());
         }
         1 => {
             if let Ok(value) = bump.try_alloc([cursor.byte(); 16]) {
-                let idx = cursor.bounded_usize(value.len());
+                let idx = cursor.bounded_usize(16);
                 value[idx] ^= cursor.byte();
                 black_box(value.as_ptr());
             }
         }
         2 => {
-            let value = bump.alloc_with(|| (cursor.byte(), cursor.byte(), cursor.byte(), cursor.byte()));
+            let value =
+                bump.alloc_with(|| (cursor.byte(), cursor.byte(), cursor.byte(), cursor.byte()));
             value.0 ^= cursor.byte();
             black_box(value.2);
         }
         3 => {
             let _ = bump.try_alloc_with(|| [cursor.byte(); 24]).map(|value| {
-                let idx = cursor.bounded_usize(value.len());
+                let idx = cursor.bounded_usize(24);
                 value[idx] = value[idx].wrapping_add(cursor.byte());
                 black_box(value.as_ptr());
             });
@@ -233,8 +236,8 @@ fn direct_alloc_ops(bump: &Bump, blob: &[u8], text: &str, cursor: &mut Cursor<'_
         _ => {
             let len = bounded_len(cursor, 32);
             let slice = bump.alloc_slice_fill_copy(len, cursor.byte());
-            if !slice.is_empty() {
-                let idx = cursor.bounded_usize(slice.len());
+            if len != 0 {
+                let idx = cursor.bounded_usize(len);
                 slice[idx] ^= cursor.byte();
             }
             black_box(slice.len());
@@ -249,14 +252,18 @@ fn slice_alloc_ops(bump: &Bump, blob: &[u8], text: &str, cursor: &mut Cursor<'_>
             black_box(slice.len());
         }
         1 => {
-            let _ = bump.try_alloc_slice_copy(blob).map(|slice| black_box(slice.len()));
+            let _ = bump
+                .try_alloc_slice_copy(blob)
+                .map(|slice| black_box(slice.len()));
         }
         2 => {
             let slice = bump.alloc_slice_clone(blob);
             black_box(slice.len());
         }
         3 => {
-            let _ = bump.try_alloc_slice_clone(blob).map(|slice| black_box(slice.len()));
+            let _ = bump
+                .try_alloc_slice_clone(blob)
+                .map(|slice| black_box(slice.len()));
         }
         4 => {
             let s = bump.alloc_str(text);
@@ -296,11 +303,14 @@ fn fill_alloc_ops(bump: &Bump, blob: &[u8], cursor: &mut Cursor<'_>) {
             black_box(slice.len());
         }
         3 => {
-            let _ = bump.try_alloc_slice_fill_iter(blob.iter().copied().map(|byte| byte ^ cursor.byte()));
+            let _ = bump
+                .try_alloc_slice_fill_iter(blob.iter().copied().map(|byte| byte ^ cursor.byte()));
         }
         _ => {
             let len = bounded_len(cursor, MAX_ALLOC_LEN / 2);
-            let _ = bump.try_alloc_slice_fill_with(len, |_| cursor.byte()).map(|slice| black_box(slice.len()));
+            let _ = bump
+                .try_alloc_slice_fill_with(len, |_| cursor.byte())
+                .map(|slice| black_box(slice.len()));
         }
     }
 }
@@ -544,7 +554,8 @@ fn rollover_ops(bump: &Bump, blob: &[u8], cursor: &mut Cursor<'_>) {
         if let Ok(slice) = bump.try_alloc_slice_copy(src) {
             total = total.wrapping_add(slice.len());
         }
-        if let Ok(layout) = Layout::from_size_align(1 + bounded_len(cursor, 16), pick_align(cursor)) {
+        if let Ok(layout) = Layout::from_size_align(1 + bounded_len(cursor, 16), pick_align(cursor))
+        {
             if let Ok(ptr) = bump.try_alloc_layout(layout) {
                 unsafe {
                     ptr::write_bytes(ptr.as_ptr(), cursor.byte(), layout.size());
@@ -554,6 +565,14 @@ fn rollover_ops(bump: &Bump, blob: &[u8], cursor: &mut Cursor<'_>) {
         }
     }
     black_box(total);
+}
+
+fn maybe_recycle_bump(bump: &mut Bump) {
+    if bump.allocated_bytes() > MAX_ARENA_LIVE_BYTES
+        || bump.chunk_capacity() > MAX_ARENA_CHUNK_CAPACITY
+    {
+        *bump = Bump::new();
+    }
 }
 
 fn run_step(
@@ -625,6 +644,8 @@ fn run_step(
             black_box(texts[pool_a].len());
         }
     }
+
+    maybe_recycle_bump(&mut bumps[slot]);
 }
 
 fn main() {

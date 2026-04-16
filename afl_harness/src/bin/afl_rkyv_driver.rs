@@ -2,12 +2,12 @@ use rkyv::{rancor::Error, util::AlignedVec, Archive, Deserialize, Serialize};
 use std::hint::black_box;
 
 const SLOT_COUNT: usize = 2;
-const MAX_STEPS: usize = 96;
-const MAX_BLOB_LEN: usize = 96;
-const MAX_TEXT_LEN: usize = 64;
-const MAX_TAGS: usize = 12;
-const MAX_CHUNKS: usize = 6;
-const MAX_CHUNK_LEN: usize = 24;
+const MAX_STEPS: usize = 32;
+const MAX_BLOB_LEN: usize = 64;
+const MAX_TEXT_LEN: usize = 32;
+const MAX_TAGS: usize = 8;
+const MAX_CHUNKS: usize = 4;
+const MAX_CHUNK_LEN: usize = 16;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, Default)]
 struct FuzzRecord {
@@ -112,6 +112,17 @@ fn build_record(cursor: &mut Cursor<'_>) -> FuzzRecord {
     }
 }
 
+fn truncate_string_to_char_boundary(text: &mut String, new_len: usize) {
+    if new_len >= text.len() {
+        return;
+    }
+    let mut boundary = new_len;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+}
+
 fn mutate_record(record: &mut FuzzRecord, cursor: &mut Cursor<'_>) {
     match cursor.byte() % 8 {
         0 => {
@@ -136,7 +147,8 @@ fn mutate_record(record: &mut FuzzRecord, cursor: &mut Cursor<'_>) {
             if record.text.len() + extra.len() <= MAX_TEXT_LEN {
                 record.text.push_str(&String::from_utf8_lossy(&extra));
             } else {
-                record.text.truncate(cursor.bounded_usize(record.text.len() + 1));
+                let new_len = cursor.bounded_usize(record.text.len() + 1);
+                truncate_string_to_char_boundary(&mut record.text, new_len);
             }
         }
         4 => {
@@ -149,12 +161,10 @@ fn mutate_record(record: &mut FuzzRecord, cursor: &mut Cursor<'_>) {
         }
         5 => {
             if record.chunks.len() < MAX_CHUNKS && (cursor.byte() & 1) == 0 {
-                record
-                    .chunks
-                    .push({
-                        let chunk_len = cursor.bounded_usize(MAX_CHUNK_LEN + 1);
-                        cursor.take_vec(chunk_len)
-                    });
+                record.chunks.push({
+                    let chunk_len = cursor.bounded_usize(MAX_CHUNK_LEN + 1);
+                    cursor.take_vec(chunk_len)
+                });
             } else if !record.chunks.is_empty() {
                 let idx = cursor.bounded_usize(record.chunks.len());
                 if record.chunks[idx].is_empty() {
@@ -182,18 +192,18 @@ fn touch_archived(record: &ArchivedFuzzRecord) -> u64 {
     for &byte in record.tail.iter() {
         acc = acc.rotate_left(7) ^ byte as u64;
     }
-    for &byte in record.blob.as_slice().iter().take(16) {
+    for &byte in record.blob.as_slice().iter().take(8) {
         acc = acc.rotate_left(5) ^ byte as u64;
     }
-    for &byte in record.text.as_str().as_bytes().iter().take(16) {
+    for &byte in record.text.as_str().as_bytes().iter().take(8) {
         acc = acc.rotate_left(3) ^ byte as u64;
     }
-    for tag in record.tags.iter().take(8) {
+    for tag in record.tags.iter().take(4) {
         acc = acc.wrapping_add(tag.to_native() as u64).rotate_left(9);
     }
-    for chunk in record.chunks.iter().take(4) {
+    for chunk in record.chunks.iter().take(2) {
         acc ^= chunk.len() as u64;
-        for &byte in chunk.as_slice().iter().take(8) {
+        for &byte in chunk.as_slice().iter().take(4) {
             acc = acc.wrapping_mul(0x100_0000_01b3).wrapping_add(byte as u64);
         }
     }
@@ -239,7 +249,9 @@ fn unchecked_deserialize(slot: &BufferSlot, sink: &mut u64) {
     if !slot.valid {
         return;
     }
-    if let Ok(value) = unsafe { rkyv::from_bytes_unchecked::<FuzzRecord, Error>(slot.bytes.as_slice()) } {
+    if let Ok(value) =
+        unsafe { rkyv::from_bytes_unchecked::<FuzzRecord, Error>(slot.bytes.as_slice()) }
+    {
         *sink = sink.wrapping_add(value.header as u64);
         *sink ^= value.text.len() as u64;
     }
@@ -287,6 +299,24 @@ fn corrupt_buffer(slot: &mut BufferSlot, cursor: &mut Cursor<'_>) {
     slot.valid = false;
 }
 
+fn distinct_pair_mut<T>(
+    slots: &mut [T; SLOT_COUNT],
+    first: usize,
+    second: usize,
+) -> (&mut T, &mut T) {
+    debug_assert!(first < SLOT_COUNT);
+    debug_assert!(second < SLOT_COUNT);
+    debug_assert_ne!(first, second);
+
+    if first < second {
+        let (left, right) = slots.split_at_mut(second);
+        (&mut left[first], &mut right[0])
+    } else {
+        let (left, right) = slots.split_at_mut(first);
+        (&mut right[0], &mut left[second])
+    }
+}
+
 fn run_step(
     records: &mut [FuzzRecord; SLOT_COUNT],
     buffers: &mut [BufferSlot; SLOT_COUNT],
@@ -296,26 +326,35 @@ fn run_step(
     let slot = cursor.bounded_usize(SLOT_COUNT);
     let other = 1 - slot;
 
-    match cursor.byte() % 12 {
+    match cursor.byte() % 16 {
         0 => records[slot] = build_record(cursor),
         1 => mutate_record(&mut records[slot], cursor),
-        2 => records[slot] = records[other].clone(),
+        2 => {
+            let (dst, src) = distinct_pair_mut(records, slot, other);
+            *dst = src.clone();
+        }
         3 => serialize_slot(&records[slot], &mut buffers[slot]),
         4 => checked_access(&buffers[slot], sink),
-        5 => checked_deserialize(&buffers[slot], sink),
-        6 => checked_mutate(&mut buffers[slot], cursor, sink),
-        7 => unchecked_access(&buffers[slot], sink),
-        8 => unchecked_deserialize(&buffers[slot], sink),
-        9 => corrupt_buffer(&mut buffers[slot], cursor),
-        10 => {
-            buffers[slot].bytes = buffers[other].bytes.clone();
-            buffers[slot].valid = buffers[other].valid;
+        5 => corrupt_buffer(&mut buffers[slot], cursor),
+        6 => unchecked_access(&buffers[slot], sink),
+        7 => {
+            let (dst, src) = distinct_pair_mut(buffers, slot, other);
+            dst.bytes = src.bytes.clone();
+            dst.valid = src.valid;
         }
-        _ => {
-            if let Ok(value) = rkyv::from_bytes::<FuzzRecord, Error>(buffers[slot].bytes.as_slice()) {
+        8 => checked_deserialize(&buffers[slot], sink),
+        9 => unchecked_deserialize(&buffers[slot], sink),
+        10 => checked_mutate(&mut buffers[slot], cursor, sink),
+        11 => {
+            if let Ok(value) = rkyv::from_bytes::<FuzzRecord, Error>(buffers[slot].bytes.as_slice())
+            {
                 records[other] = value;
             }
         }
+        12 => mutate_record(&mut records[other], cursor),
+        13 => serialize_slot(&records[other], &mut buffers[other]),
+        14 => checked_access(&buffers[other], sink),
+        _ => corrupt_buffer(&mut buffers[other], cursor),
     }
 }
 
