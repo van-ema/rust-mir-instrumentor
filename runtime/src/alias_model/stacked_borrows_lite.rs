@@ -158,9 +158,7 @@ fn sb_lite_validate_ref_creation(
     if !rz_sb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
         return None;
     }
-    // Keep default behavior for thin refs. We only add an early violation for mutable wide
-    // reborrows (slice/str-like) where lineage has no same-base ref ancestor.
-    if !matches!(new_kind, PtrKind::RefMut) || parent_tag == 0 || bounds_len == 0 {
+    if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) || parent_tag == 0 {
         return None;
     }
 
@@ -204,10 +202,44 @@ fn sb_lite_validate_ref_creation(
         Some(s) => s,
         None => return None,
     };
+
+    let new_len = if bounds_len != 0 { bounds_len } else { 1 };
+    let overlaps = |entry: &BorrowEntry| {
+        ranges_overlap(entry.start, entry.end, pointee_addr, pointee_addr.saturating_add(new_len))
+    };
+
+    if let Some((pref_tag, _pref_kind)) = parent_ref {
+        let parent_pos = stack.iter().rposition(|entry| entry.tag == pref_tag);
+        if parent_pos.is_none() {
+            if let Some(blocker) = stack.iter().rev().find(|entry| {
+                entry.kind == BorrowKind::Unique && overlaps(entry)
+            }) {
+                return Some(format!(
+                    "REBORROW from inactive parent ref: new_kind={:?} parent_tag={} parent_ref={} base=0x{base:x} new=[0x{:x},0x{:x}) active_unique={}/[0x{:x},0x{:x})",
+                    new_kind,
+                    parent_tag,
+                    pref_tag,
+                    pointee_addr,
+                    pointee_addr.saturating_add(new_len),
+                    blocker.tag,
+                    blocker.start,
+                    blocker.end,
+                ));
+            }
+            return None;
+        }
+    }
+
     let top = match stack.last() {
         Some(t) => t,
         None => return None,
     };
+
+    // Keep default behavior for thin refs. We only add extra overlap checks for mutable wide
+    // reborrows (slice/str-like) where lineage has no same-base ref ancestor.
+    if !matches!(new_kind, PtrKind::RefMut) || bounds_len == 0 {
+        return None;
+    }
 
     // Helper for byte-range overlap checks on wide borrows.
     let ranges_overlap = |a_start: usize, a_len: usize, b_start: usize, b_len: usize| -> bool {
@@ -290,6 +322,34 @@ fn sb_lite_validate_ref_creation(
     }
 
     None
+}
+
+fn sb_lite_invalidate_overlapping_above(
+    stack: &mut Vec<BorrowEntry>,
+    parent_idx: usize,
+    access_start: usize,
+    access_end: usize,
+) {
+    if parent_idx + 1 >= stack.len() {
+        return;
+    }
+
+    let mut write_idx = parent_idx + 1;
+    for read_idx in parent_idx + 1..stack.len() {
+        let keep = !ranges_overlap(
+            stack[read_idx].start,
+            stack[read_idx].end,
+            access_start,
+            access_end,
+        );
+        if keep {
+            if write_idx != read_idx {
+                stack[write_idx] = stack[read_idx].clone();
+            }
+            write_idx += 1;
+        }
+    }
+    stack.truncate(write_idx);
 }
 
 fn sb_lite_check(
@@ -583,6 +643,12 @@ fn sb_lite_check(
                         // For raw writes derived from a unique ref, allow shared reborrows
                         // above as a best-effort heuristic (we do not track reborrow ends).
                         if matches!(tmeta.kind, PtrKind::RawMut) && !seen_unique {
+                            sb_lite_invalidate_overlapping_above(
+                                stack,
+                                idx,
+                                access_start,
+                                access_end,
+                            );
                             return None;
                         }
                         // For unique refs, allow reactivation if only shared borrows are above.

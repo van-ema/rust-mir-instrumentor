@@ -14,3 +14,6 @@ Protector-focused bins:
 - `fnentry_invalidation`: write through stale raw after fn-entry retag.
 - `protector_write_lazy`: lazy pointer pattern with protector-end sensitivity.
 - `reservedim_spurious_write`: simplified interior-mutability/Reserved interaction.
+
+Exact Miri ports now live in:
+- `examples/miri_tests/tb_exact`

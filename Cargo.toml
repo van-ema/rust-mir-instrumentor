@@ -76,6 +76,8 @@ members = [
     "examples/zero_size_copy_ok",
     "examples/sb_miri_micro",
     "examples/tb_miri_micro",
+    "examples/miri_tests/sb_exact",
+    "examples/miri_tests/tb_exact",
     "examples/wide_ptr_raw_slice_cast_ok",
     "examples/wide_ptr_raw_str_cast_ok",
     "examples/maybeuninit_array_assume_init_ok",

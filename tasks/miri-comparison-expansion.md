@@ -1,0 +1,201 @@
+# Fair Miri Comparison Expansion
+
+## Goal
+
+Build a fair, publishable Miri comparison for `rusteze`.
+
+Fair means:
+- compare against **exact Miri ports**, not "inspired by" tests
+- report **percentage agreement** on those exact ports
+- separate:
+  - exact Miri ports
+  - Miri-inspired regressions
+  - broader repo example suite
+
+Do **not** mix these categories in a single headline number.
+
+## Why
+
+Current numbers are easy to misread:
+- exact Miri ports in dedicated dirs: `21`
+- Miri-inspired but not exact ports: `13`
+- total Miri-related tests: `34`
+- total bins in mixed micro suites are not headline metric
+
+Current exact-port comparison:
+- `17 / 21 = 81.0%` agreement
+- report: `reports/miri_compare/20260417_133809/summary.tsv`
+
+This is honest, but sample too small.
+
+BorrowSanitizer's reported `405` is **not** "all Miri tests".
+It is their filtered relevant subset from Miri's suite.
+We need our own filtered exact-port number, much larger than `15`.
+
+Current disagreement set:
+- `miri_sb_exact::aliasing_mut4`
+- `miri_sb_exact::outdated_local`
+- `miri_sb_exact::shr_frozen_violation2`
+- `miri_tb_exact::alternate_read_write`
+
+## Required Output
+
+Produce one headline metric in repo:
+
+`rusteze agrees with Miri on X / Y exact Miri ports = Z%`
+
+Where:
+- `Y` counts only exact ports from `miri/tests/fail/...`
+- `X` counts exact behavioral agreement under current comparison script
+- disagreements are listed explicitly by test name
+
+## Current Infrastructure
+
+Already in repo:
+- exact-port marker:
+  - source comment form:
+    - `// Ported from miri/tests/fail/...`
+- comparison script:
+  - `scripts/run_miri_comparison.py`
+- dedicated exact-port suites:
+  - `examples/miri_tests/sb_exact`
+  - `examples/miri_tests/tb_exact`
+- inspired/regression suites:
+  - `examples/sb_miri_micro`
+  - `examples/tb_miri_micro`
+
+## Rules
+
+1. New comparison inputs must be **exact ports** first.
+2. Avoid adding new "inspired by" tests for comparison headline.
+3. Keep exact ports small and deterministic.
+4. Prefer thin-pointer / no-dependency / no-Miri-specific-feature tests first.
+5. Record current `rusteze` behavior honestly in expected files if gap still exists.
+6. Do not silently reclassify gaps as unsupported unless there is a concrete reason.
+
+## Expansion Plan
+
+### Phase 1: Grow Exact Port Set Fast
+
+Target families first:
+- `miri/tests/fail/both_borrows/*`
+- `miri/tests/fail/tree_borrows/*`
+- `miri/tests/fail/stacked_borrows/*`
+
+Prioritize tests that are:
+- single-file
+- no external deps
+- no Miri-only APIs
+- no panic-as-oracle
+- easy to port into `miri_sb_exact` / `miri_tb_exact`
+
+Best candidates:
+- more `pass_invalid_*`
+- more `return_invalid_*`
+- `load_invalid_*`
+- `aliasing_mut*`
+- more simple protector / fn-entry / read-vs-write cases
+
+### Phase 2: Classify Ports
+
+For each exact port:
+- `ported`
+- `rusteze` expected behavior recorded
+- included in `scripts/run_miri_comparison.py`
+
+For each disagreement:
+- classify reason:
+  - missing instrumentation
+  - missing runtime metadata
+  - alias-model mismatch
+  - unsupported wildcard / exposed / wide-pointer semantics
+  - expectation bug
+
+### Phase 3: Raise Agreement
+
+Attack highest-yield disagreement clusters first:
+- `Cell` / interior-mutation exclusivity gaps
+- stale local / parent-reactivation gap
+- shared-ref freeze-after-write gap
+- Tree Borrows alternating read/write freeze gap
+
+## Milestones
+
+### Milestone A
+
+Reach:
+- `>= 25` exact Miri ports
+
+Deliver:
+- updated `reports/miri_compare/.../summary.tsv`
+- updated top-line percentage
+
+### Milestone B
+
+Reach:
+- `>= 50` exact Miri ports
+
+Deliver:
+- disagreement buckets
+- per-family pass rates
+
+### Milestone C
+
+Reach:
+- stable publishable metric on exact ports
+
+Preferred:
+- `>= 70%` on `>= 50` exact ports
+
+Stronger:
+- `>= 80%` on `>= 50` exact ports
+
+## Reporting Format
+
+Always report 3 numbers separately:
+
+1. exact Miri ports:
+   - `X / Y = Z%`
+2. Miri-inspired regressions:
+   - count only, no head-to-head claim
+3. full repo example suite:
+   - pass rate only
+
+Example:
+- exact Miri ports: `31 / 52 = 59.6%`
+- Miri-inspired regressions: `13`
+- full example suite: `109 / 109`
+
+## Stop Conditions
+
+Do **not** stop after adding tests only.
+Stop only when all are true:
+- exact-port set meaningfully larger than `21`
+- percentage agreement recomputed
+- disagreement list shortened or at least categorized
+- metric ready for paper/preprint text
+
+## Commands
+
+Run exact-port comparison:
+
+```bash
+python3 scripts/run_miri_comparison.py
+```
+
+Run exact-port additions incrementally:
+
+```bash
+EXAMPLE_FILTER='^miri_sb_exact::NEW_TEST$' RZ_ALIAS_MODEL=sb_lite RECORD_EXPECT=1 python3 scripts/run_example_tests.py
+EXAMPLE_FILTER='^miri_tb_exact::NEW_TEST$' RZ_ALIAS_MODEL=tb_lite RECORD_EXPECT=1 python3 scripts/run_example_tests.py
+```
+
+## Non-Goals
+
+Not goal here:
+- fuzzing
+- ASan comparison
+- performance benchmarking
+- new inspired-by tests for paper headline
+
+This task only exists to make Miri comparison fair and publishable.

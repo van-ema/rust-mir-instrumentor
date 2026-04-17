@@ -3181,14 +3181,61 @@ pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
     __rz_ptr_read(tag, addr, size);
 }
 
+fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
+    if tag == 0 {
+        return;
+    }
+
+    let Some(tmeta) = tag_store::get(tag) else {
+        return;
+    };
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return;
+    }
+
+    let access_size = tmeta.bounds_len.min(1).max(1);
+    let Some(msg) = active_alias_model().check_access(
+        tag,
+        tag,
+        &tmeta,
+        tmeta.pointee_addr,
+        access_size,
+        alias_model::AliasAccessKind::Read,
+    ) else {
+        return;
+    };
+
+    rz_violation(
+        active_alias_model().violation_kind(),
+        append_location_if_enabled(
+            format!(
+                "{boundary} invalid ref tag={tag} pointee=0x{:x} kind={:?}\n{msg}",
+                tmeta.pointee_addr, tmeta.kind
+            ),
+            "RZ_LOG_LOC",
+        ),
+    );
+}
+
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
+    rz_validate_ref_boundary_use(tag, "CALL_ARG");
     call_arg_tags()
         .lock()
         .unwrap()
         .insert((callee_id, arg_index, addr), tag);
+}
+
+/// Validate a non-pointer by-value call argument carrier's inner reference tag.
+#[no_mangle]
+pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
+    let _g = RzRuntimeGuard::enter();
+    if active_alias_model().name() != "sb_lite" {
+        return;
+    }
+    rz_validate_ref_boundary_use(tag, "CALL_ARG");
 }
 
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
@@ -3210,7 +3257,25 @@ pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
+    rz_validate_ref_boundary_use(tag, "RET");
     ret_tags().lock().unwrap().insert((callee_id, addr), tag);
+}
+
+/// Validate a non-pointer return carrier's inner reference tag at the return boundary.
+#[no_mangle]
+pub extern "C" fn __rz_validate_ret_tag(tag: u64) {
+    let _g = RzRuntimeGuard::enter();
+    if active_alias_model().name() != "sb_lite" {
+        return;
+    }
+    rz_validate_ref_boundary_use(tag, "RET");
+}
+
+/// Validate a reference tag restored from pointer-shadow memory.
+#[no_mangle]
+pub extern "C" fn __rz_validate_loaded_ref_tag(tag: u64) {
+    let _g = RzRuntimeGuard::enter();
+    rz_validate_ref_boundary_use(tag, "LOAD");
 }
 
 /// Take (consume) a pushed return-tag for a callee/return-address pair.
@@ -3587,7 +3652,15 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let mut alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    if !alias_exempt_flag
+        && derived_from != 0
+        && tag_store::get(derived_from)
+            .as_ref()
+            .is_some_and(|parent| parent.alias_exempt)
+    {
+        alias_exempt_flag = true;
+    }
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
@@ -3769,8 +3842,17 @@ pub extern "C" fn __record_raw_ptr_creation(
     } else {
         0
     };
-    let (origin_known, origin_base, origin_end) =
-        snapshot_tag_origin(pointee_addr, resolved_parent);
+    let (origin_known, origin_base, origin_end) = if resolved_parent != 0 {
+        tag_store::get(resolved_parent)
+            .filter(|parent| {
+                parent.origin_known
+                    && (!parent_alloc_mismatch || alloc_is_stack)
+            })
+            .map(|parent| (true, parent.origin_base, parent.origin_end))
+            .unwrap_or_else(|| snapshot_tag_origin(pointee_addr, resolved_parent))
+    } else {
+        snapshot_tag_origin(pointee_addr, resolved_parent)
+    };
 
     let tmeta = TagMeta {
         pointee_addr,

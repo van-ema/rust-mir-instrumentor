@@ -1615,6 +1615,11 @@ enum InstrKind<'tcx> {
     ShadowStore {
         src_local: Local,
     },
+    /// Store tag metadata for a pointer local into the heap pointee slot of a Box<T>.
+    ShadowStoreBoxPointee {
+        box_local: Local,
+        src_local: Local,
+    },
     /// Copy tag metadata between memory slots.
     ShadowCopySlot {
         src_place: Place<'tcx>,
@@ -1695,6 +1700,10 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
     },
+    /// Caller-side validation for non-pointer by-value carriers that contain refs.
+    CallArgValidate {
+        local: Local,
+    },
     /// Callee-side retagging of pointer arguments from the runtime side-channel.
     ArgRetag {
         callee_id: u64,
@@ -1705,6 +1714,10 @@ enum InstrKind<'tcx> {
     ArgAnchorTake {
         callee_id: u64,
         arg_index: u64,
+        local: Local,
+    },
+    /// Callee-side: validate the tag carried by a non-pointer return carrier.
+    RetValidate {
         local: Local,
     },
     /// Callee-side: push the tag for a returned pointer right before `Return`.
@@ -1784,8 +1797,11 @@ struct Hooks {
     def_id_read_allow_untagged: DefId,
     def_id_use: DefId,
     def_id_push_call_arg_tag: DefId,
+    def_id_validate_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
     def_id_push_ret_tag: DefId,
+    def_id_validate_ret_tag: DefId,
+    def_id_validate_loaded_ref_tag: DefId,
     def_id_take_ret_tag_or_root: DefId,
     def_id_exit_fn: DefId,
     def_id_shadow_store_ptr: DefId,
@@ -1890,7 +1906,43 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
-        matches!(ty.kind(), TyKind::RawPtr(..)) && self.is_thin_ptr_ty(tcx, body, ty)
+        self.is_pointer_ty(ty) && self.is_thin_ptr_ty(tcx, body, ty)
+    }
+
+    fn ty_contains_pointer_fields<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+        depth: usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if self.is_pointer_ty(ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Tuple(field_tys) => field_tys
+                .iter()
+                .any(|field_ty| self.ty_contains_pointer_fields(tcx, body, field_ty, depth - 1)),
+            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
+                variant.fields.iter().any(|field| {
+                    self.ty_contains_pointer_fields(tcx, body, field.ty(tcx, args), depth - 1)
+                })
+            }),
+            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
+                self.ty_contains_pointer_fields(tcx, body, *elem_ty, depth - 1)
+            }
+            _ => false,
+        }
+    }
+
+    fn compile_alias_model_is_sb_like(&self) -> bool {
+        std::env::var("RZ_ALIAS_MODEL")
+            .ok()
+            .map(|raw| raw.to_ascii_lowercase())
+            .is_some_and(|model| matches!(model.as_str(), "sb" | "sb_lite" | "stacked_borrows"))
     }
 
     fn normalized_ptr_copy_anchor_key<'tcx>(
@@ -2303,6 +2355,73 @@ impl MyOptimizationPass {
             ))),
         );
 
+        let addr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(addr_local),
+                Rvalue::Cast(
+                    CastKind::PointerExposeProvenance,
+                    Operand::Copy(Place::from(slot_ptr_local)),
+                    tcx.types.usize,
+                ),
+            ))),
+        );
+
+        Some((slot_ptr_stmt, addr_stmt))
+    }
+
+    fn box_pointee_slot_addr_stmts_for_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        box_local: Local,
+        addr_local: Local,
+    ) -> Option<(Statement<'tcx>, Statement<'tcx>)> {
+        let box_ty = body.local_decls[box_local].ty;
+        let TyKind::Adt(box_adt, box_args) = box_ty.kind() else {
+            return None;
+        };
+        if !self.is_box_ty(tcx, box_ty) {
+            return None;
+        }
+
+        let unique_ty = box_adt.non_enum_variant().fields[FieldIdx::from_usize(0)].ty(tcx, box_args);
+        let TyKind::Adt(unique_adt, unique_args) = unique_ty.kind() else {
+            return None;
+        };
+        let nonnull_ty = unique_adt
+            .non_enum_variant()
+            .fields[FieldIdx::from_usize(0)]
+            .ty(tcx, unique_args);
+
+        let raw_ptr_ty = Ty::new_imm_ptr(tcx, tcx.types.u8);
+        if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
+            return None;
+        }
+
+        let nonnull_place = Place::from(box_local).project_deeper(
+            &[
+                PlaceElem::Field(FieldIdx::from_usize(0), unique_ty),
+                PlaceElem::Field(FieldIdx::from_usize(0), nonnull_ty),
+            ],
+            tcx,
+        );
+        let slot_ptr_local = body
+            .local_decls
+            .push(LocalDecl::new(raw_ptr_ty, source_info.span));
+
+        let slot_ptr_stmt = Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(slot_ptr_local),
+                Rvalue::Cast(
+                    CastKind::Transmute,
+                    Operand::Copy(nonnull_place),
+                    raw_ptr_ty,
+                ),
+            ))),
+        );
         let addr_stmt = Statement::new(
             source_info,
             StatementKind::Assign(Box::new((
@@ -4652,6 +4771,98 @@ impl MyOptimizationPass {
         }
     }
 
+    fn backtrack_global_single_pointer_carrier_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        agg_local: Local,
+    ) -> Option<Local> {
+        let mut recovered: Option<Local> = None;
+
+        for block_data in body.basic_blocks.iter() {
+            for stmt in &block_data.statements {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                if place.as_local() != Some(agg_local) {
+                    continue;
+                }
+
+                let local = match rvalue {
+                    Rvalue::Aggregate(_, ops) => {
+                        let mut candidate: Option<Local> = None;
+                        for op in ops.iter() {
+                            let Some(src_local) = self
+                                .place_from_operand(op)
+                                .and_then(|p| p.as_local())
+                                .filter(|local| self.is_pointer_ty(body.local_decls[*local].ty))
+                            else {
+                                continue;
+                            };
+                            match candidate {
+                                Some(existing) if existing != src_local => return None,
+                                Some(_) => {}
+                                None => candidate = Some(src_local),
+                            }
+                        }
+                        candidate
+                    }
+                    _ => return None,
+                };
+
+                let Some(local) = local else {
+                    return None;
+                };
+                match recovered {
+                    Some(existing) if existing != local => return None,
+                    Some(_) => {}
+                    None => recovered = Some(local),
+                }
+            }
+        }
+
+        recovered
+    }
+
+    fn backtrack_single_pointer_carrier_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        agg_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        for stmt in statements.iter().rev() {
+            let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if place.as_local() != Some(agg_local) {
+                continue;
+            }
+
+            return match rvalue {
+                Rvalue::Aggregate(_, ops) => {
+                    let mut candidate: Option<Local> = None;
+                    for op in ops.iter() {
+                        let Some(src_local) = self
+                            .place_from_operand(op)
+                            .and_then(|p| p.as_local())
+                            .filter(|local| self.is_pointer_ty(body.local_decls[*local].ty))
+                        else {
+                            continue;
+                        };
+                        match candidate {
+                            Some(existing) if existing != src_local => return None,
+                            Some(_) => {}
+                            None => candidate = Some(src_local),
+                        }
+                    }
+                    candidate
+                }
+                _ => None,
+            };
+        }
+
+        None
+    }
+
     fn invalidate_ssa_anchors_for_local(
         &self,
         ssa_anchor_for_expr: &mut SsaAnchorMap,
@@ -4730,6 +4941,31 @@ impl MyOptimizationPass {
             return None;
         }
         Some(state.clone())
+    }
+
+    fn allow_ssa_anchor_reuse_for_ref_source_place<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        bk: BorrowKind,
+        src_place: Place<'tcx>,
+    ) -> bool {
+        // Reusing the last ref-created anchor for `&*raw` / `&mut *raw` turns repeated
+        // ref creation from the same raw pointer into a parent->child chain. For both SB-
+        // and TB-style models these refs should derive from the raw pointer lineage instead.
+        if matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && self.is_raw_pointer_ty(body.local_decls[src_place.local].ty)
+        {
+            return false;
+        }
+
+        // In TB mode, repeating `&_1` should not silently chain the second shared ref off the
+        // first one; that collapses independent shared-to-raw derivations into one lineage and
+        // hides later mutable conflicts.
+        if !matches!(bk, BorrowKind::Mut { .. }) && !self.compile_alias_model_is_sb_like() {
+            return false;
+        }
+
+        true
     }
 
     fn invalidate_ssa_anchors_for_call<'tcx>(
@@ -5408,8 +5644,9 @@ impl MyOptimizationPass {
         ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
         reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
         is_raw_creation: bool,
+        use_projectionless_anchor: bool,
     ) -> Operand<'tcx> {
-        if src_place.projection.is_empty() {
+        if use_projectionless_anchor && src_place.projection.is_empty() {
             if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
                 .get(&src_place.local)
                 .copied()
@@ -5437,6 +5674,13 @@ impl MyOptimizationPass {
                 }
             } else {
                 self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
+                    .or_else(|| {
+                        self.backtrack_single_pointer_carrier_local(
+                            body,
+                            src_local,
+                            &block_stmts[..upto],
+                        )
+                    })
             }
         } else {
             self.recover_pointer_source_local_for_projected_place(
@@ -5448,6 +5692,15 @@ impl MyOptimizationPass {
                 is_raw_creation,
             )
         };
+
+        let candidate_local = candidate_local.or_else(|| {
+            if src_place.projection.is_empty() && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+            {
+                self.backtrack_global_single_pointer_carrier_local(body, src_place.local)
+            } else {
+                None
+            }
+        });
 
         if let Some(local) = candidate_local {
             // Prefer the source local's concrete tag first.
@@ -5493,6 +5746,7 @@ impl MyOptimizationPass {
             ref_ancestor_local_for_ptr_local,
             reborrow_anchor_local_for_stack_local,
             false,
+            true,
         );
 
         let fallback_local = body
@@ -6103,8 +6357,10 @@ impl MyOptimizationPass {
                     if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
                         if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
                             let src_ty = src_place.ty(&body.local_decls, tcx).ty;
-                            if !src_place.projection.is_empty()
-                                && self.is_shadowable_ptr_ty(tcx, body, src_ty)
+                            let shadow_load_ok = self.is_shadowable_ptr_ty(tcx, body, src_ty)
+                                && (!matches!(src_ty.kind(), TyKind::Ref(..))
+                                    || self.place_contains_deref(src_place));
+                            if !src_place.projection.is_empty() && shadow_load_ok
                             {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 tagged_ptr_locals.insert(dst_local);
@@ -7138,14 +7394,20 @@ impl MyOptimizationPass {
                         &block_data.statements,
                         stmt_idx,
                     );
-                    let reused_anchor_state = anchor_key.as_ref().and_then(|(key, _deps)| {
-                        self.reusable_ssa_anchor_for_ref_source_expr(
-                            body,
-                            ssa_anchor_for_expr,
-                            key,
-                            lhs_local,
-                        )
-                    });
+                    let reused_anchor_state = if self
+                        .allow_ssa_anchor_reuse_for_ref_source_place(body, *bk, *src_place)
+                    {
+                        anchor_key.as_ref().and_then(|(key, _deps)| {
+                            self.reusable_ssa_anchor_for_ref_source_expr(
+                                body,
+                                ssa_anchor_for_expr,
+                                key,
+                                lhs_local,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     let ref_src_place = reused_anchor_state
                         .as_ref()
                         .map(|anchor_state| Place::from(anchor_state.local))
@@ -7595,6 +7857,21 @@ impl MyOptimizationPass {
     fn is_box_into_raw_wrapper(&self, def_path: &str) -> bool {
         (def_path.contains("::boxed::Box") || def_path.contains("boxed::Box"))
             && def_path.contains("::into_raw")
+    }
+
+    fn is_box_new_wrapper(&self, def_path: &str) -> bool {
+        (def_path.contains("::boxed::Box") || def_path.contains("boxed::Box"))
+            && def_path.ends_with("::new")
+    }
+
+    fn is_box_ty<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        match ty.kind() {
+            TyKind::Adt(adt, _) => {
+                let def_path = tcx.def_path_str(adt.did());
+                def_path.contains("::boxed::Box") || def_path.contains("boxed::Box")
+            }
+            _ => false,
+        }
     }
 
     fn is_box_from_raw_wrapper(&self, def_path: &str) -> bool {
@@ -8898,12 +9175,49 @@ impl MyOptimizationPass {
             }
         }
 
+        if let (Some(tgt_bb), Some(dst_local), Some(first_arg)) = (
+            call_target_bb,
+            destination.as_local(),
+            args.get(0).and_then(|arg| self.place_from_operand(&arg.node)),
+        ) {
+            let dst_ty = body.local_decls[dst_local].ty;
+            let src_ty = first_arg.ty(&body.local_decls, tcx).ty;
+            if args.len() == 1
+                && self.is_box_ty(tcx, dst_ty)
+                && self.is_shadowable_ptr_ty(tcx, body, src_ty)
+                && first_arg.projection.is_empty()
+            {
+                ptr_locals_needing_tag.insert(first_arg.local);
+                insert_points.push(InsertPoint {
+                    bb: tgt_bb,
+                    stmt_idx: 0,
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(dst_local),
+                    kind: InstrKind::ShadowStoreBoxPointee {
+                        box_local: dst_local,
+                        src_local: first_arg.local,
+                    },
+                });
+            }
+        }
+
         // Treat any pointer argument as tag relevant.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else {
                 continue;
             };
             let ty = body.local_decls[p.local].ty;
+            if !self.is_pointer_ty(ty) && self.ty_contains_pointer_fields(tcx, body, ty, 8) {
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: p,
+                    kind: InstrKind::CallArgValidate { local: p.local },
+                });
+            }
             if !self.is_pointer_ty(ty) {
                 continue;
             }
@@ -9090,7 +9404,9 @@ impl MyOptimizationPass {
                     if self.is_pointer_ty(ty) {
                         continue;
                     }
-                    if !interesting_stack_locals.contains(&p.local) {
+                    if !interesting_stack_locals.contains(&p.local)
+                        && !self.ty_contains_pointer_fields(tcx, body, ty, 8)
+                    {
                         continue;
                     }
                     insert_points.push(InsertPoint {
@@ -9524,6 +9840,15 @@ impl MyOptimizationPass {
                                 ptr_local: RETURN_PLACE,
                             },
                         });
+                    } else if self.ty_contains_pointer_fields(tcx, body, body.return_ty(), 8) {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(RETURN_PLACE),
+                            kind: InstrKind::RetValidate { local: RETURN_PLACE },
+                        });
                     }
                     return_sites.push((bb, term.source_info, block_data.statements.len()));
                 }
@@ -9884,6 +10209,7 @@ impl MyOptimizationPass {
             InstrKind::PtrUse { .. } => hooks.def_id_use,
             InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
+            InstrKind::ShadowStoreBoxPointee { .. } => hooks.def_id_shadow_store_ptr,
             InstrKind::ShadowCopySlot { .. } => hooks.def_id_shadow_copy_slot,
             InstrKind::ShadowCopyRange { .. } => hooks.def_id_shadow_copy_range,
             InstrKind::ShadowKill { .. } => hooks.def_id_shadow_kill_range,
@@ -9904,9 +10230,11 @@ impl MyOptimizationPass {
                 }
             }
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
+            InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
                 hooks.def_id_take_call_arg_tag
             }
+            InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
             InstrKind::FnExit { .. } => hooks.def_id_exit_fn,
@@ -9955,9 +10283,13 @@ impl MyOptimizationPass {
                 | InstrKind::PtrWriteAllowUntagged { .. }
                 | InstrKind::ShadowKill { .. } => 2,
                 InstrKind::ShadowStore { .. }
+                | InstrKind::ShadowStoreBoxPointee { .. }
                 | InstrKind::ShadowCopySlot { .. }
                 | InstrKind::ShadowCopyRange { .. } => 3,
-                InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+                InstrKind::CallArgPush { .. }
+                | InstrKind::CallArgValidate { .. }
+                | InstrKind::PtrUse { .. }
+                | InstrKind::RetValidate { .. } => 3,
                 _ => 4,
             }
         }
@@ -10040,6 +10372,12 @@ impl MyOptimizationPass {
                 let ref_block = body
                     .basic_blocks_mut()
                     .push(BasicBlockData::new(None, is_cleanup));
+                let validate_block = if matches!(body.local_decls[dst_local].ty.kind(), TyKind::Ref(..))
+                {
+                    Some(body.basic_blocks_mut().push(BasicBlockData::new(None, is_cleanup)))
+                } else {
+                    None
+                };
 
                 let tag_func = Operand::function_handle(
                     tcx,
@@ -10071,12 +10409,41 @@ impl MyOptimizationPass {
                         func: ref_func,
                         args: ref_args,
                         destination: Place::from(dst_ref_ancestor_local),
-                        target: Some(cont_block),
+                        target: Some(validate_block.unwrap_or(cont_block)),
                         unwind: UnwindAction::Continue,
                         call_source: CallSource::Misc,
                         fn_span: source_info.span,
                     },
                 });
+
+                if let Some(validate_block) = validate_block {
+                    let validate_func = Operand::function_handle(
+                        tcx,
+                        hooks.def_id_validate_loaded_ref_tag,
+                        std::iter::empty(),
+                        source_info.span,
+                    );
+                    let validate_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                        node: Operand::Copy(Place::from(dst_tag_local)),
+                        span: source_info.span,
+                    }]
+                    .into_boxed_slice();
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    body.basic_blocks_mut()[validate_block].terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: validate_func,
+                            args: validate_args,
+                            destination: Place::from(tmp_unit),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                }
 
                 let remaining_stmts = {
                     let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
@@ -10295,6 +10662,105 @@ impl MyOptimizationPass {
                         kind: TerminatorKind::Call {
                             func: copy_func,
                             args: copy_args,
+                            destination: Place::from(tmp_unit),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                    rem
+                };
+
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
+            if let InstrKind::ShadowStoreBoxPointee { box_local, src_local } = creation_kind.clone()
+            {
+                let dst_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((dst_addr_stmt1, dst_addr_stmt2)) =
+                    self.box_pointee_slot_addr_stmts_for_local(
+                        tcx,
+                        body,
+                        source_info,
+                        box_local,
+                        dst_addr_local,
+                    )
+                else {
+                    continue;
+                };
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let tag_op: Operand<'tcx> =
+                    if let Some(tl) = tag_local_for_ptr_local.get(&src_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+                let ref_ancestor_op: Operand<'tcx> =
+                    if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u64(tcx, source_info.span, 0)
+                    };
+                let store_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_shadow_store_ptr,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let store_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(dst_addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: tag_op,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: ref_ancestor_op,
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let len = bd.statements.len();
+                    let split_at = if stmt_idx >= len {
+                        len
+                    } else if ip.insert_before {
+                        stmt_idx
+                    } else {
+                        stmt_idx + 1
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(dst_addr_stmt1);
+                    bd.statements.push(dst_addr_stmt2);
+                    bd.terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: store_func,
+                            args: store_args,
                             destination: Place::from(tmp_unit),
                             target: Some(cont_block),
                             unwind: UnwindAction::Continue,
@@ -10745,6 +11211,56 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if let InstrKind::RetValidate { local } = creation_kind {
+                let tag_op = self.parent_tag_operand_for_src_place(
+                    tcx,
+                    body,
+                    bb,
+                    stmt_idx,
+                    source_info,
+                    Place::from(local),
+                    tag_local_for_ptr_local,
+                    ref_ancestor_local_for_ptr_local,
+                    reborrow_anchor_local_for_stack_local,
+                    false,
+                    true,
+                );
+                let validate_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_validate_ret_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let args_validate: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: tag_op,
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                body.basic_blocks_mut()[bb].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: validate_func,
+                        args: args_validate,
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                });
+                continue;
+            }
+
             if let InstrKind::TagProp {
                 dst,
                 src,
@@ -11107,6 +11623,7 @@ impl MyOptimizationPass {
                             ref_ancestor_local_for_ptr_local,
                             reborrow_anchor_local_for_stack_local,
                             is_raw_creation,
+                            true,
                         )),
                     ))),
                 );
@@ -11638,6 +12155,37 @@ impl MyOptimizationPass {
                         }
                     }
                 }
+                InstrKind::CallArgPush { ptr_local, .. } => {
+                    let ptr_ty = body.local_decls[ptr_local].ty;
+                    if self.is_pointer_ty(ptr_ty) {
+                        match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
+                            Some(stmts) => stmts,
+                            None => continue,
+                        }
+                    } else {
+                        let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+                            tcx,
+                            body,
+                            source_info,
+                            place,
+                            addr_local,
+                            false,
+                        ) else {
+                            continue;
+                        };
+                        (Some(slot_stmt1), slot_stmt2)
+                    }
+                }
+                InstrKind::CallArgValidate { .. } | InstrKind::RetValidate { .. } => (
+                    None,
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(addr_local),
+                            Rvalue::Use(self.const_usize(tcx, source_info.span, 0)),
+                        ))),
+                    ),
+                ),
                 InstrKind::ShadowStore { .. } | InstrKind::ShadowKill { .. } => {
                     let is_mut = matches!(
                         creation_kind,
@@ -11968,6 +12516,7 @@ impl MyOptimizationPass {
                             ref_ancestor_local_for_ptr_local,
                             reborrow_anchor_local_for_stack_local,
                             false,
+                            true,
                         )
                     };
 
@@ -11994,6 +12543,35 @@ impl MyOptimizationPass {
                     ]
                     .into_boxed_slice();
 
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::CallArgValidate { local } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let tag_op = self.parent_tag_operand_for_src_place(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        source_info,
+                        place,
+                        tag_local_for_ptr_local,
+                        ref_ancestor_local_for_ptr_local,
+                        reborrow_anchor_local_for_stack_local,
+                        false,
+                        true,
+                    );
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                        node: tag_op,
+                        span: source_info.span,
+                    }]
+                    .into_boxed_slice();
+
+                    let _ = local;
                     (args, Place::from(tmp_unit))
                 }
 
@@ -12307,23 +12885,28 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, is_mut_u8);
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
-                        InstrKind::Ref { src, .. } => projected_ref_parent_local.map_or_else(
-                            || {
-                                self.parent_tag_operand_for_src_place(
-                                    tcx,
-                                    body,
-                                    bb,
-                                    stmt_idx,
-                                    source_info,
-                                    *src,
-                                    tag_local_for_ptr_local,
-                                    ref_ancestor_local_for_ptr_local,
-                                    reborrow_anchor_local_for_stack_local,
-                                    false,
-                                )
-                            },
-                            |local| Operand::Copy(Place::from(local)),
-                        ),
+                        InstrKind::Ref { bk, src, .. } => {
+                            let use_projectionless_anchor = matches!(bk, BorrowKind::Mut { .. })
+                                || self.compile_alias_model_is_sb_like();
+                            projected_ref_parent_local.map_or_else(
+                                || {
+                                    self.parent_tag_operand_for_src_place(
+                                        tcx,
+                                        body,
+                                        bb,
+                                        stmt_idx,
+                                        source_info,
+                                        *src,
+                                        tag_local_for_ptr_local,
+                                        ref_ancestor_local_for_ptr_local,
+                                        reborrow_anchor_local_for_stack_local,
+                                        false,
+                                        use_projectionless_anchor,
+                                    )
+                                },
+                                |local| Operand::Copy(Place::from(local)),
+                            )
+                        }
                         InstrKind::Raw { src, .. } => {
                             let src_local = src.local;
                             let src_is_plain_ref_deref = src.projection.len() == 1
@@ -12350,6 +12933,7 @@ impl MyOptimizationPass {
                                     tag_local_for_ptr_local,
                                     ref_ancestor_local_for_ptr_local,
                                     reborrow_anchor_local_for_stack_local,
+                                    true,
                                     true,
                                 )
                             }
@@ -12595,6 +13179,13 @@ impl MyOptimizationPass {
                         if let Some(dst_ref_ancestor_local) =
                             ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                         {
+                            let use_projectionless_anchor = match &creation_kind {
+                                InstrKind::Ref { bk, .. } => {
+                                    matches!(bk, BorrowKind::Mut { .. })
+                                        || self.compile_alias_model_is_sb_like()
+                                }
+                                _ => true,
+                            };
                             let parent_op = projected_ref_parent_local.map_or_else(
                                 || {
                                     self.parent_tag_operand_for_src_place(
@@ -12608,6 +13199,7 @@ impl MyOptimizationPass {
                                         ref_ancestor_local_for_ptr_local,
                                         reborrow_anchor_local_for_stack_local,
                                         false,
+                                        use_projectionless_anchor,
                                     )
                                 },
                                 |local| Operand::Copy(Place::from(local)),
@@ -13380,12 +13972,21 @@ impl MyOptimizationPass {
         let def_id_push_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_tag", 4)
             .expect("missing '__rz_push_call_arg_tag' definition");
+        let def_id_validate_call_arg_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
+            .expect("missing '__rz_validate_call_arg_tag' definition");
         let def_id_take_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag", 3)
             .expect("missing '__rz_take_call_arg_tag' definition");
         let def_id_push_ret_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_ret_tag", 3)
             .expect("missing '__rz_push_ret_tag' definition");
+        let def_id_validate_ret_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_validate_ret_tag", 1)
+            .expect("missing '__rz_validate_ret_tag' definition");
+        let def_id_validate_loaded_ref_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 1)
+            .expect("missing '__rz_validate_loaded_ref_tag' definition");
         let def_id_take_ret_tag_or_root = self
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag_or_root", 5)
             .expect("missing '__rz_take_ret_tag_or_root' definition");
@@ -13422,8 +14023,11 @@ impl MyOptimizationPass {
             def_id_read_allow_untagged,
             def_id_use,
             def_id_push_call_arg_tag,
+            def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
             def_id_push_ret_tag,
+            def_id_validate_ret_tag,
+            def_id_validate_loaded_ref_tag,
             def_id_take_ret_tag_or_root,
             def_id_exit_fn,
             def_id_shadow_store_ptr,
