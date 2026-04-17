@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET="${TARGET:-bytes}" # bytes | smallvec | serde_json | toml | base64 | uuid | itoa | quick_xml | simd_json | zip | rkyv | hyper | image | hashbrown | bumpalo | indexmap | bootc_kcmdline | abacus_apportionment | kvm_bindings
+PROFILE="${PROFILE:-release}"
+MODE="${MODE:-rusteze}" # rusteze | asan
+TIMEOUT_SECS="${TIMEOUT_SECS:-5}"
+KILL_AFTER_SECS="${KILL_AFTER_SECS:-1}"
+HOST_TARGET="${HOST_TARGET:-$(rustc -vV 2>/dev/null | sed -n 's/^host: //p' | head -n1)}"
+OUT_DIR_DEFAULT="fuzz/out/${TARGET}"
+if [[ "$MODE" == "asan" ]]; then
+  OUT_DIR_DEFAULT="fuzz/out-asan/${TARGET}"
+fi
+OUT_DIR="${OUT_DIR:-$OUT_DIR_DEFAULT}"
+ONLY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --input)
+      ONLY="${2:-}"
+      if [[ -z "$ONLY" ]]; then
+        echo "--input requires a path or filename" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --input=*)
+      ONLY="${1#--input=}"
+      if [[ -z "$ONLY" ]]; then
+        echo "--input requires a path or filename" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    -h|--help)
+      cat <<EOF
+Usage: scripts/afl_repro_hangs.sh [--input <file>]
+
+Env:
+  TARGET=...             fuzz target name
+  PROFILE=release|debug  binary profile (default: release)
+  MODE=rusteze|asan      choose rusteze or asan binary/output tree
+  TIMEOUT_SECS=5         timeout before classifying as hang
+  KILL_AFTER_SECS=1      extra grace before SIGKILL
+  HOST_TARGET=...        rust host target triple for asan binary path
+  OUT_DIR=...            override AFL output dir
+
+Examples:
+  TARGET=image PROFILE=release ./scripts/afl_repro_hangs.sh
+  TARGET=zip PROFILE=release ./scripts/afl_repro_hangs.sh --input id:000000,...
+  TARGET=rkyv MODE=asan PROFILE=release ./scripts/afl_repro_hangs.sh
+EOF
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$TARGET" in
+  bytes) BIN="afl_bytes_driver" ;;
+  smallvec) BIN="afl_smallvec_driver" ;;
+  serde_json|serde) BIN="afl_serde_json_driver" ;;
+  toml) BIN="afl_toml_driver" ;;
+  base64) BIN="afl_base64_driver" ;;
+  uuid) BIN="afl_uuid_driver" ;;
+  itoa) BIN="afl_itoa_driver" ;;
+  quick_xml|quick-xml) BIN="afl_quick_xml_driver" ;;
+  simd_json|simd-json) BIN="afl_simd_json_driver" ;;
+  zip) BIN="afl_zip_driver" ;;
+  rkyv) BIN="afl_rkyv_driver" ;;
+  hyper) BIN="afl_hyper_driver" ;;
+  image) BIN="afl_image_driver" ;;
+  hashbrown) BIN="afl_hashbrown_driver" ;;
+  bumpalo) BIN="afl_bumpalo_driver" ;;
+  indexmap) BIN="afl_indexmap_driver" ;;
+  bootc_kcmdline|bootc-kcmdline|bootc_kernel_cmdline) BIN="afl_bootc_kcmdline_driver" ;;
+  abacus_apportionment|abacus-apportionment) BIN="afl_abacus_apportionment_driver" ;;
+  kvm_bindings|kvm-bindings) BIN="afl_kvm_bindings_driver" ;;
+  *) echo "unknown TARGET=$TARGET (expected bytes|smallvec|serde_json|serde|toml|base64|uuid|itoa|quick_xml|simd_json|zip|rkyv|hyper|image|hashbrown|bumpalo|indexmap|bootc_kcmdline|abacus_apportionment|kvm_bindings)" >&2; exit 2 ;;
+esac
+
+HANG_DIR=""
+if [[ -n "$ONLY" && -f "$ONLY" ]]; then
+  HANG_DIR="$(dirname "$ONLY")"
+elif [[ -d "${OUT_DIR}/${PROFILE}/hangs" ]]; then
+  HANG_DIR="${OUT_DIR}/${PROFILE}/hangs"
+elif [[ -d "${OUT_DIR}/default/hangs" ]]; then
+  HANG_DIR="${OUT_DIR}/default/hangs"
+elif [[ -d "${OUT_DIR}/hangs" ]]; then
+  HANG_DIR="${OUT_DIR}/hangs"
+else
+  echo "missing hangs dir under: $OUT_DIR" >&2
+  exit 2
+fi
+
+if [[ "$MODE" == "asan" ]]; then
+  HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-asan-${PROFILE}-${TARGET}}"
+  BIN_PATH="${HARNESS_TARGET_DIR}/${HOST_TARGET}/${PROFILE}/${BIN}"
+else
+  HARNESS_TARGET_DIR="${HARNESS_TARGET_DIR:-./target/afl-${PROFILE}-${TARGET}}"
+  BIN_PATH="${HARNESS_TARGET_DIR}/${PROFILE}/${BIN}"
+fi
+
+if [[ ! -x "$BIN_PATH" ]]; then
+  echo "missing $BIN_PATH; build first" >&2
+  exit 2
+fi
+
+echo "hang dir: $HANG_DIR"
+echo "binary: $BIN_PATH"
+echo "mode: $MODE"
+echo "timeout: ${TIMEOUT_SECS}s (+${KILL_AFTER_SECS}s kill grace)"
+echo
+
+shopt -s nullglob
+
+if [[ -n "$ONLY" ]]; then
+  if [[ -f "$ONLY" ]]; then
+    files=("$ONLY")
+  else
+    files=("${HANG_DIR}/${ONLY}")
+  fi
+else
+  files=("$HANG_DIR"/*)
+fi
+
+for f in "${files[@]}"; do
+  if [[ "$(basename "$f")" == "README.txt" ]]; then
+    continue
+  fi
+  if [[ ! -f "$f" ]]; then
+    echo "missing hang file: $f" >&2
+    exit 2
+  fi
+
+  echo "=== repro: $f ==="
+  if [[ "$MODE" == "asan" ]]; then
+    echo "+ ASAN_OPTIONS='${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:symbolize=1}' timeout --preserve-status -k ${KILL_AFTER_SECS}s ${TIMEOUT_SECS}s \"$BIN_PATH\" \"$f\""
+    /usr/bin/time -f 'exit=%x elapsed=%e sec maxrss=%M KB' \
+      env ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=1:symbolize=1}" \
+      timeout --preserve-status -k "${KILL_AFTER_SECS}s" "${TIMEOUT_SECS}s" \
+      "$BIN_PATH" "$f" || true
+  else
+    alias_model="${RZ_ALIAS_MODEL:-tb_lite}"
+    sb_lite="${RZ_SB_LITE:-1}"
+    echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} RZ_SB_LITE=${sb_lite} timeout --preserve-status -k ${KILL_AFTER_SECS}s ${TIMEOUT_SECS}s \"$BIN_PATH\" \"$f\""
+    /usr/bin/time -f 'exit=%x elapsed=%e sec maxrss=%M KB' \
+      env \
+      RUSTEZE_FAILFAST=1 \
+      RZ_ABORT_ON_VIOLATION=1 \
+      RZ_INSTRUMENT_ALL_DEPS=1 \
+      RZ_ALIAS_MODEL="${alias_model}" \
+      RZ_SB_LITE="${sb_lite}" \
+      timeout --preserve-status -k "${KILL_AFTER_SECS}s" "${TIMEOUT_SECS}s" \
+      "$BIN_PATH" "$f" || true
+  fi
+  echo
+done

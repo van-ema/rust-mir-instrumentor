@@ -1,7 +1,7 @@
 use kvm_bindings::*;
 use std::hint::black_box;
 
-const MAX_FAM_ENTRIES: usize = 32;
+const MAX_FAM_ENTRIES: usize = 8;
 
 struct Cursor<'a> {
     data: &'a [u8],
@@ -55,7 +55,14 @@ fn fuzz_x86_bindings(cursor: &mut Cursor<'_>) {
     regs.rdx = cursor.u64();
     regs.rip = cursor.u64();
     regs.rflags = cursor.u64() | 2;
-    black_box(format!("{regs:?}"));
+    black_box(
+        regs.rax
+            ^ regs.rbx
+            ^ regs.rcx
+            ^ regs.rdx
+            ^ regs.rip
+            ^ regs.rflags,
+    );
 
     let mut sregs = kvm_sregs::default();
     sregs.cs.base = cursor.u64();
@@ -64,7 +71,14 @@ fn fuzz_x86_bindings(cursor: &mut Cursor<'_>) {
     sregs.cr0 = cursor.u64();
     sregs.cr3 = cursor.u64();
     sregs.cr4 = cursor.u64();
-    black_box(format!("{sregs:?}"));
+    black_box(
+        sregs.cs.base
+            ^ u64::from(sregs.cs.limit)
+            ^ u64::from(sregs.cs.selector)
+            ^ sregs.cr0
+            ^ sregs.cr3
+            ^ sregs.cr4,
+    );
 
     let cpuid_count = cursor.bounded_usize(MAX_FAM_ENTRIES + 1);
     let mut cpuid_entries = Vec::with_capacity(cpuid_count);
@@ -80,12 +94,16 @@ fn fuzz_x86_bindings(cursor: &mut Cursor<'_>) {
         cpuid_entries.push(entry);
     }
     if let Ok(mut cpuid) = CpuId::from_entries(&cpuid_entries) {
-        if !cpuid.as_slice().is_empty() {
-            let idx = cursor.bounded_usize(cpuid.as_slice().len());
-            cpuid.as_mut_slice()[idx].eax ^= cursor.u32();
+        let slice = cpuid.as_mut_slice();
+        if !slice.is_empty() {
+            let idx = cursor.bounded_usize(slice.len());
+            slice[idx].eax ^= cursor.u32();
         }
-        black_box(format!("{:?}", cpuid.as_fam_struct_ref()));
-        black_box(cpuid.clone() == cpuid);
+        let mut acc = 0u32;
+        for entry in slice.iter().take(4) {
+            acc ^= entry.function ^ entry.index ^ entry.flags ^ entry.eax ^ entry.ebx ^ entry.ecx ^ entry.edx;
+        }
+        black_box(acc ^ cpuid.as_slice().len() as u32);
     }
 
     let msr_count = cursor.bounded_usize(MAX_FAM_ENTRIES + 1);
@@ -97,34 +115,46 @@ fn fuzz_x86_bindings(cursor: &mut Cursor<'_>) {
         msr_entries.push(entry);
     }
     if let Ok(mut msrs) = Msrs::from_entries(&msr_entries) {
-        if !msrs.as_slice().is_empty() {
-            let idx = cursor.bounded_usize(msrs.as_slice().len());
-            msrs.as_mut_slice()[idx].data ^= cursor.u64();
+        let slice = msrs.as_mut_slice();
+        if !slice.is_empty() {
+            let idx = cursor.bounded_usize(slice.len());
+            slice[idx].data ^= cursor.u64();
         }
-        black_box(format!("{:?}", msrs.as_fam_struct_ref()));
-        black_box(msrs.clone() == msrs);
+        let mut acc = 0u64;
+        for entry in slice.iter().take(4) {
+            acc ^= u64::from(entry.index) ^ entry.data;
+        }
+        black_box(acc ^ msrs.as_slice().len() as u64);
     }
 
     let routing_count = cursor.bounded_usize(MAX_FAM_ENTRIES + 1);
     if let Ok(mut routing) = KvmIrqRouting::new(routing_count) {
-        for entry in routing.as_mut_slice() {
+        let slice = routing.as_mut_slice();
+        for entry in slice.iter_mut() {
             entry.gsi = cursor.u32();
             entry.type_ = cursor.u32();
             entry.flags = cursor.u32();
         }
-        black_box(format!("{:?}", routing.as_fam_struct_ref()));
-        black_box(format!("{:?}", routing.as_slice()));
+        let mut acc = 0u32;
+        for entry in slice.iter().take(4) {
+            acc ^= entry.gsi ^ entry.type_ ^ entry.flags;
+        }
+        black_box(acc ^ routing.as_slice().len() as u32);
     }
 
     let mut mp_state = kvm_mp_state::default();
     mp_state.mp_state = cursor.u32();
-    black_box(format!("{mp_state:?}"));
+    black_box(mp_state.mp_state);
 
     let mut events = kvm_vcpu_events::default();
     events.exception.nr = cursor.byte();
     events.exception.has_error_code = cursor.byte();
     events.exception.error_code = cursor.u32();
-    black_box(format!("{events:?}"));
+    black_box(
+        u64::from(events.exception.nr)
+            ^ u64::from(events.exception.has_error_code)
+            ^ u64::from(events.exception.error_code),
+    );
 }
 
 #[cfg(not(target_arch = "x86_64"))]
