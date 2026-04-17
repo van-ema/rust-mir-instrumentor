@@ -1,3 +1,0 @@
-# Known limitation: invalid shared-return is not yet flagged by current model.
-# Should eventually fail at return-boundary retag; at minimum on caller deref.
-ok

@@ -854,6 +854,13 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::ptr::write_unaligned",
         CallEffect::Store,
     ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::cell::Cell",
+        MatchKind::EndsWith,
+        "::set",
+        CallEffect::Store,
+    ),
     EffectRule::one(MatchKind::EndsWith, "::write", CallEffect::Store),
     // Memcpy/memmove-like.
     EffectRule::one(
@@ -1591,6 +1598,12 @@ enum InstrKind<'tcx> {
         ptr_local: Local,
         size_op: SizeOperand<'tcx>,
     },
+    /// A write directly to a stack slot tracked via a reborrow anchor tag.
+    /// Uses the allow-untagged runtime path so untouched locals do not report.
+    StackSlotWriteAllowUntagged {
+        local: Local,
+        size_op: SizeOperand<'tcx>,
+    },
     /// A read through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrRead {
@@ -1793,6 +1806,7 @@ struct Hooks {
     def_id_alloc: DefId,
     def_id_write: DefId,
     def_id_write_allow_untagged: DefId,
+    def_id_local_write_allow_untagged: DefId,
     def_id_read: DefId,
     def_id_read_allow_untagged: DefId,
     def_id_use: DefId,
@@ -4000,9 +4014,14 @@ impl MyOptimizationPass {
         ptr_ty: Ty<'tcx>,
     ) -> bool {
         match ptr_ty.kind() {
-            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                self.alias_exempt_for_ty(tcx, body, *pointee)
+            TyKind::Ref(_, pointee, mutbl) => {
+                if matches!(mutbl, Mutability::Mut) {
+                    false
+                } else {
+                    self.alias_exempt_for_ty(tcx, body, *pointee)
+                }
             }
+            TyKind::RawPtr(pointee, _) => self.alias_exempt_for_ty(tcx, body, *pointee),
             _ => false,
         }
     }
@@ -4392,6 +4411,7 @@ impl MyOptimizationPass {
                 let src_local = match rvalue {
                     Rvalue::Use(op) => pass.place_from_operand(op).and_then(|p| p.as_local()),
                     Rvalue::CopyForDeref(p) => p.as_local(),
+                    Rvalue::Ref(_, _, src) | Rvalue::RawPtr(_, src) => Some(src.local),
                     _ => None,
                 }?;
                 if pass.is_pointer_ty(body.local_decls[src_local].ty) {
@@ -6342,6 +6362,37 @@ impl MyOptimizationPass {
                         source_info: stmt.source_info,
                         place: lhs_place.clone(),
                         kind: InstrKind::PtrWrite { ptr_local, size_op },
+                    });
+                }
+            }
+        }
+
+        // Direct stack-slot write: assignment to a tracked local/field without an initial Deref.
+        // Use the local's reborrow anchor as the access tag so writes through the root local
+        // invalidate stale children once that local has been borrowed. Keep this allow-untagged:
+        // most locals are never borrowed, and a zero anchor should stay silent.
+        if let StatementKind::Assign(box (lhs_place, _rhs)) = &stmt.kind {
+            let begins_with_deref = lhs_place
+                .projection
+                .iter()
+                .next()
+                .is_some_and(|pe| matches!(pe, ProjectionElem::Deref));
+            if !begins_with_deref {
+                let lhs_ty = lhs_place.ty(&body.local_decls, tcx).ty;
+                if interesting_stack_locals.contains(&lhs_place.local)
+                    && !self.is_pointer_ty(lhs_ty)
+                {
+                    let size_op = self.size_operand_for_ty(tcx, body, lhs_ty, stmt.source_info.span);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: lhs_place.clone(),
+                        kind: InstrKind::StackSlotWriteAllowUntagged {
+                            local: lhs_place.local,
+                            size_op,
+                        },
                     });
                 }
             }
@@ -8928,6 +8979,12 @@ impl MyOptimizationPass {
                             if let Some(ptr_local) =
                                 self.resolve_ptr_local_for_call_place(tcx, body, block_data, p0)
                             {
+                                let prefer_source_tag = p0.local != ptr_local
+                                    && self.alias_exempt_for_ptr_ty(
+                                        tcx,
+                                        body,
+                                        body.local_decls[p0.local].ty,
+                                    );
                                 let hook_ptr_local = if p0.projection.is_empty()
                                     && self.is_pointer_ty(body.local_decls[p0.local].ty)
                                 {
@@ -8948,7 +9005,11 @@ impl MyOptimizationPass {
                                             },
                                         });
                                     }
-                                    p0.local
+                                    if prefer_source_tag {
+                                        ptr_local
+                                    } else {
+                                        p0.local
+                                    }
                                 } else {
                                     ptr_local
                                 };
@@ -10204,6 +10265,7 @@ impl MyOptimizationPass {
             InstrKind::ConstAlloc { .. } | InstrKind::ConstAllocConst { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrWriteAllowUntagged { .. } => hooks.def_id_write_allow_untagged,
+            InstrKind::StackSlotWriteAllowUntagged { .. } => hooks.def_id_local_write_allow_untagged,
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrReadAllowUntagged { .. } => hooks.def_id_read_allow_untagged,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
@@ -10282,6 +10344,10 @@ impl MyOptimizationPass {
                 | InstrKind::PtrReadAllowUntagged { .. }
                 | InstrKind::PtrWriteAllowUntagged { .. }
                 | InstrKind::ShadowKill { .. } => 2,
+                // Keep stack-slot writes in the same bucket as reborrow-anchor maintenance so
+                // the later-scheduled anchor zeroing is inserted first and then moved after the
+                // write call when we split the block at this statement.
+                InstrKind::StackSlotWriteAllowUntagged { .. } => 1,
                 InstrKind::ShadowStore { .. }
                 | InstrKind::ShadowStoreBoxPointee { .. }
                 | InstrKind::ShadowCopySlot { .. }
@@ -12155,6 +12221,19 @@ impl MyOptimizationPass {
                         }
                     }
                 }
+                InstrKind::StackSlotWriteAllowUntagged { .. } => {
+                    let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        place,
+                        addr_local,
+                        true,
+                    ) else {
+                        continue;
+                    };
+                    (Some(slot_stmt1), slot_stmt2)
+                }
                 InstrKind::CallArgPush { ptr_local, .. } => {
                     let ptr_ty = body.local_decls[ptr_local].ty;
                     if self.is_pointer_ty(ptr_ty) {
@@ -12462,6 +12541,37 @@ impl MyOptimizationPass {
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
                             node: tag_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_size,
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::StackSlotWriteAllowUntagged { local, ref size_op } => {
+                    let Some(tag_local) = reborrow_anchor_local_for_stack_local.get(&local).copied() else {
+                        continue;
+                    };
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                    let (arg_size, mut size_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, size_op);
+                    extra_stmts.append(&mut size_stmts);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned {
+                            node: Operand::Copy(Place::from(tag_local)),
                             span: source_info.span,
                         },
                         Spanned {
@@ -13448,6 +13558,114 @@ impl MyOptimizationPass {
                         Vec::new()
                     }
                 }
+                InstrKind::Raw { src, .. } => {
+                    if let Some(dst_local) = place.as_local() {
+                        if src.projection.is_empty() {
+                            if let Some(anchor_local) =
+                                reborrow_anchor_local_for_stack_local.get(&src.local).copied()
+                            {
+                                if let Some(anchor_source_local) =
+                                    tag_local_for_ptr_local.get(&dst_local).copied()
+                                {
+                                    let anchor_is_zero_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                                    let anchor_should_init_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let anchor_new_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let anchor_selected_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+                                    vec![
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(anchor_is_zero_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Eq,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(anchor_local)),
+                                                        self.const_u64(
+                                                            tcx,
+                                                            source_info.span,
+                                                            0,
+                                                        ),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(anchor_should_init_local),
+                                                Rvalue::Cast(
+                                                    CastKind::IntToInt,
+                                                    Operand::Copy(Place::from(
+                                                        anchor_is_zero_local,
+                                                    )),
+                                                    tcx.types.u64,
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(anchor_new_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            anchor_should_init_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            anchor_source_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(anchor_selected_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Add,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(anchor_local)),
+                                                        Operand::Copy(Place::from(
+                                                            anchor_new_part_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(anchor_local),
+                                                Rvalue::Use(Operand::Copy(Place::from(
+                                                    anchor_selected_local,
+                                                ))),
+                                            ))),
+                                        ),
+                                    ]
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                }
                 _ => Vec::new(),
             };
 
@@ -13960,6 +14178,9 @@ impl MyOptimizationPass {
         let def_id_write_allow_untagged = self
             .find_runtime_fn_def_id(tcx, "__rz_ptr_write_allow_untagged", 3)
             .expect("missing '__rz_ptr_write_allow_untagged' definition");
+        let def_id_local_write_allow_untagged = self
+            .find_runtime_fn_def_id(tcx, "__rz_local_write_allow_untagged", 3)
+            .expect("missing '__rz_local_write_allow_untagged' definition");
         let def_id_read = self
             .find_runtime_fn_def_id(tcx, "__rz_ptr_read", 3)
             .expect("missing '__rz_ptr_read' definition");
@@ -14019,6 +14240,7 @@ impl MyOptimizationPass {
             def_id_alloc,
             def_id_write,
             def_id_write_allow_untagged,
+            def_id_local_write_allow_untagged,
             def_id_read,
             def_id_read_allow_untagged,
             def_id_use,

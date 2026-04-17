@@ -598,6 +598,8 @@ fn tb_lite_check(
             continue;
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
+        let child_unique_ref_ancestor =
+            child && n.tag != access_tag && matches!(n.kind, BorrowKind::Unique);
 
         let next = match (access, child, n.perm, n.protected) {
             // Child/local read: everything except Disabled is unchanged.
@@ -659,6 +661,11 @@ fn tb_lite_check(
             // - Reserved(conflicted) while protected is UB (2-phase noalias violation)
             // - Reserved/Active activate to Active
             // - Frozen/Disabled cannot be written through
+            (AliasAccessKind::Write, true, _, _)
+                if child_unique_ref_ancestor && matches!(tmeta.kind, PtrKind::RefMut) =>
+            {
+                TbPerm::Disabled
+            }
             (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
                 if tb_has_usable_clean_unique_ancestor(
                     &tree.nodes,
@@ -694,13 +701,14 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                ) || tb_only_same_family_overlap(
-                    &tree.nodes,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) {
+                ) || (matches!(tmeta.kind, PtrKind::RawMut)
+                    && tb_only_same_family_overlap(
+                        &tree.nodes,
+                        &access_lineage,
+                        addr,
+                        size,
+                        tmeta.alloc_epoch,
+                    )) {
                     n.perm
                 } else {
                     let mut msg = format!(

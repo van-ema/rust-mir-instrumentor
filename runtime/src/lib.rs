@@ -2798,6 +2798,20 @@ pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
     __rz_ptr_write(tag, addr, size);
 }
 
+/// Record a direct write to a stack slot/root local.
+/// This is not a normal tagged pointer dereference. Model it as a fresh unique child borrow
+/// rooted at the current local-anchor family, then perform the write through that fresh tag.
+#[no_mangle]
+#[track_caller]
+pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
+    if tag == 0 || size == 0 {
+        return;
+    }
+    let write_tag = __record_ref_creation(addr, 1, tag, 0, size);
+    let _relax = RelaxEpochGuard::enter();
+    __rz_ptr_write(write_tag, addr, size);
+}
+
 /// Record/validate a read through a tracked pointer tag.
 /// Best-effort checks:
 ///  - tag must exist

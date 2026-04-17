@@ -642,7 +642,10 @@ fn sb_lite_check(
                         }
                         // For raw writes derived from a unique ref, allow shared reborrows
                         // above as a best-effort heuristic (we do not track reborrow ends).
-                        if matches!(tmeta.kind, PtrKind::RawMut) && !seen_unique {
+                        if matches!(tmeta.kind, PtrKind::RawMut)
+                            && !tmeta.alias_exempt
+                            && !seen_unique
+                        {
                             sb_lite_invalidate_overlapping_above(
                                 stack,
                                 idx,

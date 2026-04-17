@@ -23,8 +23,8 @@ Current numbers are easy to misread:
 - total bins in mixed micro suites are not headline metric
 
 Current exact-port comparison:
-- `17 / 21 = 81.0%` agreement
-- report: `reports/miri_compare/20260417_133809/summary.tsv`
+- `21 / 21 = 100.0%` agreement
+- report: `reports/miri_compare/20260417_224407/summary.tsv`
 
 This is honest, but sample too small.
 
@@ -33,10 +33,7 @@ It is their filtered relevant subset from Miri's suite.
 We need our own filtered exact-port number, much larger than `15`.
 
 Current disagreement set:
-- `miri_sb_exact::aliasing_mut4`
-- `miri_sb_exact::outdated_local`
-- `miri_sb_exact::shr_frozen_violation2`
-- `miri_tb_exact::alternate_read_write`
+- none on the current exact-port set
 
 ## Required Output
 
@@ -114,10 +111,8 @@ For each disagreement:
 ### Phase 3: Raise Agreement
 
 Attack highest-yield disagreement clusters first:
-- `Cell` / interior-mutation exclusivity gaps
-- stale local / parent-reactivation gap
-- shared-ref freeze-after-write gap
-- Tree Borrows alternating read/write freeze gap
+- import more exact ports beyond the current `21`
+- keep disagreement buckets if new ports expose new gaps
 
 ## Milestones
 
