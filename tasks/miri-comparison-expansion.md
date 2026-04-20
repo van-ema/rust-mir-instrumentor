@@ -17,14 +17,14 @@ Do **not** mix these categories in a single headline number.
 ## Why
 
 Current numbers are easy to misread:
-- exact Miri ports in dedicated dirs: `21`
+- exact Miri ports in dedicated dirs: `37`
 - Miri-inspired but not exact ports: `13`
-- total Miri-related tests: `34`
+- total Miri-related tests: `50`
 - total bins in mixed micro suites are not headline metric
 
 Current exact-port comparison:
-- `21 / 21 = 100.0%` agreement
-- report: `reports/miri_compare/20260417_224407/summary.tsv`
+- `37 / 37 = 100.0%` agreement
+- report: `reports/miri_compare/20260420_130347/summary.tsv`
 
 This is honest, but sample too small.
 
@@ -33,7 +33,9 @@ It is their filtered relevant subset from Miri's suite.
 We need our own filtered exact-port number, much larger than `15`.
 
 Current disagreement set:
-- none on the current exact-port set
+- none in the current exact-port set (`37 / 37`)
+
+Next disagreement work should target newly imported exact ports beyond the current `37`.
 
 ## Required Output
 
@@ -111,8 +113,9 @@ For each disagreement:
 ### Phase 3: Raise Agreement
 
 Attack highest-yield disagreement clusters first:
-- import more exact ports beyond the current `21`
-- keep disagreement buckets if new ports expose new gaps
+- import more exact ports beyond the current `37`
+- keep exact-port agreement at `100%` while growing toward `50+`
+- separate exact-port growth from older inspired/regression-suite cleanup
 
 ## Milestones
 

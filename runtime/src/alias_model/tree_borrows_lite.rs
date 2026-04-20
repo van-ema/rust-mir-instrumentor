@@ -35,8 +35,10 @@ struct TbNode {
     perm: TbPerm,
     start: usize,
     len: usize,
+    extra_ranges: Vec<(usize, usize)>,
     alive: bool,
     protected: bool,
+    poisoned_by_protector_end: bool,
 }
 
 #[derive(Default)]
@@ -205,10 +207,48 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         let Some(tree) = all.get_mut(&base) else {
             continue;
         };
+        let active_protected_unique = tree
+            .nodes
+            .get(&tag)
+            .filter(|node| matches!(node.kind, BorrowKind::Unique) && matches!(node.perm, TbPerm::Active))
+            .cloned();
+        if let Some(protected_node) = active_protected_unique {
+            let descendant_tags: Vec<u64> = tree
+                .nodes
+                .values()
+                .filter(|n| n.tag != tag && tb_is_ancestor(&tree.nodes, tag, n.tag))
+                .map(|n| n.tag)
+                .collect();
+            for descendant in descendant_tags {
+                if let Some(node) = tree.nodes.get_mut(&descendant) {
+                    tb_disable_node_for_protector_end(node);
+                }
+            }
+            let foreign_overlap_tags: Vec<u64> = tree
+                .nodes
+                .values()
+                .filter(|n| n.tag != tag)
+                .filter(|n| tb_is_live_node(n))
+                .filter(|n| {
+                    tb_node_overlaps(n, protected_node.start, protected_node.len)
+                        || protected_node
+                            .extra_ranges
+                            .iter()
+                            .any(|(start, len)| tb_node_overlaps(n, *start, *len))
+                })
+                .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, tag) && !tb_is_ancestor(&tree.nodes, tag, n.tag))
+                .map(|n| n.tag)
+                .collect();
+            for foreign in foreign_overlap_tags {
+                if let Some(node) = tree.nodes.get_mut(&foreign) {
+                    tb_disable_node_for_protector_end(node);
+                }
+            }
+        }
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
             if !returned_tags.contains(&tag) {
-                tb_disable_node(node);
+                tb_disable_node_for_protector_end(node);
             }
         }
     }
@@ -258,41 +298,66 @@ fn tb_lite_validate_ref_creation(
     if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
         return None;
     }
-    // Creation-time mutable reborrow conflicts are always checked in TB-lite.
     if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
-        return None;
-    }
-
-    // In TB-lite, only mutable reborrows are rejected at creation time.
-    // Shared reborrows are always admitted and may freeze behavior at access time.
-    if !matches!(new_kind, PtrKind::RefMut) {
         return None;
     }
 
     let new_len = tb_effective_len(bounds_len);
     let new_end = pointee_addr.saturating_add(new_len);
     let base = tb_base_for_addr(pointee_addr);
-    let (parent_ref, parent_epoch) = if parent_tag != 0 {
+    let (parent_ref, parent_epoch, parent_tag_epoch) = if parent_tag != 0 {
         let tmap = tags().lock().unwrap();
         let pref = tb_lite_find_ref_ancestor_tag(&tmap, parent_tag);
         let pep = pref
             .and_then(|t| tmap.get(&t).map(|m| m.alloc_epoch))
             .unwrap_or(0);
-        (pref, pep)
+        let ptag_epoch = tmap.get(&parent_tag).map(|m| m.alloc_epoch).unwrap_or(0);
+        (pref, pep, ptag_epoch)
     } else {
-        (None, 0)
-    };
-
-    let Some(parent_ref) = parent_ref else {
-        // Without a ref ancestor we cannot reason about branch lineage reliably.
-        // Skip creation-time rejection and let access-time invalidation/checks decide.
-        return None;
+        (None, 0, 0)
     };
 
     let state = tb_state().lock().unwrap();
     let Some(tree) = state.get(&base) else {
         return None;
     };
+    if let Some(parent_node) = tree.nodes.get(&parent_tag) {
+        if (parent_tag_epoch == 0
+            || parent_node.alloc_epoch == 0
+            || parent_node.alloc_epoch == parent_tag_epoch)
+            && !tb_is_live_node(parent_node)
+            && parent_node.poisoned_by_protector_end
+        {
+            let access_name = match new_kind {
+                PtrKind::RefMut => "WRITE",
+                PtrKind::RefShared => "READ",
+                _ => "READ",
+            };
+            return Some(format!(
+                "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALID_PARENT_REF_CREATE create_kind={:?} parent_perm={:?}",
+                access_name,
+                parent_tag,
+                pointee_addr,
+                new_len,
+                parent_node.kind,
+                new_kind,
+                parent_node.perm,
+            ));
+        }
+    }
+
+    let Some(parent_ref) = parent_ref else {
+        // Without a ref ancestor we cannot reason about branch lineage reliably.
+        // Skip creation-time overlap rejection and let access-time invalidation/checks decide.
+        return None;
+    };
+
+    if !matches!(new_kind, PtrKind::RefMut) {
+        // Shared reborrows still validate that the immediate parent tag itself is alive (above),
+        // but they defer overlap/freeze behavior to access-time transitions.
+        return None;
+    }
+
     if !tree.nodes.contains_key(&parent_ref) {
         // Parent lineage is not materialized in TB state (best-effort metadata loss).
         // Be conservative and defer to access-time checks rather than rejecting now.
@@ -406,8 +471,10 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         perm,
         start: tmeta.pointee_addr,
         len: tb_effective_len(tmeta.bounds_len),
+        extra_ranges: Vec::new(),
         alive: true,
         protected,
+        poisoned_by_protector_end: false,
     };
     tree.nodes.insert(tag, node.clone());
 
@@ -551,6 +618,7 @@ fn tb_lite_check(
                 if let Some(n) = tree.nodes.get_mut(&access_tag) {
                     n.perm = TbPerm::Active;
                     n.alive = true;
+                    n.poisoned_by_protector_end = false;
                 }
                 return None;
             }
@@ -568,6 +636,8 @@ fn tb_lite_check(
         return Some(msg);
     }
 
+    tb_note_protected_child_access(tree, &access_lineage, addr, size, tmeta.alloc_epoch);
+
     // Apply a TB-lite transition to all overlapping nodes.
     // `child` means the access goes through this node's lineage (node is an ancestor
     // of the accessing tag, including itself). `foreign` means all other overlaps.
@@ -582,7 +652,7 @@ fn tb_lite_check(
                         && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
                     && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
         })
-        .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
+        .filter(|n| tb_node_overlaps(n, addr, size))
         .filter(|n| {
             if tmeta.alloc_epoch != 0 && n.alloc_epoch != 0 && n.alloc_epoch != tmeta.alloc_epoch {
                 return false;
@@ -797,6 +867,9 @@ fn tb_lite_check(
         if let Some(n) = tree.nodes.get_mut(&tag) {
             n.perm = next;
             n.alive = next != TbPerm::Disabled;
+            if next != TbPerm::Disabled {
+                n.poisoned_by_protector_end = false;
+            }
         }
     }
 
@@ -899,6 +972,15 @@ fn tb_ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize)
 }
 
 #[inline]
+fn tb_node_overlaps(node: &TbNode, addr: usize, size: usize) -> bool {
+    tb_ranges_overlap(addr, size, node.start, node.len)
+        || node
+            .extra_ranges
+            .iter()
+            .any(|(start, len)| tb_ranges_overlap(addr, size, *start, *len))
+}
+
+#[inline]
 fn tb_is_live_node(n: &TbNode) -> bool {
     n.alive && n.perm != TbPerm::Disabled
 }
@@ -907,6 +989,14 @@ fn tb_is_live_node(n: &TbNode) -> bool {
 fn tb_disable_node(n: &mut TbNode) {
     n.perm = TbPerm::Disabled;
     n.alive = false;
+    n.poisoned_by_protector_end = false;
+}
+
+#[inline]
+fn tb_disable_node_for_protector_end(n: &mut TbNode) {
+    n.perm = TbPerm::Disabled;
+    n.alive = false;
+    n.poisoned_by_protector_end = true;
 }
 
 fn tb_collect_lineage(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> Vec<u64> {
@@ -922,6 +1012,38 @@ fn tb_collect_lineage(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> Vec<u64> {
         tag = node.parent;
     }
     lineage
+}
+
+fn tb_note_protected_child_access(
+    tree: &mut TbAllocState,
+    access_lineage: &[u64],
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) {
+    let size = tb_effective_len(size);
+    for &tag in access_lineage {
+        let Some(node) = tree.nodes.get_mut(&tag) else {
+            continue;
+        };
+        if !node.protected {
+            continue;
+        }
+        if alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != alloc_epoch {
+            continue;
+        }
+        if tb_ranges_overlap(addr, size, node.start, node.len) {
+            continue;
+        }
+        if node
+            .extra_ranges
+            .iter()
+            .any(|(start, len)| tb_ranges_overlap(addr, size, *start, *len))
+        {
+            continue;
+        }
+        node.extra_ranges.push((addr, size));
+    }
 }
 
 #[inline]
@@ -1118,7 +1240,7 @@ fn tb_only_unique_ancestor_overlap(
     access_epoch: u64,
 ) -> bool {
     nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
             return true;
         }
         if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
@@ -1141,7 +1263,7 @@ fn tb_only_same_family_overlap(
     access_epoch: u64,
 ) -> bool {
     nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
             return true;
         }
         if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
@@ -1223,7 +1345,7 @@ fn tb_same_lineage_protected_conflict_ok(
         return false;
     }
     nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_ranges_overlap(addr, size, other.start, other.len) {
+        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
             return true;
         }
         tb_is_effective_ancestor(nodes, tmap, other.tag, access_tag)

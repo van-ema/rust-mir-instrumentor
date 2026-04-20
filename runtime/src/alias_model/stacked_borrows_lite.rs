@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use crate::{allocs, find_alloc_containing, rz_sb_suppressed, tags, PtrKind, TagMeta};
+use crate::{
+    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed,
+    tags, PtrKind, TagMeta,
+};
 
 use super::{AliasAccessKind, AliasModel};
 
@@ -19,12 +22,25 @@ struct BorrowEntry {
     kind: BorrowKind,
     start: usize,
     end: usize,
+    protected: bool,
 }
 
 static BORROWS: OnceLock<Mutex<HashMap<usize, Vec<BorrowEntry>>>> = OnceLock::new();
+static SB_PROTECTOR_FRAMES: OnceLock<Mutex<Vec<SbProtectorFrame>>> = OnceLock::new();
 
 fn borrows() -> &'static Mutex<HashMap<usize, Vec<BorrowEntry>>> {
     BORROWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Default)]
+struct SbProtectorFrame {
+    callee_id: u64,
+    pending_parent_tags: Vec<u64>,
+    protected_tags: Vec<u64>,
+}
+
+fn sb_protector_frames() -> &'static Mutex<Vec<SbProtectorFrame>> {
+    SB_PROTECTOR_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 #[inline]
@@ -76,6 +92,14 @@ impl AliasModel for StackedBorrowsLiteModel {
 
     fn on_tag_created(&self, tag: u64, tmeta: &TagMeta) {
         sb_lite_push(tag, tmeta);
+    }
+
+    fn on_call_arg_taken(&self, callee_id: u64, parent_tag: u64) {
+        sb_lite_on_call_arg_taken(callee_id, parent_tag);
+    }
+
+    fn on_call_exit(&self, callee_id: u64) {
+        sb_lite_on_call_exit(callee_id);
     }
 
     fn find_ref_ancestor_tag(&self, tmap: &HashMap<u64, TagMeta>, tag: u64) -> Option<u64> {
@@ -140,12 +164,93 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
         stack.clear();
     }
 
+    let protected = sb_lite_mark_protected_if_pending(tag, tmeta.parent, kind);
     stack.push(BorrowEntry {
         tag,
         kind,
         start,
         end,
+        protected,
     });
+}
+
+fn sb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
+    if !rz_sb_lite_enabled() || parent_tag == 0 {
+        return;
+    }
+    let mut frames = sb_protector_frames().lock().unwrap();
+    match frames.last_mut() {
+        Some(top) if top.callee_id == callee_id => {
+            top.pending_parent_tags.push(parent_tag);
+        }
+        _ => {
+            frames.push(SbProtectorFrame {
+                callee_id,
+                pending_parent_tags: vec![parent_tag],
+                protected_tags: Vec::new(),
+            });
+        }
+    }
+}
+
+fn sb_lite_on_call_exit(callee_id: u64) {
+    if !rz_sb_lite_enabled() {
+        return;
+    }
+
+    let popped = {
+        let mut frames = sb_protector_frames().lock().unwrap();
+        frames
+            .iter()
+            .rposition(|f| f.callee_id == callee_id)
+            .map(|idx| frames.remove(idx))
+    };
+
+    let Some(frame) = popped else {
+        return;
+    };
+    if frame.protected_tags.is_empty() {
+        return;
+    }
+
+    let returned_tags: HashSet<u64> = ret_tags()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((ret_callee_id, _addr), _tag)| *ret_callee_id == callee_id)
+        .map(|((_ret_callee_id, _addr), tag)| *tag)
+        .collect();
+
+    let mut bmap = borrows().lock().unwrap();
+    for stack in bmap.values_mut() {
+        stack.retain_mut(|entry| {
+            if !frame.protected_tags.contains(&entry.tag) {
+                return true;
+            }
+            if returned_tags.contains(&entry.tag) {
+                entry.protected = false;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn sb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) -> bool {
+    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique) || parent == 0 {
+        return false;
+    }
+    let mut frames = sb_protector_frames().lock().unwrap();
+    let Some(top) = frames.last_mut() else {
+        return false;
+    };
+    let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
+        return false;
+    };
+    top.pending_parent_tags.swap_remove(pos);
+    top.protected_tags.push(tag);
+    true
 }
 
 fn sb_lite_validate_ref_creation(
@@ -492,7 +597,7 @@ fn sb_lite_check(
         for (i, entry) in stack.iter().enumerate() {
             if let Some(tm) = tmap.get(&entry.tag) {
                 out.push_str(&format!(
-                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} bounds_len={} range=[0x{:x},0x{:x}) alias_exempt={}\n",
+                    "  {i}: tag={} stack_kind={:?} ptr_kind={:?} parent={} pointee=0x{:x} bounds_len={} range=[0x{:x},0x{:x}) protected={} alias_exempt={}\n",
                     entry.tag,
                     entry.kind,
                     tm.kind,
@@ -501,12 +606,13 @@ fn sb_lite_check(
                     tm.bounds_len,
                     entry.start,
                     entry.end,
+                    entry.protected,
                     tm.alias_exempt
                 ));
             } else {
                 out.push_str(&format!(
-                    "  {i}: tag={} stack_kind={:?} <missing>\n",
-                    entry.tag, entry.kind
+                    "  {i}: tag={} stack_kind={:?} protected={} <missing>\n",
+                    entry.tag, entry.kind, entry.protected
                 ));
             }
         }
@@ -515,6 +621,51 @@ fn sb_lite_check(
     } else {
         String::new()
     };
+
+    {
+        let tmap = tags().lock().unwrap();
+        let access_tag = if orig_tag != 0 { orig_tag } else { sb_tag };
+        for entry in stack.iter().rev() {
+            if !entry.protected || !ranges_overlap(entry.start, entry.end, access_start, access_end)
+            {
+                continue;
+            }
+            let same_or_descendant = access_tag == entry.tag
+                || sb_lite_tag_is_descendant_of(&tmap, access_tag, entry.tag);
+            if same_or_descendant {
+                continue;
+            }
+            let protected_conflict = match (entry.kind, access) {
+                (BorrowKind::Shared, AliasAccessKind::Write) => true,
+                (BorrowKind::Unique, AliasAccessKind::Read | AliasAccessKind::Write) => true,
+                _ => false,
+            };
+            if protected_conflict {
+                let mut msg = format!(
+                    "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=SB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+                    match access {
+                        AliasAccessKind::Read => "READ",
+                        AliasAccessKind::Write => "WRITE",
+                    },
+                    access_tag,
+                    addr,
+                    size,
+                    tmeta.kind,
+                    entry.tag,
+                    entry.kind
+                );
+                msg.push_str(&dump);
+                return Some(append_location_if_enabled(msg, "RZ_LOG_LOC"));
+            }
+        }
+    }
+
+    if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        let tmap = tags().lock().unwrap();
+        if sb_lite_find_ref_ancestor_tag(&tmap, orig_tag).is_none() {
+            return None;
+        }
+    }
 
     match access {
         AliasAccessKind::Read => {
@@ -602,6 +753,7 @@ fn sb_lite_check(
                         kind: BorrowKind::Unique,
                         start: access_start,
                         end: access_end,
+                        protected: false,
                     });
                     return None;
                 }

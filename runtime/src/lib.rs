@@ -2403,7 +2403,9 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
-        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+        active_alias_model()
+            .find_ref_ancestor_tag(&tmap, tag)
+            .or_else(|| (active_alias_model().name() == "sb_lite").then_some(tag))
     } else {
         Some(tag)
     };
@@ -2859,7 +2861,9 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         let tmap = tags().lock().unwrap();
-        active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+        active_alias_model()
+            .find_ref_ancestor_tag(&tmap, tag)
+            .or_else(|| (active_alias_model().name() == "sb_lite").then_some(tag))
     } else {
         Some(tag)
     };

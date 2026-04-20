@@ -2277,13 +2277,28 @@ impl MyOptimizationPass {
                         op,
                         _,
                     ) => {
+                        let mut has_tag_source = false;
                         if let Some(src_local) =
                             self.place_from_operand(op).and_then(|p| p.as_local())
                         {
                             let src_ty = body.local_decls[src_local].ty;
                             if self.is_pointer_ty(src_ty) {
-                                locals.insert(dst_local);
+                                has_tag_source = true;
                             }
+                        }
+                        if !has_tag_source && matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
+                        {
+                            let src_ty = op.ty(body, tcx);
+                            has_tag_source = match src_ty.kind() {
+                                TyKind::Adt(adt, _) => {
+                                    let name = tcx.def_path_str(adt.did());
+                                    name.contains("::NonNull") || name.contains("::Unique")
+                                }
+                                _ => false,
+                            };
+                        }
+                        if has_tag_source {
+                            locals.insert(dst_local);
                         }
                     }
                     Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
@@ -2418,6 +2433,21 @@ impl MyOptimizationPass {
         );
 
         Some((slot_ptr_stmt, addr_stmt))
+    }
+
+    fn supports_arg_anchor_take_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        let local_ty = body.local_decls[local].ty;
+        if !local_ty.is_sized(tcx, body.typing_env(tcx)) {
+            return false;
+        }
+
+        let raw_ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
+        self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
     }
 
     /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
@@ -5814,6 +5844,16 @@ impl MyOptimizationPass {
             }
         }
 
+        if !src_place.projection.is_empty() && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+        {
+            if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
+                .get(&src_place.local)
+                .copied()
+            {
+                return Operand::Copy(Place::from(anchor_local));
+            }
+        }
+
         self.const_u64(tcx, source_info.span, 0)
     }
 
@@ -6163,19 +6203,24 @@ impl MyOptimizationPass {
                         ptr_local: arg_local,
                     },
                 });
-            } else if interesting_stack_locals.contains(&arg_local) {
-                insert_points.push(InsertPoint {
-                    bb: entry_bb,
-                    stmt_idx: entry_stmt_idx,
-                    insert_before: false,
-                    source_info: entry_source_info,
-                    place: Place::from(arg_local),
-                    kind: InstrKind::ArgAnchorTake {
-                        callee_id,
-                        arg_index: arg_index as u64,
-                        local: arg_local,
-                    },
-                });
+            } else if interesting_stack_locals.contains(&arg_local)
+                || self.is_box_ty(tcx, arg_ty)
+                || self.ty_contains_pointer_fields(tcx, body, arg_ty, 8)
+            {
+                if self.supports_arg_anchor_take_local(tcx, body, arg_local) {
+                    insert_points.push(InsertPoint {
+                        bb: entry_bb,
+                        stmt_idx: entry_stmt_idx,
+                        insert_before: false,
+                        source_info: entry_source_info,
+                        place: Place::from(arg_local),
+                        kind: InstrKind::ArgAnchorTake {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            local: arg_local,
+                        },
+                    });
+                }
             }
         }
     }
@@ -6624,7 +6669,17 @@ impl MyOptimizationPass {
                     ) = rvalue
                     {
                         let src_ty = op.ty(&body.local_decls, tcx);
+                        let explicit_nonnull_transmute = matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
+                            && matches!(
+                                src_ty.kind(),
+                                TyKind::Adt(adt, _)
+                                    if {
+                                        let name = tcx.def_path_str(adt.did());
+                                        name.contains("::NonNull") || name.contains("::Unique")
+                                    }
+                            );
                         if !self.is_pointer_ty(src_ty)
+                            && !explicit_nonnull_transmute
                             && self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
                         {
                             let is_mut = self.ptr_is_mut(dst_ty);
@@ -7435,6 +7490,32 @@ impl MyOptimizationPass {
                                         is_ref,
                                     },
                                 });
+                            } else if let Some(src_place) = src_place_opt {
+                                if !is_ref {
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::Raw {
+                                            is_mut,
+                                            src: src_place,
+                                        },
+                                    });
+                                } else {
+                                    insert_points.push(InsertPoint {
+                                        bb,
+                                        stmt_idx,
+                                        insert_before: false,
+                                        source_info: stmt.source_info,
+                                        place: Place::from(dst_local),
+                                        kind: InstrKind::RawRoot {
+                                            ptr_local: dst_local,
+                                            is_mut,
+                                        },
+                                    });
+                                }
                             } else {
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -12008,8 +12089,15 @@ impl MyOptimizationPass {
                 let addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
-                let (addr_stmt1_opt, addr_stmt2) = self
-                    .addr_stmts_for_place(tcx, body, source_info, Place::from(local), addr_local)
+                let (addr_stmt1, addr_stmt2) = self
+                    .slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        Place::from(local),
+                        addr_local,
+                        false,
+                    )
                     .expect("ArgAnchorTake on unsupported local");
                 let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
@@ -12075,9 +12163,7 @@ impl MyOptimizationPass {
                         stmt_idx
                     };
                     let rem = bd.statements.split_off(split_at);
-                    if let Some(addr_stmt1) = addr_stmt1_opt {
-                        bd.statements.push(addr_stmt1);
-                    }
+                    bd.statements.push(addr_stmt1);
                     bd.statements.push(addr_stmt2);
                     bd.terminator = Some(take_term);
                     rem
@@ -14019,6 +14105,226 @@ impl MyOptimizationPass {
                 body.basic_blocks_mut()[cont_block]
                     .statements
                     .extend(remaining_stmts);
+                continue;
+            }
+
+            if let InstrKind::ArgAnchorTake {
+                callee_id,
+                arg_index,
+                local,
+            } = creation_kind
+            {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&local)
+                    .expect("missing anchor local for ArgAnchorTake");
+                let local_ty = body.local_decls[local].ty;
+                if self.is_box_ty(tcx, local_ty) {
+                    let take_addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let (take_addr_stmt1, take_addr_stmt2) = self
+                        .slot_addr_stmts_for_place(
+                            tcx,
+                            body,
+                            source_info,
+                            Place::from(local),
+                            take_addr_local,
+                            false,
+                        )
+                        .expect("ArgAnchorTake on unsupported local");
+                    let parent_tag_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let pointee_addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let Some((pointee_addr_stmt1, pointee_addr_stmt2)) = self
+                        .box_pointee_slot_addr_stmts_for_local(
+                            tcx,
+                            body,
+                            source_info,
+                            local,
+                            pointee_addr_local,
+                        )
+                    else {
+                        panic!("ArgAnchorTake box local missing pointee address support");
+                    };
+
+                    let (orig_term, is_cleanup) = {
+                        let bd = &mut body.basic_blocks_mut()[bb];
+                        let term = bd.terminator.take();
+                        let cleanup = bd.is_cleanup;
+                        (term, cleanup)
+                    };
+                    let cont_block = {
+                        let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                        body.basic_blocks_mut().push(cont_data)
+                    };
+                    let record_term = Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: Operand::function_handle(
+                                tcx,
+                                hooks.def_id_ref,
+                                std::iter::empty(),
+                                source_info.span,
+                            ),
+                            args: vec![
+                                Spanned {
+                                    node: Operand::Copy(Place::from(pointee_addr_local)),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u8(tcx, source_info.span, 1),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: Operand::Copy(Place::from(parent_tag_local)),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u8(tcx, source_info.span, 0),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_usize(tcx, source_info.span, 0),
+                                    span: source_info.span,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                            destination: Place::from(anchor_local),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    };
+                    let record_block = {
+                        let record_data = BasicBlockData::new(Some(record_term), is_cleanup);
+                        body.basic_blocks_mut().push(record_data)
+                    };
+                    let take_term = Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: Operand::function_handle(
+                                tcx,
+                                hooks.def_id_take_call_arg_tag,
+                                std::iter::empty(),
+                                source_info.span,
+                            ),
+                            args: vec![
+                                Spanned {
+                                    node: self.const_u64(tcx, source_info.span, callee_id),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u64(tcx, source_info.span, arg_index),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: Operand::Copy(Place::from(take_addr_local)),
+                                    span: source_info.span,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                            destination: Place::from(parent_tag_local),
+                            target: Some(record_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    };
+                    let remaining_stmts = {
+                        let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                        let split_at = if stmt_idx > bd.statements.len() {
+                            bd.statements.len()
+                        } else {
+                            stmt_idx
+                        };
+                        let rem = bd.statements.split_off(split_at);
+                        bd.statements.push(take_addr_stmt1);
+                        bd.statements.push(take_addr_stmt2);
+                        bd.statements.push(pointee_addr_stmt1);
+                        bd.statements.push(pointee_addr_stmt2);
+                        bd.terminator = Some(take_term);
+                        rem
+                    };
+                    body.basic_blocks_mut()[cont_block]
+                        .statements
+                        .extend(remaining_stmts);
+                } else {
+                    let addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let (addr_stmt1, addr_stmt2) = self
+                        .slot_addr_stmts_for_place(
+                            tcx,
+                            body,
+                            source_info,
+                            Place::from(local),
+                            addr_local,
+                            false,
+                        )
+                        .expect("ArgAnchorTake on unsupported local");
+
+                    let (orig_term, is_cleanup) = {
+                        let bd = &mut body.basic_blocks_mut()[bb];
+                        let term = bd.terminator.take();
+                        let cleanup = bd.is_cleanup;
+                        (term, cleanup)
+                    };
+                    let cont_block = {
+                        let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                        body.basic_blocks_mut().push(cont_data)
+                    };
+                    let take_term = Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: Operand::function_handle(
+                                tcx,
+                                hooks.def_id_take_call_arg_tag,
+                                std::iter::empty(),
+                                source_info.span,
+                            ),
+                            args: vec![
+                                Spanned {
+                                    node: self.const_u64(tcx, source_info.span, callee_id),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u64(tcx, source_info.span, arg_index),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: Operand::Copy(Place::from(addr_local)),
+                                    span: source_info.span,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                            destination: Place::from(anchor_local),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    };
+                    let remaining_stmts = {
+                        let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                        let split_at = if stmt_idx > bd.statements.len() {
+                            bd.statements.len()
+                        } else {
+                            stmt_idx
+                        };
+                        let rem = bd.statements.split_off(split_at);
+                        bd.statements.push(addr_stmt1);
+                        bd.statements.push(addr_stmt2);
+                        bd.terminator = Some(take_term);
+                        rem
+                    };
+                    body.basic_blocks_mut()[cont_block]
+                        .statements
+                        .extend(remaining_stmts);
+                }
             }
         }
     }
