@@ -1628,7 +1628,12 @@ enum InstrKind<'tcx> {
     ShadowStore {
         src_local: Local,
     },
-    /// Store tag metadata for a pointer local into the heap pointee slot of a Box<T>.
+    /// Store tag metadata for a pointer local into the heap pointee slot of a `Box<T>`.
+    ///
+    /// This is used for calls like `Box::new(p)` where `p` is itself pointer-typed. The pointer
+    /// value is written into newly-allocated heap memory owned by the returned box, so we must
+    /// also write the pointer's shadow metadata into that heap slot to preserve lineage for later
+    /// loads such as `let q = *boxed_ptr`.
     ShadowStoreBoxPointee {
         box_local: Local,
         src_local: Local,
@@ -1713,7 +1718,17 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
     },
-    /// Caller-side validation for non-pointer by-value carriers that contain refs.
+    /// Caller-side validation for a by-value argument that is not itself pointer-typed,
+    /// but carries a reference inside an aggregate/container.
+    ///
+    /// Examples:
+    /// - `Option<&T>`
+    /// - `(&T, bool)`
+    /// - `struct Wrap<'a> { r: &'a T }`
+    ///
+    /// We do not push/take a call-boundary tag for these values because the ABI value is not a
+    /// plain pointer local. Instead we recover the inner reference lineage from the carrier local
+    /// and validate it immediately before the call.
     CallArgValidate {
         local: Local,
     },
@@ -1723,13 +1738,29 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
     },
-    /// Callee-side lineage anchor initialization for non-pointer by-value arguments.
+    /// Callee-side lineage anchor initialization for a non-pointer by-value argument.
+    ///
+    /// Used for argument carriers such as `Option<&T>`, tuples, or small wrapper structs when the
+    /// callee local is not itself pointer-typed but still needs a stable reborrow-family anchor.
+    /// The callee consumes the caller-pushed call-argument tag from the runtime side channel and
+    /// stores it into the local anchor slot, so later inner-ref recovery does not fall back to
+    /// `parent=0`.
     ArgAnchorTake {
         callee_id: u64,
         arg_index: u64,
         local: Local,
     },
-    /// Callee-side: validate the tag carried by a non-pointer return carrier.
+    /// Callee-side validation for a return value that is not itself pointer-typed,
+    /// but carries a reference inside an aggregate/container.
+    ///
+    /// Examples:
+    /// - `Option<&T>`
+    /// - `(&T, bool)`
+    /// - `struct Wrap<'a> { r: &'a T }`
+    ///
+    /// Pointer returns use `RetPush`/`RetTake`. This hook exists for wrapper returns where the
+    /// returned MIR local is not a plain pointer local, so we instead recover the inner reference
+    /// lineage from `RETURN_PLACE` and validate it right before `Return`.
     RetValidate {
         local: Local,
     },
@@ -1923,6 +1954,11 @@ impl MyOptimizationPass {
         self.is_pointer_ty(ty) && self.is_thin_ptr_ty(tcx, body, ty)
     }
 
+    /// Best-effort recursive check for whether `ty` contains any reference/raw-pointer field.
+    ///
+    /// This is used for non-pointer carrier values such as `Option<&T>`, tuples, or small wrapper
+    /// structs so we can still add boundary validation/lineage handling even when the MIR local is
+    /// not itself pointer-typed.
     fn ty_contains_pointer_fields<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -2384,6 +2420,13 @@ impl MyOptimizationPass {
         Some((slot_ptr_stmt, addr_stmt))
     }
 
+    /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
+    ///
+    /// This is specifically for `ShadowStoreBoxPointee`: after a call such as `Box::new(p)`, we
+    /// need the address of the box pointee storage so we can write `p`'s shadow tag metadata into
+    /// that heap slot. The helper walks the `Box<T>` representation down to its internal
+    /// `NonNull<T>`, converts it to a raw byte pointer, and then exposes provenance to obtain the
+    /// slot address as `usize`.
     fn box_pointee_slot_addr_stmts_for_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -4791,6 +4834,12 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Best-effort whole-body fallback: if `agg_local` is a non-pointer aggregate local, recover
+    /// the single pointer local consistently packed into it across all assignments in the body.
+    ///
+    /// This is used when local block backtracking cannot find the carrier origin near the current
+    /// use site, but we still want to recover lineage for wrappers like `Option<&T>` or single-ref
+    /// tuple/struct carriers instead of dropping to `parent=0`.
     fn backtrack_global_single_pointer_carrier_local<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -4843,6 +4892,12 @@ impl MyOptimizationPass {
         recovered
     }
 
+    /// Best-effort local-block backtracking for a non-pointer aggregate local that wraps exactly
+    /// one pointer local.
+    ///
+    /// We scan recent assignments to `agg_local` and recover the unique pointer operand used to
+    /// build carriers such as `Option<&T>`, `(&T, bool)`, or small wrapper structs. If multiple
+    /// different pointer locals feed the aggregate, we return `None`.
     fn backtrack_single_pointer_carrier_local<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -4919,6 +4974,12 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Return a reusable SSA anchor for a normalized pointer-expression key, if the existing
+    /// anchor is type-compatible with `dst_local`.
+    ///
+    /// This lets repeated MIR expressions such as casts/copies/projected pointer computations
+    /// reuse one previously-materialized tag/ref-ancestor source instead of synthesizing a fresh
+    /// lineage chain every time.
     fn reusable_ssa_anchor_for_expr<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -4946,6 +5007,11 @@ impl MyOptimizationPass {
         Some(state.clone())
     }
 
+    /// Return a reusable SSA anchor for a normalized ref-source place key when the anchor local is
+    /// itself pointer-typed.
+    ///
+    /// This is the ref-source-specific variant used for `&src` / `&mut src` style creations where
+    /// we want to preserve the source pointer lineage instead of rebuilding it from scratch.
     fn reusable_ssa_anchor_for_ref_source_expr<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -4963,6 +5029,11 @@ impl MyOptimizationPass {
         Some(state.clone())
     }
 
+    /// Decide whether repeated ref creation from `src_place` may safely reuse a cached SSA anchor.
+    ///
+    /// We disable reuse in cases where reusing the last anchor would incorrectly turn independent
+    /// derivations into a parent->child chain, notably raw-deref ref creation and TB shared-ref
+    /// repetition.
     fn allow_ssa_anchor_reuse_for_ref_source_place<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -4988,6 +5059,10 @@ impl MyOptimizationPass {
         true
     }
 
+    /// Drop SSA anchors that may no longer be valid across a call boundary.
+    ///
+    /// Any anchor depending on the call destination or argument locals is conservatively removed,
+    /// except for some ref-ancestor anchors whose dependencies are only non-pointer carrier locals.
     fn invalidate_ssa_anchors_for_call<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -5043,6 +5118,11 @@ impl MyOptimizationPass {
         merged
     }
 
+    /// Forward dataflow analysis computing the SSA-anchor map available at entry to each basic
+    /// block.
+    ///
+    /// The pass simulates `scan_statement` effects, meets predecessor maps, and applies call-site
+    /// invalidation so later instrumentation can reuse stable anchors across CFG joins.
     fn analyze_ssa_anchor_entry_maps<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
