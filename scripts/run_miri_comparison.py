@@ -14,9 +14,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 REPORT_ROOT = REPO_ROOT / "reports" / "miri_compare"
 PORT_RE = re.compile(r"^\s*//\s*Ported from (miri/tests/fail/[A-Za-z0-9_./-]+\.rs)\.")
+COMPILE_FLAGS_RE = re.compile(r"^\s*//@compile-flags:\s*(.*)$")
 PACKAGE_DIRS = {
     "miri_sb_exact": EXAMPLES_DIR / "miri_tests" / "sb_exact",
     "miri_tb_exact": EXAMPLES_DIR / "miri_tests" / "tb_exact",
+    "miri_mem_exact": EXAMPLES_DIR / "miri_tests" / "memory_exact",
 }
 
 
@@ -37,7 +39,20 @@ class PortedTest:
 
     @property
     def miri_mode(self) -> str:
-        return "stacked" if self.package == "miri_sb_exact" else "tree"
+        if self.package == "miri_sb_exact":
+            return "stacked"
+        if self.package == "miri_tb_exact":
+            return "tree"
+        return "default"
+
+    @property
+    def miri_compile_flags(self) -> list[str]:
+        flags: list[str] = []
+        for line in self.src.read_text(errors="replace").splitlines():
+            m = COMPILE_FLAGS_RE.match(line)
+            if m:
+                flags.extend(m.group(1).split())
+        return flags
 
 
 def die(msg: str) -> None:
@@ -66,12 +81,29 @@ def discover_ported_tests() -> list[PortedTest]:
     return out
 
 
-def run(cmd: list[str], env: dict[str, str], cwd: Path, log: Path) -> int:
+def run(
+    cmd: list[str],
+    env: dict[str, str],
+    cwd: Path,
+    log: Path,
+    timeout_s: float | None = None,
+) -> int:
     with log.open("w") as f:
         f.write(f"$ {' '.join(cmd)}\n")
         f.flush()
-        result = subprocess.run(cmd, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT)
-    return result.returncode
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_s,
+            )
+            return result.returncode
+        except subprocess.TimeoutExpired:
+            f.write(f"\nTIMEOUT after {timeout_s}s\n")
+            return 124
 
 
 def parse_summary(summary: Path) -> dict[str, dict[str, str]]:
@@ -103,22 +135,29 @@ def run_rusteze_test(test: PortedTest, report_dir: Path) -> Path:
     env["RZ_ALIAS_MODEL"] = test.rz_model
     env["REPORT_DIR"] = str(report_dir)
     env.setdefault("CARGO_INCREMENTAL", "0")
+    tool_dir = REPO_ROOT / "target" / "debug"
+    local_cargo_tool = tool_dir / "cargo-instrument-mir"
+    local_inst_tool = tool_dir / "instrument-mir"
+    if local_cargo_tool.exists() and local_inst_tool.exists():
+        env["PATH"] = f"{tool_dir}{os.pathsep}{env.get('PATH', '')}"
     cmd = [sys.executable, "scripts/run_example_tests.py"]
     log = report_dir / f"{test.package}__{test.bin_name}.{test.rz_model}.log"
-    code = run(cmd, env, REPO_ROOT, log)
-    if code != 0:
-        die(f"rusteze example run failed for {test.label} ({test.rz_model}); see {log}")
-    summaries = sorted(report_dir.glob("*/summary.tsv"))
-    if not summaries:
-        die(f"missing summary.tsv under {report_dir}")
-    return summaries[-1]
+    last_code = 0
+    for _attempt in range(3):
+        last_code = run(cmd, env, REPO_ROOT, log, timeout_s=60.0)
+        summaries = sorted(report_dir.glob("*/summary.tsv"))
+        if last_code == 0 and summaries:
+            return summaries[-1]
+    die(f"rusteze example run failed for {test.label} ({test.rz_model}); see {log}")
 
 
 def run_miri(test: PortedTest, report_dir: Path) -> tuple[int, str]:
     env = os.environ.copy()
-    env.setdefault("MIRIFLAGS", "")
+    miri_flags = env.get("MIRIFLAGS", "").split()
     if test.miri_mode == "tree":
-        env["MIRIFLAGS"] = (env["MIRIFLAGS"] + " -Zmiri-tree-borrows").strip()
+        miri_flags.append("-Zmiri-tree-borrows")
+    miri_flags.extend(test.miri_compile_flags)
+    env["MIRIFLAGS"] = " ".join(miri_flags).strip()
     cmd = ["cargo", "miri", "run", "-q", "-p", test.package, "--bin", test.bin_name]
     log = report_dir / f"{test.package}__{test.bin_name}.miri.log"
     code = run(cmd, env, REPO_ROOT, log)
