@@ -633,6 +633,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
+use std::thread::ThreadId;
 
 #[cfg(feature = "rz_log")]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -998,8 +999,8 @@ pub struct TagMeta {
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
-static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(u64, u64, usize), u64>>> = OnceLock::new();
-static RET_TAGS: OnceLock<Mutex<HashMap<(u64, usize), u64>>> = OnceLock::new();
+static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> = OnceLock::new();
+static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1009,11 +1010,40 @@ fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
     TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn call_arg_tags() -> &'static Mutex<HashMap<(u64, u64, usize), u64>> {
+fn tag_alias_exempt_via_bounded_ancestor(tag: u64, addr: usize, size: usize) -> bool {
+    let access_len = size.max(1);
+    let access_end = addr.saturating_add(access_len);
+    let tmap = tags().lock().unwrap();
+    let mut cur = tag;
+
+    for _ in 0..8 {
+        let Some(meta) = tmap.get(&cur) else {
+            break;
+        };
+        if meta.parent == 0 {
+            break;
+        }
+        let Some(parent) = tmap.get(&meta.parent) else {
+            break;
+        };
+        if parent.alias_exempt && parent.bounds_len != 0 {
+            let parent_start = parent.pointee_addr;
+            let parent_end = parent_start.saturating_add(parent.bounds_len);
+            if addr >= parent_start && access_end <= parent_end {
+                return true;
+            }
+        }
+        cur = meta.parent;
+    }
+
+    false
+}
+
+fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(u64, usize), u64>> {
+pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2364,7 +2394,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
+pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::write(profile);
 
@@ -2400,12 +2430,26 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    tmeta.alias_exempt |=
+        access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        let tmap = tags().lock().unwrap();
-        active_alias_model()
-            .find_ref_ancestor_tag(&tmap, tag)
-            .or_else(|| (active_alias_model().name() == "sb_lite").then_some(tag))
+        match active_alias_model().name() {
+            // Tree Borrows tracks raws as first-class nodes in the tree.
+            // Rewriting them to a reference ancestor skips state transitions
+            // that should happen on the raw itself.
+            "tb_lite" => Some(tag),
+            "sb_lite" => {
+                let tmap = tags().lock().unwrap();
+                active_alias_model()
+                    .find_ref_ancestor_tag(&tmap, tag)
+                    .or(Some(tag))
+            }
+            _ => {
+                let tmap = tags().lock().unwrap();
+                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+            }
+        }
     } else {
         Some(tag)
     };
@@ -2791,13 +2835,13 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize) {
 /// Like `__rz_ptr_write`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize) {
+pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(tag, addr, size);
+    __rz_ptr_write(tag, addr, size, access_alias_exempt);
 }
 
 /// Record a direct write to a stack slot/root local.
@@ -2811,7 +2855,7 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
     }
     let write_tag = __record_ref_creation(addr, 1, tag, 0, size);
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(write_tag, addr, size);
+    __rz_ptr_write(write_tag, addr, size, 0);
 }
 
 /// Record/validate a read through a tracked pointer tag.
@@ -2822,7 +2866,7 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
+pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::read(profile);
 
@@ -2858,12 +2902,26 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    tmeta.alias_exempt |=
+        access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        let tmap = tags().lock().unwrap();
-        active_alias_model()
-            .find_ref_ancestor_tag(&tmap, tag)
-            .or_else(|| (active_alias_model().name() == "sb_lite").then_some(tag))
+        match active_alias_model().name() {
+            // Tree Borrows tracks raws as first-class nodes in the tree.
+            // Rewriting them to a reference ancestor skips state transitions
+            // that should happen on the raw itself.
+            "tb_lite" => Some(tag),
+            "sb_lite" => {
+                let tmap = tags().lock().unwrap();
+                active_alias_model()
+                    .find_ref_ancestor_tag(&tmap, tag)
+                    .or(Some(tag))
+            }
+            _ => {
+                let tmap = tags().lock().unwrap();
+                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
+            }
+        }
     } else {
         Some(tag)
     };
@@ -3190,13 +3248,13 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize) {
 /// Like `__rz_ptr_read`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize) {
+pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_read(tag, addr, size);
+    __rz_ptr_read(tag, addr, size, access_alias_exempt);
 }
 
 fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
@@ -3240,10 +3298,11 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
 pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
+    let thread_id = std::thread::current().id();
     call_arg_tags()
         .lock()
         .unwrap()
-        .insert((callee_id, arg_index, addr), tag);
+        .insert((thread_id, callee_id, arg_index, addr), tag);
 }
 
 /// Validate a non-pointer by-value call argument carrier's inner reference tag.
@@ -3260,13 +3319,42 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
     let tag = call_arg_tags()
         .lock()
         .unwrap()
-        .remove(&(callee_id, arg_index, addr))
+        .remove(&(thread_id, callee_id, arg_index, addr))
         .unwrap_or(0);
     if tag != 0 {
         active_alias_model().on_call_arg_taken(callee_id, tag);
+    }
+    tag
+}
+
+/// Take (consume) a pushed inner tag for a non-pointer carrier argument.
+#[no_mangle]
+pub extern "C" fn __rz_take_call_arg_tag_anchor(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let tag = {
+        let mut tags = call_arg_tags().lock().unwrap();
+        tags.remove(&(thread_id, callee_id, arg_index, addr))
+            .or_else(|| {
+                tags.iter()
+                    .find(|((tid, cid, idx, _slot_addr), _)| {
+                        *tid == thread_id && *cid == callee_id && *idx == arg_index
+                    })
+                    .map(|(key, _)| *key)
+                    .and_then(|key| tags.remove(&key))
+            })
+            .unwrap_or(0)
+    };
+    if tag != 0 {
+        active_alias_model().on_call_arg_anchor_taken(callee_id, tag);
     }
     tag
 }
@@ -3276,7 +3364,11 @@ pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: u
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     rz_validate_ref_boundary_use(tag, "RET");
-    ret_tags().lock().unwrap().insert((callee_id, addr), tag);
+    let thread_id = std::thread::current().id();
+    ret_tags()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, addr), tag);
 }
 
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
@@ -3300,10 +3392,11 @@ pub extern "C" fn __rz_validate_loaded_ref_tag(tag: u64) {
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
     ret_tags()
         .lock()
         .unwrap()
-        .remove(&(callee_id, addr))
+        .remove(&(thread_id, callee_id, addr))
         .unwrap_or(0)
 }
 
@@ -3320,11 +3413,12 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     bounds_len: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
     let tag = {
         ret_tags()
             .lock()
             .unwrap()
-            .remove(&(callee_id, addr))
+            .remove(&(thread_id, callee_id, addr))
             .unwrap_or(0)
     };
     if tag != 0 {
@@ -3670,15 +3764,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let mut alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    if !alias_exempt_flag
-        && derived_from != 0
-        && tag_store::get(derived_from)
-            .as_ref()
-            .is_some_and(|parent| parent.alias_exempt)
-    {
-        alias_exempt_flag = true;
-    }
+    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
@@ -3862,10 +3948,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     };
     let (origin_known, origin_base, origin_end) = if resolved_parent != 0 {
         tag_store::get(resolved_parent)
-            .filter(|parent| {
-                parent.origin_known
-                    && (!parent_alloc_mismatch || alloc_is_stack)
-            })
+            .filter(|parent| parent.origin_known && (!parent_alloc_mismatch || alloc_is_stack))
             .map(|parent| (true, parent.origin_base, parent.origin_end))
             .unwrap_or_else(|| snapshot_tag_origin(pointee_addr, resolved_parent))
     } else {

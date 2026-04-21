@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-mod metadata_dataflow;
 mod config;
+mod metadata_dataflow;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
@@ -623,6 +623,20 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::ptr::",
         MatchKind::EndsWith,
         "::cast",
+        CallEffect::PtrDerive,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::ptr::",
+        MatchKind::EndsWith,
+        "::cast_mut",
+        CallEffect::PtrDerive,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::ptr::",
+        MatchKind::EndsWith,
+        "::cast_const",
         CallEffect::PtrDerive,
     ),
     EffectRule::two(
@@ -1844,6 +1858,7 @@ struct Hooks {
     def_id_push_call_arg_tag: DefId,
     def_id_validate_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
+    def_id_take_call_arg_tag_anchor: DefId,
     def_id_push_ret_tag: DefId,
     def_id_validate_ret_tag: DefId,
     def_id_validate_loaded_ref_tag: DefId,
@@ -1984,6 +1999,37 @@ impl MyOptimizationPass {
             TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
                 self.ty_contains_pointer_fields(tcx, body, *elem_ty, depth - 1)
             }
+            _ => false,
+        }
+    }
+
+    /// Shallow boundary-carrier check for source-level wrapper values that directly store a
+    /// reference/raw pointer, such as `Option<&T>`, tuples of pointers, or small newtypes.
+    ///
+    /// This intentionally does *not* recurse through arbitrary nested ADTs like `Vec`, `RawVec`,
+    /// `IntoIter`, or `NonNull`. Treating those owner/container internals as call-boundary
+    /// borrow carriers produces false positives by transporting allocator/internal raw tags across
+    /// moves and ABI copies where no source-level borrow is being passed.
+    fn ty_contains_direct_pointer_fields<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        if self.is_pointer_ty(ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Tuple(field_tys) => field_tys
+                .iter()
+                .any(|field_ty| self.is_pointer_ty(field_ty)),
+            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| self.is_pointer_ty(field.ty(tcx, args)))
+            }),
+            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => self.is_pointer_ty(*elem_ty),
             _ => false,
         }
     }
@@ -2286,7 +2332,8 @@ impl MyOptimizationPass {
                                 has_tag_source = true;
                             }
                         }
-                        if !has_tag_source && matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
+                        if !has_tag_source
+                            && matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
                         {
                             let src_ty = op.ty(body, tcx);
                             has_tag_source = match src_ty.kind() {
@@ -2473,14 +2520,13 @@ impl MyOptimizationPass {
             return None;
         }
 
-        let unique_ty = box_adt.non_enum_variant().fields[FieldIdx::from_usize(0)].ty(tcx, box_args);
+        let unique_ty =
+            box_adt.non_enum_variant().fields[FieldIdx::from_usize(0)].ty(tcx, box_args);
         let TyKind::Adt(unique_adt, unique_args) = unique_ty.kind() else {
             return None;
         };
-        let nonnull_ty = unique_adt
-            .non_enum_variant()
-            .fields[FieldIdx::from_usize(0)]
-            .ty(tcx, unique_args);
+        let nonnull_ty =
+            unique_adt.non_enum_variant().fields[FieldIdx::from_usize(0)].ty(tcx, unique_args);
 
         let raw_ptr_ty = Ty::new_imm_ptr(tcx, tcx.types.u8);
         if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
@@ -4039,9 +4085,10 @@ impl MyOptimizationPass {
         None
     }
 
-    /// Returns true when alias checks should be skipped for this pointee type.
-    /// We conservatively opt out if the type may contain UnsafeCell or if it is
-    /// not fully known/normalizable in the current typing context.
+    /// Returns true when alias checks should be skipped for an accessed memory type.
+    /// This is intentionally broad: accesses that touch an aggregate containing
+    /// interior-mutability must stay exempt to avoid attributing writes to the
+    /// wrong subfield.
     fn alias_exempt_for_ty<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -4080,6 +4127,50 @@ impl MyOptimizationPass {
         !ty.is_freeze(tcx, typing_env)
     }
 
+    /// Returns true when a pointee type is itself an interior-mutability root that should
+    /// propagate alias exemption to a directly-derived child pointer.
+    ///
+    /// This is narrower than `alias_exempt_for_ty`: aggregates that merely *contain*
+    /// an `UnsafeCell` (for example a struct with one `Cell` field) are not treated as
+    /// alias-exempt roots for derived tags, otherwise a raw/shared tag to the whole
+    /// aggregate would suppress alias checks for unrelated non-interior-mutable fields.
+    fn alias_exempt_root_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        if matches!(ty.kind(), TyKind::Slice(_) | TyKind::Str) {
+            return false;
+        }
+
+        if ty.has_param()
+            || ty.has_infer()
+            || ty.has_aliases()
+            || ty.has_opaque_types()
+            || ty.has_placeholders()
+        {
+            return true;
+        }
+
+        let typing_env = body.typing_env(tcx);
+        if ty.is_freeze(tcx, typing_env) {
+            return false;
+        }
+
+        match ty.kind() {
+            TyKind::Adt(adt, _) => {
+                let path = tcx.def_path_str(adt.did());
+                path.contains("::cell::UnsafeCell")
+                    || path.contains("::cell::SyncUnsafeCell")
+                    || path.contains("::cell::Cell")
+                    || path.contains("::cell::RefCell")
+            }
+            TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) => false,
+            _ => true,
+        }
+    }
+
     fn alias_exempt_for_ptr_ty<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -4091,11 +4182,63 @@ impl MyOptimizationPass {
                 if matches!(mutbl, Mutability::Mut) {
                     false
                 } else {
-                    self.alias_exempt_for_ty(tcx, body, *pointee)
+                    self.alias_exempt_root_for_ty(tcx, body, *pointee)
                 }
             }
-            TyKind::RawPtr(pointee, _) => self.alias_exempt_for_ty(tcx, body, *pointee),
+            TyKind::RawPtr(pointee, _) => self.alias_exempt_root_for_ty(tcx, body, *pointee),
             _ => false,
+        }
+    }
+
+    /// Preserve alias exemption for direct derivations out of an interior-mutability root
+    /// (`UnsafeCell<T>`, `Cell<T>`, etc.) when the child pointee still fits entirely within
+    /// the source storage.
+    ///
+    /// This keeps wrappers like `UnsafeCell::get()` exempt, while avoiding false negatives
+    /// when a non-root aggregate or a zero-sized interior-mutable wrapper is cast to some
+    /// unrelated byte/field pointer.
+    fn alias_exempt_child_from_source_ptr<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_ty: Ty<'tcx>,
+        dst_ptr_ty: Ty<'tcx>,
+    ) -> bool {
+        let src_pointee = match src_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return false,
+        };
+        let dst_pointee = match dst_ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return false,
+        };
+
+        if !self.alias_exempt_root_for_ty(tcx, body, src_pointee) {
+            return false;
+        }
+
+        let src_size = self.layout_size_bytes(tcx, src_pointee);
+        let dst_size = self.layout_size_bytes(tcx, dst_pointee);
+        src_size != 0 && dst_size != 0 && dst_size <= src_size
+    }
+
+    /// Return the alias-exempt classification for the memory location accessed by `ty`.
+    ///
+    /// For pointer-typed access places (`&T`, `*mut T`) the access is to the pointee, not to the
+    /// pointer value itself. For projected writes like `(*p).field = ...`, `ty` is already the
+    /// field type, which lets us keep interior-mutable fields alias-exempt without exempting the
+    /// entire aggregate.
+    fn alias_exempt_for_access_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                self.alias_exempt_for_ty(tcx, body, *pointee)
+            }
+            _ => self.alias_exempt_for_ty(tcx, body, ty),
         }
     }
 
@@ -5824,7 +5967,8 @@ impl MyOptimizationPass {
         };
 
         let candidate_local = candidate_local.or_else(|| {
-            if src_place.projection.is_empty() && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+            if src_place.projection.is_empty()
+                && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
             {
                 self.backtrack_global_single_pointer_carrier_local(body, src_place.local)
             } else {
@@ -5844,7 +5988,8 @@ impl MyOptimizationPass {
             }
         }
 
-        if !src_place.projection.is_empty() && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+        if !src_place.projection.is_empty()
+            && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
         {
             if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
                 .get(&src_place.local)
@@ -6205,7 +6350,7 @@ impl MyOptimizationPass {
                 });
             } else if interesting_stack_locals.contains(&arg_local)
                 || self.is_box_ty(tcx, arg_ty)
-                || self.ty_contains_pointer_fields(tcx, body, arg_ty, 8)
+                || self.ty_contains_direct_pointer_fields(tcx, body, arg_ty)
             {
                 if self.supports_arg_anchor_take_local(tcx, body, arg_local) {
                     insert_points.push(InsertPoint {
@@ -6507,7 +6652,8 @@ impl MyOptimizationPass {
                 if interesting_stack_locals.contains(&lhs_place.local)
                     && !self.is_pointer_ty(lhs_ty)
                 {
-                    let size_op = self.size_operand_for_ty(tcx, body, lhs_ty, stmt.source_info.span);
+                    let size_op =
+                        self.size_operand_for_ty(tcx, body, lhs_ty, stmt.source_info.span);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx,
@@ -6536,8 +6682,7 @@ impl MyOptimizationPass {
                             let shadow_load_ok = self.is_shadowable_ptr_ty(tcx, body, src_ty)
                                 && (!matches!(src_ty.kind(), TyKind::Ref(..))
                                     || self.place_contains_deref(src_place));
-                            if !src_place.projection.is_empty() && shadow_load_ok
-                            {
+                            if !src_place.projection.is_empty() && shadow_load_ok {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 tagged_ptr_locals.insert(dst_local);
                                 rz_pass_trace!(
@@ -6669,15 +6814,16 @@ impl MyOptimizationPass {
                     ) = rvalue
                     {
                         let src_ty = op.ty(&body.local_decls, tcx);
-                        let explicit_nonnull_transmute = matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
-                            && matches!(
-                                src_ty.kind(),
-                                TyKind::Adt(adt, _)
-                                    if {
-                                        let name = tcx.def_path_str(adt.did());
-                                        name.contains("::NonNull") || name.contains("::Unique")
-                                    }
-                            );
+                        let explicit_nonnull_transmute =
+                            matches!(rvalue, Rvalue::Cast(CastKind::Transmute, ..))
+                                && matches!(
+                                    src_ty.kind(),
+                                    TyKind::Adt(adt, _)
+                                        if {
+                                            let name = tcx.def_path_str(adt.did());
+                                            name.contains("::NonNull") || name.contains("::Unique")
+                                        }
+                                );
                         if !self.is_pointer_ty(src_ty)
                             && !explicit_nonnull_transmute
                             && self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
@@ -9400,7 +9546,8 @@ impl MyOptimizationPass {
         if let (Some(tgt_bb), Some(dst_local), Some(first_arg)) = (
             call_target_bb,
             destination.as_local(),
-            args.get(0).and_then(|arg| self.place_from_operand(&arg.node)),
+            args.get(0)
+                .and_then(|arg| self.place_from_operand(&arg.node)),
         ) {
             let dst_ty = body.local_decls[dst_local].ty;
             let src_ty = first_arg.ty(&body.local_decls, tcx).ty;
@@ -9430,7 +9577,7 @@ impl MyOptimizationPass {
                 continue;
             };
             let ty = body.local_decls[p.local].ty;
-            if !self.is_pointer_ty(ty) && self.ty_contains_pointer_fields(tcx, body, ty, 8) {
+            if !self.is_pointer_ty(ty) && self.ty_contains_direct_pointer_fields(tcx, body, ty) {
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx: block_data.statements.len(),
@@ -9627,7 +9774,7 @@ impl MyOptimizationPass {
                         continue;
                     }
                     if !interesting_stack_locals.contains(&p.local)
-                        && !self.ty_contains_pointer_fields(tcx, body, ty, 8)
+                        && !self.ty_contains_direct_pointer_fields(tcx, body, ty)
                     {
                         continue;
                     }
@@ -10062,14 +10209,16 @@ impl MyOptimizationPass {
                                 ptr_local: RETURN_PLACE,
                             },
                         });
-                    } else if self.ty_contains_pointer_fields(tcx, body, body.return_ty(), 8) {
+                    } else if self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty()) {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
                             insert_before: false,
                             source_info: term.source_info,
                             place: Place::from(RETURN_PLACE),
-                            kind: InstrKind::RetValidate { local: RETURN_PLACE },
+                            kind: InstrKind::RetValidate {
+                                local: RETURN_PLACE,
+                            },
                         });
                     }
                     return_sites.push((bb, term.source_info, block_data.statements.len()));
@@ -10426,7 +10575,9 @@ impl MyOptimizationPass {
             InstrKind::ConstAlloc { .. } | InstrKind::ConstAllocConst { .. } => hooks.def_id_alloc,
             InstrKind::PtrWrite { .. } => hooks.def_id_write,
             InstrKind::PtrWriteAllowUntagged { .. } => hooks.def_id_write_allow_untagged,
-            InstrKind::StackSlotWriteAllowUntagged { .. } => hooks.def_id_local_write_allow_untagged,
+            InstrKind::StackSlotWriteAllowUntagged { .. } => {
+                hooks.def_id_local_write_allow_untagged
+            }
             InstrKind::PtrRead { .. } => hooks.def_id_read,
             InstrKind::PtrReadAllowUntagged { .. } => hooks.def_id_read_allow_untagged,
             InstrKind::PtrUse { .. } => hooks.def_id_use,
@@ -10599,12 +10750,15 @@ impl MyOptimizationPass {
                 let ref_block = body
                     .basic_blocks_mut()
                     .push(BasicBlockData::new(None, is_cleanup));
-                let validate_block = if matches!(body.local_decls[dst_local].ty.kind(), TyKind::Ref(..))
-                {
-                    Some(body.basic_blocks_mut().push(BasicBlockData::new(None, is_cleanup)))
-                } else {
-                    None
-                };
+                let validate_block =
+                    if matches!(body.local_decls[dst_local].ty.kind(), TyKind::Ref(..)) {
+                        Some(
+                            body.basic_blocks_mut()
+                                .push(BasicBlockData::new(None, is_cleanup)),
+                        )
+                    } else {
+                        None
+                    };
 
                 let tag_func = Operand::function_handle(
                     tcx,
@@ -10905,13 +11059,16 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::ShadowStoreBoxPointee { box_local, src_local } = creation_kind.clone()
+            if let InstrKind::ShadowStoreBoxPointee {
+                box_local,
+                src_local,
+            } = creation_kind.clone()
             {
                 let dst_addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
-                let Some((dst_addr_stmt1, dst_addr_stmt2)) =
-                    self.box_pointee_slot_addr_stmts_for_local(
+                let Some((dst_addr_stmt1, dst_addr_stmt2)) = self
+                    .box_pointee_slot_addr_stmts_for_local(
                         tcx,
                         body,
                         source_info,
@@ -12129,7 +12286,7 @@ impl MyOptimizationPass {
                     kind: TerminatorKind::Call {
                         func: Operand::function_handle(
                             tcx,
-                            hooks.def_id_take_call_arg_tag,
+                            hooks.def_id_take_call_arg_tag_anchor,
                             std::iter::empty(),
                             source_info.span,
                         ),
@@ -12558,6 +12715,15 @@ impl MyOptimizationPass {
                     let (arg_size, mut size_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, size_op);
                     extra_stmts.append(&mut size_stmts);
+                    let access_alias = self.const_u8(
+                        tcx,
+                        source_info.span,
+                        self.alias_exempt_for_access_ty(
+                            tcx,
+                            body,
+                            place.ty(&body.local_decls, tcx).ty,
+                        ) as u8,
+                    );
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -12570,6 +12736,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_size,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: access_alias,
                             span: source_info.span,
                         },
                     ]
@@ -12703,6 +12873,15 @@ impl MyOptimizationPass {
                     let (arg_size, mut size_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, size_op);
                     extra_stmts.append(&mut size_stmts);
+                    let access_alias = self.const_u8(
+                        tcx,
+                        source_info.span,
+                        self.alias_exempt_for_access_ty(
+                            tcx,
+                            body,
+                            place.ty(&body.local_decls, tcx).ty,
+                        ) as u8,
+                    );
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -12717,6 +12896,10 @@ impl MyOptimizationPass {
                             node: arg_size,
                             span: source_info.span,
                         },
+                        Spanned {
+                            node: access_alias,
+                            span: source_info.span,
+                        },
                     ]
                     .into_boxed_slice();
 
@@ -12724,7 +12907,9 @@ impl MyOptimizationPass {
                 }
 
                 InstrKind::StackSlotWriteAllowUntagged { local, ref size_op } => {
-                    let Some(tag_local) = reborrow_anchor_local_for_stack_local.get(&local).copied() else {
+                    let Some(tag_local) =
+                        reborrow_anchor_local_for_stack_local.get(&local).copied()
+                    else {
                         continue;
                     };
                     let tmp_unit = body
@@ -13222,6 +13407,12 @@ impl MyOptimizationPass {
                             if let Some(dst_local) = place.as_local() {
                                 let dst_ty = body.local_decls[dst_local].ty;
                                 self.alias_exempt_for_ptr_ty(tcx, body, dst_ty)
+                                    || self.alias_exempt_child_from_source_ptr(
+                                        tcx,
+                                        body,
+                                        src.ty(&body.local_decls, tcx).ty,
+                                        dst_ty,
+                                    )
                             } else {
                                 let ty = src.ty(&body.local_decls, tcx).ty;
                                 self.alias_exempt_for_ty(tcx, body, ty)
@@ -13727,8 +13918,9 @@ impl MyOptimizationPass {
                 InstrKind::Raw { src, .. } => {
                     if let Some(dst_local) = place.as_local() {
                         if src.projection.is_empty() {
-                            if let Some(anchor_local) =
-                                reborrow_anchor_local_for_stack_local.get(&src.local).copied()
+                            if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
+                                .get(&src.local)
+                                .copied()
                             {
                                 if let Some(anchor_source_local) =
                                     tag_local_for_ptr_local.get(&dst_local).copied()
@@ -13755,11 +13947,7 @@ impl MyOptimizationPass {
                                                     BinOp::Eq,
                                                     Box::new((
                                                         Operand::Copy(Place::from(anchor_local)),
-                                                        self.const_u64(
-                                                            tcx,
-                                                            source_info.span,
-                                                            0,
-                                                        ),
+                                                        self.const_u64(tcx, source_info.span, 0),
                                                     )),
                                                 ),
                                             ))),
@@ -14208,7 +14396,7 @@ impl MyOptimizationPass {
                         kind: TerminatorKind::Call {
                             func: Operand::function_handle(
                                 tcx,
-                                hooks.def_id_take_call_arg_tag,
+                                hooks.def_id_take_call_arg_tag_anchor,
                                 std::iter::empty(),
                                 source_info.span,
                             ),
@@ -14282,7 +14470,7 @@ impl MyOptimizationPass {
                         kind: TerminatorKind::Call {
                             func: Operand::function_handle(
                                 tcx,
-                                hooks.def_id_take_call_arg_tag,
+                                hooks.def_id_take_call_arg_tag_anchor,
                                 std::iter::empty(),
                                 source_info.span,
                             ),
@@ -14559,19 +14747,19 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_record_alloc", 3)
             .expect("missing '__rz_record_alloc' definition");
         let def_id_write = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_write", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_write", 4)
             .expect("missing '__rz_ptr_write' definition");
         let def_id_write_allow_untagged = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_write_allow_untagged", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_write_allow_untagged", 4)
             .expect("missing '__rz_ptr_write_allow_untagged' definition");
         let def_id_local_write_allow_untagged = self
             .find_runtime_fn_def_id(tcx, "__rz_local_write_allow_untagged", 3)
             .expect("missing '__rz_local_write_allow_untagged' definition");
         let def_id_read = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_read", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_read", 4)
             .expect("missing '__rz_ptr_read' definition");
         let def_id_read_allow_untagged = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_read_allow_untagged", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_read_allow_untagged", 4)
             .expect("missing '__rz_ptr_read_allow_untagged' definition");
         let def_id_use = self
             .find_runtime_fn_def_id(tcx, "__rz_ptr_use", 2)
@@ -14585,6 +14773,9 @@ impl MyOptimizationPass {
         let def_id_take_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag", 3)
             .expect("missing '__rz_take_call_arg_tag' definition");
+        let def_id_take_call_arg_tag_anchor = self
+            .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag_anchor", 3)
+            .expect("missing '__rz_take_call_arg_tag_anchor' definition");
         let def_id_push_ret_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_ret_tag", 3)
             .expect("missing '__rz_push_ret_tag' definition");
@@ -14633,6 +14824,7 @@ impl MyOptimizationPass {
             def_id_push_call_arg_tag,
             def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
+            def_id_take_call_arg_tag_anchor,
             def_id_push_ret_tag,
             def_id_validate_ret_tag,
             def_id_validate_loaded_ref_tag,

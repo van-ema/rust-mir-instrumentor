@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed,
@@ -33,6 +34,7 @@ struct TbNode {
     alloc_epoch: u64,
     kind: BorrowKind,
     perm: TbPerm,
+    lazy_perm: TbPerm,
     start: usize,
     len: usize,
     extra_ranges: Vec<(usize, usize)>,
@@ -46,8 +48,8 @@ struct TbAllocState {
     nodes: HashMap<u64, TbNode>,
 }
 
-#[derive(Default)]
 struct TbProtectorFrame {
+    thread_id: ThreadId,
     callee_id: u64,
     pending_parent_tags: Vec<u64>,
     protected_tags: Vec<u64>,
@@ -74,6 +76,13 @@ fn rz_tb_lite_enabled() -> bool {
 #[inline]
 fn rz_tb_dump_enabled() -> bool {
     std::env::var("RZ_TB_DUMP")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+fn rz_tb_trace_enabled() -> bool {
+    std::env::var("RZ_TB_TRACE")
         .ok()
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
@@ -130,6 +139,10 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_on_call_arg_taken(callee_id, parent_tag);
     }
 
+    fn on_call_arg_anchor_taken(&self, callee_id: u64, parent_tag: u64) {
+        tb_lite_on_call_arg_anchor_taken(callee_id, parent_tag);
+    }
+
     fn on_call_exit(&self, callee_id: u64) {
         tb_lite_on_call_exit(callee_id);
     }
@@ -155,13 +168,15 @@ fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
     if !rz_tb_lite_enabled() || parent_tag == 0 {
         return;
     }
+    let thread_id = std::thread::current().id();
     let mut frames = tb_protector_frames().lock().unwrap();
     match frames.last_mut() {
-        Some(top) if top.callee_id == callee_id => {
+        Some(top) if top.thread_id == thread_id && top.callee_id == callee_id => {
             top.pending_parent_tags.push(parent_tag);
         }
         _ => {
             frames.push(TbProtectorFrame {
+                thread_id,
                 callee_id,
                 pending_parent_tags: vec![parent_tag],
                 protected_tags: Vec::new(),
@@ -170,16 +185,56 @@ fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
     }
 }
 
+fn tb_lite_on_call_arg_anchor_taken(callee_id: u64, parent_tag: u64) {
+    if !rz_tb_lite_enabled() || parent_tag == 0 {
+        return;
+    }
+
+    tb_lite_on_call_arg_taken(callee_id, parent_tag);
+
+    let thread_id = std::thread::current().id();
+    let mut frames = tb_protector_frames().lock().unwrap();
+    let frame = match frames.last_mut() {
+        Some(top) if top.thread_id == thread_id && top.callee_id == callee_id => top,
+        _ => {
+            frames.push(TbProtectorFrame {
+                thread_id,
+                callee_id,
+                pending_parent_tags: Vec::new(),
+                protected_tags: Vec::new(),
+            });
+            frames.last_mut().unwrap()
+        }
+    };
+    if !frame.protected_tags.contains(&parent_tag) {
+        frame.protected_tags.push(parent_tag);
+    }
+
+    let tmap = tags().lock().unwrap();
+    let Some(tmeta) = tmap.get(&parent_tag) else {
+        return;
+    };
+    let base = tb_base_for_addr(tmeta.pointee_addr);
+    let mut all = tb_state().lock().unwrap();
+    let Some(tree) = all.get_mut(&base) else {
+        return;
+    };
+    if let Some(node) = tree.nodes.get_mut(&parent_tag) {
+        node.protected = true;
+    }
+}
+
 fn tb_lite_on_call_exit(callee_id: u64) {
     if !rz_tb_lite_enabled() {
         return;
     }
+    let thread_id = std::thread::current().id();
 
     let popped = {
         let mut frames = tb_protector_frames().lock().unwrap();
         frames
             .iter()
-            .rposition(|f| f.callee_id == callee_id)
+            .rposition(|f| f.thread_id == thread_id && f.callee_id == callee_id)
             .map(|idx| frames.remove(idx))
     };
 
@@ -194,8 +249,10 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         .lock()
         .unwrap()
         .iter()
-        .filter(|((ret_callee_id, _addr), _tag)| *ret_callee_id == callee_id)
-        .map(|((_ret_callee_id, _addr), tag)| *tag)
+        .filter(|((ret_thread_id, ret_callee_id, _addr), _tag)| {
+            *ret_thread_id == thread_id && *ret_callee_id == callee_id
+        })
+        .map(|((_ret_thread_id, _ret_callee_id, _addr), tag)| *tag)
         .collect();
     let tmap = tags().lock().unwrap();
     let mut all = tb_state().lock().unwrap();
@@ -210,7 +267,9 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         let active_protected_unique = tree
             .nodes
             .get(&tag)
-            .filter(|node| matches!(node.kind, BorrowKind::Unique) && matches!(node.perm, TbPerm::Active))
+            .filter(|node| {
+                matches!(node.kind, BorrowKind::Unique) && matches!(node.perm, TbPerm::Active)
+            })
             .cloned();
         if let Some(protected_node) = active_protected_unique {
             let descendant_tags: Vec<u64> = tree
@@ -236,7 +295,10 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                             .iter()
                             .any(|(start, len)| tb_node_overlaps(n, *start, *len))
                 })
-                .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, tag) && !tb_is_ancestor(&tree.nodes, tag, n.tag))
+                .filter(|n| {
+                    !tb_is_ancestor(&tree.nodes, n.tag, tag)
+                        && !tb_is_ancestor(&tree.nodes, tag, n.tag)
+                })
                 .map(|n| n.tag)
                 .collect();
             for foreign in foreign_overlap_tags {
@@ -364,60 +426,11 @@ fn tb_lite_validate_ref_creation(
         return None;
     }
 
-    for node in tree.nodes.values() {
-        if !tb_is_live_node(node) {
-            continue;
-        }
-        if node.kind != BorrowKind::Unique {
-            continue;
-        }
-        if !tb_ranges_overlap(pointee_addr, new_len, node.start, node.len) {
-            continue;
-        }
-        if parent_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != parent_epoch {
-            // Different allocation epoch at same base address (e.g. stack slot reuse).
-            // Ignore old-lifetime nodes to avoid stale-lineage conflicts.
-            continue;
-        }
-
-        // Allow creation if the overlap is within the same lineage.
-        let same_lineage = node.tag == parent_ref
-            || tb_is_ancestor(&tree.nodes, node.tag, parent_ref)
-            || tb_is_ancestor(&tree.nodes, parent_ref, node.tag);
-        if same_lineage {
-            continue;
-        }
-
-        // TB-lite policy:
-        // - for non-protected overlaps, defer to access-time transitions/violations;
-        // - reject at creation only when this would overlap an active protected unique.
-        //
-        // This avoids false positives in safe code paths that transiently create overlapping
-        // mutable refs but never perform an invalid protected/foreign access.
-        if !node.protected {
-            continue;
-        }
-
-        return Some(format!(
-            "TB_LITE reborrow conflict: create RefMut [0x{:x},0x{:x}) parent_tag={} parent_ref={} parent_epoch={} overlaps active protected tag={} active_epoch={} kind={:?} [0x{:x},0x{:x})",
-            pointee_addr,
-            new_end,
-            parent_tag,
-            parent_ref,
-            parent_epoch,
-            node.tag,
-            node.alloc_epoch,
-            node.kind,
-            node.start,
-            node.start.saturating_add(node.len)
-        ));
-    }
-
     None
 }
 
 fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
-    if !rz_tb_lite_enabled() || tmeta.alias_exempt {
+    if !rz_tb_lite_enabled() {
         return;
     }
 
@@ -469,6 +482,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         alloc_epoch: tmeta.alloc_epoch,
         kind,
         perm,
+        lazy_perm: perm,
         start: tmeta.pointee_addr,
         len: tb_effective_len(tmeta.bounds_len),
         extra_ranges: Vec::new(),
@@ -486,6 +500,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
             .values()
             .filter(|n| tb_is_live_node(n) && n.tag != tag)
             .filter(|n| tb_ranges_overlap(node.start, node.len, n.start, n.len))
+            .filter(|n| !n.protected)
             .filter(|n| {
                 // Best-effort metadata can lose parent lineage on projection-heavy code paths,
                 // yielding overlapping root uniques (`parent=0`) that are still used safely.
@@ -499,6 +514,11 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
                 // as a fresh root unique over overlapping ranges. Eager sibling invalidation here
                 // would disable earlier roots immediately and report TB_LITE_INVALIDATED on valid
                 // subsequent writes in the same loop.
+                //
+                // Also keep already-protected siblings alive until an actual access. In TB,
+                // protectors are meant to make later conflicting accesses fail; eagerly killing
+                // the protected node at creation time hides those conflicts and misses cases like
+                // `spurious_read` and `reservedim_spurious_write`.
                 if node.parent == 0 && n.parent == 0 {
                     return false;
                 }
@@ -530,7 +550,8 @@ fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) ->
         return false;
     }
     let mut frames = tb_protector_frames().lock().unwrap();
-    let Some(top) = frames.last_mut() else {
+    let thread_id = std::thread::current().id();
+    let Some(top) = frames.iter_mut().rfind(|f| f.thread_id == thread_id) else {
         return false;
     };
     let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
@@ -578,6 +599,24 @@ fn tb_lite_check(
         return None;
     };
     let mut access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
+    let mut recovered_const_write_root: Option<u64> = None;
+    if matches!(access, AliasAccessKind::Write) {
+        if let Some(recovered_tag) = tb_lite_recover_root_raw_mut_sibling_for_const_write(
+            tree,
+            access_tag,
+            &node,
+            addr,
+            size,
+            tmeta.alloc_epoch,
+        ) {
+            recovered_const_write_root = Some(access_tag);
+            access_tag = recovered_tag;
+            if let Some(recovered_node) = tree.nodes.get(&access_tag).cloned() {
+                node = recovered_node;
+                access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
+            }
+        }
+    }
     if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
         // Tag metadata and TB node disagree on epoch; treat as stale model state and skip.
         return None;
@@ -636,12 +675,34 @@ fn tb_lite_check(
         return Some(msg);
     }
 
-    tb_note_protected_child_access(tree, &access_lineage, addr, size, tmeta.alloc_epoch);
+    if rz_tb_trace_enabled() {
+        eprintln!(
+            "[tb-trace] access={:?} orig_tag={} access_tag={} addr=0x{:x} size={} kind={:?} lineage={:?}",
+            access, orig_tag, access_tag, addr, size, tmeta.kind, access_lineage
+        );
+        for traced in tree.nodes.values().filter(|n| {
+            tmeta.alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == tmeta.alloc_epoch
+        }) {
+            eprintln!(
+                "[tb-trace]   node tag={} parent={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} range=[0x{:x},0x{:x}) extras={:?}",
+                traced.tag,
+                traced.parent,
+                traced.kind,
+                traced.perm,
+                traced.lazy_perm,
+                traced.alive,
+                traced.protected,
+                traced.start,
+                traced.start.saturating_add(traced.len),
+                traced.extra_ranges
+            );
+        }
+    }
 
-    // Apply a TB-lite transition to all overlapping nodes.
-    // `child` means the access goes through this node's lineage (node is an ancestor
-    // of the accessing tag, including itself). `foreign` means all other overlaps.
-    let overlapping_tags: Vec<u64> = tree
+    // Apply a TB-lite transition to all nodes of the allocation.
+    // For locations outside the node's currently accessed ranges, `lazy_perm`
+    // approximates the "future initial permission" from the TB state machine.
+    let candidate_tags: Vec<u64> = tree
         .nodes
         .values()
         .filter(|n| {
@@ -652,7 +713,6 @@ fn tb_lite_check(
                         && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
                     && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
         })
-        .filter(|n| tb_node_overlaps(n, addr, size))
         .filter(|n| {
             if tmeta.alloc_epoch != 0 && n.alloc_epoch != 0 && n.alloc_epoch != tmeta.alloc_epoch {
                 return false;
@@ -662,16 +722,19 @@ fn tb_lite_check(
         .map(|n| n.tag)
         .collect();
 
-    let mut updates: Vec<(u64, TbPerm)> = Vec::new();
-    for tag in overlapping_tags {
+    let mut updates: Vec<(u64, TbPerm, bool)> = Vec::new();
+    let mut newly_accessed_ranges: Vec<u64> = Vec::new();
+    for tag in candidate_tags {
         let Some(n) = tree.nodes.get(&tag).cloned() else {
             continue;
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
         let child_unique_ref_ancestor =
             child && n.tag != access_tag && matches!(n.kind, BorrowKind::Unique);
+        let covered = tb_node_overlaps(&n, addr, size);
+        let old_perm = if covered { n.perm } else { n.lazy_perm };
 
-        let next = match (access, child, n.perm, n.protected) {
+        let next = match (access, child, old_perm, n.protected) {
             // Child/local read: everything except Disabled is unchanged.
             (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
                 if tb_has_live_unique_lineage_ancestor(
@@ -721,7 +784,7 @@ fn tb_lite_check(
             (AliasAccessKind::Read, false, TbPerm::Reserved { conflicted: false }, true) => {
                 TbPerm::Reserved { conflicted: true }
             }
-            (AliasAccessKind::Read, false, TbPerm::Reserved { .. }, _) => n.perm,
+            (AliasAccessKind::Read, false, TbPerm::Reserved { .. }, _) => old_perm,
             (AliasAccessKind::Read, false, TbPerm::Active, true) => TbPerm::Disabled,
             (AliasAccessKind::Read, false, TbPerm::Active, false) => TbPerm::Frozen,
             (AliasAccessKind::Read, false, TbPerm::Frozen, _) => TbPerm::Frozen,
@@ -745,7 +808,7 @@ fn tb_lite_check(
                     size,
                     tmeta.alloc_epoch,
                 ) {
-                    n.perm
+                    old_perm
                 } else {
                     let mut msg = format!(
                         "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
@@ -772,13 +835,21 @@ fn tb_lite_check(
                     size,
                     tmeta.alloc_epoch,
                 ) || (matches!(tmeta.kind, PtrKind::RawMut)
+                    && tb_has_live_unique_lineage_ancestor(
+                        &tree.nodes,
+                        &access_lineage,
+                        addr,
+                        size,
+                        tmeta.alloc_epoch,
+                    )
                     && tb_only_same_family_overlap(
                         &tree.nodes,
                         &access_lineage,
                         addr,
                         size,
                         tmeta.alloc_epoch,
-                    )) {
+                    ))
+                {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -815,21 +886,55 @@ fn tb_lite_check(
                 }
             }
 
+            // Foreign write: preserve the original raw-const family when we reinterpret
+            // an administrative write through a same-place raw-mutable root sibling.
+            (AliasAccessKind::Write, false, perm, _)
+                if recovered_const_write_root.is_some_and(|raw_const_root| {
+                    n.kind == BorrowKind::RawConst
+                        && (n.tag == raw_const_root
+                            || tb_is_ancestor(&tree.nodes, raw_const_root, n.tag))
+                }) =>
+            {
+                perm
+            }
+
+            // Foreign write: raw root siblings over the same exact place stay writable.
+            // This covers allocator/admin patterns such as same-base `realloc` where multiple
+            // raw-mutable roots can legitimately refer to the same allocation bytes.
+            (AliasAccessKind::Write, false, perm, _)
+                if node.kind == BorrowKind::RawMut
+                    && node.parent == 0
+                    && n.kind == BorrowKind::RawMut
+                    && n.parent == 0
+                    && n.start == node.start
+                    && n.len == node.len
+                    && !tb_has_live_non_raw_overlap(tree, addr, size, tmeta.alloc_epoch) =>
+            {
+                perm
+            }
+
             // Foreign write: disable.
             (AliasAccessKind::Write, false, _, _) => TbPerm::Disabled,
         };
 
-        if next != n.perm {
-            updates.push((tag, next));
+        if child && !covered {
+            newly_accessed_ranges.push(tag);
+        }
+        if covered {
+            if next != n.perm {
+                updates.push((tag, next, true));
+            }
+        } else if next != n.lazy_perm {
+            updates.push((tag, next, false));
         }
     }
 
     if matches!(access, AliasAccessKind::Write) {
         // Keep dedicated protector diagnostic for write-through-other-tag while protected.
-        if let Some(protected) = tree
+        let mut protected_nodes: Vec<TbNode> = tree
             .nodes
             .values()
-            .find(|n| {
+            .filter(|n| {
                 tb_is_live_node(n)
                     && n.protected
                     && n.tag != access_tag
@@ -838,12 +943,17 @@ fn tb_lite_check(
                         || n.alloc_epoch == tmeta.alloc_epoch)
             })
             .cloned()
-        {
-            let touched_protected = updates
-                .iter()
-                .any(|(t, next)| *t == protected.tag && *next == TbPerm::Disabled);
-            if touched_protected {
-                let tmap = tags().lock().unwrap();
+            .collect();
+        protected_nodes.sort_by_key(|n| n.tag);
+        if !protected_nodes.is_empty() {
+            let tmap = tags().lock().unwrap();
+            for protected in protected_nodes {
+                let touched_protected = updates.iter().any(|(t, next, covered)| {
+                    *covered && *t == protected.tag && *next == TbPerm::Disabled
+                });
+                if !touched_protected {
+                    continue;
+                }
                 if !tb_same_lineage_protected_conflict_ok(
                     &tree.nodes,
                     &tmap,
@@ -863,12 +973,31 @@ fn tb_lite_check(
         }
     }
 
-    for (tag, next) in updates {
+    let access_len = tb_effective_len(size);
+    for (tag, next, covered) in updates {
         if let Some(n) = tree.nodes.get_mut(&tag) {
-            n.perm = next;
-            n.alive = next != TbPerm::Disabled;
-            if next != TbPerm::Disabled {
-                n.poisoned_by_protector_end = false;
+            if covered {
+                n.perm = next;
+                n.alive = next != TbPerm::Disabled;
+                if next != TbPerm::Disabled {
+                    n.poisoned_by_protector_end = false;
+                }
+            } else {
+                n.lazy_perm = next;
+            }
+        }
+    }
+    for tag in newly_accessed_ranges {
+        if let Some(n) = tree.nodes.get_mut(&tag) {
+            if !tb_ranges_overlap(addr, access_len, n.start, n.len)
+                && !n
+                    .extra_ranges
+                    .iter()
+                    .any(|(start, len)| tb_ranges_overlap(addr, access_len, *start, *len))
+            {
+                n.extra_ranges.push((addr, access_len));
+                n.perm = n.lazy_perm;
+                n.alive = n.perm != TbPerm::Disabled;
             }
         }
     }
@@ -900,6 +1029,50 @@ fn tb_lite_recover_same_place_live_sibling(
         .filter(|n| alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
         .map(|n| n.tag)
         .max()
+}
+
+fn tb_lite_recover_root_raw_mut_sibling_for_const_write(
+    tree: &TbAllocState,
+    raw_const_tag: u64,
+    raw_const_node: &TbNode,
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) -> Option<u64> {
+    let access_len = tb_effective_len(size);
+    if raw_const_node.kind != BorrowKind::RawConst
+        || raw_const_node.parent != 0
+        || raw_const_node.start != addr
+        || raw_const_node.len >= access_len
+        || tb_has_live_non_raw_overlap(tree, addr, size, alloc_epoch)
+    {
+        return None;
+    }
+
+    tree.nodes
+        .values()
+        .filter(|n| n.tag != raw_const_tag)
+        .filter(|n| tb_is_live_node(n))
+        .filter(|n| n.kind == BorrowKind::RawMut)
+        .filter(|n| n.parent == 0)
+        .filter(|n| n.start == raw_const_node.start && n.len == raw_const_node.len)
+        .filter(|n| alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
+        .map(|n| n.tag)
+        .max()
+}
+
+fn tb_has_live_non_raw_overlap(
+    tree: &TbAllocState,
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) -> bool {
+    tree.nodes.values().any(|n| {
+        tb_is_live_node(n)
+            && matches!(n.kind, BorrowKind::Shared | BorrowKind::Unique)
+            && (alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
+            && tb_node_overlaps(n, addr, size)
+    })
 }
 
 #[inline]
@@ -1012,38 +1185,6 @@ fn tb_collect_lineage(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> Vec<u64> {
         tag = node.parent;
     }
     lineage
-}
-
-fn tb_note_protected_child_access(
-    tree: &mut TbAllocState,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    alloc_epoch: u64,
-) {
-    let size = tb_effective_len(size);
-    for &tag in access_lineage {
-        let Some(node) = tree.nodes.get_mut(&tag) else {
-            continue;
-        };
-        if !node.protected {
-            continue;
-        }
-        if alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != alloc_epoch {
-            continue;
-        }
-        if tb_ranges_overlap(addr, size, node.start, node.len) {
-            continue;
-        }
-        if node
-            .extra_ranges
-            .iter()
-            .any(|(start, len)| tb_ranges_overlap(addr, size, *start, *len))
-        {
-            continue;
-        }
-        node.extra_ranges.push((addr, size));
-    }
 }
 
 #[inline]
