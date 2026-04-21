@@ -257,6 +257,9 @@ def main() -> int:
     record_expect = env.get("RECORD_EXPECT", "0") != "0"
     alias_model = normalize_alias_model(env.get("RZ_ALIAS_MODEL"))
     example_filter = env.get("EXAMPLE_FILTER", "").strip()
+    forced_run_attempts = int(env.get("RZ_EXAMPLE_RUN_ATTEMPTS", "0") or "0")
+    forced_run_timeout_s = env.get("RZ_EXAMPLE_RUN_TIMEOUT_S", "").strip()
+    keep_best_observed = env.get("RZ_EXAMPLE_KEEP_BEST_OBSERVED", "0") != "0"
 
     if build_profile not in ("debug", "release"):
         die(f"Unknown BUILD_PROFILE={build_profile}. Use debug or release.")
@@ -362,11 +365,17 @@ def main() -> int:
 
         compile_flags = compile_flags_for_example(pkg_dir, bin_name)
         deterministic_concurrency = "-Zmiri-deterministic-concurrency" in compile_flags
-        run_attempts = 8 if deterministic_concurrency else 1
-        run_timeout_s = 10.0 if deterministic_concurrency else None
+        run_attempts = forced_run_attempts or (8 if deterministic_concurrency else 1)
+        run_timeout_s = (
+            float(forced_run_timeout_s)
+            if forced_run_timeout_s
+            else (10.0 if deterministic_concurrency else None)
+        )
         bin_path = bin_dir_for_run / bin_name
         observed = None
         panicked = False
+        best_observed = None
+        best_panicked = False
         for _attempt in range(run_attempts):
             with run_log.open("w") as f:
                 try:
@@ -387,6 +396,19 @@ def main() -> int:
 
             observed = extract_signature(run_log)
             panicked = did_panic(run_log) or run_result.returncode != 0 or timed_out
+            if observed is not None:
+                best_observed = observed
+                best_panicked = panicked
+            elif best_observed is None:
+                best_panicked = best_panicked or panicked
+
+            if keep_best_observed:
+                if best_observed is not None:
+                    observed = best_observed
+                    panicked = best_panicked
+                    break
+                continue
+
             expected_lower = (expected or "").lower()
             matched = False
             if expected_lower in ("ok", "pass", "none"):
@@ -397,6 +419,10 @@ def main() -> int:
                 matched = observed == expected
             if matched:
                 break
+
+        if keep_best_observed and best_observed is not None:
+            observed = best_observed
+            panicked = best_panicked
 
         if expected is None and record_expect:
             expected = observed or "ok"

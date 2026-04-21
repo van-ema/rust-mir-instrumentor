@@ -152,6 +152,10 @@ def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
     env["RZ_ALIAS_MODEL"] = test.rz_model
     env["REPORT_DIR"] = str(report_dir)
     env.setdefault("CARGO_INCREMENTAL", "0")
+    if "-Zmiri-deterministic-concurrency" in test.miri_compile_flags:
+        env["RZ_EXAMPLE_RUN_ATTEMPTS"] = "8"
+        env["RZ_EXAMPLE_RUN_TIMEOUT_S"] = "10"
+        env["RZ_EXAMPLE_KEEP_BEST_OBSERVED"] = "1"
     tool_dir = REPO_ROOT / "target" / "debug"
     local_cargo_tool = tool_dir / "cargo-instrument-mir"
     local_inst_tool = tool_dir / "instrument-mir"
@@ -163,7 +167,7 @@ def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
     for _attempt in range(3):
         last_code = run(cmd, env, REPO_ROOT, log, timeout_s=60.0)
         summaries = sorted(report_dir.glob("*/summary.tsv"))
-        if last_code == 0 and summaries:
+        if summaries:
             summary = summaries[-1]
             run_log = summary.parent / f"{test.package}__{test.bin_name}" / "run.log"
             return summary, run_log

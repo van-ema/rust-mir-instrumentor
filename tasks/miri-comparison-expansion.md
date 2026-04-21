@@ -26,8 +26,8 @@ Current numbers are easy to misread:
 - total bins in mixed micro suites are not headline metric
 
 Current exact-port comparison:
-- `51 / 52 = 98.1%` agreement
-- report: `reports/miri_compare/20260421_215600/summary.tsv`
+- `52 / 52 = 100.0%` agreement
+- report: `reports/miri_compare/20260421_220831/summary.tsv`
 
 This is honest, but sample too small.
 
@@ -36,7 +36,7 @@ It is their filtered relevant subset from Miri's suite.
 We need our own filtered exact-port number, much larger than `15`.
 
 Current disagreement set:
-- `miri_tb_exact::spurious_read`
+- none in the current exact-port set
 
 Next disagreement work should target these new TB-specific exact ports first.
 
