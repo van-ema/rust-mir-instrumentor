@@ -11,20 +11,23 @@ Fair means:
   - exact Miri ports
   - Miri-inspired regressions
   - broader repo example suite
+- grow coverage not only for borrowing rules, but also for other Miri classes that match
+  `rusteze` goals: provenance, dangling/stale pointers, allocation lifetime, unaligned access,
+  uninit, and call-boundary transport bugs
 
 Do **not** mix these categories in a single headline number.
 
 ## Why
 
 Current numbers are easy to misread:
-- exact Miri ports in dedicated dirs: `37`
+- exact Miri ports in dedicated dirs: `52`
 - Miri-inspired but not exact ports: `13`
-- total Miri-related tests: `50`
+- total Miri-related tests: `55`
 - total bins in mixed micro suites are not headline metric
 
 Current exact-port comparison:
-- `37 / 37 = 100.0%` agreement
-- report: `reports/miri_compare/20260420_130347/summary.tsv`
+- `51 / 52 = 98.1%` agreement
+- report: `reports/miri_compare/20260421_215600/summary.tsv`
 
 This is honest, but sample too small.
 
@@ -33,9 +36,9 @@ It is their filtered relevant subset from Miri's suite.
 We need our own filtered exact-port number, much larger than `15`.
 
 Current disagreement set:
-- none in the current exact-port set (`37 / 37`)
+- `miri_tb_exact::spurious_read`
 
-Next disagreement work should target newly imported exact ports beyond the current `37`.
+Next disagreement work should target these new TB-specific exact ports first.
 
 ## Required Output
 
@@ -81,6 +84,14 @@ Target families first:
 - `miri/tests/fail/tree_borrows/*`
 - `miri/tests/fail/stacked_borrows/*`
 
+Also target exact ports from other Miri classes that are directly relevant to `rusteze`:
+- `miri/tests/fail/provenance/*`
+- `miri/tests/fail/dangling_pointers/*`
+- `miri/tests/fail/alloc/*`
+- `miri/tests/fail/unaligned_pointers/*`
+- selected `miri/tests/fail/uninit/*`
+- selected `miri/tests/fail/function_calls/*`
+
 Prioritize tests that are:
 - single-file
 - no external deps
@@ -94,6 +105,20 @@ Best candidates:
 - `load_invalid_*`
 - `aliasing_mut*`
 - more simple protector / fn-entry / read-vs-write cases
+- provenance / dangling / alloc / unaligned cases with direct memory-safety signal
+
+Priority order for this repo:
+1. `tree_borrows`
+2. `both_borrows`
+3. memory-safety/provenance classes:
+   - `provenance`
+   - `dangling_pointers`
+   - `alloc`
+   - `unaligned_pointers`
+   - selected `uninit`
+   - selected `function_calls`
+4. only selected `stacked_borrows` cases that are still meaningful for Tree Borrows or
+   general memory safety
 
 ### Phase 2: Classify Ports
 
@@ -113,9 +138,14 @@ For each disagreement:
 ### Phase 3: Raise Agreement
 
 Attack highest-yield disagreement clusters first:
-- import more exact ports beyond the current `37`
-- keep exact-port agreement at `100%` while growing toward `50+`
+- tree-borrows interior-mutability / lazy-conflict gaps:
+  `cell_inside_struct`, `repeated_foreign_read_lazy_conflicted`,
+  `reservedim_spurious_write`, `spurious_read`
+- import more exact ports beyond the current `42`
+- keep exact-port agreement high while growing beyond `50+`
 - separate exact-port growth from older inspired/regression-suite cleanup
+- once current TB disagreement set shrinks, expand into provenance / dangling / alloc /
+  unaligned classes instead of padding with low-value SB-specific tests
 
 ## Milestones
 
@@ -195,5 +225,9 @@ Not goal here:
 - ASan comparison
 - performance benchmarking
 - new inspired-by tests for paper headline
+
+Also not goal:
+- bulk-importing all `stacked_borrows/*` tests just to inflate port count
+- broad Miri feature coverage unrelated to aliasing, provenance, or memory safety
 
 This task only exists to make Miri comparison fair and publishable.

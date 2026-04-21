@@ -12,6 +12,7 @@ const EMPTY_TAG_META: TagMeta = TagMeta {
     alloc_live_at_creation: false,
     alias_exempt: false,
     lineage_hint: 0,
+    exposed_provenance_root: false,
     bounds_len: 0,
     origin_known: false,
     origin_base: 0,

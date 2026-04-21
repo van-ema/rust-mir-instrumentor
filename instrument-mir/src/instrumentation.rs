@@ -1572,6 +1572,7 @@ enum InstrKind<'tcx> {
     RawRoot {
         ptr_local: Local,
         is_mut: bool,
+        exposed_provenance: bool,
     },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc {
@@ -2268,7 +2269,11 @@ impl MyOptimizationPass {
                     is_ref: true,
                 }
             } else {
-                InstrKind::RawRoot { ptr_local, is_mut }
+                InstrKind::RawRoot {
+                    ptr_local,
+                    is_mut,
+                    exposed_provenance: false,
+                }
             },
         });
     }
@@ -6900,6 +6905,7 @@ impl MyOptimizationPass {
                                     kind: InstrKind::RawRoot {
                                         ptr_local: dst_local,
                                         is_mut,
+                                        exposed_provenance: true,
                                     },
                                 });
                                 if let Some((key, deps)) = anchor_key {
@@ -7270,6 +7276,13 @@ impl MyOptimizationPass {
                                                 InstrKind::RawRoot {
                                                     ptr_local: dst_local,
                                                     is_mut,
+                                                    exposed_provenance: matches!(
+                                                        rvalue,
+                                                        Rvalue::Cast(
+                                                            CastKind::PointerWithExposedProvenance,
+                                                            ..,
+                                                        )
+                                                    ),
                                                 }
                                             },
                                         });
@@ -7325,6 +7338,7 @@ impl MyOptimizationPass {
                                                 kind: InstrKind::RawRoot {
                                                     ptr_local: dst_local,
                                                     is_mut,
+                                                    exposed_provenance: false,
                                                 },
                                             });
                                             tagged_ptr_locals.insert(dst_local);
@@ -7659,6 +7673,7 @@ impl MyOptimizationPass {
                                         kind: InstrKind::RawRoot {
                                             ptr_local: dst_local,
                                             is_mut,
+                                            exposed_provenance: false,
                                         },
                                     });
                                 }
@@ -7672,6 +7687,7 @@ impl MyOptimizationPass {
                                     kind: InstrKind::RawRoot {
                                         ptr_local: dst_local,
                                         is_mut,
+                                        exposed_provenance: false,
                                     },
                                 });
                             }
@@ -8639,6 +8655,7 @@ impl MyOptimizationPass {
                 kind: InstrKind::RawRoot {
                     ptr_local: dst_local,
                     is_mut,
+                    exposed_provenance: false,
                 },
             });
             insert_points.push(InsertPoint {
@@ -8663,6 +8680,7 @@ impl MyOptimizationPass {
                 kind: InstrKind::RawRoot {
                     ptr_local: dst_local,
                     is_mut,
+                    exposed_provenance: false,
                 },
             });
             insert_points.push(InsertPoint {
@@ -9236,6 +9254,7 @@ impl MyOptimizationPass {
                                             kind: InstrKind::RawRoot {
                                                 ptr_local: dst_local,
                                                 is_mut: true,
+                                                exposed_provenance: false,
                                             },
                                         });
                                     } else {
@@ -9249,6 +9268,7 @@ impl MyOptimizationPass {
                                             kind: InstrKind::RawRoot {
                                                 ptr_local: dst_local,
                                                 is_mut: true,
+                                                exposed_provenance: false,
                                             },
                                         });
                                     }
@@ -9666,6 +9686,7 @@ impl MyOptimizationPass {
                         InstrKind::RawRoot {
                             ptr_local: p.local,
                             is_mut,
+                            exposed_provenance: false,
                         }
                     };
                     insert_points.push(InsertPoint {
@@ -11164,7 +11185,12 @@ impl MyOptimizationPass {
             // workaround for pointers produced from NonNull/Unique via Transmute
             // RawRoot lowering: we implement this by mirroring the existing Raw lowering code path:
             //   tag(ptr_local) = __record_raw_ptr_creation(expose(ptr_local), is_mut, 0)
-            if let InstrKind::RawRoot { ptr_local, is_mut } = creation_kind.clone() {
+            if let InstrKind::RawRoot {
+                ptr_local,
+                is_mut,
+                exposed_provenance,
+            } = creation_kind.clone()
+            {
                 let ptr_ty = body.local_decls[ptr_local].ty;
                 if !self.is_pointer_ty(ptr_ty) {
                     continue;
@@ -11276,7 +11302,8 @@ impl MyOptimizationPass {
                         node: self.const_u8(
                             tcx,
                             source_info.span,
-                            if alias_exempt { 1 } else { 0 },
+                            (if alias_exempt { 1 } else { 0 })
+                                | (if exposed_provenance { 0b10_0000 } else { 0 }),
                         ),
                         span: source_info.span,
                     },

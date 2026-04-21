@@ -114,21 +114,38 @@ def parse_summary(summary: Path) -> dict[str, dict[str, str]]:
     return rows
 
 
-def derive_rusteze_class(row: dict[str, str]) -> str:
+def did_panic(log: Path | None) -> bool:
+    if log is None:
+        return False
+    try:
+        text = log.read_text(errors="replace")
+    except OSError:
+        return False
+    return (
+        "panicked at" in text
+        or "thread 'main' panicked" in text
+        or "thread caused non-unwinding panic. aborting." in text
+        or "SIGABRT" in text
+    )
+
+
+def derive_rusteze_class(row: dict[str, str], panicked: bool) -> str:
     expected = row["expected"].strip().lower()
     observed = row["observed"].strip().lower()
+    if observed not in ("", "-"):
+        return "violation"
+    if panicked:
+        return "panic"
     if expected in ("ok", "pass", "none") and observed in ("", "-"):
         return "ok"
     if expected in ("panic", "panics") and observed == "panic":
         return "panic"
-    if observed not in ("", "-"):
-        return "violation"
     if expected not in ("ok", "pass", "none", "panic", "panics", "-", ""):
         return "violation"
     return "other"
 
 
-def run_rusteze_test(test: PortedTest, report_dir: Path) -> Path:
+def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["EXAMPLE_FILTER"] = rf"^{re.escape(test.label)}$"
@@ -147,7 +164,9 @@ def run_rusteze_test(test: PortedTest, report_dir: Path) -> Path:
         last_code = run(cmd, env, REPO_ROOT, log, timeout_s=60.0)
         summaries = sorted(report_dir.glob("*/summary.tsv"))
         if last_code == 0 and summaries:
-            return summaries[-1]
+            summary = summaries[-1]
+            run_log = summary.parent / f"{test.package}__{test.bin_name}" / "run.log"
+            return summary, run_log
     die(f"rusteze example run failed for {test.label} ({test.rz_model}); see {log}")
 
 
@@ -195,9 +214,11 @@ def main() -> int:
     miri_dir.mkdir(parents=True, exist_ok=True)
 
     rusteze_rows: dict[str, dict[str, str]] = {}
+    rusteze_run_logs: dict[str, Path] = {}
     for test in tests:
-        summary = run_rusteze_test(test, rusteze_dir / test.package / test.bin_name)
+        summary, run_log = run_rusteze_test(test, rusteze_dir / test.package / test.bin_name)
         rusteze_rows.update(parse_summary(summary))
+        rusteze_run_logs[test.label] = run_log
 
     summary_path = run_dir / "summary.tsv"
     with summary_path.open("w") as f:
@@ -212,7 +233,10 @@ def main() -> int:
         row = rusteze_rows.get(test.label)
         if row is None:
             die(f"missing rusteze row for {test.label}")
-        rusteze_class = derive_rusteze_class(row)
+        rusteze_class = derive_rusteze_class(
+            row,
+            did_panic(rusteze_run_logs.get(test.label)),
+        )
         miri_exit, miri_class = run_miri(test, miri_dir)
         same = (
             (miri_class == "ok" and rusteze_class == "ok")

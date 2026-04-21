@@ -1,11 +1,5 @@
 // Ported from miri/tests/fail/tree_borrows/fnentry_invalidation.rs.
-trait Bad {
-    fn do_bad(&mut self) {
-        // no-op
-    }
-}
-
-impl Bad for i32 {}
+//@compile-flags: -Zmiri-tree-borrows
 
 fn main() {
     let mut x = 0i32;
@@ -18,3 +12,9 @@ fn main() {
         *z = 2;
     }
 }
+
+trait Bad {
+    fn do_bad(&mut self) {}
+}
+
+impl Bad for i32 {}

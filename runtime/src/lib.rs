@@ -530,6 +530,86 @@ fn rz_static_range_for_addr(addr: usize) -> Option<&'static StaticRange> {
 }
 
 #[inline]
+fn rz_validate_ref_creation_addr(
+    pointee_addr: usize,
+    kind: PtrKind,
+    parent_tag: u64,
+    bounds_len: usize,
+) -> Option<(&'static str, String)> {
+    let access_name = match kind {
+        PtrKind::RefMut => "WRITE",
+        PtrKind::RefShared => "READ",
+        _ => "READ",
+    };
+    let access_len = bounds_len.max(1);
+
+    let suspicious_untracked_parent = tag_store::get(parent_tag)
+        .as_ref()
+        .is_some_and(|parent| parent.exposed_provenance_root);
+
+    if pointee_addr == 0 && (parent_tag != 0 || suspicious_untracked_parent) {
+        return Some((
+            "WILD_POINTER",
+            format!(
+                "{access_name} via root ref create addr=0x0 size={access_len}\nreason=NULL_REF_CREATE kind={kind:?} parent={parent_tag}"
+            ),
+        ));
+    }
+
+    if let Some(r) = rz_static_range_for_addr(pointee_addr) {
+        let access_end = pointee_addr.saturating_add(access_len);
+        if access_end <= r.end {
+            return None;
+        }
+    }
+
+    if suspicious_untracked_parent {
+        return Some((
+            "WILD_POINTER",
+            format!(
+                "{access_name} via root ref create addr=0x{pointee_addr:x} size={access_len}\nreason=REF_CREATE_UNTRACKED kind={kind:?} parent={parent_tag}"
+            ),
+        ));
+    }
+
+    let alloc_opt = {
+        let amap = allocs().lock().unwrap();
+        find_alloc_containing(&amap, pointee_addr).map(|(base, meta)| (base, *meta))
+    };
+
+    if let Some((base, ameta)) = alloc_opt {
+        if !ameta.live {
+            return Some((
+                "USE_AFTER_DEAD",
+                format!(
+                    "{access_name} via root ref create addr=0x{pointee_addr:x} size={access_len}\nreason=REF_CREATE_FROM_DEAD_ALLOC alloc_base=0x{base:x} alloc_size={} alloc_epoch={} kind={kind:?} parent={parent_tag}",
+                    ameta.size,
+                    ameta.epoch,
+                ),
+            ));
+        }
+
+        if ameta.size != 0 {
+            let access_end = pointee_addr.saturating_add(access_len);
+            let alloc_end = base.saturating_add(ameta.size);
+            if access_end > alloc_end {
+                return Some((
+                    "OUT_OF_BOUNDS",
+                    format!(
+                        "{access_name} via root ref create addr=0x{pointee_addr:x} size={access_len}\nreason=REF_CREATE_OOB alloc_base=0x{base:x} alloc_end=0x{alloc_end:x} alloc_size={} kind={kind:?} parent={parent_tag}",
+                        ameta.size,
+                    ),
+                ));
+            }
+        }
+
+        return None;
+    }
+
+    None
+}
+
+#[inline]
 fn rz_record_heap_event(ptr: *mut u8, size: usize, live: bool) {
     if ptr.is_null() {
         return;
@@ -985,6 +1065,8 @@ pub struct TagMeta {
     /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source.
     /// bit5=internal runtime normalization for const refs materialized at alloc end.
     pub lineage_hint: u8,
+    /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
+    pub exposed_provenance_root: bool,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
@@ -3471,6 +3553,13 @@ pub extern "C" fn __record_ref_creation(
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
 
     let validate_start = profile.map(|_| Instant::now());
+    if !alias_exempt_flag {
+        if let Some((vk, msg)) =
+            rz_validate_ref_creation_addr(pointee_addr, kind, parent_tag, bounds_len)
+        {
+            rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
+        }
+    }
     if let Some(msg) = active_alias_model().validate_ref_creation(
         pointee_addr,
         kind,
@@ -3684,6 +3773,7 @@ pub extern "C" fn __record_ref_creation(
             } else {
                 0
             },
+        exposed_provenance_root: false,
         bounds_len,
         origin_known,
         origin_base,
@@ -3768,6 +3858,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
+    let exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
     // MIR and optimized std/alloc lowering often materialize administrative `*const`
     // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
     // and then write through them. Preserve the parent's effective write capability so
@@ -3786,6 +3877,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
+    // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
@@ -3846,6 +3938,8 @@ pub extern "C" fn __record_raw_ptr_creation(
             } else {
                 (parent_epoch, parent_live, inherited_bounds_len)
             }
+        } else if exposed_provenance_root {
+            (0, false, 0)
         } else {
             // Root creation: if the match is a dead stack slot, treat metadata as unknown
             // to avoid inheriting stale bounds/epoch from recycled stack storage.
@@ -3946,7 +4040,9 @@ pub extern "C" fn __record_raw_ptr_creation(
     } else {
         0
     };
-    let (origin_known, origin_base, origin_end) = if resolved_parent != 0 {
+    let (origin_known, origin_base, origin_end) = if exposed_provenance_root {
+        (false, 0, 0)
+    } else if resolved_parent != 0 {
         tag_store::get(resolved_parent)
             .filter(|parent| parent.origin_known && (!parent_alloc_mismatch || alloc_is_stack))
             .map(|parent| (true, parent.origin_base, parent.origin_end))
@@ -3964,6 +4060,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
         lineage_hint: alias_exempt & 0b0000_1110,
+        exposed_provenance_root,
         bounds_len,
         origin_known,
         origin_base,

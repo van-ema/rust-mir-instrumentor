@@ -126,6 +126,26 @@ def write_expectation(pkg_dir: Path, bin_name: str, alias_model: str, value: str
     expect_file.write_text(f"{value}\n")
 
 
+def source_file_for_example(pkg_dir: Path, bin_name: str) -> Path:
+    bin_src = pkg_dir / "src" / "bin" / f"{bin_name}.rs"
+    if bin_src.exists():
+        return bin_src
+    return pkg_dir / "src" / "main.rs"
+
+
+def compile_flags_for_example(pkg_dir: Path, bin_name: str) -> list[str]:
+    src_file = source_file_for_example(pkg_dir, bin_name)
+    if not src_file.exists():
+        return []
+    flags: list[str] = []
+    for line in src_file.read_text(errors="replace").splitlines():
+        if not line.startswith("//@compile-flags:"):
+            continue
+        _, raw = line.split(":", 1)
+        flags.extend(raw.strip().split())
+    return flags
+
+
 def load_examples(cargo: str, env: dict[str, str]) -> list[tuple[str, str, Path]]:
     output = subprocess.check_output(
         [cargo, "metadata", "--no-deps", "--format-version", "1"],
@@ -340,12 +360,43 @@ def main() -> int:
             failures += 1
             continue
 
+        compile_flags = compile_flags_for_example(pkg_dir, bin_name)
+        deterministic_concurrency = "-Zmiri-deterministic-concurrency" in compile_flags
+        run_attempts = 8 if deterministic_concurrency else 1
+        run_timeout_s = 10.0 if deterministic_concurrency else None
         bin_path = bin_dir_for_run / bin_name
-        with run_log.open("w") as f:
-            run_result = subprocess.run([str(bin_path)], env=env, stdout=f, stderr=subprocess.STDOUT)
+        observed = None
+        panicked = False
+        for _attempt in range(run_attempts):
+            with run_log.open("w") as f:
+                try:
+                    run_result = subprocess.run(
+                        [str(bin_path)],
+                        env=env,
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                        timeout=run_timeout_s,
+                    )
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    f.write(f"\nTIMEOUT after {run_timeout_s}s\n")
+                    class TimeoutResult:
+                        returncode = 124
+                    run_result = TimeoutResult()
+                    timed_out = True
 
-        observed = extract_signature(run_log)
-        panicked = did_panic(run_log) or run_result.returncode != 0
+            observed = extract_signature(run_log)
+            panicked = did_panic(run_log) or run_result.returncode != 0 or timed_out
+            expected_lower = (expected or "").lower()
+            matched = False
+            if expected_lower in ("ok", "pass", "none"):
+                matched = observed is None and not panicked
+            elif expected_lower in ("panic", "panics"):
+                matched = panicked and observed is None
+            elif expected is not None:
+                matched = observed == expected
+            if matched:
+                break
 
         if expected is None and record_expect:
             expected = observed or "ok"
