@@ -1,5 +1,3 @@
-∆
-
 # Notes
 
 ## Current defaults
