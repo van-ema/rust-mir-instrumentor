@@ -579,6 +579,21 @@ fn rz_validate_ref_creation_addr(
 
     if let Some((base, ameta)) = alloc_opt {
         if !ameta.live {
+            // Epoch bumps on every live/dead transition, so the natural sequence for a
+            // single allocation is: N (live) -> N+1 (dead). When `ameta.epoch == parent.alloc_epoch + 1`
+            // the tag is still pinned to the allocation instance that just died — real UAD.
+            // A larger gap (`>= 2`) means the slot was reborn and died again in between,
+            // which is the address-reuse false-positive pattern for stack frames.
+            if ameta.is_stack {
+                let parent_epoch = tag_store::get(parent_tag).map(|p| p.alloc_epoch).unwrap_or(0);
+                // If we don't have a parent epoch to correlate against (root creation
+                // or untagged parent), fall back to the conservative old behavior and
+                // skip the UAD report — we cannot distinguish real UAD from stack-slot
+                // reuse in that case.
+                if parent_epoch == 0 || ameta.epoch > parent_epoch + 1 {
+                    return None;
+                }
+            }
             return Some((
                 "USE_AFTER_DEAD",
                 format!(
@@ -607,6 +622,64 @@ fn rz_validate_ref_creation_addr(
     }
 
     None
+}
+
+#[inline]
+fn rz_validate_strict_raw_creation_addr(
+    pointee_addr: usize,
+    kind: PtrKind,
+    parent_tag: u64,
+    exposed_provenance_root: bool,
+) -> Option<(&'static str, String)> {
+    if exposed_provenance_root {
+        return Some((
+            "WILD_POINTER",
+            format!(
+                "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}"
+            ),
+        ));
+    }
+
+    let Some(parent_meta) = tag_store::get(parent_tag) else {
+        return None;
+    };
+
+    if parent_meta.origin_known && parent_meta.origin_end > parent_meta.origin_base {
+        if pointee_addr < parent_meta.origin_base || pointee_addr > parent_meta.origin_end {
+            return Some((
+                "OUT_OF_BOUNDS",
+                format!(
+                    "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=RAW_DERIVE_OOB origin_base=0x{:x} origin_end=0x{:x} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                    parent_meta.origin_base,
+                    parent_meta.origin_end,
+                    parent_meta.pointee_addr
+                ),
+            ));
+        }
+    }
+
+    None
+}
+
+#[inline]
+fn rz_has_exposed_provenance_root(tag: u64, tmeta: &TagMeta) -> bool {
+    if tmeta.exposed_provenance_root {
+        return true;
+    }
+
+    let mut cur = tmeta.parent;
+    let mut depth = 0usize;
+    while cur != 0 && depth < 16 {
+        let Some(parent) = tag_store::get(cur) else {
+            break;
+        };
+        if parent.exposed_provenance_root {
+            return true;
+        }
+        cur = parent.parent;
+        depth += 1;
+    }
+    false
 }
 
 #[inline]
@@ -652,7 +725,7 @@ unsafe impl ::std::alloc::GlobalAlloc for RzGlobalAlloc {
         RZ_IN_ALLOC_HOOK.with(|f| f.set(true));
 
         // Validate before calling the system allocator to avoid abort on double-free.
-        let ok = rz_pre_free_check(ptr);
+        let ok = rz_pre_free_check(ptr, layout.size(), layout.align());
         if ok {
             ::std::alloc::System.dealloc(ptr, layout);
         }
@@ -893,7 +966,7 @@ macro_rules! rz_trace {
 /// IMPORTANT: this intentionally diverges from program behavior to keep the
 /// process alive long enough to report the violation.
 #[inline]
-fn rz_pre_free_check(ptr: *mut u8) -> bool {
+fn rz_pre_free_check(ptr: *mut u8, layout_size: usize, _layout_align: usize) -> bool {
     if ptr.is_null() {
         return false;
     }
@@ -907,20 +980,28 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
     match amap.get_mut(&base) {
         None => {
             // This pointer base was not tracked in our allocation map.
-            // This can legitimately happen for allocations performed while inside runtime hooks
-            // (we intentionally suppress allocator recording to avoid recursion).
+            // Two cases:
+            //   (a) Legit: alloc performed while inside a runtime hook (recording suppressed).
+            //       Those allocs go through `System.alloc` directly and land at real heap
+            //       addresses (>= one page).
+            //   (b) Invalid-free: user code passed a bogus pointer to dealloc, e.g.
+            //       `Box::from_raw(NonNull::<T>::dangling().as_ptr())` where the "pointer"
+            //       is just `align_of::<T>()` (a small integer well below any page).
             //
-            // Default: allow the system deallocator to run to avoid false positives and leaks.
-            // Opt-in strict mode: report and skip the system deallocator.
+            // Heuristic: if base is implausibly small for a real heap address and the free
+            // is non-ZST, treat it as INVALID_FREE. `RZ_STRICT_FREE_CHECK=1` promotes all
+            // untracked frees to violations.
             let strict = std::env::var("RZ_STRICT_FREE_CHECK")
                 .ok()
                 .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false");
 
-            if strict {
+            let looks_like_sentinel = layout_size > 0 && base < 0x10000;
+
+            if strict || looks_like_sentinel {
                 rz_violation(
                     "INVALID_FREE",
                     format!(
-                        "FREE of unknown base=0x{base:x} (skipping system dealloc to avoid abort)"
+                        "FREE of unknown base=0x{base:x} size={layout_size} (skipping system dealloc to avoid abort)"
                     ),
                 );
                 false
@@ -947,6 +1028,18 @@ fn rz_pre_free_check(ptr: *mut u8) -> bool {
                 }
 
                 return false;
+            }
+
+            // Layout-size mismatch: alloc recorded with one size, dealloc called with another
+            // (e.g. `Box::from_raw(ptr as *mut u32)` when the alloc was `u16`).
+            if layout_size != 0 && meta.size != 0 && layout_size != meta.size {
+                rz_violation(
+                    "DEALLOC_LAYOUT_MISMATCH",
+                    format!(
+                        "DEALLOC_LAYOUT_MISMATCH base=0x{base:x} alloc_size={} dealloc_size={}",
+                        meta.size, layout_size
+                    ),
+                );
             }
 
             // Mark as dead in our bookkeeping now (and bump epoch on death transition).
@@ -1905,7 +1998,6 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     }
 
     let new_live = (live & 0x1) != 0;
-
     // We treat `epoch` as an allocation-instance counter for a given base address.
     // We must bump it not only on death, but also on reuse (dead -> live), otherwise
     // a later allocation at the same numeric address could "revive" stale pointers.
@@ -2512,6 +2604,17 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    if rz_has_exposed_provenance_root(tag, &tmeta) {
+        let msg = append_location_if_enabled(
+            format!(
+                "WRITE via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                tmeta.kind, tmeta.parent, tmeta.pointee_addr
+            ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("WILD_POINTER", msg);
+        return;
+    }
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
@@ -2746,8 +2849,18 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u
     }
 
     if !ameta.live {
+        // `slot_reused` is true when we can prove the tag was minted against an older
+        // allocation instance (gap >= 2). When the tag's alloc_epoch is unknown (0) we
+        // conservatively treat stack accesses as ambiguous and also suppress, matching
+        // the previous unconditional stack-skip behavior for that specific case.
+        let slot_reused = tmeta.alloc_epoch == 0 || ameta.epoch > tmeta.alloc_epoch + 1;
+        if ameta.is_stack && slot_reused && tmeta.parent != 0 && tmeta.pointee_addr == base {
+            return;
+        }
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
             && (ameta.is_stack || rz_stack_addr_hint(addr))
+            && (tmeta.alloc_epoch == 0 || !tmeta.origin_known)
+            && (!ameta.is_stack || slot_reused)
         {
             return;
         }
@@ -2984,6 +3097,17 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8
         rz_violation("UNKNOWN_TAG", msg);
         return;
     };
+    if rz_has_exposed_provenance_root(tag, &tmeta) {
+        let msg = append_location_if_enabled(
+            format!(
+                "READ via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                tmeta.kind, tmeta.parent, tmeta.pointee_addr
+            ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("WILD_POINTER", msg);
+        return;
+    }
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
@@ -3160,8 +3284,18 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8
     };
 
     if !ameta.live {
+        // `slot_reused` is true when we can prove the tag was minted against an older
+        // allocation instance (gap >= 2). When the tag's alloc_epoch is unknown (0) we
+        // conservatively treat stack accesses as ambiguous and also suppress, matching
+        // the previous unconditional stack-skip behavior for that specific case.
+        let slot_reused = tmeta.alloc_epoch == 0 || ameta.epoch > tmeta.alloc_epoch + 1;
+        if ameta.is_stack && slot_reused && tmeta.parent != 0 && tmeta.pointee_addr == base {
+            return;
+        }
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
             && (ameta.is_stack || rz_stack_addr_hint(addr))
+            && (tmeta.alloc_epoch == 0 || !tmeta.origin_known)
+            && (!ameta.is_stack || slot_reused)
         {
             return;
         }
@@ -3858,7 +3992,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
-    let exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
+    let mut exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
+    let strict_creation_check = (alias_exempt & 0b0100_0000) != 0;
     // MIR and optimized std/alloc lowering often materialize administrative `*const`
     // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
     // and then write through them. Preserve the parent's effective write capability so
@@ -3878,6 +4013,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit2: strong root-origin repair hint
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
     // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
+    // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
@@ -4033,6 +4169,28 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
 
+    if !exposed_provenance_root && projected_raw_hint && pointee_addr != 0 {
+        let poisoned_same_addr = tags().lock().unwrap().values().any(|meta| {
+            meta.pointee_addr == pointee_addr
+                && meta.exposed_provenance_root
+                && (alloc_epoch == 0 || meta.alloc_epoch == 0 || meta.alloc_epoch == alloc_epoch)
+        });
+        if poisoned_same_addr {
+            exposed_provenance_root = true;
+        }
+    }
+
+    if strict_creation_check {
+        if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
+            pointee_addr,
+            kind,
+            resolved_parent,
+            exposed_provenance_root,
+        ) {
+            rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
+        }
+    }
+
     let bounds_len = if bounds_len != 0 {
         bounds_len
     } else if carry_bounds_from_source {
@@ -4076,7 +4234,6 @@ pub extern "C" fn __record_raw_ptr_creation(
         lineage_cache::remember_non_root_tag(tag, &tmeta);
     }
     active_alias_model().on_tag_created(tag, &tmeta);
-
     let kind_str = match kind {
         PtrKind::RawConst => "const",
         PtrKind::RawMut => "mut",

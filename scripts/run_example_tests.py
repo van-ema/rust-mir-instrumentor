@@ -19,6 +19,18 @@ def trim(s: str) -> str:
 
 
 def extract_signature(log_path: Path) -> str | None:
+    def signature_priority(kind: str) -> int:
+        if "TREE_BORROWS_VIOLATION" in kind or "STACKED_BORROWS_VIOLATION" in kind:
+            return 4
+        if kind == "USE_AFTER_DEAD" or kind == "STALE_POINTER_EPOCH_MISMATCH":
+            return 3
+        if kind == "OUT_OF_BOUNDS":
+            return 2
+        if kind == "WILD_POINTER":
+            return 1
+        return 0
+
+    blocks: list[tuple[int, int, str]] = []
     kind = None
     access = None
     size = None
@@ -52,17 +64,21 @@ def extract_signature(log_path: Path) -> str | None:
                     pkind = part.split("=", 1)[1]
 
         if line.lstrip().startswith("="):
-            break
+            sig = f"{kind}|{access or 'UNKNOWN'}|{pkind or 'unknown'}|{size or 'unknown'}"
+            blocks.append((signature_priority(kind), len(blocks), sig))
+            kind = None
+            access = None
+            size = None
+            pkind = None
+            in_block = False
 
-    if kind is None:
+    if not blocks:
         return None
-    if access is None:
-        access = "UNKNOWN"
-    if pkind is None:
-        pkind = "unknown"
-    if size is None:
-        size = "unknown"
-    return f"{kind}|{access}|{pkind}|{size}"
+    max_priority = max(priority for priority, _idx, _sig in blocks)
+    candidates = [(idx, sig) for priority, idx, sig in blocks if priority == max_priority]
+    if max_priority == signature_priority("OUT_OF_BOUNDS"):
+        return candidates[-1][1]
+    return candidates[0][1]
 
 
 def did_panic(log_path: Path) -> bool:

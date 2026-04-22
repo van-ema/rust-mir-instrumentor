@@ -189,6 +189,8 @@ enum CallEffect {
     Store,
     /// Pointer derivation wrappers that return a pointer derived from arg0 (fresh tag, parent linkage).
     PtrDerive,
+    /// Pointer-returning helpers that create a raw root from an integer/exposed address.
+    ExposedProvenanceRoot,
     /// Box boundary modeling.
     BoxIntoRaw,
     BoxFromRaw,
@@ -400,6 +402,16 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::Contains, "::ptr::addr_eq", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::null", CallEffect::Ignore),
     EffectRule::one(MatchKind::Contains, "::ptr::null_mut", CallEffect::Ignore),
+    EffectRule::one(
+        MatchKind::Contains,
+        "::without_provenance",
+        CallEffect::ExposedProvenanceRoot,
+    ),
+    EffectRule::one(
+        MatchKind::Contains,
+        "::with_exposed_provenance",
+        CallEffect::ExposedProvenanceRoot,
+    ),
     EffectRule::two(
         MatchKind::Contains,
         "::ptr::const_ptr",
@@ -1547,6 +1559,14 @@ pub(in crate::instrumentation) enum SizeOperand<'tcx> {
     PtrMetadataStr {
         ptr_local: Local,
     },
+    /// Size derived from wide-pointer metadata for a struct DST with trailing `[T]` field.
+    /// Total bytes = offset_of(adt_ty, field_idx) + metadata * size_of::<elem_ty>().
+    PtrMetadataAdtSlice {
+        ptr_local: Local,
+        adt_ty: Ty<'tcx>,
+        field_idx: FieldIdx,
+        elem_ty: Ty<'tcx>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1720,12 +1740,14 @@ enum InstrKind<'tcx> {
         src: Local,
         is_mut: bool,
         is_ref: bool,
+        strict_validity: bool,
     },
     /// Fresh tag for a derived pointer value using an explicit pre-call parent snapshot.
     PtrDeriveParent {
         dst: Local,
         is_mut: bool,
         is_ref: bool,
+        strict_validity: bool,
     },
     /// Caller-side tag push for pointer arguments to a direct call.
     CallArgPush {
@@ -1816,6 +1838,7 @@ struct ScanResult<'tcx> {
     insert_points: Vec<InsertPoint<'tcx>>,
     ptr_locals_needing_tag: HashSet<Local>,
     projected_reborrow_anchor_specs: ReborrowAnchorSpecMap,
+    fallback_return_locals: Vec<(Local, SizeOperand<'tcx>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3668,7 +3691,42 @@ impl MyOptimizationPass {
                 elem_ty: *elem_ty,
             },
             TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            TyKind::Adt(..) => match self.adt_slice_tail(tcx, body, pointee) {
+                Some((field_idx, elem_ty)) => SizeOperand::PtrMetadataAdtSlice {
+                    ptr_local,
+                    adt_ty: pointee,
+                    field_idx,
+                    elem_ty,
+                },
+                None => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+            },
             _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        }
+    }
+
+    /// For a struct DST with a trailing `[T]` field, return the field index and element type.
+    /// Other DST forms (`dyn Trait`, nested DST) return None.
+    fn adt_slice_tail<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        adt_ty: Ty<'tcx>,
+    ) -> Option<(FieldIdx, Ty<'tcx>)> {
+        let (adt_def, substs) = match adt_ty.kind() {
+            TyKind::Adt(adt_def, substs) if adt_def.is_struct() => (adt_def, substs),
+            _ => return None,
+        };
+        let variant = adt_def.non_enum_variant();
+        let last_idx = variant.fields.len().checked_sub(1)?;
+        let field = &variant.fields[FieldIdx::from_usize(last_idx)];
+        let field_ty = field.ty(tcx, substs);
+        let typing_env = body.typing_env(tcx);
+        if field_ty.is_sized(tcx, typing_env) {
+            return None;
+        }
+        match field_ty.kind() {
+            TyKind::Slice(elem_ty) => Some((FieldIdx::from_usize(last_idx), *elem_ty)),
+            _ => None,
         }
     }
 
@@ -3693,6 +3751,15 @@ impl MyOptimizationPass {
                 elem_ty: *elem_ty,
             },
             TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            TyKind::Adt(..) => match self.adt_slice_tail(tcx, body, pointee) {
+                Some((field_idx, elem_ty)) => SizeOperand::PtrMetadataAdtSlice {
+                    ptr_local,
+                    adt_ty: pointee,
+                    field_idx,
+                    elem_ty,
+                },
+                None => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+            },
             _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
         }
     }
@@ -3722,6 +3789,17 @@ impl MyOptimizationPass {
                 elem_ty: *elem_ty,
             },
             TyKind::Str => SizeOperand::PtrMetadataStr { ptr_local },
+            TyKind::Adt(..) if !pointee.is_sized(tcx, body.typing_env(tcx)) => {
+                match self.adt_slice_tail(tcx, body, pointee) {
+                    Some((field_idx, elem_ty)) => SizeOperand::PtrMetadataAdtSlice {
+                        ptr_local,
+                        adt_ty: pointee,
+                        field_idx,
+                        elem_ty,
+                    },
+                    None => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+                }
+            }
             _ if pointee.is_sized(tcx, body.typing_env(tcx)) => {
                 self.size_operand_for_ty(tcx, body, pointee, span)
             }
@@ -3729,10 +3807,21 @@ impl MyOptimizationPass {
         }
     }
 
-    fn ptr_ty_has_precise_wide_bounds<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+    fn ptr_ty_has_precise_wide_bounds<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                matches!(pointee.kind(), TyKind::Slice(..) | TyKind::Str)
+                if matches!(pointee.kind(), TyKind::Slice(..) | TyKind::Str) {
+                    return true;
+                }
+                if matches!(pointee.kind(), TyKind::Adt(..)) {
+                    return self.adt_slice_tail(tcx, body, *pointee).is_some();
+                }
+                false
             }
             _ => false,
         }
@@ -3747,7 +3836,7 @@ impl MyOptimizationPass {
     ) -> bool {
         let src_ty = body.local_decls[src].ty;
         let dst_ty = body.local_decls[dst].ty;
-        self.ptr_ty_has_precise_wide_bounds(src_ty) && self.is_thin_ptr_ty(tcx, body, dst_ty)
+        self.ptr_ty_has_precise_wide_bounds(tcx, body, src_ty) && self.is_thin_ptr_ty(tcx, body, dst_ty)
     }
 
     fn field_offset_bytes<'tcx>(
@@ -4893,6 +4982,76 @@ impl MyOptimizationPass {
                 match rvalue {
                     Rvalue::Ref(_, BorrowKind::Mut { .. }, src_place) => {
                         return Some(src_place.local);
+                    }
+                    Rvalue::Use(op) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::CopyForDeref(p) => {
+                        let Some(next_local) = p.as_local() else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(_, _) | CastKind::Transmute,
+                        op,
+                        _,
+                    )
+                    | Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                        let Some(next_local) =
+                            self.place_from_operand(op).and_then(|p| p.as_local())
+                        else {
+                            return None;
+                        };
+                        current_local = next_local;
+                        search_end = idx;
+                        continue 'outer;
+                    }
+                    _ => return None,
+                }
+            }
+
+            return None;
+        }
+    }
+
+    /// Recover the non-pointer pointee local behind a local that ultimately comes from
+    /// `&mut _p`, `&_p`, or `&raw {_mut,const} _p` within the same block.
+    fn backtrack_pointer_pointee_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        statements: &[Statement<'tcx>],
+    ) -> Option<Local> {
+        let mut current_local = ptr_local;
+        let mut search_end = statements.len();
+
+        'outer: loop {
+            for (idx, stmt) in statements[..search_end].iter().enumerate().rev() {
+                let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                if place.as_local() != Some(current_local) {
+                    continue;
+                }
+
+                match rvalue {
+                    Rvalue::Ref(_, _, src_place) | Rvalue::RawPtr(_, src_place) => {
+                        if !self.is_pointer_ty(body.local_decls[src_place.local].ty) {
+                            return Some(src_place.local);
+                        }
+                        current_local = src_place.local;
+                        search_end = idx;
+                        continue 'outer;
                     }
                     Rvalue::Use(op) => {
                         let Some(next_local) =
@@ -6353,24 +6512,19 @@ impl MyOptimizationPass {
                         ptr_local: arg_local,
                     },
                 });
-            } else if interesting_stack_locals.contains(&arg_local)
-                || self.is_box_ty(tcx, arg_ty)
-                || self.ty_contains_direct_pointer_fields(tcx, body, arg_ty)
-            {
-                if self.supports_arg_anchor_take_local(tcx, body, arg_local) {
-                    insert_points.push(InsertPoint {
-                        bb: entry_bb,
-                        stmt_idx: entry_stmt_idx,
-                        insert_before: false,
-                        source_info: entry_source_info,
-                        place: Place::from(arg_local),
-                        kind: InstrKind::ArgAnchorTake {
-                            callee_id,
-                            arg_index: arg_index as u64,
-                            local: arg_local,
-                        },
-                    });
-                }
+            } else if self.supports_arg_anchor_take_local(tcx, body, arg_local) {
+                insert_points.push(InsertPoint {
+                    bb: entry_bb,
+                    stmt_idx: entry_stmt_idx,
+                    insert_before: false,
+                    source_info: entry_source_info,
+                    place: Place::from(arg_local),
+                    kind: InstrKind::ArgAnchorTake {
+                        callee_id,
+                        arg_index: arg_index as u64,
+                        local: arg_local,
+                    },
+                });
             }
         }
     }
@@ -7079,6 +7233,7 @@ impl MyOptimizationPass {
                                                 src: src_local,
                                                 is_mut: self.ptr_is_mut(dst_ty),
                                                 is_ref: matches!(dst_ty.kind(), TyKind::Ref(..)),
+                                                strict_validity: false,
                                             },
                                         });
                                         if let Some((key, deps)) = anchor_key {
@@ -7648,6 +7803,7 @@ impl MyOptimizationPass {
                                         src: src_local,
                                         is_mut,
                                         is_ref,
+                                        strict_validity: false,
                                     },
                                 });
                             } else if let Some(src_place) = src_place_opt {
@@ -7745,6 +7901,7 @@ impl MyOptimizationPass {
                                             src: src_local,
                                             is_mut,
                                             is_ref: matches!(dst_ty.kind(), TyKind::Ref(..)),
+                                            strict_validity: true,
                                         },
                                     });
                                 }
@@ -8220,6 +8377,89 @@ impl MyOptimizationPass {
                 );
                 (Operand::Copy(Place::from(meta_local)), vec![meta_stmt])
             }
+            SizeOperand::PtrMetadataAdtSlice {
+                ptr_local,
+                adt_ty,
+                field_idx,
+                elem_ty,
+            } => {
+                let meta_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let elem_size_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let tail_bytes_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let head_off_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let total_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let meta_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(meta_local),
+                        Rvalue::UnaryOp(UnOp::PtrMetadata, Operand::Copy(Place::from(*ptr_local))),
+                    ))),
+                );
+                let elem_size_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(elem_size_local),
+                        Rvalue::NullaryOp(NullOp::SizeOf, *elem_ty),
+                    ))),
+                );
+                let tail_bytes_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(tail_bytes_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Mul,
+                            Box::new((
+                                Operand::Copy(Place::from(meta_local)),
+                                Operand::Copy(Place::from(elem_size_local)),
+                            )),
+                        ),
+                    ))),
+                );
+                let offset_of_list =
+                    tcx.mk_offset_of(&[(VariantIdx::from_u32(0), *field_idx)]);
+                let head_off_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(head_off_local),
+                        Rvalue::NullaryOp(NullOp::OffsetOf(offset_of_list), *adt_ty),
+                    ))),
+                );
+                let total_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(total_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Box::new((
+                                Operand::Copy(Place::from(head_off_local)),
+                                Operand::Copy(Place::from(tail_bytes_local)),
+                            )),
+                        ),
+                    ))),
+                );
+
+                (
+                    Operand::Copy(Place::from(total_local)),
+                    vec![
+                        meta_stmt,
+                        elem_size_stmt,
+                        tail_bytes_stmt,
+                        head_off_stmt,
+                        total_stmt,
+                    ],
+                )
+            }
         }
     }
 
@@ -8496,6 +8736,56 @@ impl MyOptimizationPass {
         }
     }
 
+    fn ptr_derive_call_requires_strict_validation(&self, def_path: &str) -> bool {
+        def_path.contains("::ptr::")
+            && (def_path.ends_with("::add")
+                || def_path.ends_with("::sub")
+                || def_path.ends_with("::offset")
+                || def_path.ends_with("::wrapping_add")
+                || def_path.ends_with("::wrapping_sub")
+                || def_path.ends_with("::wrapping_offset")
+                || def_path.ends_with("::byte_add")
+                || def_path.ends_with("::byte_sub")
+                || def_path.ends_with("::wrapping_byte_add")
+                || def_path.ends_with("::wrapping_byte_sub"))
+    }
+
+    fn local_is_temp_like<'tcx>(&self, body: &Body<'tcx>, local: Local) -> bool {
+        if local == RETURN_PLACE || body.args_iter().any(|arg| arg == local) {
+            return false;
+        }
+
+        if body.var_debug_info.iter().any(|info| {
+            let VarDebugInfoContents::Place(place) = info.value else {
+                return false;
+            };
+            place.projection.is_empty() && place.local == local
+        }) {
+            return false;
+        }
+
+        match body.local_decls[local].local_info.as_ref() {
+            rustc_middle::mir::ClearCrossCrate::Set(info) => !matches!(
+                &**info,
+                rustc_middle::mir::LocalInfo::User(_)
+                    | rustc_middle::mir::LocalInfo::StaticRef { .. }
+                    | rustc_middle::mir::LocalInfo::ConstRef { .. }
+            ),
+            rustc_middle::mir::ClearCrossCrate::Clear => true,
+        }
+    }
+
+    fn local_has_explicit_storage<'tcx>(&self, body: &Body<'tcx>, local: Local) -> bool {
+        body.basic_blocks.iter().any(|block_data| {
+            block_data.statements.iter().any(|stmt| {
+                matches!(
+                    stmt.kind,
+                    StatementKind::StorageLive(l) | StatementKind::StorageDead(l) if l == local
+                )
+            })
+        })
+    }
+
     fn push_ptr_derive_call<'tcx>(
         bb: BasicBlock,
         block_data: &BasicBlockData<'tcx>,
@@ -8503,6 +8793,7 @@ impl MyOptimizationPass {
         dst_local: Local,
         dst_ty: Ty<'tcx>,
         src_local: Local,
+        strict_validity: bool,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         tagged_ptr_locals: &mut HashSet<Local>,
         classified_derive_ptr_local: &mut Option<Local>,
@@ -8542,6 +8833,7 @@ impl MyOptimizationPass {
                     src: src_local,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 },
             });
         } else {
@@ -8557,6 +8849,7 @@ impl MyOptimizationPass {
                     src: src_local,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 },
             });
         }
@@ -8568,6 +8861,7 @@ impl MyOptimizationPass {
         term: &Terminator<'tcx>,
         dst_local: Local,
         dst_ty: Ty<'tcx>,
+        strict_validity: bool,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         tagged_ptr_locals: &mut HashSet<Local>,
     ) {
@@ -8594,6 +8888,7 @@ impl MyOptimizationPass {
                     dst: dst_local,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 },
             });
         } else {
@@ -8607,6 +8902,7 @@ impl MyOptimizationPass {
                     dst: dst_local,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 },
             });
         }
@@ -9498,6 +9794,9 @@ impl MyOptimizationPass {
                                         term,
                                         dst_local,
                                         dst_ty,
+                                        callee_path_opt.as_deref().is_some_and(|p| {
+                                            self.ptr_derive_call_requires_strict_validation(p)
+                                        }),
                                         insert_points,
                                         tagged_ptr_locals,
                                     );
@@ -9519,11 +9818,38 @@ impl MyOptimizationPass {
                                     dst_local,
                                     dst_ty,
                                     src_local,
+                                    callee_path_opt.as_deref().is_some_and(|p| {
+                                        self.ptr_derive_call_requires_strict_validation(p)
+                                    }),
                                     insert_points,
                                     tagged_ptr_locals,
                                     &mut classified_derive_ptr_local,
                                 );
                                 local_ptr_derive_emitted = true;
+                            }
+                        }
+                    }
+                }
+
+                CallEffect::ExposedProvenanceRoot => {
+                    if let Some(dst_local) = destination.as_local() {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                            ptr_locals_needing_tag.insert(dst_local);
+                            tagged_ptr_locals.insert(dst_local);
+                            if let Some(tgt_bb) = call_target_bb {
+                                insert_points.push(InsertPoint {
+                                    bb: tgt_bb,
+                                    stmt_idx: 0,
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: Place::from(dst_local),
+                                    kind: InstrKind::RawRoot {
+                                        ptr_local: dst_local,
+                                        is_mut: self.ptr_is_mut(dst_ty),
+                                        exposed_provenance: true,
+                                    },
+                                });
                             }
                         }
                     }
@@ -9596,7 +9922,27 @@ impl MyOptimizationPass {
             let Some(p) = self.place_from_operand(&a.node) else {
                 continue;
             };
-            let ty = body.local_decls[p.local].ty;
+            let ty = p.ty(&body.local_decls, tcx).ty;
+            if callee_instrumented
+                && !self.is_pointer_ty(ty)
+                && !p.projection.is_empty()
+                && self.is_pointer_ty(body.local_decls[p.local].ty)
+            {
+                if let Some(callee_id) = callee_id_opt {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind: InstrKind::CallArgPush {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            ptr_local: p.local,
+                        },
+                    });
+                }
+            }
             if !self.is_pointer_ty(ty) && self.ty_contains_direct_pointer_fields(tcx, body, ty) {
                 insert_points.push(InsertPoint {
                     bb,
@@ -9669,6 +10015,7 @@ impl MyOptimizationPass {
                             src: src_local,
                             is_mut,
                             is_ref,
+                            strict_validity: false,
                         },
                     });
                 } else {
@@ -9790,7 +10137,7 @@ impl MyOptimizationPass {
                     let Some(p) = self.place_from_operand(&a.node) else {
                         continue;
                     };
-                    let ty = body.local_decls[p.local].ty;
+                    let ty = p.ty(&body.local_decls, tcx).ty;
                     if self.is_pointer_ty(ty) {
                         continue;
                     }
@@ -9989,6 +10336,7 @@ impl MyOptimizationPass {
                                 dst_local,
                                 dst_ty,
                                 src_local,
+                                false,
                                 insert_points,
                                 tagged_ptr_locals,
                                 &mut classified_derive_ptr_local,
@@ -10075,7 +10423,15 @@ impl MyOptimizationPass {
             }
         }
 
-        let interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
+        let mut interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
+        for arg_local in body.args_iter() {
+            let arg_ty = body.local_decls[arg_local].ty;
+            if !self.is_pointer_ty(arg_ty)
+                && self.supports_arg_anchor_take_local(tcx, body, arg_local)
+            {
+                interesting_stack_locals.insert(arg_local);
+            }
+        }
 
         // Fallback stack locals:
         // Some locals never get explicit `StorageLive/StorageDead` in optimized MIR,
@@ -10259,7 +10615,7 @@ impl MyOptimizationPass {
         // To ensure fallback entry alloc tracking runs at real function entry (after prologue) and
         // before other inserted hooks, we prepend these InsertPoints.
         let mut fallback_entry_points: Vec<InsertPoint<'tcx>> = Vec::new();
-        let mut fallback_return_points: Vec<InsertPoint<'tcx>> = Vec::new();
+        let mut fallback_return_locals: Vec<(Local, SizeOperand<'tcx>)> = Vec::new();
 
         for (local, size_op) in fallback_locals.iter().cloned() {
             if local == RETURN_PLACE && !interesting_stack_locals.contains(&local) {
@@ -10295,27 +10651,13 @@ impl MyOptimizationPass {
             });
             self.trace_stack_alloc_emit(tcx, body, local, true, &size_op, "FallbackEntry");
 
-            for (ret_bb, ret_source_info, ret_stmt_idx) in return_sites.iter().copied() {
-                fallback_return_points.push(InsertPoint {
-                    bb: ret_bb,
-                    stmt_idx: ret_stmt_idx,
-                    insert_before: false,
-                    source_info: ret_source_info,
-                    place: Place::from(local),
-                    kind: InstrKind::StackAlloc {
-                        local,
-                        live: false,
-                        size_op: size_op.clone(),
-                    },
-                });
-                self.trace_stack_alloc_emit(tcx, body, local, false, &size_op, "FallbackReturn");
+            if !return_sites.is_empty() {
+                fallback_return_locals.push((local, size_op.clone()));
             }
         }
 
         // Prepend entry fallback points so they are applied last and execute first.
         insert_points.splice(0..0, fallback_entry_points);
-        // Append return points normally; they stay associated with return blocks.
-        insert_points.extend(fallback_return_points);
 
         let mut insert_points = self.filter_insert_points_by_unsafe_dataflow(
             tcx,
@@ -10329,6 +10671,7 @@ impl MyOptimizationPass {
             insert_points,
             ptr_locals_needing_tag,
             projected_reborrow_anchor_specs,
+            fallback_return_locals,
         }
     }
 
@@ -10649,6 +10992,31 @@ impl MyOptimizationPass {
         debug_ref_bindings: &HashMap<DebugRefBindingKey, DebugRefBinding>,
         hooks: Hooks,
     ) {
+        fn resolve_return_chain_bb<'tcx>(
+            body: &Body<'tcx>,
+            mut bb: BasicBlock,
+        ) -> BasicBlock {
+            for _ in 0..64 {
+                let Some(term) = body.basic_blocks[bb].terminator.as_ref() else {
+                    break;
+                };
+                match &term.kind {
+                    TerminatorKind::Return => break,
+                    // End-of-block instrumentation on a return site can be applied after the
+                    // block has already been split into a synthetic call chain. Follow the
+                    // continuation so return-side hooks still land immediately before the
+                    // real `Return`.
+                    TerminatorKind::Call {
+                        target: Some(next), ..
+                    } if body.basic_blocks[bb].statements.is_empty() => {
+                        bb = *next;
+                    }
+                    _ => break,
+                }
+            }
+            bb
+        }
+
         fn instr_priority(kind: &InstrKind<'_>) -> u8 {
             match kind {
                 InstrKind::Ref { .. }
@@ -10719,11 +11087,23 @@ impl MyOptimizationPass {
         sort_points(&mut arg_retag_points);
 
         for (_idx, ip) in other_points.into_iter().rev() {
-            let bb = ip.bb;
-            let stmt_idx = ip.stmt_idx;
+            let mut bb = ip.bb;
+            let mut stmt_idx = ip.stmt_idx;
             let source_info = ip.source_info;
             let place = ip.place;
             let creation_kind = ip.kind;
+
+            if matches!(
+                creation_kind,
+                InstrKind::StackAlloc { live: false, .. }
+            ) && !ip.insert_before
+            {
+                let resolved_bb = resolve_return_chain_bb(body, bb);
+                if resolved_bb != bb {
+                    bb = resolved_bb;
+                    stmt_idx = body.basic_blocks[bb].statements.len();
+                }
+            }
 
             // Avoid emitting allow-untagged READ/WRITE for raw-pointer args from unknown calls.
             // These are a common source of false positives (e.g., pointer casts).
@@ -12585,8 +12965,8 @@ impl MyOptimizationPass {
                     (Some(slot_stmt1), slot_stmt2)
                 }
                 InstrKind::CallArgPush { ptr_local, .. } => {
-                    let ptr_ty = body.local_decls[ptr_local].ty;
-                    if self.is_pointer_ty(ptr_ty) {
+                    let place_ty = place.ty(&body.local_decls, tcx).ty;
+                    if self.is_pointer_ty(place_ty) {
                         match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
                             Some(stmts) => stmts,
                             None => continue,
@@ -13219,6 +13599,7 @@ impl MyOptimizationPass {
                     src,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 } => {
                     let dst_tag = *tag_local_for_ptr_local
                         .get(&dst)
@@ -13256,6 +13637,9 @@ impl MyOptimizationPass {
                         alias_flags |= 0b10 | 0b100;
                         if self.should_forward_bounds_from_src_ptr_derive(tcx, body, src, dst) {
                             alias_flags |= 0b1000;
+                        }
+                        if strict_validity {
+                            alias_flags |= 0b0100_0000;
                         }
                     }
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
@@ -13295,6 +13679,7 @@ impl MyOptimizationPass {
                     dst,
                     is_mut,
                     is_ref,
+                    strict_validity,
                 } => {
                     let dst_tag = *tag_local_for_ptr_local
                         .get(&dst)
@@ -13311,6 +13696,9 @@ impl MyOptimizationPass {
                     let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
                     if !is_ref {
                         alias_flags |= 0b10 | 0b100;
+                        if strict_validity {
+                            alias_flags |= 0b0100_0000;
+                        }
                     }
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
                     let bounds_len_op =
@@ -13459,6 +13847,7 @@ impl MyOptimizationPass {
                     // - bit0: alias-exempt pointee classification (existing behavior)
                     // - bit1: projected-source creation hint (used by runtime lineage repair)
                     // - bit2: stronger root-origin repair hint (bounded overlap recovery)
+                    // - bit6: strict creation-time validity check for projected/derived raws
                     let alias_flags: u8 = match &creation_kind {
                         InstrKind::Ref { src, .. } => {
                             let mut flags = if alias_exempt { 1 } else { 0 };
@@ -13492,6 +13881,7 @@ impl MyOptimizationPass {
                             // bounded-overlap parent recovery in the runtime repair path.
                             if !src.projection.is_empty() {
                                 flags |= 0b100;
+                                flags |= 0b0100_0000;
                             }
                             flags
                         }
@@ -14481,6 +14871,12 @@ impl MyOptimizationPass {
                             false,
                         )
                         .expect("ArgAnchorTake on unsupported local");
+                    let parent_tag_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let size_op = self.size_operand_for_ty(tcx, body, local_ty, source_info.span);
+                    let (bounds_len, mut bounds_len_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &size_op);
 
                     let (orig_term, is_cleanup) = {
                         let bd = &mut body.basic_blocks_mut()[bb];
@@ -14491,6 +14887,49 @@ impl MyOptimizationPass {
                     let cont_block = {
                         let cont_data = BasicBlockData::new(orig_term, is_cleanup);
                         body.basic_blocks_mut().push(cont_data)
+                    };
+                    let record_term = Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: Operand::function_handle(
+                                tcx,
+                                hooks.def_id_ref,
+                                std::iter::empty(),
+                                source_info.span,
+                            ),
+                            args: vec![
+                                Spanned {
+                                    node: Operand::Copy(Place::from(addr_local)),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u8(tcx, source_info.span, 1),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: Operand::Copy(Place::from(parent_tag_local)),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: self.const_u8(tcx, source_info.span, 0),
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: bounds_len,
+                                    span: source_info.span,
+                                },
+                            ]
+                            .into_boxed_slice(),
+                            destination: Place::from(anchor_local),
+                            target: Some(cont_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    };
+                    let record_block = {
+                        let record_data = BasicBlockData::new(Some(record_term), is_cleanup);
+                        body.basic_blocks_mut().push(record_data)
                     };
                     let take_term = Terminator {
                         source_info,
@@ -14516,8 +14955,8 @@ impl MyOptimizationPass {
                                 },
                             ]
                             .into_boxed_slice(),
-                            destination: Place::from(anchor_local),
-                            target: Some(cont_block),
+                            destination: Place::from(parent_tag_local),
+                            target: Some(record_block),
                             unwind: UnwindAction::Continue,
                             call_source: CallSource::Misc,
                             fn_span: source_info.span,
@@ -14533,6 +14972,9 @@ impl MyOptimizationPass {
                         let rem = bd.statements.split_off(split_at);
                         bd.statements.push(addr_stmt1);
                         bd.statements.push(addr_stmt2);
+                        if !bounds_len_stmts.is_empty() {
+                            bd.statements.append(&mut bounds_len_stmts);
+                        }
                         bd.terminator = Some(take_term);
                         rem
                     };
@@ -14542,6 +14984,61 @@ impl MyOptimizationPass {
                 }
             }
         }
+    }
+
+    fn insert_fallback_return_stack_allocs<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        fallback_return_locals: &[(Local, SizeOperand<'tcx>)],
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        projected_reborrow_anchor_local_for_key: &HashMap<String, Local>,
+        debug_ref_bindings: &HashMap<DebugRefBindingKey, DebugRefBinding>,
+        hooks: Hooks,
+    ) {
+        if fallback_return_locals.is_empty() {
+            return;
+        }
+
+        let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
+        for (bb, block_data) in body.basic_blocks.iter_enumerated() {
+            let Some(term) = block_data.terminator.as_ref() else {
+                continue;
+            };
+            if !matches!(term.kind, TerminatorKind::Return) {
+                continue;
+            }
+
+            for (local, size_op) in fallback_return_locals.iter().cloned() {
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(local),
+                    kind: InstrKind::StackAlloc {
+                        local,
+                        live: false,
+                        size_op: size_op.clone(),
+                    },
+                });
+                self.trace_stack_alloc_emit(tcx, body, local, false, &size_op, "FallbackReturn");
+            }
+        }
+
+        self.insert_instrumentation(
+            tcx,
+            body,
+            insert_points,
+            tag_local_for_ptr_local,
+            ref_ancestor_local_for_ptr_local,
+            reborrow_anchor_local_for_stack_local,
+            projected_reborrow_anchor_local_for_key,
+            debug_ref_bindings,
+            hooks,
+        );
     }
 
     fn find_def_id_by_name<'tcx>(&self, tcx: TyCtxt<'tcx>, target_name: &str) -> Option<DefId> {
@@ -15004,6 +15501,17 @@ impl MyOptimizationPass {
             &debug_ref_bindings,
             hooks,
         );
+        self.insert_fallback_return_stack_allocs(
+            tcx,
+            body,
+            &scan.fallback_return_locals,
+            &tag_local_for_ptr_local,
+            &ref_ancestor_local_for_ptr_local,
+            &reborrow_anchor_local_for_stack_local,
+            &projected_reborrow_anchor_local_for_key,
+            &debug_ref_bindings,
+            hooks,
+        );
 
         // Avoid reading uninitialized tag locals in callees: default them to 0 ("untagged").
         // IMPORTANT: do this AFTER insert_instrumentation so we don't invalidate `stmt_idx`
@@ -15118,6 +15626,7 @@ fn call_effect_label(effect: CallEffect) -> &'static str {
         CallEffect::Load => "Load",
         CallEffect::Store => "Store",
         CallEffect::PtrDerive => "PtrDerive",
+        CallEffect::ExposedProvenanceRoot => "ExposedProvenanceRoot",
         CallEffect::BoxIntoRaw => "BoxIntoRaw",
         CallEffect::BoxFromRaw => "BoxFromRaw",
         CallEffect::AllocShim(AllocShimKind::Alloc) => "AllocShim(Alloc)",
