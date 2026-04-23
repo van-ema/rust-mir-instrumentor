@@ -2537,6 +2537,24 @@ impl MyOptimizationPass {
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
     }
 
+    fn first_direct_ref_field_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> Option<(Place<'tcx>, Ty<'tcx>, bool)> {
+        let local_ty = body.local_decls[local].ty;
+        let field_tys = self.aggregate_field_tys(tcx, local_ty)?;
+        for (field_idx, field_ty) in field_tys.into_iter().enumerate() {
+            let TyKind::Ref(_, pointee_ty, mutbl) = field_ty.kind() else {
+                continue;
+            };
+            let field_place = self.pointer_field_place(tcx, local, field_idx, field_ty);
+            return Some((field_place, *pointee_ty, matches!(mutbl, Mutability::Mut)));
+        }
+        None
+    }
+
     /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
     ///
     /// This is specifically for `ShadowStoreBoxPointee`: after a call such as `Box::new(p)`, we
@@ -15246,7 +15264,7 @@ impl MyOptimizationPass {
                         .statements
                         .extend(remaining_stmts);
                 } else {
-                    let addr_local = body
+                    let take_addr_local = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.usize, source_info.span));
                     let (addr_stmt1, addr_stmt2) = self
@@ -15255,17 +15273,48 @@ impl MyOptimizationPass {
                             body,
                             source_info,
                             Place::from(local),
-                            addr_local,
+                            take_addr_local,
                             false,
                         )
                         .expect("ArgAnchorTake on unsupported local");
+                    let direct_ref_field = self.first_direct_ref_field_place(tcx, body, local);
+                    let record_addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let (record_addr_stmt1_opt, record_addr_stmt2, record_is_mut, record_ty) =
+                        if let Some((field_place, pointee_ty, is_mut)) = direct_ref_field {
+                            let (field_addr_stmt1_opt, field_addr_stmt2) = self
+                                .addr_stmts_for_place(
+                                    tcx,
+                                    body,
+                                    source_info,
+                                    field_place,
+                                    record_addr_local,
+                                )
+                                .expect("ArgAnchorTake direct ref field address");
+                            (field_addr_stmt1_opt, field_addr_stmt2, is_mut, pointee_ty)
+                        } else {
+                            (
+                                None,
+                                Statement::new(
+                                    source_info,
+                                    StatementKind::Assign(Box::new((
+                                        Place::from(record_addr_local),
+                                        Rvalue::Use(Operand::Copy(Place::from(take_addr_local))),
+                                    ))),
+                                ),
+                                true,
+                                local_ty,
+                            )
+                        };
                     let parent_tag_local = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                    let size_op = self.size_operand_for_ty(tcx, body, local_ty, source_info.span);
+                    let size_op = self.size_operand_for_ty(tcx, body, record_ty, source_info.span);
                     let (bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &size_op);
-                    let align_op = self.align_operand_for_ty(tcx, body, local_ty, source_info.span);
+                    let align_op =
+                        self.align_operand_for_ty(tcx, body, record_ty, source_info.span);
                     let (align_len, mut align_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &align_op);
 
@@ -15290,11 +15339,15 @@ impl MyOptimizationPass {
                             ),
                             args: vec![
                                 Spanned {
-                                    node: Operand::Copy(Place::from(addr_local)),
+                                    node: Operand::Copy(Place::from(record_addr_local)),
                                     span: source_info.span,
                                 },
                                 Spanned {
-                                    node: self.const_u8(tcx, source_info.span, 1),
+                                    node: self.const_u8(
+                                        tcx,
+                                        source_info.span,
+                                        if record_is_mut { 1 } else { 0 },
+                                    ),
                                     span: source_info.span,
                                 },
                                 Spanned {
@@ -15345,7 +15398,7 @@ impl MyOptimizationPass {
                                     span: source_info.span,
                                 },
                                 Spanned {
-                                    node: Operand::Copy(Place::from(addr_local)),
+                                    node: Operand::Copy(Place::from(take_addr_local)),
                                     span: source_info.span,
                                 },
                             ]
@@ -15367,6 +15420,10 @@ impl MyOptimizationPass {
                         let rem = bd.statements.split_off(split_at);
                         bd.statements.push(addr_stmt1);
                         bd.statements.push(addr_stmt2);
+                        if let Some(record_addr_stmt1) = record_addr_stmt1_opt {
+                            bd.statements.push(record_addr_stmt1);
+                        }
+                        bd.statements.push(record_addr_stmt2);
                         if !bounds_len_stmts.is_empty() {
                             bd.statements.append(&mut bounds_len_stmts);
                         }
