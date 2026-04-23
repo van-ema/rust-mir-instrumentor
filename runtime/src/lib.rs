@@ -1688,6 +1688,54 @@ fn rz_allow_stack_raw_root_oob_noise(
 }
 
 #[inline]
+fn rz_allow_stack_raw_nonroot_boundary_oob_noise(
+    tmeta: &TagMeta,
+    ameta: &AllocMeta,
+    base: usize,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        return false;
+    }
+    if tmeta.parent == 0 || tmeta.bounds_len != 0 {
+        return false;
+    }
+    if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
+        return false;
+    }
+
+    let usize_sz = std::mem::size_of::<usize>();
+    if ameta.size > usize_sz || size == 0 || size > usize_sz {
+        return false;
+    }
+
+    let alloc_end = base.saturating_add(ameta.size);
+    let access_end = addr.saturating_add(size);
+    if addr != alloc_end || access_end <= alloc_end {
+        return false;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut cur = tmeta.parent;
+    let mut depth = 0usize;
+    while cur != 0 && depth < 8 {
+        let Some(parent) = tmap.get(&cur) else {
+            break;
+        };
+        if matches!(parent.kind, PtrKind::RefShared)
+            && parent.pointee_addr >= base
+            && parent.pointee_addr < alloc_end
+        {
+            return true;
+        }
+        cur = parent.parent;
+        depth += 1;
+    }
+    false
+}
+
+#[inline]
 fn rz_allow_projected_raw_stack_slot_oob_noise(
     tmeta: &TagMeta,
     ameta: &AllocMeta,
@@ -2901,6 +2949,11 @@ pub fn __rz_ptr_write(
                     if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
                         return;
                     }
+                    if rz_allow_stack_raw_nonroot_boundary_oob_noise(
+                        &tmeta, &ometa, obase, addr, size,
+                    ) {
+                        return;
+                    }
                     if rz_allow_projected_raw_stack_slot_oob_noise(
                         &tmeta, &ometa, obase, addr, size,
                     ) {
@@ -3182,7 +3235,11 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
     if tag == 0 || size == 0 {
         return;
     }
-    let write_tag = __record_ref_creation(addr, 1, tag, 0, size, 0);
+    let parent_tag = match tag_store::get(tag).map(|m| m.kind) {
+        Some(PtrKind::RefShared | PtrKind::RawConst) => 0,
+        _ => tag,
+    };
+    let write_tag = __record_ref_creation(addr, 1, parent_tag, 0, size, 0);
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_write(write_tag, addr, size, 0, 0);
 }
@@ -3392,6 +3449,11 @@ pub fn __rz_ptr_read(
                         return;
                     }
                     if rz_allow_stack_raw_root_oob_noise(&tmeta, &ometa, obase, addr, size) {
+                        return;
+                    }
+                    if rz_allow_stack_raw_nonroot_boundary_oob_noise(
+                        &tmeta, &ometa, obase, addr, size,
+                    ) {
                         return;
                     }
                     let msg = append_location_if_enabled(

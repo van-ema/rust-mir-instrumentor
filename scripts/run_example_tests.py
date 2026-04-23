@@ -381,6 +381,9 @@ def main() -> int:
 
         compile_flags = compile_flags_for_example(pkg_dir, bin_name)
         deterministic_concurrency = "-Zmiri-deterministic-concurrency" in compile_flags
+        run_env = env.copy()
+        if "-Zmiri-tree-borrows-no-precise-interior-mut" in compile_flags:
+            run_env["RZ_TB_NO_PRECISE_INTERIOR_MUT"] = "1"
         run_attempts = forced_run_attempts or (8 if deterministic_concurrency else 1)
         run_timeout_s = (
             float(forced_run_timeout_s)
@@ -397,7 +400,7 @@ def main() -> int:
                 try:
                     run_result = subprocess.run(
                         [str(bin_path)],
-                        env=env,
+                        env=run_env,
                         stdout=f,
                         stderr=subprocess.STDOUT,
                         timeout=run_timeout_s,

@@ -4432,6 +4432,7 @@ impl MyOptimizationPass {
                     || path.contains("::cell::SyncUnsafeCell")
                     || path.contains("::cell::Cell")
                     || path.contains("::cell::RefCell")
+                    || path.contains("::pin::UnsafePinned")
             }
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) => false,
             _ => true,
@@ -4454,6 +4455,18 @@ impl MyOptimizationPass {
             }
             TyKind::RawPtr(pointee, _) => self.alias_exempt_root_for_ty(tcx, body, *pointee),
             _ => false,
+        }
+    }
+
+    fn tb_call_arg_protector_supported_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_ty: Ty<'tcx>,
+    ) -> bool {
+        match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, Mutability::Mut) => pointee.is_unpin(tcx, body.typing_env(tcx)),
+            _ => true,
         }
     }
 
@@ -10321,7 +10334,7 @@ impl MyOptimizationPass {
             }
 
             // Inter-procedural: push argument tag to callee if instrumented.
-            if callee_instrumented {
+            if callee_instrumented && self.tb_call_arg_protector_supported_for_ty(tcx, body, ty) {
                 if let Some(callee_id) = callee_id_opt {
                     ptr_locals_needing_tag.insert(p.local);
                     insert_points.push(InsertPoint {
@@ -11298,7 +11311,7 @@ impl MyOptimizationPass {
                 | InstrKind::RawRoot { .. }
                 | InstrKind::ArgRetag { .. }
                 | InstrKind::ArgAnchorTake { .. }
-                | InstrKind::FnExit { .. }
+                | InstrKind::RetPush { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. }
                 | InstrKind::PtrDeriveParent { .. } => 0,
@@ -11306,6 +11319,7 @@ impl MyOptimizationPass {
                 // access/usage hooks at the same insertion site.
                 InstrKind::TagProp { .. }
                 | InstrKind::TagPropFromRefAncestor { .. }
+                | InstrKind::FnExit { .. }
                 | InstrKind::ReborrowAnchorSet { .. }
                 | InstrKind::ReborrowAnchorSeed { .. }
                 | InstrKind::ReborrowAnchorZero { .. }

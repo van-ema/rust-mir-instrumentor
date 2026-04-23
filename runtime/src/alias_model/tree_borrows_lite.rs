@@ -89,6 +89,13 @@ fn rz_tb_trace_enabled() -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
+#[inline]
+fn rz_tb_no_precise_interior_mut_enabled() -> bool {
+    std::env::var("RZ_TB_NO_PRECISE_INTERIOR_MUT")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
 #[cfg(feature = "runtime_lineage_repair")]
 #[inline]
 fn rz_tb_runtime_lineage_repair_enabled() -> bool {
@@ -336,7 +343,7 @@ fn tb_lite_check_protected_dealloc(base_addr: usize) {
         };
         tree.nodes
             .values()
-            .find(|n| tb_is_live_node(n) && n.protected)
+            .find(|n| tb_is_live_node(n) && n.protected && matches!(n.kind, BorrowKind::Unique))
             .map(|n| (n.tag, n.kind))
     };
 
@@ -361,7 +368,11 @@ fn tb_lite_validate_ref_creation(
     alias_exempt: bool,
     bounds_len: usize,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled()
+        || rz_tb_no_precise_interior_mut_enabled()
+        || alias_exempt
+        || rz_sb_suppressed()
+    {
         return None;
     }
     if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
@@ -497,43 +508,31 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     };
     tree.nodes.insert(tag, node.clone());
 
-    // Eager invalidation for mutable-reference creation keeps the tree state monotonic and
-    // catches "two overlapping unique sibling" constructions immediately.
-    if kind == BorrowKind::Unique {
+    // Tree Borrows treats `&mut` creation as a reserved borrow. It does not by itself perform the
+    // write-like invalidation that Stacked Borrows would perform; conflicts are decided when the
+    // new borrow is actually read/written. Keeping creation side-effect-free is required for
+    // valid TB patterns with multiple reserved `&mut` values and with `copy_nonoverlapping`
+    // arguments built in either order.
+    //
+    // Function-entry protectors are stronger: creating a protected unique borrow must rule out
+    // pre-existing sibling aliases that could be used during the protected call.
+    if kind == BorrowKind::Unique && protected {
         let victim_tags: Vec<u64> = tree
             .nodes
             .values()
             .filter(|n| tb_is_live_node(n) && n.tag != tag)
+            .filter(|n| matches!(n.kind, BorrowKind::RawConst | BorrowKind::RawMut))
             .filter(|n| tb_ranges_overlap(node.start, node.len, n.start, n.len))
-            .filter(|n| !n.protected)
-            .filter(|n| {
-                // Best-effort metadata can lose parent lineage on projection-heavy code paths,
-                // yielding overlapping root uniques (`parent=0`) that are still used safely.
-                // Do not eagerly invalidate root-vs-root siblings at creation; let access-time
-                // transitions decide conflicts when/if they actually occur.
-                //
-                // Example:
-                //   let chunk = &mut out[i..i+4];
-                //   chunk[0] = ...; chunk[1] = ...;
-                // With imprecise parent lowering, each per-element/per-subslice ref can appear
-                // as a fresh root unique over overlapping ranges. Eager sibling invalidation here
-                // would disable earlier roots immediately and report TB_LITE_INVALIDATED on valid
-                // subsequent writes in the same loop.
-                //
-                // Also keep already-protected siblings alive until an actual access. In TB,
-                // protectors are meant to make later conflicting accesses fail; eagerly killing
-                // the protected node at creation time hides those conflicts and misses cases like
-                // `spurious_read` and `reservedim_spurious_write`.
-                if node.parent == 0 && n.parent == 0 {
-                    return false;
-                }
-                !tb_is_ancestor(&tree.nodes, n.tag, tag) && !tb_is_ancestor(&tree.nodes, tag, n.tag)
-            })
+            .filter(|n| !tb_is_ancestor(&tree.nodes, n.tag, tag))
+            .filter(|n| !tb_is_ancestor(&tree.nodes, tag, n.tag))
             .map(|n| n.tag)
             .collect();
         for victim in victim_tags {
             if let Some(n) = tree.nodes.get_mut(&victim) {
-                tb_disable_node(n);
+                n.perm = TbPerm::Frozen;
+                n.lazy_perm = TbPerm::Frozen;
+                n.alive = true;
+                n.poisoned_by_protector_end = true;
             }
         }
     }
@@ -616,7 +615,11 @@ fn tb_lite_check(
     size: usize,
     access: AliasAccessKind,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled()
+        || rz_tb_no_precise_interior_mut_enabled()
+        || tmeta.alias_exempt
+        || rz_sb_suppressed()
+    {
         return None;
     }
     if !matches!(
@@ -703,6 +706,26 @@ fn tb_lite_check(
         }
     }
     if !tb_is_live_node(&node) {
+        if matches!(tmeta.kind, PtrKind::RawMut) && matches!(access, AliasAccessKind::Write) {
+            let tmap = tags().lock().unwrap();
+            if tb_lite_reactivatable_missing_parent_raw_mut(
+                tree,
+                &tmap,
+                access_tag,
+                &node,
+                addr,
+                size,
+                tmeta.alloc_epoch,
+            ) {
+                drop(tmap);
+                if let Some(n) = tree.nodes.get_mut(&access_tag) {
+                    n.perm = TbPerm::Active;
+                    n.alive = true;
+                    n.poisoned_by_protector_end = false;
+                }
+                return None;
+            }
+        }
         if matches!(tmeta.kind, PtrKind::RefMut) {
             if let Some(descendants) =
                 tb_lite_reactivatable_same_lineage(tree, access_tag, addr, size, tmeta.alloc_epoch)
@@ -855,7 +878,11 @@ fn tb_lite_check(
             (AliasAccessKind::Write, true, _, _)
                 if child_unique_ref_ancestor && matches!(tmeta.kind, PtrKind::RefMut) =>
             {
-                TbPerm::Disabled
+                if n.start == addr && n.len <= tb_effective_len(size) {
+                    TbPerm::Disabled
+                } else {
+                    old_perm
+                }
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
                 if tb_has_usable_clean_unique_ancestor(
@@ -878,6 +905,28 @@ fn tb_lite_check(
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
+            (AliasAccessKind::Write, true, TbPerm::Frozen, _)
+                if n.tag == access_tag && matches!(tmeta.kind, PtrKind::RefMut) =>
+            {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
+                    access_tag, addr, size, tmeta.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+            (AliasAccessKind::Write, true, TbPerm::Frozen, _)
+                if n.tag == access_tag
+                    && matches!(tmeta.kind, PtrKind::RawMut)
+                    && n.poisoned_by_protector_end =>
+            {
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_FROZEN_WRITE",
+                    access_tag, addr, size, tmeta.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
                 if tb_has_usable_clean_unique_ancestor(
                     &tree.nodes,
@@ -907,6 +956,7 @@ fn tb_lite_check(
                         size,
                         tmeta.alloc_epoch,
                     ))
+                    || (matches!(tmeta.kind, PtrKind::RawMut) && !covered)
                 {
                     n.perm
                 } else {
@@ -956,6 +1006,19 @@ fn tb_lite_check(
                 perm
             }
 
+            // Foreign write: same-parent raw-mutable siblings over the same exact place stay
+            // writable.
+            (AliasAccessKind::Write, false, perm, _)
+                if node.kind == BorrowKind::RawMut
+                    && n.kind == BorrowKind::RawMut
+                    && node.parent == n.parent
+                    && node.parent != 0
+                    && n.start == node.start
+                    && n.len == node.len =>
+            {
+                perm
+            }
+
             // Foreign write: raw root siblings over the same exact place stay writable.
             // This covers allocator/admin patterns such as same-base `realloc` where multiple
             // raw-mutable roots can legitimately refer to the same allocation bytes.
@@ -987,8 +1050,26 @@ fn tb_lite_check(
         }
     }
 
-    if matches!(access, AliasAccessKind::Write) {
-        // Keep dedicated protector diagnostic for write-through-other-tag while protected.
+    // Protector diagnostic: a foreign access that drives a protected node to Disabled
+    // is immediate UB ("protected tags must never be Disabled").
+    //
+    // Includes both write AND read access paths (foreign read on a protected Active
+    // Unique transitions to Disabled per the transition table; foreign write on any
+    // non-exempt protected node lands at Disabled). Includes Shared-kind protected
+    // (for `&T` args like in `invalidate_against_protector2` TB rev).
+    //
+    // We deliberately do NOT fire on transitions to Reserved{true} (conflicted) here:
+    // a conflicted-Reserved may still be rescued if the surrounding context (interior
+    // mutability via UnsafeCell) relaxes the transition back to Frozen at access time.
+    // Reporting at access time would FP on legal `&mut UnsafeCell<T>` arg patterns
+    // (see `miri_tb_pass_exact::reserved`, `interior_mutability`). Conflicted-at-
+    // protector-release UB is covered by the poisoned_by_protector_end path.
+    {
+        // For Shared-kind protected nodes, exclude those whose pointee carries interior
+        // mutability (UnsafeCell / RefCell / Cell etc.). Instrumentation sets
+        // `alias_exempt` on the tag in that case. `&UnsafeCell<_>` foreign accesses
+        // through the interior-mut path are deliberately not UB under TB.
+        let tmap_for_exempt = tags().lock().unwrap();
         let mut protected_nodes: Vec<TbNode> = tree
             .nodes
             .values()
@@ -999,9 +1080,17 @@ fn tb_lite_check(
                     && (tmeta.alloc_epoch == 0
                         || n.alloc_epoch == 0
                         || n.alloc_epoch == tmeta.alloc_epoch)
+                    && match n.kind {
+                        BorrowKind::Unique => true,
+                        BorrowKind::Shared => !tmap_for_exempt
+                            .get(&n.tag)
+                            .map_or(false, |m| m.alias_exempt),
+                        _ => false,
+                    }
             })
             .cloned()
             .collect();
+        drop(tmap_for_exempt);
         protected_nodes.sort_by_key(|n| n.tag);
         if !protected_nodes.is_empty() {
             let tmap = tags().lock().unwrap();
@@ -1021,8 +1110,14 @@ fn tb_lite_check(
                     size,
                 ) {
                     let mut msg = format!(
-                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
-                        access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+                        "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+                        tb_access_name(access),
+                        access_tag,
+                        addr,
+                        size,
+                        tmeta.kind,
+                        protected.tag,
+                        protected.kind
                     );
                     msg.push_str(&dump);
                     return Some(msg);
@@ -1330,6 +1425,63 @@ fn tb_lite_reactivatable_same_lineage(
         return None;
     }
     Some(descendants_to_disable)
+}
+
+fn tb_lite_reactivatable_missing_parent_raw_mut(
+    tree: &TbAllocState,
+    tmap: &HashMap<u64, TagMeta>,
+    access_tag: u64,
+    access_node: &TbNode,
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) -> bool {
+    if access_node.parent == 0 || tree.nodes.contains_key(&access_node.parent) {
+        return false;
+    }
+
+    let access_end = addr.saturating_add(size);
+    let mut cur = access_node.parent;
+    let mut unique_ancestor = None;
+    for _ in 0..tmap.len().saturating_add(1) {
+        if let Some(node) = tree.nodes.get(&cur) {
+            if tb_is_live_node(node)
+                && matches!(node.kind, BorrowKind::Unique)
+                && (alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch)
+            {
+                let node_end = node.start.saturating_add(node.len);
+                if node.len != 0 && addr >= node.start && access_end <= node_end {
+                    unique_ancestor = Some(node.tag);
+                    break;
+                }
+            }
+        }
+
+        let Some(meta) = tmap.get(&cur) else {
+            return false;
+        };
+        if meta.parent == 0 {
+            return false;
+        }
+        cur = meta.parent;
+    }
+
+    let Some(unique_ancestor) = unique_ancestor else {
+        return false;
+    };
+
+    tree.nodes.values().all(|other| {
+        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
+            return true;
+        }
+        if alloc_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != alloc_epoch {
+            return true;
+        }
+        tb_is_effective_ancestor(&tree.nodes, tmap, unique_ancestor, other.tag)
+            || tb_is_effective_ancestor(&tree.nodes, tmap, other.tag, unique_ancestor)
+            || tb_is_effective_ancestor(&tree.nodes, tmap, access_tag, other.tag)
+            || tb_is_effective_ancestor(&tree.nodes, tmap, other.tag, access_tag)
+    })
 }
 
 #[inline]
