@@ -1168,6 +1168,10 @@ name = "miri_tb_exact"
 version = "0.1.0"
 
 [[package]]
+name = "miri_tb_pass_exact"
+version = "0.1.0"
+
+[[package]]
 name = "miri_unaligned_exact"
 version = "0.1.0"
 

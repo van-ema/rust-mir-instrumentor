@@ -13,11 +13,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 REPORT_ROOT = REPO_ROOT / "reports" / "miri_compare"
-PORT_RE = re.compile(r"^\s*//\s*Ported from (miri/tests/fail/[A-Za-z0-9_./-]+\.rs)\.")
+PORT_RE = re.compile(r"^\s*//\s*Ported from (miri/tests/(?:fail|pass)/[A-Za-z0-9_./-]+\.rs)\.")
 COMPILE_FLAGS_RE = re.compile(r"^\s*//@compile-flags:\s*(.*)$")
 PACKAGE_DIRS = {
     "miri_sb_exact": EXAMPLES_DIR / "miri_tests" / "sb_exact",
     "miri_tb_exact": EXAMPLES_DIR / "miri_tests" / "tb_exact",
+    "miri_tb_pass_exact": EXAMPLES_DIR / "miri_tests" / "tb_pass_exact",
     "miri_mem_exact": EXAMPLES_DIR / "miri_tests" / "memory_exact",
     "miri_function_calls_exact": EXAMPLES_DIR / "miri_tests" / "function_calls_exact",
     "miri_provenance_exact": EXAMPLES_DIR / "miri_tests" / "provenance_exact",
@@ -46,7 +47,7 @@ class PortedTest:
     def miri_mode(self) -> str:
         if self.package == "miri_sb_exact":
             return "stacked"
-        if self.package in ("miri_tb_exact", "miri_function_calls_exact"):
+        if self.package in ("miri_tb_exact", "miri_tb_pass_exact", "miri_function_calls_exact"):
             return "tree"
         return "default"
 
