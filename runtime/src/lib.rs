@@ -1181,6 +1181,7 @@ static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
+static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1188,6 +1189,10 @@ fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
 
 fn tags() -> &'static Mutex<HashMap<u64, TagMeta>> {
     TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn promised_alignments() -> &'static Mutex<HashMap<(usize, u64), usize>> {
+    PROMISED_ALIGNMENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn tag_alias_exempt_via_bounded_ancestor(tag: u64, addr: usize, size: usize) -> bool {
@@ -1328,6 +1333,49 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> 
 
 pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn rz_promised_alignment_for_addr(addr: usize, alloc_epoch: u64) -> usize {
+    let map = promised_alignments().lock().unwrap();
+    map.get(&(addr, alloc_epoch))
+        .copied()
+        .or_else(|| map.get(&(addr, 0)).copied())
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_promise_symbolic_alignment(ptr: *const (), align: usize) {
+    let _g = RzRuntimeGuard::enter();
+    if !align.is_power_of_two() {
+        let msg = append_location_if_enabled(
+            format!("alignment must be a power of 2\nalign={align}"),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("MISALIGNED_ACCESS", msg);
+        return;
+    }
+
+    let addr = ptr as usize;
+    if addr != 0 && addr % align != 0 {
+        let msg = append_location_if_enabled(
+            format!(
+                "pointer is not actually aligned\naddr=0x{addr:x} promised_alignment={align} found_alignment={}",
+                rz_addr_alignment(addr)
+            ),
+            "RZ_LOG_LOC",
+        );
+        rz_violation("MISALIGNED_ACCESS", msg);
+        return;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_, meta)| meta.epoch)
+        .unwrap_or(0);
+    let mut map = promised_alignments().lock().unwrap();
+    map.entry((addr, alloc_epoch))
+        .and_modify(|prev| *prev = (*prev).max(align))
+        .or_insert(align);
 }
 
 /// Find the allocation whose range [base, base+size) contains `addr`.
@@ -2780,6 +2828,9 @@ pub fn __rz_ptr_write(
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
+    let guaranteed_align = tmeta
+        .align_req
+        .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
     let align_req = if align_req != 0 {
         align_req
     } else {
@@ -2790,7 +2841,7 @@ pub fn __rz_ptr_write(
         tag,
         addr,
         size,
-        tmeta.align_req,
+        guaranteed_align,
         align_req,
         Some(&tmeta),
     );
@@ -3308,6 +3359,9 @@ pub fn __rz_ptr_read(
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
+    let guaranteed_align = tmeta
+        .align_req
+        .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
     let align_req = if align_req != 0 {
         align_req
     } else {
@@ -3318,7 +3372,7 @@ pub fn __rz_ptr_read(
         tag,
         addr,
         size,
-        tmeta.align_req,
+        guaranteed_align,
         align_req,
         Some(&tmeta),
     );
@@ -3926,7 +3980,14 @@ pub extern "C" fn __record_ref_creation(
     // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let requested_align = align_req;
-    let align_req = rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr);
+    let align_req = rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr).max(
+        rz_promised_alignment_for_addr(
+            pointee_addr,
+            lookup_alloc_snapshot(pointee_addr)
+                .map(|(_, meta)| meta.epoch)
+                .unwrap_or(0),
+        ),
+    );
     let required_align = if requested_align != 0 {
         requested_align
     } else {
@@ -4257,7 +4318,14 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    let align_req = rz_effective_align_req(align_req, derived_from);
+    let align_req = rz_effective_align_req(align_req, derived_from).max(
+        rz_promised_alignment_for_addr(
+            pointee_addr,
+            lookup_alloc_snapshot(pointee_addr)
+                .map(|(_, meta)| meta.epoch)
+                .unwrap_or(0),
+        ),
+    );
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
