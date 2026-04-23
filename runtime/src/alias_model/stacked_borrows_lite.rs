@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed,
-    tags, PtrKind, TagMeta,
+    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed, tags,
+    PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -32,8 +33,8 @@ fn borrows() -> &'static Mutex<HashMap<usize, Vec<BorrowEntry>>> {
     BORROWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Default)]
 struct SbProtectorFrame {
+    thread_id: ThreadId,
     callee_id: u64,
     pending_parent_tags: Vec<u64>,
     protected_tags: Vec<u64>,
@@ -178,13 +179,15 @@ fn sb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
     if !rz_sb_lite_enabled() || parent_tag == 0 {
         return;
     }
+    let thread_id = std::thread::current().id();
     let mut frames = sb_protector_frames().lock().unwrap();
     match frames.last_mut() {
-        Some(top) if top.callee_id == callee_id => {
+        Some(top) if top.thread_id == thread_id && top.callee_id == callee_id => {
             top.pending_parent_tags.push(parent_tag);
         }
         _ => {
             frames.push(SbProtectorFrame {
+                thread_id,
                 callee_id,
                 pending_parent_tags: vec![parent_tag],
                 protected_tags: Vec::new(),
@@ -197,12 +200,13 @@ fn sb_lite_on_call_exit(callee_id: u64) {
     if !rz_sb_lite_enabled() {
         return;
     }
+    let thread_id = std::thread::current().id();
 
     let popped = {
         let mut frames = sb_protector_frames().lock().unwrap();
         frames
             .iter()
-            .rposition(|f| f.callee_id == callee_id)
+            .rposition(|f| f.thread_id == thread_id && f.callee_id == callee_id)
             .map(|idx| frames.remove(idx))
     };
 
@@ -217,8 +221,10 @@ fn sb_lite_on_call_exit(callee_id: u64) {
         .lock()
         .unwrap()
         .iter()
-        .filter(|((ret_callee_id, _addr), _tag)| *ret_callee_id == callee_id)
-        .map(|((_ret_callee_id, _addr), tag)| *tag)
+        .filter(|((ret_thread_id, ret_callee_id, _addr), _tag)| {
+            *ret_thread_id == thread_id && *ret_callee_id == callee_id
+        })
+        .map(|((_ret_thread_id, _ret_callee_id, _addr), tag)| *tag)
         .collect();
 
     let mut bmap = borrows().lock().unwrap();
@@ -242,7 +248,8 @@ fn sb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) ->
         return false;
     }
     let mut frames = sb_protector_frames().lock().unwrap();
-    let Some(top) = frames.last_mut() else {
+    let thread_id = std::thread::current().id();
+    let Some(top) = frames.iter_mut().rfind(|f| f.thread_id == thread_id) else {
         return false;
     };
     let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
@@ -310,15 +317,22 @@ fn sb_lite_validate_ref_creation(
 
     let new_len = if bounds_len != 0 { bounds_len } else { 1 };
     let overlaps = |entry: &BorrowEntry| {
-        ranges_overlap(entry.start, entry.end, pointee_addr, pointee_addr.saturating_add(new_len))
+        ranges_overlap(
+            entry.start,
+            entry.end,
+            pointee_addr,
+            pointee_addr.saturating_add(new_len),
+        )
     };
 
     if let Some((pref_tag, _pref_kind)) = parent_ref {
         let parent_pos = stack.iter().rposition(|entry| entry.tag == pref_tag);
         if parent_pos.is_none() {
-            if let Some(blocker) = stack.iter().rev().find(|entry| {
-                entry.kind == BorrowKind::Unique && overlaps(entry)
-            }) {
+            if let Some(blocker) = stack
+                .iter()
+                .rev()
+                .find(|entry| entry.kind == BorrowKind::Unique && overlaps(entry))
+            {
                 return Some(format!(
                     "REBORROW from inactive parent ref: new_kind={:?} parent_tag={} parent_ref={} base=0x{base:x} new=[0x{:x},0x{:x}) active_unique={}/[0x{:x},0x{:x})",
                     new_kind,

@@ -187,6 +187,8 @@ enum CallEffect {
     /// Ptr load/store wrappers/intrinsics (plain or volatile).
     Load,
     Store,
+    LoadUnaligned,
+    StoreUnaligned,
     /// Pointer derivation wrappers that return a pointer derived from arg0 (fresh tag, parent linkage).
     PtrDerive,
     /// Pointer-returning helpers that create a raw root from an integer/exposed address.
@@ -872,14 +874,15 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(
         MatchKind::Contains,
         "::ptr::read_unaligned",
-        CallEffect::Load,
+        CallEffect::LoadUnaligned,
     ),
     EffectRule::one(MatchKind::EndsWith, "::read", CallEffect::Load),
     EffectRule::one(
         MatchKind::Contains,
         "::ptr::write_unaligned",
-        CallEffect::Store,
+        CallEffect::StoreUnaligned,
     ),
+    EffectRule::one(MatchKind::EndsWith, "::drop_in_place", CallEffect::Store),
     EffectRule::two(
         MatchKind::Contains,
         "::cell::Cell",
@@ -1546,6 +1549,7 @@ mod logging;
 pub(in crate::instrumentation) enum SizeOperand<'tcx> {
     Const(Operand<'tcx>),
     SizeOf(Ty<'tcx>),
+    AlignOf(Ty<'tcx>),
     ElemCount {
         elem_ty: Ty<'tcx>,
         count_op: Operand<'tcx>,
@@ -1627,28 +1631,33 @@ enum InstrKind<'tcx> {
     PtrWrite {
         ptr_local: Local,
         size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// A write through a pointer local, but skip if the tag is uninitialized (tag=0).
     PtrWriteAllowUntagged {
         ptr_local: Local,
         size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// A write directly to a stack slot tracked via a reborrow anchor tag.
     /// Uses the allow-untagged runtime path so untouched locals do not report.
     StackSlotWriteAllowUntagged {
         local: Local,
         size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// A read through a pointer local.
     /// `size_op` is best-effort (0 = unknown). Kept as an operand so we can pass dynamic sizes.
     PtrRead {
         ptr_local: Local,
         size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// A read through a pointer local, but skip if the tag is uninitialized (tag=0).
     PtrReadAllowUntagged {
         ptr_local: Local,
         size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// Coarse pointer-use tracking: a pointer-typed local appears in a call argument.
     /// This is treated as an escape event at call boundaries.
@@ -2518,6 +2527,9 @@ impl MyOptimizationPass {
     ) -> bool {
         let local_ty = body.local_decls[local].ty;
         if !local_ty.is_sized(tcx, body.typing_env(tcx)) {
+            return false;
+        }
+        if !self.ty_contains_direct_pointer_fields(tcx, body, local_ty) {
             return false;
         }
 
@@ -3644,6 +3656,24 @@ impl MyOptimizationPass {
         SizeOperand::SizeOf(ty)
     }
 
+    fn align_operand_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let typing_env = body.typing_env(tcx);
+        if ty.is_sized(tcx, typing_env) {
+            return SizeOperand::AlignOf(ty);
+        }
+        match ty.kind() {
+            TyKind::Slice(elem_ty) => self.align_operand_for_ty(tcx, body, *elem_ty, span),
+            TyKind::Str => SizeOperand::Const(self.const_usize(tcx, span, 1)),
+            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        }
+    }
+
     /// Compute stack-slot size for a local type.
     ///
     /// For local stack slots we want to preserve `SizeOf(ty)` even for generic ADTs where
@@ -3702,6 +3732,130 @@ impl MyOptimizationPass {
             },
             _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
         }
+    }
+
+    fn align_operand_for_deref<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        let pointee = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        };
+        self.align_operand_for_ty(tcx, body, pointee, span)
+    }
+
+    fn align_operand_for_ptr_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let ptr_ty = body.local_decls[ptr_local].ty;
+        let pointee = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
+        };
+        self.align_operand_for_ty(tcx, body, pointee, span)
+    }
+
+    fn align_operand_for_ptr_derive<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src: Local,
+        dst: Local,
+        is_ref: bool,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        if is_ref {
+            let dst_ty = body.local_decls[dst].ty;
+            if matches!(
+                dst_ty.kind(),
+                TyKind::Ref(_, pointee, _) if matches!(pointee.kind(), TyKind::Dynamic(..))
+            ) {
+                return self.align_operand_for_ptr_local(tcx, body, src, span);
+            }
+        }
+        self.align_operand_for_ptr_local(tcx, body, dst, span)
+    }
+
+    fn align_operand_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src: Place<'tcx>,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let mut place_ty = PlaceTy::from_ty(body.local_decls[src.local].ty);
+        for proj in src.projection.iter() {
+            if let ProjectionElem::Field(..) = proj {
+                if let TyKind::Adt(adt_def, _) = place_ty.ty.kind() {
+                    if adt_def.repr().packed() {
+                        return SizeOperand::Const(self.const_usize(tcx, span, 1));
+                    }
+                }
+            }
+            if matches!(proj, ProjectionElem::Deref) {
+                return SizeOperand::Const(self.const_usize(tcx, span, 0));
+            }
+            place_ty = place_ty.projection_ty(tcx, proj.clone());
+        }
+        self.align_operand_for_ty(tcx, body, place_ty.ty, span)
+    }
+
+    fn align_operand_for_ref_creation_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        dst_ty: Ty<'tcx>,
+        src: Place<'tcx>,
+        span: Span,
+    ) -> SizeOperand<'tcx> {
+        let src_ty = src.ty(&body.local_decls, tcx).ty;
+        match src_ty.kind() {
+            // When we copy/load an existing pointer value into a new `&T`, the creation hook
+            // must validate the loaded reference against the pointee alignment, not the source
+            // slot alignment of the reference object itself.
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                if self.place_may_cross_packed_field(tcx, body, src) {
+                    SizeOperand::Const(self.const_usize(tcx, span, 1))
+                } else if matches!(
+                    dst_ty.kind(),
+                    TyKind::Ref(_, dst_pointee, _) if *dst_pointee == src_ty
+                ) {
+                    self.align_operand_for_src_place(tcx, body, src, span)
+                } else {
+                    self.align_operand_for_ty(tcx, body, *pointee, span)
+                }
+            }
+            _ => self.align_operand_for_src_place(tcx, body, src, span),
+        }
+    }
+
+    fn place_may_cross_packed_field<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src: Place<'tcx>,
+    ) -> bool {
+        let mut place_ty = PlaceTy::from_ty(body.local_decls[src.local].ty);
+        for proj in src.projection.iter() {
+            if let ProjectionElem::Field(..) = proj {
+                if let TyKind::Adt(adt_def, _) = place_ty.ty.kind() {
+                    if adt_def.repr().packed() {
+                        return true;
+                    }
+                }
+            }
+            place_ty = place_ty.projection_ty(tcx, proj.clone());
+        }
+        false
     }
 
     /// For a struct DST with a trailing `[T]` field, return the field index and element type.
@@ -3836,7 +3990,8 @@ impl MyOptimizationPass {
     ) -> bool {
         let src_ty = body.local_decls[src].ty;
         let dst_ty = body.local_decls[dst].ty;
-        self.ptr_ty_has_precise_wide_bounds(tcx, body, src_ty) && self.is_thin_ptr_ty(tcx, body, dst_ty)
+        self.ptr_ty_has_precise_wide_bounds(tcx, body, src_ty)
+            && self.is_thin_ptr_ty(tcx, body, dst_ty)
     }
 
     fn field_offset_bytes<'tcx>(
@@ -6698,14 +6853,11 @@ impl MyOptimizationPass {
                                 }
                                 _ => self.is_fn_table_adt_ty(tcx, read_ty),
                             };
-                            // Optimized MIR frequently materializes pointer-valued loads that are
-                            // only metadata/provenance plumbing (e.g. forwarding `&&T` / raw ptr
-                            // values through temporaries). Instrumenting those as memory READs can
-                            // misclassify them as data accesses and produce false OOB/stale reports.
-                            // We only instrument deref reads when the loaded value is non-pointer data.
-                            let skip_pointer_value_read = self.is_pointer_ty(loaded_ty);
-                            if skip_fn_ptr_read || skip_vtable_field_read || skip_pointer_value_read
-                            {
+                            // Keep function-pointer and vtable-like metadata loads silent, but
+                            // still instrument pointer-valued memory reads. We need those for
+                            // unaligned ptr-to-ptr loads and similar cases where the loaded value
+                            // is itself a pointer and the UB happens at the read.
+                            if skip_fn_ptr_read || skip_vtable_field_read {
                                 // Skip only the READ instrumentation; continue scanning this stmt.
                             } else {
                                 let size_op = self.size_operand_for_deref(
@@ -6713,6 +6865,12 @@ impl MyOptimizationPass {
                                     body,
                                     ptr_local,
                                     loaded_ty,
+                                    stmt.source_info.span,
+                                );
+                                let align_op = self.align_operand_for_deref(
+                                    tcx,
+                                    body,
+                                    ptr_local,
                                     stmt.source_info.span,
                                 );
 
@@ -6735,7 +6893,11 @@ impl MyOptimizationPass {
                                     insert_before: true,
                                     source_info: stmt.source_info,
                                     place: p.clone(),
-                                    kind: InstrKind::PtrRead { ptr_local, size_op },
+                                    kind: InstrKind::PtrRead {
+                                        ptr_local,
+                                        size_op,
+                                        align_op,
+                                    },
                                 });
                             }
                         }
@@ -6770,6 +6932,8 @@ impl MyOptimizationPass {
                         lhs_ty,
                         stmt.source_info.span,
                     );
+                    let align_op =
+                        self.align_operand_for_deref(tcx, body, ptr_local, stmt.source_info.span);
 
                     self.ensure_raw_root_before(
                         tcx,
@@ -6790,7 +6954,11 @@ impl MyOptimizationPass {
                         insert_before: true,
                         source_info: stmt.source_info,
                         place: lhs_place.clone(),
-                        kind: InstrKind::PtrWrite { ptr_local, size_op },
+                        kind: InstrKind::PtrWrite {
+                            ptr_local,
+                            size_op,
+                            align_op,
+                        },
                     });
                 }
             }
@@ -6822,6 +6990,12 @@ impl MyOptimizationPass {
                         kind: InstrKind::StackSlotWriteAllowUntagged {
                             local: lhs_place.local,
                             size_op,
+                            align_op: self.align_operand_for_ty(
+                                tcx,
+                                body,
+                                lhs_ty,
+                                stmt.source_info.span,
+                            ),
                         },
                     });
                 }
@@ -7266,6 +7440,18 @@ impl MyOptimizationPass {
                                         src_local,
                                         dst_local,
                                     );
+                                    if matches!(dst_ty.kind(), TyKind::Ref(..)) {
+                                        insert_points.push(InsertPoint {
+                                            bb,
+                                            stmt_idx,
+                                            insert_before: false,
+                                            source_info: stmt.source_info,
+                                            place: Place::from(dst_local),
+                                            kind: InstrKind::PtrUse {
+                                                ptr_local: dst_local,
+                                            },
+                                        });
+                                    }
                                 }
                                 tagged_ptr_locals.insert(dst_local);
                                 handled_ptr_tag = true;
@@ -8289,6 +8475,19 @@ impl MyOptimizationPass {
                 );
                 (Operand::Copy(Place::from(size_local)), vec![stmt])
             }
+            SizeOperand::AlignOf(ty) => {
+                let align_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(align_local),
+                        Rvalue::NullaryOp(NullOp::AlignOf, *ty),
+                    ))),
+                );
+                (Operand::Copy(Place::from(align_local)), vec![stmt])
+            }
             SizeOperand::ElemCount { elem_ty, count_op } => {
                 let size_local = body
                     .local_decls
@@ -8426,8 +8625,7 @@ impl MyOptimizationPass {
                         ),
                     ))),
                 );
-                let offset_of_list =
-                    tcx.mk_offset_of(&[(VariantIdx::from_u32(0), *field_idx)]);
+                let offset_of_list = tcx.mk_offset_of(&[(VariantIdx::from_u32(0), *field_idx)]);
                 let head_off_stmt = Statement::new(
                     source_info,
                     StatementKind::Assign(Box::new((
@@ -9140,6 +9338,11 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrRead {
                             ptr_local: src,
                             size_op,
+                            align_op: SizeOperand::Const(self.const_usize(
+                                tcx,
+                                term.source_info.span,
+                                1,
+                            )),
                         },
                     });
                 }
@@ -9156,6 +9359,11 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrWrite {
                             ptr_local: dst,
                             size_op,
+                            align_op: SizeOperand::Const(self.const_usize(
+                                tcx,
+                                term.source_info.span,
+                                1,
+                            )),
                         },
                     });
                 }
@@ -9199,6 +9407,11 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrWrite {
                             ptr_local: dst,
                             size_op,
+                            align_op: SizeOperand::Const(self.const_usize(
+                                tcx,
+                                term.source_info.span,
+                                1,
+                            )),
                         },
                     });
                     if let Some(dst_place) = dst_place {
@@ -9595,7 +9808,7 @@ impl MyOptimizationPass {
                     );
                 }
 
-                CallEffect::Store => {
+                CallEffect::Store | CallEffect::StoreUnaligned => {
                     // store wrapper/intrinsic: WRITE through arg0.
                     if let Some(first) = args.get(0) {
                         if let Some(p0) = self.place_from_operand(&first.node) {
@@ -9640,24 +9853,42 @@ impl MyOptimizationPass {
                                 ptr_locals_needing_tag.insert(hook_ptr_local);
 
                                 let ty0 = p0.ty(&body.local_decls, tcx).ty;
-                                let size_op = match ty0.kind() {
-                                    TyKind::RawPtr(pointee_ty, _mutbl) => self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        *pointee_ty,
-                                        term.source_info.span,
+                                let (size_op, align_op) = match ty0.kind() {
+                                    TyKind::RawPtr(pointee_ty, _mutbl)
+                                    | TyKind::Ref(_, pointee_ty, _mutbl) => (
+                                        self.size_operand_for_ty(
+                                            tcx,
+                                            body,
+                                            *pointee_ty,
+                                            term.source_info.span,
+                                        ),
+                                        if matches!(effect, CallEffect::StoreUnaligned) {
+                                            SizeOperand::Const(self.const_usize(
+                                                tcx,
+                                                term.source_info.span,
+                                                1,
+                                            ))
+                                        } else {
+                                            self.align_operand_for_ty(
+                                                tcx,
+                                                body,
+                                                *pointee_ty,
+                                                term.source_info.span,
+                                            )
+                                        },
                                     ),
-                                    TyKind::Ref(_, pointee_ty, _mutbl) => self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        *pointee_ty,
-                                        term.source_info.span,
+                                    _ => (
+                                        SizeOperand::Const(self.const_usize(
+                                            tcx,
+                                            term.source_info.span,
+                                            0,
+                                        )),
+                                        SizeOperand::Const(self.const_usize(
+                                            tcx,
+                                            term.source_info.span,
+                                            0,
+                                        )),
                                     ),
-                                    _ => SizeOperand::Const(self.const_usize(
-                                        tcx,
-                                        term.source_info.span,
-                                        0,
-                                    )),
                                 };
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -9668,6 +9899,7 @@ impl MyOptimizationPass {
                                     kind: InstrKind::PtrWrite {
                                         ptr_local: hook_ptr_local,
                                         size_op,
+                                        align_op,
                                     },
                                 });
                             }
@@ -9675,7 +9907,7 @@ impl MyOptimizationPass {
                     }
                 }
 
-                CallEffect::Load => {
+                CallEffect::Load | CallEffect::LoadUnaligned => {
                     // load wrapper/intrinsic: READ through arg0.
                     if let Some(first) = args.get(0) {
                         if let Some(p0) = self.place_from_operand(&first.node) {
@@ -9710,24 +9942,42 @@ impl MyOptimizationPass {
                                 ptr_locals_needing_tag.insert(hook_ptr_local);
 
                                 let ty0 = p0.ty(&body.local_decls, tcx).ty;
-                                let size_op = match ty0.kind() {
-                                    TyKind::RawPtr(pointee_ty, _mutbl) => self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        *pointee_ty,
-                                        term.source_info.span,
+                                let (size_op, align_op) = match ty0.kind() {
+                                    TyKind::RawPtr(pointee_ty, _mutbl)
+                                    | TyKind::Ref(_, pointee_ty, _mutbl) => (
+                                        self.size_operand_for_ty(
+                                            tcx,
+                                            body,
+                                            *pointee_ty,
+                                            term.source_info.span,
+                                        ),
+                                        if matches!(effect, CallEffect::LoadUnaligned) {
+                                            SizeOperand::Const(self.const_usize(
+                                                tcx,
+                                                term.source_info.span,
+                                                1,
+                                            ))
+                                        } else {
+                                            self.align_operand_for_ty(
+                                                tcx,
+                                                body,
+                                                *pointee_ty,
+                                                term.source_info.span,
+                                            )
+                                        },
                                     ),
-                                    TyKind::Ref(_, pointee_ty, _mutbl) => self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        *pointee_ty,
-                                        term.source_info.span,
+                                    _ => (
+                                        SizeOperand::Const(self.const_usize(
+                                            tcx,
+                                            term.source_info.span,
+                                            0,
+                                        )),
+                                        SizeOperand::Const(self.const_usize(
+                                            tcx,
+                                            term.source_info.span,
+                                            0,
+                                        )),
                                     ),
-                                    _ => SizeOperand::Const(self.const_usize(
-                                        tcx,
-                                        term.source_info.span,
-                                        0,
-                                    )),
                                 };
                                 insert_points.push(InsertPoint {
                                     bb,
@@ -9738,6 +9988,7 @@ impl MyOptimizationPass {
                                     kind: InstrKind::PtrRead {
                                         ptr_local: hook_ptr_local,
                                         size_op,
+                                        align_op,
                                     },
                                 });
                             }
@@ -10084,6 +10335,12 @@ impl MyOptimizationPass {
                     }
                     _ => SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0)),
                 };
+                let align_op = match ty.kind() {
+                    TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
+                        self.align_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
+                    }
+                    _ => SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0)),
+                };
                 ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
@@ -10094,6 +10351,7 @@ impl MyOptimizationPass {
                     kind: InstrKind::PtrReadAllowUntagged {
                         ptr_local: p.local,
                         size_op: size_op.clone(),
+                        align_op: align_op.clone(),
                     },
                 });
                 // Shared refs (`&T`) are read-only at the type level. Emitting unknown-call
@@ -10109,6 +10367,7 @@ impl MyOptimizationPass {
                         kind: InstrKind::PtrWriteAllowUntagged {
                             ptr_local: p.local,
                             size_op,
+                            align_op,
                         },
                     });
                 }
@@ -10992,10 +11251,7 @@ impl MyOptimizationPass {
         debug_ref_bindings: &HashMap<DebugRefBindingKey, DebugRefBinding>,
         hooks: Hooks,
     ) {
-        fn resolve_return_chain_bb<'tcx>(
-            body: &Body<'tcx>,
-            mut bb: BasicBlock,
-        ) -> BasicBlock {
+        fn resolve_return_chain_bb<'tcx>(body: &Body<'tcx>, mut bb: BasicBlock) -> BasicBlock {
             for _ in 0..64 {
                 let Some(term) = body.basic_blocks[bb].terminator.as_ref() else {
                     break;
@@ -11093,10 +11349,8 @@ impl MyOptimizationPass {
             let place = ip.place;
             let creation_kind = ip.kind;
 
-            if matches!(
-                creation_kind,
-                InstrKind::StackAlloc { live: false, .. }
-            ) && !ip.insert_before
+            if matches!(creation_kind, InstrKind::StackAlloc { live: false, .. })
+                && !ip.insert_before
             {
                 let resolved_bb = resolve_return_chain_bb(body, bb);
                 if resolved_bb != bb {
@@ -11602,6 +11856,10 @@ impl MyOptimizationPass {
                     self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
                 let (arg_bounds_len, mut bounds_len_stmts) =
                     self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
+                let align_op =
+                    self.align_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
+                let (arg_align, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
                 if !bounds_len_stmts.is_empty() {
                     // Appended after address statements once call_bb exists.
                 }
@@ -11654,6 +11912,11 @@ impl MyOptimizationPass {
                         .statements
                         .append(&mut bounds_len_stmts);
                 }
+                if !align_stmts.is_empty() {
+                    body.basic_blocks_mut()[call_bb]
+                        .statements
+                        .append(&mut align_stmts);
+                }
 
                 let root_func = Operand::function_handle(
                     tcx,
@@ -11689,6 +11952,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: arg_bounds_len,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_align,
                         span: source_info.span,
                     },
                 ]
@@ -11821,6 +12088,10 @@ impl MyOptimizationPass {
                 };
                 let (arg_bounds_len, mut bounds_len_stmts) =
                     self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
+                let align_op =
+                    self.align_operand_for_ptr_local(tcx, body, dst_local, source_info.span);
+                let (arg_align, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
                 let args_take: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: self.const_u64(tcx, source_info.span, callee_id),
@@ -11840,6 +12111,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: arg_bounds_len,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_align,
                         span: source_info.span,
                     },
                 ]
@@ -11877,6 +12152,9 @@ impl MyOptimizationPass {
                     take_bd.statements.push(addr_stmt2);
                     if !bounds_len_stmts.is_empty() {
                         take_bd.statements.append(&mut bounds_len_stmts);
+                    }
+                    if !align_stmts.is_empty() {
+                        take_bd.statements.append(&mut align_stmts);
                     }
                     body.basic_blocks_mut().push(take_bd)
                 };
@@ -12485,6 +12763,10 @@ impl MyOptimizationPass {
                     self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
                 let (arg_bounds_len, mut bounds_len_stmts) =
                     self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
+                let align_op =
+                    self.align_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
+                let (arg_align, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
 
                 let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                 let arg_index = self.const_u64(tcx, source_info.span, arg_index);
@@ -12525,6 +12807,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: arg_bounds_len,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_align,
                         span: source_info.span,
                     },
                 ]
@@ -12599,6 +12885,9 @@ impl MyOptimizationPass {
                     bd.statements.push(addr_stmt2);
                     if !bounds_len_stmts.is_empty() {
                         bd.statements.append(&mut bounds_len_stmts);
+                    }
+                    if !align_stmts.is_empty() {
+                        bd.statements.append(&mut align_stmts);
                     }
                     bd.terminator = Some(take_term);
                     rem
@@ -13096,10 +13385,12 @@ impl MyOptimizationPass {
                 InstrKind::PtrRead {
                     ptr_local,
                     ref size_op,
+                    ref align_op,
                 }
                 | InstrKind::PtrReadAllowUntagged {
                     ptr_local,
                     ref size_op,
+                    ref align_op,
                 } => {
                     let tag_op: Operand<'tcx> = if let Some(debug_tag_local) = self
                         .active_debug_ref_binding_tag_local(
@@ -13122,6 +13413,9 @@ impl MyOptimizationPass {
                     let (arg_size, mut size_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, size_op);
                     extra_stmts.append(&mut size_stmts);
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, align_op);
+                    extra_stmts.append(&mut align_stmts);
                     let access_alias = self.const_u8(
                         tcx,
                         source_info.span,
@@ -13143,6 +13437,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_size,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
                             span: source_info.span,
                         },
                         Spanned {
@@ -13254,10 +13552,12 @@ impl MyOptimizationPass {
                 InstrKind::PtrWrite {
                     ptr_local,
                     ref size_op,
+                    ref align_op,
                 }
                 | InstrKind::PtrWriteAllowUntagged {
                     ptr_local,
                     ref size_op,
+                    ref align_op,
                 } => {
                     let tag_op: Operand<'tcx> = if let Some(debug_tag_local) = self
                         .active_debug_ref_binding_tag_local(
@@ -13280,6 +13580,9 @@ impl MyOptimizationPass {
                     let (arg_size, mut size_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, size_op);
                     extra_stmts.append(&mut size_stmts);
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, align_op);
+                    extra_stmts.append(&mut align_stmts);
                     let access_alias = self.const_u8(
                         tcx,
                         source_info.span,
@@ -13304,6 +13607,10 @@ impl MyOptimizationPass {
                             span: source_info.span,
                         },
                         Spanned {
+                            node: arg_align,
+                            span: source_info.span,
+                        },
+                        Spanned {
                             node: access_alias,
                             span: source_info.span,
                         },
@@ -13313,7 +13620,9 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::StackSlotWriteAllowUntagged { local, ref size_op } => {
+                InstrKind::StackSlotWriteAllowUntagged {
+                    local, ref size_op, ..
+                } => {
                     let Some(tag_local) =
                         reborrow_anchor_local_for_stack_local.get(&local).copied()
                     else {
@@ -13507,6 +13816,11 @@ impl MyOptimizationPass {
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);
+                    let align_op =
+                        self.align_operand_for_ptr_local(tcx, body, raw_local, source_info.span);
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
+                    extra_stmts.append(&mut align_stmts);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -13531,6 +13845,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_bounds_len,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
                             span: source_info.span,
                         },
                     ]
@@ -13648,6 +13966,17 @@ impl MyOptimizationPass {
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);
+                    let align_op = self.align_operand_for_ptr_derive(
+                        tcx,
+                        body,
+                        src,
+                        dst,
+                        is_ref,
+                        source_info.span,
+                    );
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
+                    extra_stmts.append(&mut align_stmts);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -13668,6 +13997,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_bounds_len,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
                             span: source_info.span,
                         },
                     ]
@@ -13706,6 +14039,11 @@ impl MyOptimizationPass {
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);
+                    let align_op =
+                        self.align_operand_for_ptr_local(tcx, body, dst, source_info.span);
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
+                    extra_stmts.append(&mut align_stmts);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -13726,6 +14064,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_bounds_len,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
                             span: source_info.span,
                         },
                     ]
@@ -13950,6 +14292,29 @@ impl MyOptimizationPass {
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);
+                    let align_op = match &creation_kind {
+                        InstrKind::Ref { src, .. } => self
+                            .align_operand_for_ref_creation_src_place(
+                                tcx,
+                                body,
+                                place.ty(&body.local_decls, tcx).ty,
+                                *src,
+                                source_info.span,
+                            ),
+                        InstrKind::Raw { src, .. } => {
+                            self.align_operand_for_src_place(tcx, body, *src, source_info.span)
+                        }
+                        _ => bounds_ptr_local
+                            .map(|pl| {
+                                self.align_operand_for_ptr_local(tcx, body, pl, source_info.span)
+                            })
+                            .unwrap_or_else(|| {
+                                SizeOperand::Const(self.const_usize(tcx, source_info.span, 0))
+                            }),
+                    };
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
+                    extra_stmts.append(&mut align_stmts);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -13970,6 +14335,10 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_bounds_len,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
                             span: source_info.span,
                         },
                     ]
@@ -14034,6 +14403,10 @@ impl MyOptimizationPass {
                             source_info.span,
                             if alias_exempt { 1 } else { 0 },
                         ),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_usize(tcx, source_info.span, 0),
                         span: source_info.span,
                     },
                     Spanned {
@@ -14557,6 +14930,10 @@ impl MyOptimizationPass {
                 };
                 let (arg_bounds_len, mut bounds_len_stmts) =
                     self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
+                let align_op =
+                    self.align_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
+                let (arg_align, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
 
                 let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                 let arg_index = self.const_u64(tcx, source_info.span, arg_index);
@@ -14597,6 +14974,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: arg_bounds_len,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: arg_align,
                         span: source_info.span,
                     },
                 ]
@@ -14671,6 +15052,9 @@ impl MyOptimizationPass {
                     bd.statements.push(addr_stmt2);
                     if !bounds_len_stmts.is_empty() {
                         bd.statements.append(&mut bounds_len_stmts);
+                    }
+                    if !align_stmts.is_empty() {
+                        bd.statements.append(&mut align_stmts);
                     }
                     bd.terminator = Some(take_term);
                     rem
@@ -14795,6 +15179,10 @@ impl MyOptimizationPass {
                                     node: self.const_usize(tcx, source_info.span, 0),
                                     span: source_info.span,
                                 },
+                                Spanned {
+                                    node: self.const_usize(tcx, source_info.span, 0),
+                                    span: source_info.span,
+                                },
                             ]
                             .into_boxed_slice(),
                             destination: Place::from(anchor_local),
@@ -14877,6 +15265,9 @@ impl MyOptimizationPass {
                     let size_op = self.size_operand_for_ty(tcx, body, local_ty, source_info.span);
                     let (bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &size_op);
+                    let align_op = self.align_operand_for_ty(tcx, body, local_ty, source_info.span);
+                    let (align_len, mut align_len_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
 
                     let (orig_term, is_cleanup) = {
                         let bd = &mut body.basic_blocks_mut()[bb];
@@ -14916,6 +15307,10 @@ impl MyOptimizationPass {
                                 },
                                 Spanned {
                                     node: bounds_len,
+                                    span: source_info.span,
+                                },
+                                Spanned {
+                                    node: align_len,
                                     span: source_info.span,
                                 },
                             ]
@@ -14974,6 +15369,9 @@ impl MyOptimizationPass {
                         bd.statements.push(addr_stmt2);
                         if !bounds_len_stmts.is_empty() {
                             bd.statements.append(&mut bounds_len_stmts);
+                        }
+                        if !align_len_stmts.is_empty() {
+                            bd.statements.append(&mut align_len_stmts);
                         }
                         bd.terminator = Some(take_term);
                         rem
@@ -15259,31 +15657,31 @@ impl MyOptimizationPass {
         // self.print_runtime_items(tcx);
 
         let def_id_ref = self
-            .find_runtime_fn_def_id(tcx, "__record_ref_creation", 5)
+            .find_runtime_fn_def_id(tcx, "__record_ref_creation", 6)
             .expect("missing '__record_ref_creation' definition");
         let def_id_debug_ref = self
-            .find_runtime_fn_def_id(tcx, "__record_debug_ref_creation", 6)
+            .find_runtime_fn_def_id(tcx, "__record_debug_ref_creation", 7)
             .expect("missing '__record_debug_ref_creation' definition");
         let def_id_raw = self
-            .find_runtime_fn_def_id(tcx, "__record_raw_ptr_creation", 5)
+            .find_runtime_fn_def_id(tcx, "__record_raw_ptr_creation", 6)
             .expect("missing '__record_raw_ptr_creation' definition");
         let def_id_alloc = self
             .find_runtime_fn_def_id(tcx, "__rz_record_alloc", 3)
             .expect("missing '__rz_record_alloc' definition");
         let def_id_write = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_write", 4)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_write", 5)
             .expect("missing '__rz_ptr_write' definition");
         let def_id_write_allow_untagged = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_write_allow_untagged", 4)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_write_allow_untagged", 5)
             .expect("missing '__rz_ptr_write_allow_untagged' definition");
         let def_id_local_write_allow_untagged = self
             .find_runtime_fn_def_id(tcx, "__rz_local_write_allow_untagged", 3)
             .expect("missing '__rz_local_write_allow_untagged' definition");
         let def_id_read = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_read", 4)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_read", 5)
             .expect("missing '__rz_ptr_read' definition");
         let def_id_read_allow_untagged = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_read_allow_untagged", 4)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_read_allow_untagged", 5)
             .expect("missing '__rz_ptr_read_allow_untagged' definition");
         let def_id_use = self
             .find_runtime_fn_def_id(tcx, "__rz_ptr_use", 2)
@@ -15310,7 +15708,7 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 1)
             .expect("missing '__rz_validate_loaded_ref_tag' definition");
         let def_id_take_ret_tag_or_root = self
-            .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag_or_root", 5)
+            .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag_or_root", 6)
             .expect("missing '__rz_take_ret_tag_or_root' definition");
         let def_id_exit_fn = self
             .find_runtime_fn_def_id(tcx, "__rz_exit_fn", 1)
@@ -15625,6 +16023,8 @@ fn call_effect_label(effect: CallEffect) -> &'static str {
         CallEffect::MemSet => "MemSet",
         CallEffect::Load => "Load",
         CallEffect::Store => "Store",
+        CallEffect::LoadUnaligned => "LoadUnaligned",
+        CallEffect::StoreUnaligned => "StoreUnaligned",
         CallEffect::PtrDerive => "PtrDerive",
         CallEffect::ExposedProvenanceRoot => "ExposedProvenanceRoot",
         CallEffect::BoxIntoRaw => "BoxIntoRaw",

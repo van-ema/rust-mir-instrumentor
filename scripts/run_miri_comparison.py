@@ -19,6 +19,9 @@ PACKAGE_DIRS = {
     "miri_sb_exact": EXAMPLES_DIR / "miri_tests" / "sb_exact",
     "miri_tb_exact": EXAMPLES_DIR / "miri_tests" / "tb_exact",
     "miri_mem_exact": EXAMPLES_DIR / "miri_tests" / "memory_exact",
+    "miri_function_calls_exact": EXAMPLES_DIR / "miri_tests" / "function_calls_exact",
+    "miri_provenance_exact": EXAMPLES_DIR / "miri_tests" / "provenance_exact",
+    "miri_unaligned_exact": EXAMPLES_DIR / "miri_tests" / "unaligned_exact",
 }
 
 
@@ -35,13 +38,15 @@ class PortedTest:
 
     @property
     def rz_model(self) -> str:
-        return "sb_lite" if self.package == "miri_sb_exact" else "tb_lite"
+        if self.package == "miri_sb_exact":
+            return "sb_lite"
+        return "tb_lite"
 
     @property
     def miri_mode(self) -> str:
         if self.package == "miri_sb_exact":
             return "stacked"
-        if self.package == "miri_tb_exact":
+        if self.package in ("miri_tb_exact", "miri_function_calls_exact"):
             return "tree"
         return "default"
 

@@ -1148,11 +1148,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "miri_function_calls_exact"
+version = "0.1.0"
+
+[[package]]
+name = "miri_mem_exact"
+version = "0.1.0"
+
+[[package]]
+name = "miri_provenance_exact"
+version = "0.1.0"
+
+[[package]]
 name = "miri_sb_exact"
 version = "0.1.0"
 
 [[package]]
 name = "miri_tb_exact"
+version = "0.1.0"
+
+[[package]]
+name = "miri_unaligned_exact"
 version = "0.1.0"
 
 [[package]]

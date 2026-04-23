@@ -41,6 +41,12 @@ pub(crate) trait AliasModel: Sync {
     /// Alias models can use this to seed call-scope metadata (e.g., protectors).
     fn on_call_arg_taken(&self, _callee_id: u64, _parent_tag: u64) {}
 
+    /// Called when a non-pointer carrier argument (`Option<&T>`, tuple/newtype wrapper, etc.)
+    /// consumes a caller-pushed inner tag.
+    fn on_call_arg_anchor_taken(&self, callee_id: u64, parent_tag: u64) {
+        self.on_call_arg_taken(callee_id, parent_tag);
+    }
+
     /// Called at instrumented function return.
     fn on_call_exit(&self, _callee_id: u64) {}
 

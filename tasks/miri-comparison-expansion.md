@@ -17,6 +17,21 @@ Fair means:
 
 Do **not** mix these categories in a single headline number.
 
+## Aliasing-Model Focus
+
+**Tree Borrows (`tb_lite`) is the target aliasing model.** Prefer `miri_tb_exact`,
+`miri_mem_exact`, `miri_provenance_exact`, and `miri_function_calls_exact` for new
+exact ports — they all run under `tb_lite` by default.
+
+Exclude:
+- tests from `miri/tests/fail/stacked_borrows/*` that are SB-only
+- SB-only variants of `both_borrows` tests whose TB counterpart is unavailable or
+  behaves differently
+
+Port SB-flavored tests only when they also exercise Tree Borrows semantics. The
+`miri_sb_exact` package still exists for historical coverage but is **not** the
+target of further expansion.
+
 ## Why
 
 Current numbers are easy to misread:
@@ -79,10 +94,11 @@ Already in repo:
 
 ### Phase 1: Grow Exact Port Set Fast
 
-Target families first:
-- `miri/tests/fail/both_borrows/*`
+Target families first (all scoped to Tree Borrows behavior):
 - `miri/tests/fail/tree_borrows/*`
-- `miri/tests/fail/stacked_borrows/*`
+- `miri/tests/fail/both_borrows/*` (only tests whose `tree` revision reports a violation)
+
+Do **not** add new ports from `miri/tests/fail/stacked_borrows/*`.
 
 Also target exact ports from other Miri classes that are directly relevant to `rusteze`:
 - `miri/tests/fail/provenance/*`
@@ -109,7 +125,7 @@ Best candidates:
 
 Priority order for this repo:
 1. `tree_borrows`
-2. `both_borrows`
+2. `both_borrows` (TB-relevant only)
 3. memory-safety/provenance classes:
    - `provenance`
    - `dangling_pointers`
@@ -117,8 +133,7 @@ Priority order for this repo:
    - `unaligned_pointers`
    - selected `uninit`
    - selected `function_calls`
-4. only selected `stacked_borrows` cases that are still meaningful for Tree Borrows or
-   general memory safety
+4. `stacked_borrows` is **out of scope** for expansion.
 
 ### Phase 2: Classify Ports
 
@@ -211,11 +226,13 @@ Run exact-port comparison:
 python3 scripts/run_miri_comparison.py
 ```
 
-Run exact-port additions incrementally:
+Run exact-port additions incrementally (tb_lite is the default model; omit
+`RZ_ALIAS_MODEL` unless specifically recording for the historical `miri_sb_exact`
+package):
 
 ```bash
-EXAMPLE_FILTER='^miri_sb_exact::NEW_TEST$' RZ_ALIAS_MODEL=sb_lite RECORD_EXPECT=1 python3 scripts/run_example_tests.py
-EXAMPLE_FILTER='^miri_tb_exact::NEW_TEST$' RZ_ALIAS_MODEL=tb_lite RECORD_EXPECT=1 python3 scripts/run_example_tests.py
+EXAMPLE_FILTER='^miri_tb_exact::NEW_TEST$' RECORD_EXPECT=1 python3 scripts/run_example_tests.py
+EXAMPLE_FILTER='^miri_mem_exact::NEW_TEST$' RECORD_EXPECT=1 python3 scripts/run_example_tests.py
 ```
 
 ## Non-Goals
@@ -227,7 +244,8 @@ Not goal here:
 - new inspired-by tests for paper headline
 
 Also not goal:
-- bulk-importing all `stacked_borrows/*` tests just to inflate port count
-- broad Miri feature coverage unrelated to aliasing, provenance, or memory safety
+- importing any new `stacked_borrows/*` tests — SB is out of scope for expansion
+- bulk-importing tests just to inflate port count
+- broad Miri feature coverage unrelated to Tree Borrows, provenance, or memory safety
 
 This task only exists to make Miri comparison fair and publishable.

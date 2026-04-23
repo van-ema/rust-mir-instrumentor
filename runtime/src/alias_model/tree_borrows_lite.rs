@@ -190,38 +190,11 @@ fn tb_lite_on_call_arg_anchor_taken(callee_id: u64, parent_tag: u64) {
         return;
     }
 
+    // For aggregate/non-pointer carriers we still want callee-side protector semantics, but the
+    // protected node must be the immediate ref child materialized in the callee, not the caller's
+    // raw/parent tag. Protecting the parent directly incorrectly makes sibling raw accesses look
+    // like descendant/self accesses and hides the conflict that Tree Borrows should report.
     tb_lite_on_call_arg_taken(callee_id, parent_tag);
-
-    let thread_id = std::thread::current().id();
-    let mut frames = tb_protector_frames().lock().unwrap();
-    let frame = match frames.last_mut() {
-        Some(top) if top.thread_id == thread_id && top.callee_id == callee_id => top,
-        _ => {
-            frames.push(TbProtectorFrame {
-                thread_id,
-                callee_id,
-                pending_parent_tags: Vec::new(),
-                protected_tags: Vec::new(),
-            });
-            frames.last_mut().unwrap()
-        }
-    };
-    if !frame.protected_tags.contains(&parent_tag) {
-        frame.protected_tags.push(parent_tag);
-    }
-
-    let tmap = tags().lock().unwrap();
-    let Some(tmeta) = tmap.get(&parent_tag) else {
-        return;
-    };
-    let base = tb_base_for_addr(tmeta.pointee_addr);
-    let mut all = tb_state().lock().unwrap();
-    let Some(tree) = all.get_mut(&base) else {
-        return;
-    };
-    if let Some(node) = tree.nodes.get_mut(&parent_tag) {
-        node.protected = true;
-    }
 }
 
 fn tb_lite_on_call_exit(callee_id: u64) {

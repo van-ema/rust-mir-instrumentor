@@ -585,7 +585,9 @@ fn rz_validate_ref_creation_addr(
             // A larger gap (`>= 2`) means the slot was reborn and died again in between,
             // which is the address-reuse false-positive pattern for stack frames.
             if ameta.is_stack {
-                let parent_epoch = tag_store::get(parent_tag).map(|p| p.alloc_epoch).unwrap_or(0);
+                let parent_epoch = tag_store::get(parent_tag)
+                    .map(|p| p.alloc_epoch)
+                    .unwrap_or(0);
                 // If we don't have a parent epoch to correlate against (root creation
                 // or untagged parent), fall back to the conservative old behavior and
                 // skip the UAD report — we cannot distinguish real UAD from stack-slot
@@ -1163,6 +1165,9 @@ pub struct TagMeta {
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
+    /// Best-effort required alignment for this pointer/reference in bytes.
+    /// 0 means unknown and falls back to parent/access-specific metadata.
+    pub align_req: usize,
     /// Whether we captured an allocation-origin snapshot for this tag.
     pub origin_known: bool,
     /// Base address of the allocation that originated this tag.
@@ -1212,6 +1217,109 @@ fn tag_alias_exempt_via_bounded_ancestor(tag: u64, addr: usize, size: usize) -> 
     }
 
     false
+}
+
+#[inline]
+fn rz_addr_alignment(addr: usize) -> usize {
+    if addr == 0 {
+        return 0;
+    }
+    1usize << addr.trailing_zeros()
+}
+
+#[inline]
+fn rz_effective_align_req(requested_align: usize, parent_tag: u64) -> usize {
+    let parent_align = if parent_tag == 0 {
+        0
+    } else {
+        tag_store::get(parent_tag)
+            .map(|meta| meta.align_req)
+            .unwrap_or(0)
+    };
+    match (requested_align, parent_align) {
+        (0, p) => p,
+        (r, 0) => r,
+        (r, p) => r.min(p),
+    }
+}
+
+#[inline]
+fn rz_effective_ref_align_req(
+    requested_align: usize,
+    parent_tag: u64,
+    pointee_addr: usize,
+) -> usize {
+    let Some(parent) = (if parent_tag == 0 {
+        None
+    } else {
+        tag_store::get(parent_tag)
+    }) else {
+        return requested_align;
+    };
+    if requested_align == 0 {
+        return parent.align_req;
+    }
+    if parent.pointee_addr == pointee_addr {
+        return match parent.align_req {
+            0 => requested_align,
+            parent_align => requested_align.min(parent_align),
+        };
+    }
+    requested_align
+}
+
+fn rz_check_alignment(
+    access_name: &str,
+    tag: u64,
+    addr: usize,
+    size: usize,
+    guaranteed_align: usize,
+    required_align: usize,
+    tmeta: Option<&TagMeta>,
+) {
+    if required_align <= 1 {
+        return;
+    }
+
+    if guaranteed_align != 0 && guaranteed_align < required_align {
+        let mut msg = format!(
+            "{access_name} via tag={tag} addr=0x{addr:x} size={size}\nrequired_alignment={required_align} guaranteed_alignment={guaranteed_align}"
+        );
+        if let Some(meta) = tmeta {
+            use std::fmt::Write as _;
+            let _ = write!(
+                msg,
+                "\nkind={:?} parent={} pointee=0x{:x}",
+                meta.kind, meta.parent, meta.pointee_addr
+            );
+        }
+        rz_violation(
+            "MISALIGNED_ACCESS",
+            append_location_if_enabled(msg, "RZ_LOG_LOC"),
+        );
+        return;
+    }
+
+    if addr == 0 || addr % required_align == 0 {
+        return;
+    }
+
+    let found_align = rz_addr_alignment(addr);
+    let mut msg = format!(
+        "{access_name} via tag={tag} addr=0x{addr:x} size={size}\nrequired_alignment={required_align} guaranteed_alignment={guaranteed_align} found_alignment={found_align}"
+    );
+    if let Some(meta) = tmeta {
+        use std::fmt::Write as _;
+        let _ = write!(
+            msg,
+            "\nkind={:?} parent={} pointee=0x{:x}",
+            meta.kind, meta.parent, meta.pointee_addr
+        );
+    }
+    rz_violation(
+        "MISALIGNED_ACCESS",
+        append_location_if_enabled(msg, "RZ_LOG_LOC"),
+    );
 }
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
@@ -2568,7 +2676,13 @@ pub extern "C" fn __rz_dump_hook_profile() {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
+pub fn __rz_ptr_write(
+    tag: u64,
+    addr: usize,
+    size: usize,
+    align_req: usize,
+    access_alias_exempt: u8,
+) {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::write(profile);
 
@@ -2577,7 +2691,7 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 1, 0, 0, 0)
+            __record_raw_ptr_creation(addr, 1, 0, 0, 0, align_req)
         } else {
             tag
         }
@@ -2618,6 +2732,20 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
+    let align_req = if align_req != 0 {
+        align_req
+    } else {
+        tmeta.align_req
+    };
+    rz_check_alignment(
+        "WRITE",
+        tag,
+        addr,
+        size,
+        tmeta.align_req,
+        align_req,
+        Some(&tmeta),
+    );
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         match active_alias_model().name() {
             // Tree Borrows tracks raws as first-class nodes in the tree.
@@ -3030,13 +3158,19 @@ pub fn __rz_ptr_write(tag: u64, addr: usize, size: usize, access_alias_exempt: u
 /// Like `__rz_ptr_write`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_write_allow_untagged(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
+pub fn __rz_ptr_write_allow_untagged(
+    tag: u64,
+    addr: usize,
+    size: usize,
+    align_req: usize,
+    access_alias_exempt: u8,
+) {
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(tag, addr, size, access_alias_exempt);
+    __rz_ptr_write(tag, addr, size, align_req, access_alias_exempt);
 }
 
 /// Record a direct write to a stack slot/root local.
@@ -3048,9 +3182,9 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
     if tag == 0 || size == 0 {
         return;
     }
-    let write_tag = __record_ref_creation(addr, 1, tag, 0, size);
+    let write_tag = __record_ref_creation(addr, 1, tag, 0, size, 0);
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(write_tag, addr, size, 0);
+    __rz_ptr_write(write_tag, addr, size, 0, 0);
 }
 
 /// Record/validate a read through a tracked pointer tag.
@@ -3061,7 +3195,13 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
+pub fn __rz_ptr_read(
+    tag: u64,
+    addr: usize,
+    size: usize,
+    align_req: usize,
+    access_alias_exempt: u8,
+) {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::read(profile);
 
@@ -3070,7 +3210,7 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8
             return;
         }
         if rz_tag0_as_root() {
-            __record_raw_ptr_creation(addr, 0, 0, 0, 0)
+            __record_raw_ptr_creation(addr, 0, 0, 0, 0, align_req)
         } else {
             tag
         }
@@ -3111,6 +3251,20 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
+    let align_req = if align_req != 0 {
+        align_req
+    } else {
+        tmeta.align_req
+    };
+    rz_check_alignment(
+        "READ",
+        tag,
+        addr,
+        size,
+        tmeta.align_req,
+        align_req,
+        Some(&tmeta),
+    );
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         match active_alias_model().name() {
             // Tree Borrows tracks raws as first-class nodes in the tree.
@@ -3464,13 +3618,19 @@ pub fn __rz_ptr_read(tag: u64, addr: usize, size: usize, access_alias_exempt: u8
 /// Like `__rz_ptr_read`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
 #[track_caller]
-pub fn __rz_ptr_read_allow_untagged(tag: u64, addr: usize, size: usize, access_alias_exempt: u8) {
+pub fn __rz_ptr_read_allow_untagged(
+    tag: u64,
+    addr: usize,
+    size: usize,
+    align_req: usize,
+    access_alias_exempt: u8,
+) {
     if tag == 0 {
         return;
     }
     let _sb = SbSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_read(tag, addr, size, access_alias_exempt);
+    __rz_ptr_read(tag, addr, size, align_req, access_alias_exempt);
 }
 
 fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
@@ -3627,6 +3787,7 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     is_mut: u8,
     alias_exempt: u8,
     bounds_len: usize,
+    align_req: usize,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
@@ -3641,7 +3802,7 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
         return tag;
     }
     // Fallback: synthesize a fresh raw-pointer tag rooted at this address.
-    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len)
+    __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len, align_req)
 }
 
 /// Notify runtime alias models that the current instrumented function is exiting.
@@ -3655,7 +3816,7 @@ pub extern "C" fn __rz_exit_fn(callee_id: u64) {
 macro_rules! force_runtime {
     ($sym:path) => {
         #[used]
-        static _FORCE_RUNTIME: fn(usize, u8, u64, u8, usize) -> u64 = $sym;
+        static _FORCE_RUNTIME: fn(usize, u8, u64, u8, usize, usize) -> u64 = $sym;
     };
 }
 
@@ -3667,6 +3828,7 @@ pub extern "C" fn __record_ref_creation(
     parent_tag: u64,
     alias_exempt: u8,
     bounds_len: usize,
+    align_req: usize,
 ) -> u64 {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::ref_create(profile);
@@ -3685,8 +3847,26 @@ pub extern "C" fn __record_ref_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let requested_align = align_req;
+    let align_req = rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr);
+    let required_align = if requested_align != 0 {
+        requested_align
+    } else {
+        align_req
+    };
 
     let validate_start = profile.map(|_| Instant::now());
+    if required_align != 0 && align_req != 0 && align_req < required_align {
+        rz_check_alignment(
+            "REF_CREATE",
+            tag,
+            pointee_addr,
+            bounds_len.max(1),
+            align_req,
+            required_align,
+            None,
+        );
+    }
     if !alias_exempt_flag {
         if let Some((vk, msg)) =
             rz_validate_ref_creation_addr(pointee_addr, kind, parent_tag, bounds_len)
@@ -3909,6 +4089,7 @@ pub extern "C" fn __record_ref_creation(
             },
         exposed_provenance_root: false,
         bounds_len,
+        align_req,
         origin_known,
         origin_base,
         origin_end,
@@ -3966,13 +4147,21 @@ pub extern "C" fn __record_debug_ref_creation(
     ref_ancestor: u64,
     alias_exempt: u8,
     bounds_len: usize,
+    align_req: usize,
 ) -> u64 {
     let parent_tag = if ref_ancestor != 0 {
         ref_ancestor
     } else {
         raw_tag
     };
-    __record_ref_creation(pointee_addr, is_mut, parent_tag, alias_exempt, bounds_len)
+    __record_ref_creation(
+        pointee_addr,
+        is_mut,
+        parent_tag,
+        alias_exempt,
+        bounds_len,
+        align_req,
+    )
 }
 
 #[no_mangle]
@@ -3983,12 +4172,14 @@ pub extern "C" fn __record_raw_ptr_creation(
     derived_from: u64,
     alias_exempt: u8,
     bounds_len: usize,
+    align_req: usize,
 ) -> u64 {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let align_req = rz_effective_align_req(align_req, derived_from);
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
@@ -4220,6 +4411,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         lineage_hint: alias_exempt & 0b0000_1110,
         exposed_provenance_root,
         bounds_len,
+        align_req,
         origin_known,
         origin_base,
         origin_end,
@@ -4270,6 +4462,15 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
     }
 
     if let Some(tmeta) = tag_store::mark_escaped(tag) {
+        rz_check_alignment(
+            "USE",
+            tag,
+            addr,
+            1,
+            tmeta.align_req,
+            tmeta.align_req,
+            Some(&tmeta),
+        );
         tag_pruning::mark_tag_escaped(tag, &tmeta);
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
