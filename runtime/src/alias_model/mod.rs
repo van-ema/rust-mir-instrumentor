@@ -47,6 +47,12 @@ pub(crate) trait AliasModel: Sync {
         self.on_call_arg_taken(callee_id, parent_tag);
     }
 
+    /// Called when the call side-channel observes two arguments carrying the same tag/address.
+    /// This models exact MIR shapes such as `callee(Move(*ptr), ptr)`, where Miri treats the
+    /// first by-value argument as an in-place transfer from the same storage later passed by raw
+    /// pointer.
+    fn on_call_arg_inplace_alias(&self, _callee_id: u64, _parent_tag: u64, _addr: usize) {}
+
     /// Called at instrumented function return.
     fn on_call_exit(&self, _callee_id: u64) {}
 

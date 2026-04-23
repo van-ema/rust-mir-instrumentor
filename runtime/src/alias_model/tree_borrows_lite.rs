@@ -53,6 +53,8 @@ struct TbProtectorFrame {
     callee_id: u64,
     pending_parent_tags: Vec<u64>,
     protected_tags: Vec<u64>,
+    pending_inplace_parent_tags: Vec<(u64, usize)>,
+    inplace_protected_tags: Vec<u64>,
 }
 
 static TB_STATE: OnceLock<Mutex<HashMap<usize, TbAllocState>>> = OnceLock::new();
@@ -143,6 +145,10 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_on_call_arg_anchor_taken(callee_id, parent_tag);
     }
 
+    fn on_call_arg_inplace_alias(&self, callee_id: u64, parent_tag: u64, addr: usize) {
+        tb_lite_on_call_arg_inplace_alias(callee_id, parent_tag, addr);
+    }
+
     fn on_call_exit(&self, callee_id: u64) {
         tb_lite_on_call_exit(callee_id);
     }
@@ -180,6 +186,8 @@ fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
                 callee_id,
                 pending_parent_tags: vec![parent_tag],
                 protected_tags: Vec::new(),
+                pending_inplace_parent_tags: Vec::new(),
+                inplace_protected_tags: Vec::new(),
             });
         }
     }
@@ -195,6 +203,29 @@ fn tb_lite_on_call_arg_anchor_taken(callee_id: u64, parent_tag: u64) {
     // raw/parent tag. Protecting the parent directly incorrectly makes sibling raw accesses look
     // like descendant/self accesses and hides the conflict that Tree Borrows should report.
     tb_lite_on_call_arg_taken(callee_id, parent_tag);
+}
+
+fn tb_lite_on_call_arg_inplace_alias(callee_id: u64, parent_tag: u64, addr: usize) {
+    if !rz_tb_lite_enabled() || parent_tag == 0 || addr == 0 {
+        return;
+    }
+    let thread_id = std::thread::current().id();
+    let mut frames = tb_protector_frames().lock().unwrap();
+    match frames.last_mut() {
+        Some(top) if top.thread_id == thread_id && top.callee_id == callee_id => {
+            top.pending_inplace_parent_tags.push((parent_tag, addr));
+        }
+        _ => {
+            frames.push(TbProtectorFrame {
+                thread_id,
+                callee_id,
+                pending_parent_tags: Vec::new(),
+                protected_tags: Vec::new(),
+                pending_inplace_parent_tags: vec![(parent_tag, addr)],
+                inplace_protected_tags: Vec::new(),
+            });
+        }
+    }
 }
 
 fn tb_lite_on_call_exit(callee_id: u64) {
@@ -449,6 +480,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         }
     };
     let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
+    tb_lite_mark_inplace_protected_if_pending(tag, parent, tmeta.parent, tmeta.pointee_addr, kind);
     let node = TbNode {
         tag,
         parent,
@@ -535,6 +567,47 @@ fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) ->
     true
 }
 
+fn tb_lite_mark_inplace_protected_if_pending(
+    tag: u64,
+    parent: u64,
+    raw_parent: u64,
+    addr: usize,
+    kind: BorrowKind,
+) {
+    if !matches!(kind, BorrowKind::RawConst | BorrowKind::RawMut) {
+        return;
+    }
+    let mut frames = tb_protector_frames().lock().unwrap();
+    let thread_id = std::thread::current().id();
+    let Some(top) = frames.iter_mut().rfind(|f| f.thread_id == thread_id) else {
+        return;
+    };
+    let Some(pos) =
+        top.pending_inplace_parent_tags
+            .iter()
+            .position(|(pending_parent, pending_addr)| {
+                (*pending_parent == parent || *pending_parent == raw_parent)
+                    && *pending_addr == addr
+            })
+    else {
+        return;
+    };
+    top.pending_inplace_parent_tags.swap_remove(pos);
+    top.inplace_protected_tags.push(tag);
+}
+
+fn tb_lite_inplace_protected_tag(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    let frames = tb_protector_frames().lock().unwrap();
+    let thread_id = std::thread::current().id();
+    frames
+        .iter()
+        .rev()
+        .any(|f| f.thread_id == thread_id && f.inplace_protected_tags.iter().any(|t| *t == tag))
+}
+
 fn tb_lite_check(
     sb_tag: u64,
     orig_tag: u64,
@@ -599,6 +672,18 @@ fn tb_lite_check(
     } else {
         String::new()
     };
+    if tb_lite_inplace_protected_tag(access_tag) || tb_lite_inplace_protected_tag(orig_tag) {
+        let mut msg = format!(
+            "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INPLACE_CALL_ARG",
+            tb_access_name(access),
+            access_tag,
+            addr,
+            size,
+            tmeta.kind
+        );
+        msg.push_str(&dump);
+        return Some(msg);
+    }
     if !tb_is_live_node(&node) {
         if rz_tb_runtime_lineage_repair_enabled() {
             if let Some(recovered_tag) = tb_lite_recover_same_place_live_sibling(

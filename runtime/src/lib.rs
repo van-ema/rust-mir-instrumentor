@@ -3696,13 +3696,29 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let tag = call_arg_tags()
-        .lock()
-        .unwrap()
-        .remove(&(thread_id, callee_id, arg_index, addr))
-        .unwrap_or(0);
+    let (tag, has_inplace_alias) = {
+        let mut tags = call_arg_tags().lock().unwrap();
+        let tag = tags
+            .remove(&(thread_id, callee_id, arg_index, addr))
+            .unwrap_or(0);
+        let has_inplace_alias = tag != 0
+            && arg_index > 0
+            && tags
+                .iter()
+                .any(|((tid, cid, other_arg, other_addr), other_tag)| {
+                    *tid == thread_id
+                        && *cid == callee_id
+                        && *other_arg != arg_index
+                        && *other_addr == addr
+                        && *other_tag == tag
+                });
+        (tag, has_inplace_alias)
+    };
     if tag != 0 {
         active_alias_model().on_call_arg_taken(callee_id, tag);
+        if has_inplace_alias {
+            active_alias_model().on_call_arg_inplace_alias(callee_id, tag, addr);
+        }
     }
     tag
 }
