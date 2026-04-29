@@ -14287,7 +14287,7 @@ impl MyOptimizationPass {
                     // - bit0: alias-exempt pointee classification (existing behavior)
                     // - bit1: projected-source creation hint (used by runtime lineage repair)
                     // - bit2: stronger root-origin repair hint (bounded overlap recovery)
-                    // - bit6: strict creation-time validity check for projected/derived raws
+                    // - bit6: strict creation-time provenance check for projected/derived raws
                     let alias_flags: u8 = match &creation_kind {
                         InstrKind::Ref { src, .. } => {
                             let mut flags = if alias_exempt { 1 } else { 0 };

@@ -640,6 +640,13 @@ fn rz_validate_strict_raw_creation_addr(
     parent_tag: u64,
     exposed_provenance_root: bool,
 ) -> Option<(&'static str, String)> {
+    // Raw-pointer creation should reject missing provenance, and should still catch the common
+    // case of deriving an out-of-bounds raw from an in-bounds parent. However, some libraries
+    // intentionally use already-out-of-bounds raw values as integer metadata carriers and later
+    // reverse the arithmetic before any dereference (for example, `bytes` stores small offsets
+    // in pointer-typed fields and reconstructs the real base pointer in `rebuild_vec`).
+    // In that shape, eager OOB-on-derive is too strong: once the parent is already outside its
+    // origin range, defer bounds enforcement to actual access / ref creation.
     if exposed_provenance_root {
         return Some((
             "WILD_POINTER",
@@ -663,18 +670,25 @@ fn rz_validate_strict_raw_creation_addr(
         ));
     }
 
-    if parent_meta.origin_known && parent_meta.origin_end > parent_meta.origin_base {
-        if pointee_addr < parent_meta.origin_base || pointee_addr > parent_meta.origin_end {
-            return Some((
-                "OUT_OF_BOUNDS",
-                format!(
-                    "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=RAW_DERIVE_OOB origin_base=0x{:x} origin_end=0x{:x} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
-                    parent_meta.origin_base,
-                    parent_meta.origin_end,
-                    parent_meta.pointee_addr
-                ),
-            ));
-        }
+    let parent_already_oob = parent_meta.origin_known
+        && parent_meta.origin_end > parent_meta.origin_base
+        && (parent_meta.pointee_addr < parent_meta.origin_base
+            || parent_meta.pointee_addr > parent_meta.origin_end);
+
+    if !parent_already_oob
+        && parent_meta.origin_known
+        && parent_meta.origin_end > parent_meta.origin_base
+        && (pointee_addr < parent_meta.origin_base || pointee_addr > parent_meta.origin_end)
+    {
+        return Some((
+            "OUT_OF_BOUNDS",
+            format!(
+                "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=RAW_DERIVE_OOB origin_base=0x{:x} origin_end=0x{:x} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                parent_meta.origin_base,
+                parent_meta.origin_end,
+                parent_meta.pointee_addr
+            ),
+        ));
     }
 
     None
