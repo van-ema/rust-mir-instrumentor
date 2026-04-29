@@ -11362,6 +11362,62 @@ impl MyOptimizationPass {
             bb
         }
 
+        fn is_runtime_hook_call<'tcx>(
+            tcx: TyCtxt<'tcx>,
+            term: &Terminator<'tcx>,
+        ) -> Option<BasicBlock> {
+            let TerminatorKind::Call {
+                func,
+                target: Some(next),
+                ..
+            } = &term.kind
+            else {
+                return None;
+            };
+
+            let Operand::Constant(c) = func else {
+                return None;
+            };
+            let TyKind::FnDef(def_id, _) = c.const_.ty().kind() else {
+                return None;
+            };
+            (tcx.crate_name(def_id.krate).as_str() == "runtime").then_some(*next)
+        }
+
+        fn resolve_split_chain_insert_site<'tcx>(
+            tcx: TyCtxt<'tcx>,
+            body: &Body<'tcx>,
+            orig_stmt_prefix_len: &HashMap<BasicBlock, usize>,
+            mut bb: BasicBlock,
+            mut stmt_idx: usize,
+            insert_before: bool,
+        ) -> (BasicBlock, usize) {
+            for _ in 0..64 {
+                let bd = &body.basic_blocks[bb];
+                let len = orig_stmt_prefix_len
+                    .get(&bb)
+                    .copied()
+                    .unwrap_or_else(|| bd.statements.len());
+                let needs_follow = if insert_before {
+                    stmt_idx > len
+                } else {
+                    stmt_idx >= len
+                };
+                if !needs_follow {
+                    break;
+                }
+                let Some(term) = bd.terminator.as_ref() else {
+                    break;
+                };
+                let Some(next) = is_runtime_hook_call(tcx, term) else {
+                    break;
+                };
+                stmt_idx = stmt_idx.saturating_sub(len);
+                bb = next;
+            }
+            (bb, stmt_idx)
+        }
+
         fn instr_priority(kind: &InstrKind<'_>) -> u8 {
             match kind {
                 InstrKind::Ref { .. }
@@ -11432,12 +11488,26 @@ impl MyOptimizationPass {
         sort_points(&mut other_points);
         sort_points(&mut arg_retag_points);
 
+        let mut orig_stmt_prefix_len: HashMap<BasicBlock, usize> = HashMap::new();
+
         for (_idx, ip) in other_points.into_iter().rev() {
             let mut bb = ip.bb;
             let mut stmt_idx = ip.stmt_idx;
             let source_info = ip.source_info;
             let place = ip.place;
             let creation_kind = ip.kind;
+
+            let (resolved_bb, resolved_stmt_idx) =
+                resolve_split_chain_insert_site(
+                    tcx,
+                    body,
+                    &orig_stmt_prefix_len,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                );
+            bb = resolved_bb;
+            stmt_idx = resolved_stmt_idx;
 
             if matches!(creation_kind, InstrKind::StackAlloc { live: false, .. })
                 && !ip.insert_before
@@ -13417,6 +13487,11 @@ impl MyOptimizationPass {
                 body.basic_blocks_mut().push(cont_data)
             };
 
+            let orig_stmt_len = orig_stmt_prefix_len
+                .get(&bb)
+                .copied()
+                .unwrap_or_else(|| body.basic_blocks[bb].statements.len());
+
             let heap_alloc_info = match &creation_kind {
                 InstrKind::HeapAlloc {
                     ptr_local, live, ..
@@ -14911,17 +14986,22 @@ impl MyOptimizationPass {
                 _ => Vec::new(),
             };
 
-            let remaining_stmts = {
-                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-
-                let len = bd.statements.len();
-                let split_at = if stmt_idx >= len {
+            let split_at = {
+                let len = body.basic_blocks[bb].statements.len();
+                if stmt_idx >= len {
                     len
                 } else if insert_before {
                     stmt_idx
                 } else {
                     stmt_idx + 1
-                };
+                }
+            };
+            let split_at_prefix = split_at.min(orig_stmt_len);
+            orig_stmt_prefix_len.insert(bb, split_at_prefix);
+            orig_stmt_prefix_len.insert(cont_block, orig_stmt_len.saturating_sub(split_at_prefix));
+
+            let remaining_stmts = {
+                let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
 
                 let rem = bd.statements.split_off(split_at);
 

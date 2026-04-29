@@ -2802,7 +2802,6 @@ pub extern "C" fn __rz_dump_hook_profile() {
 ///  - slow path falls back to range lookup when cache is missing/invalid
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-#[track_caller]
 pub fn __rz_ptr_write(
     tag: u64,
     addr: usize,
@@ -3292,7 +3291,6 @@ pub fn __rz_ptr_write(
 
 /// Like `__rz_ptr_write`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
-#[track_caller]
 pub fn __rz_ptr_write_allow_untagged(
     tag: u64,
     addr: usize,
@@ -3333,7 +3331,6 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
 ///  - slow path falls back to range lookup when cache is missing/invalid
 ///  - if both alloc and tag have epochs, they must match
 #[no_mangle]
-#[track_caller]
 pub fn __rz_ptr_read(
     tag: u64,
     addr: usize,
@@ -3764,7 +3761,6 @@ pub fn __rz_ptr_read(
 
 /// Like `__rz_ptr_read`, but silently skips untagged pointers (tag=0).
 #[no_mangle]
-#[track_caller]
 pub fn __rz_ptr_read_allow_untagged(
     tag: u64,
     addr: usize,
@@ -4654,15 +4650,20 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
     }
 
     if let Some(tmeta) = tag_store::mark_escaped(tag) {
-        rz_check_alignment(
-            "USE",
-            tag,
-            addr,
-            1,
-            tmeta.align_req,
-            tmeta.align_req,
-            Some(&tmeta),
-        );
+        if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+            let required_align = tmeta
+                .align_req
+                .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
+            rz_check_alignment(
+                "REF_USE",
+                tag,
+                addr,
+                tmeta.bounds_len.max(1),
+                required_align,
+                required_align,
+                Some(&tmeta),
+            );
+        }
         tag_pruning::mark_tag_escaped(tag, &tmeta);
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
