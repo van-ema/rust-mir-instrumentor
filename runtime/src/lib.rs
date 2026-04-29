@@ -459,6 +459,13 @@ fn rz_untracked_region_strict() -> bool {
 }
 
 #[inline]
+fn rz_strict_provenance_enabled() -> bool {
+    std::env::var("RZ_STRICT_PROVENANCE")
+        .ok()
+        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
 fn rz_tls_pseudo_range() -> (usize, usize) {
     RZ_IN_RUNTIME_HOOK.with(|c| {
         let tls = c as *const _ as usize;
@@ -645,6 +652,16 @@ fn rz_validate_strict_raw_creation_addr(
     let Some(parent_meta) = tag_store::get(parent_tag) else {
         return None;
     };
+
+    if rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
+        return Some((
+            "WILD_POINTER",
+            format!(
+                "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                parent_meta.pointee_addr
+            ),
+        ));
+    }
 
     if parent_meta.origin_known && parent_meta.origin_end > parent_meta.origin_base {
         if pointee_addr < parent_meta.origin_base || pointee_addr > parent_meta.origin_end {
@@ -4517,7 +4534,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
 
-    if strict_creation_check {
+    if strict_creation_check || (exposed_provenance_root && rz_strict_provenance_enabled()) {
         if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
             pointee_addr,
             kind,

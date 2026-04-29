@@ -384,6 +384,10 @@ def main() -> int:
         run_env = env.copy()
         if "-Zmiri-tree-borrows-no-precise-interior-mut" in compile_flags:
             run_env["RZ_TB_NO_PRECISE_INTERIOR_MUT"] = "1"
+        if "-Zmiri-strict-provenance" in compile_flags:
+            run_env["RZ_STRICT_PROVENANCE"] = "1"
+        elif "-Zmiri-permissive-provenance" in compile_flags:
+            run_env["RZ_STRICT_PROVENANCE"] = "0"
         run_attempts = forced_run_attempts or (8 if deterministic_concurrency else 1)
         run_timeout_s = (
             float(forced_run_timeout_s)
