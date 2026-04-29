@@ -2,6 +2,7 @@
 //@compile-flags: -Zmiri-deterministic-concurrency
 //@compile-flags: -Zmiri-tree-borrows
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -28,11 +29,15 @@ fn retagx_retagy_retx_writey_rety() {
     let barrier = Arc::new(Barrier::new(2));
     let bx = Arc::clone(&barrier);
     let by = Arc::clone(&barrier);
+    let x_returned = Arc::new(AtomicBool::new(false));
+    let x_returned_x = Arc::clone(&x_returned);
+    let x_returned_y = Arc::clone(&x_returned);
 
     let thread_x = thread::spawn(move || {
         let b = (1, bx);
         synchronized!(b, "start");
         let ptr = ptr;
+        let x_returned = x_returned_x;
         synchronized!(b, "retag x (&mut, protect)");
         fn as_mut(x: &mut u8, b: (usize, Arc<Barrier>)) -> *mut u8 {
             synchronized!(b, "retag y (&mut, protect)");
@@ -42,6 +47,7 @@ fn retagx_retagy_retx_writey_rety() {
             x as *mut u8
         }
         let _x = as_mut(unsafe { &mut *ptr.0 }, b.clone());
+        x_returned.store(true, Ordering::Release);
         synchronized!(b, "ret y");
         synchronized!(b, "end");
     });
@@ -50,20 +56,24 @@ fn retagx_retagy_retx_writey_rety() {
         let b = (2, by);
         synchronized!(b, "start");
         let ptr = ptr;
+        let x_returned = x_returned_y;
         synchronized!(b, "retag x (&mut, protect)");
         synchronized!(b, "retag y (&mut, protect)");
-        fn as_mut(y: &mut u8, b: (usize, Arc<Barrier>)) -> *mut u8 {
+        fn as_mut(y: &mut u8, b: (usize, Arc<Barrier>), x_returned: &AtomicBool) -> *mut u8 {
             synchronized!(b, "location where spurious read of x would happen in the target");
             synchronized!(b, "ret x");
             let y = y as *mut u8;
             synchronized!(b, "write y");
+            while !x_returned.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
             unsafe {
                 *y = 2;
             }
             synchronized!(b, "ret y");
             y
         }
-        let _y = as_mut(unsafe { &mut *ptr.0 }, b.clone());
+        let _y = as_mut(unsafe { &mut *ptr.0 }, b.clone(), &x_returned);
         synchronized!(b, "end");
     });
 

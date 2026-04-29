@@ -1667,6 +1667,7 @@ enum InstrKind<'tcx> {
     /// Restore tag metadata for a pointer local loaded from a memory slot.
     ShadowLoad {
         dst_local: Local,
+        require_tag: bool,
     },
     /// Store tag metadata for a pointer local into a memory slot.
     ShadowStore {
@@ -1895,6 +1896,7 @@ struct Hooks {
     def_id_push_ret_tag: DefId,
     def_id_validate_ret_tag: DefId,
     def_id_validate_loaded_ref_tag: DefId,
+    def_id_require_loaded_ptr_tag: DefId,
     def_id_take_ret_tag_or_root: DefId,
     def_id_exit_fn: DefId,
     def_id_shadow_store_ptr: DefId,
@@ -6991,6 +6993,7 @@ impl MyOptimizationPass {
                             align_op,
                         },
                     });
+
                 }
             }
         }
@@ -7061,7 +7064,10 @@ impl MyOptimizationPass {
                                     insert_before: false,
                                     source_info: stmt.source_info,
                                     place: src_place,
-                                    kind: InstrKind::ShadowLoad { dst_local },
+                                    kind: InstrKind::ShadowLoad {
+                                        dst_local,
+                                        require_tag: false,
+                                    },
                                 });
                                 return;
                             }
@@ -8181,6 +8187,16 @@ impl MyOptimizationPass {
                             projected_reborrow_anchor_key,
                         },
                     });
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::ShadowStore {
+                            src_local: lhs_local,
+                        },
+                    });
                     if let Some(anchor_state) = reused_anchor_state.as_ref() {
                         if trace_ssa_anchor {
                             rz_pass_trace!(
@@ -8235,6 +8251,16 @@ impl MyOptimizationPass {
                         kind: InstrKind::Raw {
                             is_mut,
                             src: src_place.clone(),
+                        },
+                    });
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info: stmt.source_info,
+                        place: place.clone(),
+                        kind: InstrKind::ShadowStore {
+                            src_local: lhs_local,
                         },
                     });
                 }
@@ -9719,6 +9745,7 @@ impl MyOptimizationPass {
         let mut classified_read_ptr_local: Option<Local> = None;
         let mut classified_derive_ptr_local: Option<Local> = None;
         let mut local_ptr_derive_emitted = false;
+        let mut load_shadow_emitted = false;
         let unknown_call_returns_ptr =
             unknown_call && self.is_pointer_ty(destination.ty(&body.local_decls, tcx).ty);
         let call_target_bb: Option<BasicBlock> = match &term.kind {
@@ -10022,6 +10049,36 @@ impl MyOptimizationPass {
                                         align_op,
                                     },
                                 });
+
+                                if let (Some(dst_local), Some(tgt_bb)) =
+                                    (destination.as_local(), call_target_bb)
+                                {
+                                    let dst_ty = body.local_decls[dst_local].ty;
+                                    let loaded_ptr_ty = match ty0.kind() {
+                                        TyKind::RawPtr(pointee_ty, _mutbl)
+                                        | TyKind::Ref(_, pointee_ty, _mutbl) => Some(*pointee_ty),
+                                        _ => None,
+                                    };
+                                    if self.is_shadowable_ptr_ty(tcx, body, dst_ty)
+                                        && loaded_ptr_ty
+                                            .is_some_and(|ty| self.is_shadowable_ptr_ty(tcx, body, ty))
+                                    {
+                                        let load_src_place =
+                                            p0.project_deeper(&[PlaceElem::Deref], tcx);
+                                        insert_points.push(InsertPoint {
+                                            bb: tgt_bb,
+                                            stmt_idx: 0,
+                                            insert_before: false,
+                                            source_info: term.source_info,
+                                            place: load_src_place,
+                                            kind: InstrKind::ShadowLoad {
+                                                dst_local,
+                                                require_tag: true,
+                                            },
+                                        });
+                                        load_shadow_emitted = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -10608,7 +10665,8 @@ impl MyOptimizationPass {
                         matches!(call_effect_opt, Some(CallEffect::BoxIntoRaw))
                             || (matches!(call_effect_opt, Some(CallEffect::PtrDerive))
                                 && local_ptr_derive_emitted)
-                            || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled());
+                            || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled())
+                            || load_shadow_emitted;
 
                     // `core::intrinsics::read_via_copy` is classified as `Load`: when it returns
                     // a pointer value, that return is derived from arg0's pointer provenance.
@@ -11402,7 +11460,11 @@ impl MyOptimizationPass {
                 }
             }
 
-            if let InstrKind::ShadowLoad { dst_local } = creation_kind.clone() {
+            if let InstrKind::ShadowLoad {
+                dst_local,
+                require_tag,
+            } = creation_kind.clone()
+            {
                 let dst_tag_local = *tag_local_for_ptr_local
                     .get(&dst_local)
                     .expect("missing tag local for ShadowLoad dst");
@@ -11487,7 +11549,11 @@ impl MyOptimizationPass {
                 if let Some(validate_block) = validate_block {
                     let validate_func = Operand::function_handle(
                         tcx,
-                        hooks.def_id_validate_loaded_ref_tag,
+                        if require_tag {
+                            hooks.def_id_require_loaded_ptr_tag
+                        } else {
+                            hooks.def_id_validate_loaded_ref_tag
+                        },
                         std::iter::empty(),
                         source_info.span,
                     );
@@ -15778,6 +15844,9 @@ impl MyOptimizationPass {
         let def_id_validate_loaded_ref_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 1)
             .expect("missing '__rz_validate_loaded_ref_tag' definition");
+        let def_id_require_loaded_ptr_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_require_loaded_ptr_tag", 1)
+            .expect("missing '__rz_require_loaded_ptr_tag' definition");
         let def_id_take_ret_tag_or_root = self
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag_or_root", 6)
             .expect("missing '__rz_take_ret_tag_or_root' definition");
@@ -15821,6 +15890,7 @@ impl MyOptimizationPass {
             def_id_push_ret_tag,
             def_id_validate_ret_tag,
             def_id_validate_loaded_ref_tag,
+            def_id_require_loaded_ptr_tag,
             def_id_take_ret_tag_or_root,
             def_id_exit_fn,
             def_id_shadow_store_ptr,

@@ -3913,6 +3913,21 @@ pub extern "C" fn __rz_validate_loaded_ref_tag(tag: u64) {
     rz_validate_ref_boundary_use(tag, "LOAD");
 }
 
+/// Require a nonzero tag when loading a pointer/reference value from memory.
+#[no_mangle]
+pub extern "C" fn __rz_require_loaded_ptr_tag(tag: u64) {
+    let _g = RzRuntimeGuard::enter();
+    if tag == 0 {
+        rz_violation(
+            "WILD_POINTER",
+            append_location_if_enabled(
+                "READ invalid loaded ref tag=0 size=1\nreason=NO_PROVENANCE_LOAD".to_string(),
+                "RZ_LOG_LOC",
+            ),
+        );
+    }
+}
+
 /// Take (consume) a pushed return-tag for a callee/return-address pair.
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
