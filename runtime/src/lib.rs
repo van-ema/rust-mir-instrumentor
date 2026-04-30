@@ -570,6 +570,13 @@ fn rz_validate_ref_creation_addr(
         }
     }
 
+    if bounds_len == 0 && pointee_addr != 0 {
+        // Empty slices / ZST-backed refs may legally carry a dangling non-null pointer so long
+        // as alignment was checked separately. Do not require allocation tracking for these
+        // zero-length creations; later concrete accesses still validate normally.
+        return None;
+    }
+
     if suspicious_untracked_parent {
         return Some((
             "WILD_POINTER",
@@ -592,9 +599,19 @@ fn rz_validate_ref_creation_addr(
             // A larger gap (`>= 2`) means the slot was reborn and died again in between,
             // which is the address-reuse false-positive pattern for stack frames.
             if ameta.is_stack {
-                let parent_epoch = tag_store::get(parent_tag)
-                    .map(|p| p.alloc_epoch)
-                    .unwrap_or(0);
+                let parent_meta = tag_store::get(parent_tag);
+                if parent_meta.as_ref().is_some_and(|parent| {
+                    parent.parent != 0
+                        && !parent.exposed_provenance_root
+                        && parent.pointee_addr == base
+                }) {
+                    // Creating a same-address stack reborrow from an existing live-tag family is
+                    // too early to call UAD under optimized MIR. Stack-slot liveness can be more
+                    // stale/coarse than the borrow lineage here; defer to the subsequent concrete
+                    // read/write checks instead of failing at ref creation.
+                    return None;
+                }
+                let parent_epoch = parent_meta.map(|p| p.alloc_epoch).unwrap_or(0);
                 // If we don't have a parent epoch to correlate against (root creation
                 // or untagged parent), fall back to the conservative old behavior and
                 // skip the UAD report — we cannot distinguish real UAD from stack-slot
@@ -639,6 +656,7 @@ fn rz_validate_strict_raw_creation_addr(
     kind: PtrKind,
     parent_tag: u64,
     exposed_provenance_root: bool,
+    enforce_no_provenance: bool,
 ) -> Option<(&'static str, String)> {
     // Raw-pointer creation should reject missing provenance, and should still catch the common
     // case of deriving an out-of-bounds raw from an in-bounds parent. However, some libraries
@@ -647,7 +665,7 @@ fn rz_validate_strict_raw_creation_addr(
     // in pointer-typed fields and reconstructs the real base pointer in `rebuild_vec`).
     // In that shape, eager OOB-on-derive is too strong: once the parent is already outside its
     // origin range, defer bounds enforcement to actual access / ref creation.
-    if exposed_provenance_root {
+    if exposed_provenance_root && enforce_no_provenance {
         return Some((
             "WILD_POINTER",
             format!(
@@ -660,7 +678,7 @@ fn rz_validate_strict_raw_creation_addr(
         return None;
     };
 
-    if rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
+    if enforce_no_provenance && rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
         return Some((
             "WILD_POINTER",
             format!(
@@ -1212,6 +1230,8 @@ static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
+static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> =
+    OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
@@ -1364,6 +1384,10 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> 
 
 pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn mut_arg_ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
+    MUT_ARG_RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[inline]
@@ -3812,11 +3836,364 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
     );
 }
 
+fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
+    if tag == 0 {
+        return true;
+    }
+
+    let Some(tmeta) = tag_store::get(tag) else {
+        return false;
+    };
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return true;
+    }
+
+    let access_size = tmeta.bounds_len.min(1).max(1);
+    active_alias_model()
+        .check_access(
+            tag,
+            tag,
+            &tmeta,
+            tmeta.pointee_addr,
+            access_size,
+            alias_model::AliasAccessKind::Read,
+        )
+        .is_none()
+}
+
+#[inline]
+fn rz_trace_call_tags_enabled() -> bool {
+    std::env::var("RZ_TRACE_CALL_TAGS")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+pub(crate) fn rz_can_recover_parent_tag(tag: u64) -> bool {
+    tag != 0 && active_alias_model().can_recover_parent_tag(tag)
+}
+
+fn recover_call_arg_parent_tag(addr: usize) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let tmap = tags().lock().unwrap();
+    let mut latest_any = 0u64;
+    let mut latest_mut = 0u64;
+    let mut latest_any_epochless = 0u64;
+    let mut latest_mut_epochless = 0u64;
+    let mut seen: Vec<(u64, u64, u64, PtrKind)> = Vec::new();
+    for (tag, meta) in tmap.iter() {
+        if meta.parent == 0 || meta.pointee_addr != addr {
+            continue;
+        }
+        if rz_trace_call_tags_enabled() {
+            seen.push((*tag, meta.parent, meta.alloc_epoch, meta.kind));
+        }
+        if !rz_can_recover_parent_tag(*tag) {
+            continue;
+        }
+        if alloc_epoch != 0 {
+            if meta.alloc_epoch != alloc_epoch {
+                if stack_or_tls_addr && meta.alloc_epoch == 0 {
+                    if *tag > latest_any_epochless {
+                        latest_any_epochless = *tag;
+                    }
+                    if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut)
+                        && *tag > latest_mut_epochless
+                    {
+                        latest_mut_epochless = *tag;
+                    }
+                }
+                continue;
+            }
+        } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+            continue;
+        }
+        if *tag > latest_any {
+            latest_any = *tag;
+        }
+        if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) && *tag > latest_mut {
+            latest_mut = *tag;
+        }
+    }
+    let recovered = if latest_mut != 0 {
+        latest_mut
+    } else if latest_any != 0 {
+        latest_any
+    } else if latest_mut_epochless != 0 {
+        latest_mut_epochless
+    } else if latest_any_epochless != 0 {
+        latest_any_epochless
+    } else {
+        0
+    };
+    if rz_trace_call_tags_enabled() && recovered == 0 && !seen.is_empty() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] exact-repair miss addr=0x{:x} alloc_epoch={} allow_epochless={} seen={:?}",
+            addr, alloc_epoch, allow_epochless_exact, seen
+        );
+    }
+    recovered
+}
+
+fn recover_live_boundary_tag(addr: usize) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let mut mut_candidates: Vec<u64> = Vec::new();
+    let mut any_candidates: Vec<u64> = Vec::new();
+    {
+        let tmap = tags().lock().unwrap();
+        for (tag, meta) in tmap.iter() {
+            if meta.pointee_addr != addr {
+                continue;
+            }
+            if alloc_epoch != 0 {
+                if meta.alloc_epoch != alloc_epoch {
+                    if !(stack_or_tls_addr && meta.alloc_epoch == 0) {
+                        continue;
+                    }
+                }
+            } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+                continue;
+            }
+            any_candidates.push(*tag);
+            if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
+                mut_candidates.push(*tag);
+            }
+        }
+    }
+
+    mut_candidates.sort_unstable_by(|a, b| b.cmp(a));
+    any_candidates.sort_unstable_by(|a, b| b.cmp(a));
+
+    for tag in mut_candidates.into_iter().chain(any_candidates.into_iter()) {
+        if rz_ref_boundary_tag_is_valid(tag) {
+            return tag;
+        }
+    }
+    0
+}
+
+fn recover_oldest_live_boundary_tag(addr: usize) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let mut mut_candidates: Vec<u64> = Vec::new();
+    let mut any_candidates: Vec<u64> = Vec::new();
+    {
+        let tmap = tags().lock().unwrap();
+        for (tag, meta) in tmap.iter() {
+            if meta.pointee_addr != addr {
+                continue;
+            }
+            if alloc_epoch != 0 {
+                if meta.alloc_epoch != alloc_epoch {
+                    if !(stack_or_tls_addr && meta.alloc_epoch == 0) {
+                        continue;
+                    }
+                }
+            } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+                continue;
+            }
+            any_candidates.push(*tag);
+            if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
+                mut_candidates.push(*tag);
+            }
+        }
+    }
+
+    mut_candidates.sort_unstable();
+    any_candidates.sort_unstable();
+
+    for tag in mut_candidates.into_iter().chain(any_candidates.into_iter()) {
+        if rz_ref_boundary_tag_is_valid(tag) {
+            return tag;
+        }
+    }
+    0
+}
+
+fn recover_newest_exact_slot_tag(addr: usize) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let tmap = tags().lock().unwrap();
+    let mut latest_any = 0u64;
+    let mut latest_mut = 0u64;
+    let mut latest_any_epochless = 0u64;
+    let mut latest_mut_epochless = 0u64;
+    for (tag, meta) in tmap.iter() {
+        if meta.pointee_addr != addr {
+            continue;
+        }
+        let is_mut_like = matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut);
+        if alloc_epoch != 0 {
+            if meta.alloc_epoch != alloc_epoch {
+                if stack_or_tls_addr && meta.alloc_epoch == 0 {
+                    if *tag > latest_any_epochless {
+                        latest_any_epochless = *tag;
+                    }
+                    if is_mut_like && *tag > latest_mut_epochless {
+                        latest_mut_epochless = *tag;
+                    }
+                }
+                continue;
+            }
+        } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+            continue;
+        }
+        if *tag > latest_any {
+            latest_any = *tag;
+        }
+        if is_mut_like && *tag > latest_mut {
+            latest_mut = *tag;
+        }
+    }
+    if latest_mut != 0 {
+        latest_mut
+    } else if latest_any != 0 {
+        latest_any
+    } else if latest_mut_epochless != 0 {
+        latest_mut_epochless
+    } else {
+        latest_any_epochless
+    }
+}
+
+fn recover_nearest_valid_lineage_boundary_tag(addr: usize, start_tag: u64) -> u64 {
+    if addr == 0 || start_tag == 0 {
+        return 0;
+    }
+
+    let mut lineage: Vec<u64> = Vec::new();
+    {
+        let tmap = tags().lock().unwrap();
+        let mut cursor = start_tag;
+        for _ in 0..tmap.len().saturating_add(1) {
+            let Some(meta) = tmap.get(&cursor) else {
+                break;
+            };
+            if meta.pointee_addr == addr
+                && matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            {
+                lineage.push(cursor);
+            }
+            if meta.parent == 0 {
+                break;
+            }
+            cursor = meta.parent;
+        }
+    }
+
+    for tag in lineage {
+        if rz_can_recover_parent_tag(tag) && rz_ref_boundary_tag_is_valid(tag) {
+            return tag;
+        }
+    }
+    0
+}
+
+/// Canonicalize the family exported by a callee for a mutated `&mut T` carrier pointee slot.
+///
+/// The raw callee-side tag may point at a transient inner child created during helper calls.
+/// Caller-side writeback wants the nearest surviving family that future reborrows from the
+/// carrier should inherit once helper-local children are gone, not an arbitrary older root ref.
+fn canonical_mut_arg_ret_tag(addr: usize, tag: u64) -> u64 {
+    if tag == 0 {
+        return recover_live_boundary_tag(addr);
+    }
+
+    let raw_model_tag = active_alias_model().canonicalize_mut_arg_ret_tag(tag, addr);
+    if raw_model_tag != 0 {
+        return raw_model_tag;
+    }
+    let valid_raw_tag = recover_nearest_valid_lineage_boundary_tag(addr, tag);
+    if valid_raw_tag != 0 {
+        return valid_raw_tag;
+    }
+
+    let candidate = recover_newest_exact_slot_tag(addr).max(tag);
+    let model_tag = active_alias_model().canonicalize_mut_arg_ret_tag(candidate, addr);
+    if model_tag != 0 {
+        let valid_model_tag = recover_nearest_valid_lineage_boundary_tag(addr, model_tag);
+        if valid_model_tag != 0 {
+            return valid_model_tag;
+        }
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut cursor = candidate;
+    for _ in 0..tmap.len().saturating_add(1) {
+        let Some(meta) = tmap.get(&cursor) else {
+            break;
+        };
+        if matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut)
+            && meta.pointee_addr == addr
+            && rz_can_recover_parent_tag(cursor)
+        {
+            return cursor;
+        }
+        if meta.parent == 0 {
+            break;
+        }
+        cursor = meta.parent;
+    }
+    drop(tmap);
+
+    let oldest_live = recover_oldest_live_boundary_tag(addr);
+    if oldest_live != 0 {
+        return oldest_live;
+    }
+
+    let recovered = recover_live_boundary_tag(addr);
+    if recovered != 0 {
+        recovered
+    } else {
+        candidate
+    }
+}
+
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} tag={}",
+            callee_id, arg_index, addr, tag
+        );
+    }
     let thread_id = std::thread::current().id();
     call_arg_tags()
         .lock()
@@ -3839,28 +4216,67 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
 pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, has_inplace_alias) = {
+    let (tag, has_inplace_alias, matched_callee_id) = {
         let mut tags = call_arg_tags().lock().unwrap();
+        let mut matched_callee_id = callee_id;
+        let mut saw_slot_candidate = false;
+        let allow_cross_callee_fallback = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
         let tag = tags
             .remove(&(thread_id, callee_id, arg_index, addr))
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if !allow_cross_callee_fallback {
+                    return 0;
+                }
+                let mut fallback_matches = tags
+                    .keys()
+                    .filter(|(tid, _cid, idx, other_addr)| {
+                        *tid == thread_id && *idx == arg_index && *other_addr == addr
+                    })
+                    .copied();
+                let first = fallback_matches.next();
+                if fallback_matches.next().is_some() {
+                    return 0;
+                }
+                if let Some((_, fallback_callee_id, _, _)) = first {
+                    saw_slot_candidate = true;
+                    matched_callee_id = fallback_callee_id;
+                    return tags
+                        .remove(&(thread_id, fallback_callee_id, arg_index, addr))
+                        .unwrap_or(0);
+                }
+                0
+            });
+        if tag != 0 {
+            saw_slot_candidate = true;
+        }
+        let tag = if tag == 0 && saw_slot_candidate {
+            recover_call_arg_parent_tag(addr)
+        } else {
+            tag
+        };
         let has_inplace_alias = tag != 0
             && arg_index > 0
             && tags
                 .iter()
                 .any(|((tid, cid, other_arg, other_addr), other_tag)| {
                     *tid == thread_id
-                        && *cid == callee_id
+                        && *cid == matched_callee_id
                         && *other_arg != arg_index
                         && *other_addr == addr
                         && *other_tag == tag
                 });
-        (tag, has_inplace_alias)
+        (tag, has_inplace_alias, matched_callee_id)
     };
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} inplace_alias={}",
+            callee_id, matched_callee_id, arg_index, addr, tag, has_inplace_alias
+        );
+    }
     if tag != 0 {
-        active_alias_model().on_call_arg_taken(callee_id, tag);
+        active_alias_model().on_call_arg_taken(matched_callee_id, tag);
         if has_inplace_alias {
-            active_alias_model().on_call_arg_inplace_alias(callee_id, tag, addr);
+            active_alias_model().on_call_arg_inplace_alias(matched_callee_id, tag, addr);
         }
     }
     tag
@@ -3894,6 +4310,48 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
     tag
 }
 
+/// Export the post-call family for a non-pointer carrier pointee mutated through `&mut T`.
+#[no_mangle]
+pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
+    let _g = RzRuntimeGuard::enter();
+    let raw_tag = tag;
+    let newest_exact = recover_newest_exact_slot_tag(addr);
+    let tag = canonical_mut_arg_ret_tag(addr, tag);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][mut-arg-ret] push callee={} arg={} addr=0x{:x} raw_tag={} newest_exact={} tag={}",
+            callee_id, arg_index, addr, raw_tag, newest_exact, tag
+        );
+    }
+    if tag != 0 {
+        active_alias_model().on_mut_arg_ret_export(tag, addr);
+    }
+    let thread_id = std::thread::current().id();
+    mut_arg_ret_tags()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, arg_index, addr), tag);
+}
+
+/// Consume the callee-exported family for a non-pointer carrier pointee after a call returns.
+#[no_mangle]
+pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let tag = mut_arg_ret_tags()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id, arg_index, addr))
+        .unwrap_or(0);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][mut-arg-ret] take callee={} arg={} addr=0x{:x} -> {}",
+            callee_id, arg_index, addr, tag
+        );
+    }
+    tag
+}
+
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
@@ -3908,8 +4366,15 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
 
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
 #[no_mangle]
-pub extern "C" fn __rz_validate_ret_tag(tag: u64) {
+pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
     let _g = RzRuntimeGuard::enter();
+    if tag != 0 {
+        let thread_id = std::thread::current().id();
+        ret_tags()
+            .lock()
+            .unwrap()
+            .insert((thread_id, callee_id, 0), tag);
+    }
     if active_alias_model().name() != "sb_lite" {
         return;
     }
@@ -4110,6 +4575,16 @@ pub extern "C" fn __record_ref_creation(
                             && parent_epoch != pointee_meta.epoch)
                     {
                         (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
+                    } else if parent_epoch == 0 && pointee_meta.epoch != 0 {
+                        // Parent lineage is correct, but its allocation snapshot was lost.
+                        // Keep the parent tag while refreshing the epoch/live snapshot from the
+                        // actual pointee allocation so later exact-address repairs still work.
+                        (
+                            pointee_meta.epoch,
+                            pointee_meta.live,
+                            inherited_bounds_len,
+                            parent_tag,
+                        )
                     } else {
                         (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
                     }
@@ -4360,14 +4835,13 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
-    let align_req = rz_effective_align_req(align_req, derived_from).max(
-        rz_promised_alignment_for_addr(
+    let align_req =
+        rz_effective_align_req(align_req, derived_from).max(rz_promised_alignment_for_addr(
             pointee_addr,
             lookup_alloc_snapshot(pointee_addr)
                 .map(|(_, meta)| meta.epoch)
                 .unwrap_or(0),
-        ),
-    );
+        ));
     let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
     let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
@@ -4559,12 +5033,14 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
 
+    let enforce_no_provenance = strict_creation_check || rz_strict_provenance_enabled();
     if strict_creation_check || (exposed_provenance_root && rz_strict_provenance_enabled()) {
         if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
             pointee_addr,
             kind,
             resolved_parent,
             exposed_provenance_root,
+            enforce_no_provenance,
         ) {
             rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
         }

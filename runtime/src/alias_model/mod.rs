@@ -60,6 +60,29 @@ pub(crate) trait AliasModel: Sync {
         None
     }
 
+    /// Whether a tag is still a valid parent candidate for runtime lineage/call-boundary repair.
+    ///
+    /// Recovery paths must not resurrect alias-model-dead tags (for example a TB protected tag
+    /// that was disabled at call exit), or a metadata miss turns into a false positive.
+    fn can_recover_parent_tag(&self, _tag: u64) -> bool {
+        true
+    }
+
+    /// Return a stable family tag suitable for exporting a mutated `&mut T` carrier back to the
+    /// caller. Models that track transient child tags across a call can map those back to the
+    /// live ancestor that should survive after the call boundary.
+    fn canonicalize_mut_arg_ret_tag(&self, tag: u64, _addr: usize) -> u64 {
+        tag
+    }
+
+    /// Mark a family exported through the mut-arg-ret side channel as surviving the current call
+    /// boundary.
+    ///
+    /// This is the runtime backstop for cases where return-edge hook ordering still publishes the
+    /// tag after call-exit teardown has run. Models may use it to revive the exported family so
+    /// the caller can immediately reuse it.
+    fn on_mut_arg_ret_export(&self, _tag: u64, _addr: usize) {}
+
     fn check_access(
         &self,
         _sb_tag: u64,

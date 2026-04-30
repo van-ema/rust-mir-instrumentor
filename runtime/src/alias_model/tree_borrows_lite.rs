@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed,
-    rz_violation, tags, PtrKind, TagMeta,
+    allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_tags, ret_tags,
+    rz_sb_suppressed, rz_violation, tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -40,6 +40,7 @@ struct TbNode {
     extra_ranges: Vec<(usize, usize)>,
     alive: bool,
     protected: bool,
+    protector_shadow_depth: u32,
     poisoned_by_protector_end: bool,
 }
 
@@ -66,6 +67,11 @@ fn tb_state() -> &'static Mutex<HashMap<usize, TbAllocState>> {
 
 fn tb_protector_frames() -> &'static Mutex<Vec<TbProtectorFrame>> {
     TB_PROTECTOR_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[inline]
+fn tb_protector_active(node: &TbNode) -> bool {
+    node.protected && node.protector_shadow_depth == 0
 }
 
 #[inline]
@@ -164,6 +170,18 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_find_ref_ancestor_tag(tmap, tag)
     }
 
+    fn can_recover_parent_tag(&self, tag: u64) -> bool {
+        tb_lite_can_recover_parent_tag(tag)
+    }
+
+    fn canonicalize_mut_arg_ret_tag(&self, tag: u64, addr: usize) -> u64 {
+        tb_lite_canonicalize_mut_arg_ret_tag(tag, addr)
+    }
+
+    fn on_mut_arg_ret_export(&self, tag: u64, addr: usize) {
+        tb_lite_on_mut_arg_ret_export(tag, addr);
+    }
+
     fn check_access(
         &self,
         sb_tag: u64,
@@ -177,6 +195,7 @@ impl AliasModel for TreeBorrowsLiteModel {
     }
 }
 
+/// Record that the current callee will materialize a protected child from `parent_tag`.
 fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
     if !rz_tb_lite_enabled() || parent_tag == 0 {
         return;
@@ -200,6 +219,8 @@ fn tb_lite_on_call_arg_taken(callee_id: u64, parent_tag: u64) {
     }
 }
 
+/// Aggregate carriers feed the same protector pipeline as plain pointer args, but the protected
+/// child is created later from the imported anchor rather than directly from the ABI argument.
 fn tb_lite_on_call_arg_anchor_taken(callee_id: u64, parent_tag: u64) {
     if !rz_tb_lite_enabled() || parent_tag == 0 {
         return;
@@ -212,6 +233,8 @@ fn tb_lite_on_call_arg_anchor_taken(callee_id: u64, parent_tag: u64) {
     tb_lite_on_call_arg_taken(callee_id, parent_tag);
 }
 
+/// Track exact-slot by-value/in-place aliases so a raw child created in the callee can inherit
+/// the same call-arg protector semantics as its paired reference argument.
 fn tb_lite_on_call_arg_inplace_alias(callee_id: u64, parent_tag: u64, addr: usize) {
     if !rz_tb_lite_enabled() || parent_tag == 0 || addr == 0 {
         return;
@@ -235,6 +258,11 @@ fn tb_lite_on_call_arg_inplace_alias(callee_id: u64, parent_tag: u64, addr: usiz
     }
 }
 
+/// End the current call-frame protector scope.
+///
+/// Protected children created for this callee are released, any same-slot ancestor protectors
+/// shadowed by nested `&mut self` calls are restored, and non-returned protected tags are
+/// disabled at protector end.
 fn tb_lite_on_call_exit(callee_id: u64) {
     if !rz_tb_lite_enabled() {
         return;
@@ -264,6 +292,18 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             *ret_thread_id == thread_id && *ret_callee_id == callee_id
         })
         .map(|((_ret_thread_id, _ret_callee_id, _addr), tag)| *tag)
+        .chain(
+            mut_arg_ret_tags()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(
+                    |((ret_thread_id, ret_callee_id, _arg_index, _addr), _tag)| {
+                        *ret_thread_id == thread_id && *ret_callee_id == callee_id
+                    },
+                )
+                .map(|((_ret_thread_id, _ret_callee_id, _arg_index, _addr), tag)| *tag),
+        )
         .collect();
     let tmap = tags().lock().unwrap();
     let mut all = tb_state().lock().unwrap();
@@ -279,7 +319,9 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             .nodes
             .get(&tag)
             .filter(|node| {
-                matches!(node.kind, BorrowKind::Unique) && matches!(node.perm, TbPerm::Active)
+                matches!(node.kind, BorrowKind::Unique)
+                    && matches!(node.perm, TbPerm::Active)
+                    && tb_protector_active(node)
             })
             .cloned();
         if let Some(protected_node) = active_protected_unique {
@@ -324,6 +366,12 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                 tb_disable_node_for_protector_end(node);
             }
         }
+        tb_unshadow_same_slot_protected_unique_ancestors(
+            tree,
+            tag,
+            tmeta.pointee_addr,
+            tb_effective_len(tmeta.bounds_len),
+        );
     }
 }
 
@@ -343,7 +391,9 @@ fn tb_lite_check_protected_dealloc(base_addr: usize) {
         };
         tree.nodes
             .values()
-            .find(|n| tb_is_live_node(n) && n.protected && matches!(n.kind, BorrowKind::Unique))
+            .find(|n| {
+                tb_is_live_node(n) && tb_protector_active(n) && matches!(n.kind, BorrowKind::Unique)
+            })
             .map(|n| (n.tag, n.kind))
     };
 
@@ -504,9 +554,13 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         extra_ranges: Vec::new(),
         alive: true,
         protected,
+        protector_shadow_depth: 0,
         poisoned_by_protector_end: false,
     };
     tree.nodes.insert(tag, node.clone());
+    if kind == BorrowKind::Unique && protected {
+        tb_shadow_same_slot_protected_unique_ancestors(tree, tag, node.start, node.len);
+    }
 
     // Tree Borrows treats `&mut` creation as a reserved borrow. It does not by itself perform the
     // write-like invalidation that Stacked Borrows would perform; conflicts are decided when the
@@ -549,6 +603,10 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 //   let n = &mut 0u8;
 //   let y = n as *mut u8;
 //   callee(n, y); // x is protected in callee; write through y should violate.
+/// Convert a pending call-arg parent into an active protected child.
+///
+/// For nested same-slot `&mut` calls we keep only the innermost protected Unique active; older
+/// protected Unique ancestors remain live but are shadowed until the inner call exits.
 fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) -> bool {
     if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique) || parent == 0 {
         return false;
@@ -605,6 +663,100 @@ fn tb_lite_inplace_protected_tag(tag: u64) -> bool {
         .iter()
         .rev()
         .any(|f| f.thread_id == thread_id && f.inplace_protected_tags.iter().any(|t| *t == tag))
+}
+
+/// Nested `&mut self` helpers on the same exact slot should transfer protector ownership to the
+/// innermost protected Unique child instead of keeping every ancestor protector simultaneously
+/// active. Shadowed ancestors stay live in the lineage but do not participate in protector or
+/// 2-phase diagnostics until the child call exits.
+fn tb_shadow_same_slot_protected_unique_ancestors(
+    tree: &mut TbAllocState,
+    child_tag: u64,
+    start: usize,
+    len: usize,
+) {
+    let mut cur = tree
+        .nodes
+        .get(&child_tag)
+        .map(|node| node.parent)
+        .unwrap_or(0);
+    while cur != 0 {
+        let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
+        if let Some(node) = tree.nodes.get_mut(&cur) {
+            if matches!(node.kind, BorrowKind::Unique)
+                && node.protected
+                && node.start == start
+                && node.len == len
+            {
+                node.protector_shadow_depth = node.protector_shadow_depth.saturating_add(1);
+            }
+        }
+        cur = next;
+    }
+}
+
+/// Restore same-slot protected Unique ancestors previously shadowed by a nested protected child.
+fn tb_unshadow_same_slot_protected_unique_ancestors(
+    tree: &mut TbAllocState,
+    child_tag: u64,
+    start: usize,
+    len: usize,
+) {
+    let mut cur = tree
+        .nodes
+        .get(&child_tag)
+        .map(|node| node.parent)
+        .unwrap_or(0);
+    while cur != 0 {
+        let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
+        if let Some(node) = tree.nodes.get_mut(&cur) {
+            if matches!(node.kind, BorrowKind::Unique)
+                && node.protected
+                && node.start == start
+                && node.len == len
+                && node.protector_shadow_depth != 0
+            {
+                node.protector_shadow_depth -= 1;
+            }
+        }
+        cur = next;
+    }
+}
+
+/// Re-enable a family exported through the mut-arg-ret side channel after call-exit teardown.
+///
+/// Today the return-side hook ordering can still publish the exported tag after `FnExit` has
+/// already released the callee's protector frame. When that happens, the exported family is the
+/// caller-visible survivor and must be live again before the next call boundary validates it.
+fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
+    if !rz_tb_lite_enabled() || tag == 0 || addr == 0 {
+        return;
+    }
+
+    let base = tb_base_for_addr(addr);
+    let mut all = tb_state().lock().unwrap();
+    let Some(tree) = all.get_mut(&base) else {
+        return;
+    };
+    let Some(node) = tree.nodes.get_mut(&tag) else {
+        return;
+    };
+    if node.start != addr {
+        return;
+    }
+    node.protected = false;
+    node.protector_shadow_depth = 0;
+    node.poisoned_by_protector_end = false;
+    node.alive = true;
+    if matches!(node.perm, TbPerm::Disabled) {
+        node.perm = match node.kind {
+            BorrowKind::Unique | BorrowKind::RawMut => TbPerm::Active,
+            BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
+        };
+    }
+    if matches!(node.lazy_perm, TbPerm::Disabled) {
+        node.lazy_perm = node.perm;
+    }
 }
 
 fn tb_lite_check(
@@ -765,7 +917,7 @@ fn tb_lite_check(
             tmeta.alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == tmeta.alloc_epoch
         }) {
             eprintln!(
-                "[tb-trace]   node tag={} parent={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} range=[0x{:x},0x{:x}) extras={:?}",
+                "[tb-trace]   node tag={} parent={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x}) extras={:?}",
                 traced.tag,
                 traced.parent,
                 traced.kind,
@@ -773,6 +925,7 @@ fn tb_lite_check(
                 traced.lazy_perm,
                 traced.alive,
                 traced.protected,
+                traced.protector_shadow_depth,
                 traced.start,
                 traced.start.saturating_add(traced.len),
                 traced.extra_ranges
@@ -815,7 +968,7 @@ fn tb_lite_check(
         let covered = tb_node_overlaps(&n, addr, size);
         let old_perm = if covered { n.perm } else { n.lazy_perm };
 
-        let next = match (access, child, old_perm, n.protected) {
+        let next = match (access, child, old_perm, tb_protector_active(&n)) {
             // Child/local read: everything except Disabled is unchanged.
             (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
                 if tb_has_live_unique_lineage_ancestor(
@@ -1075,7 +1228,7 @@ fn tb_lite_check(
             .values()
             .filter(|n| {
                 tb_is_live_node(n)
-                    && n.protected
+                    && tb_protector_active(n)
                     && n.tag != access_tag
                     && (tmeta.alloc_epoch == 0
                         || n.alloc_epoch == 0
@@ -1254,7 +1407,7 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} epoch={} kind={:?} perm={:?} alive={} protected={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} epoch={} kind={:?} perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x})\n",
             n.tag,
             n.parent,
             n.alloc_epoch,
@@ -1262,6 +1415,7 @@ fn tb_dump(
             n.perm,
             n.alive,
             n.protected,
+            n.protector_shadow_depth,
             n.start,
             n.start.saturating_add(n.len)
         ));
@@ -1375,6 +1529,67 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
         tag = t.parent;
     }
     None
+}
+
+fn tb_lite_can_recover_parent_tag(tag: u64) -> bool {
+    if !rz_tb_lite_enabled() || tag == 0 {
+        return tag != 0;
+    }
+    let all = tb_state().lock().unwrap();
+    for tree in all.values() {
+        if let Some(node) = tree.nodes.get(&tag) {
+            return tb_is_live_node(node);
+        }
+    }
+    true
+}
+
+/// Collapse a callee-exported exact-slot tag back to the nearest live `Unique` family that
+/// survives helper teardown at call exit.
+///
+/// For nested `&mut self` helpers the newest exact-slot tag is often a temporary Shared child
+/// (or a protected Unique that will be disabled at call exit). The caller must not refresh its
+/// carrier anchor to an older root family like `50`, but it also must not import a dead inner
+/// helper tag. Choosing the nearest live exact-slot Unique ancestor preserves the post-call
+/// family that remains valid after the helper frame ends.
+fn tb_lite_canonicalize_mut_arg_ret_tag(tag: u64, addr: usize) -> u64 {
+    if !rz_tb_lite_enabled() || tag == 0 || addr == 0 {
+        return tag;
+    }
+
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let Some(tree) = all.get(&base) else {
+        return tag;
+    };
+
+    let mut cursor = tag;
+    let mut best_live_ref = 0u64;
+    for _ in 0..tree.nodes.len().saturating_add(1) {
+        let Some(node) = tree.nodes.get(&cursor) else {
+            break;
+        };
+        if node.start == addr && tb_is_live_node(node) && matches!(node.kind, BorrowKind::Unique) {
+            return cursor;
+        }
+        if best_live_ref == 0
+            && node.start == addr
+            && tb_is_live_node(node)
+            && matches!(node.kind, BorrowKind::Shared | BorrowKind::Unique)
+        {
+            best_live_ref = cursor;
+        }
+        if node.parent == 0 {
+            break;
+        }
+        cursor = node.parent;
+    }
+
+    if best_live_ref != 0 {
+        best_live_ref
+    } else {
+        tag
+    }
 }
 
 fn tb_lite_reactivatable_same_lineage(
@@ -1693,7 +1908,18 @@ fn tb_same_lineage_protected_conflict_ok(
     size: usize,
 ) -> bool {
     if !tb_is_effective_ancestor(nodes, tmap, protected_tag, access_tag) {
-        return false;
+        let Some(access_node) = nodes.get(&access_tag) else {
+            return false;
+        };
+        let Some(protected_node) = nodes.get(&protected_tag) else {
+            return false;
+        };
+        if !matches!(access_node.kind, BorrowKind::Unique)
+            || !matches!(protected_node.kind, BorrowKind::Shared)
+            || !tb_is_effective_ancestor(nodes, tmap, access_tag, protected_tag)
+        {
+            return false;
+        }
     }
     nodes.values().all(|other| {
         if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
