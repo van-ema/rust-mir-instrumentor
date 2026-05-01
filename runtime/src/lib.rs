@@ -4747,7 +4747,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     callee_id: u64,
     arg_index: u64,
     addr: usize,
-    leaf_index: u64,
+    leaf_key: u64,
     slot_addr: usize,
 ) {
     let _g = RzRuntimeGuard::enter();
@@ -4763,7 +4763,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     mut_arg_ret_leaf_shadows()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, arg_index, addr, leaf_index), (tag, ref_ancestor));
+        .insert((thread_id, callee_id, arg_index, addr, leaf_key), (tag, ref_ancestor));
 }
 
 /// Take one exported `&mut T` carrier leaf shadow and recreate the caller destination slot
@@ -4773,7 +4773,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
     callee_id: u64,
     arg_index: u64,
     addr: usize,
-    leaf_index: u64,
+    leaf_key: u64,
     slot_addr: usize,
 ) {
     let _g = RzRuntimeGuard::enter();
@@ -4781,7 +4781,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
     let (tag, ref_ancestor) = mut_arg_ret_leaf_shadows()
         .lock()
         .unwrap()
-        .remove(&(thread_id, callee_id, arg_index, addr, leaf_index))
+        .remove(&(thread_id, callee_id, arg_index, addr, leaf_key))
         .unwrap_or((0, 0));
     ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
 }
@@ -4815,7 +4815,7 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
 
 /// Push the exact shadow of one returned carrier leaf so the caller can recreate its slot shadow.
 #[no_mangle]
-pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_index: u64, slot_addr: usize) {
+pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
@@ -4829,7 +4829,7 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_index: u64, slo
     ret_leaf_shadows()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, leaf_index), (tag, ref_ancestor));
+        .insert((thread_id, callee_id, leaf_key), (tag, ref_ancestor));
 }
 
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
@@ -4885,13 +4885,13 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
 
 /// Take one returned carrier-leaf shadow and recreate the caller destination slot shadow.
 #[no_mangle]
-pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_index: u64, slot_addr: usize) {
+pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
     let (tag, ref_ancestor) = ret_leaf_shadows()
         .lock()
         .unwrap()
-        .remove(&(thread_id, callee_id, leaf_index))
+        .remove(&(thread_id, callee_id, leaf_key))
         .unwrap_or((0, 0));
     ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
 }
@@ -5340,7 +5340,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
     let mut exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
     let strict_creation_check = (alias_exempt & 0b0100_0000) != 0;
-    let deref_creation_no_provenance_check = (alias_exempt & 0b1000_0000) != 0;
+    let _deref_creation_no_provenance_check = (alias_exempt & 0b1000_0000) != 0;
     // MIR and optimized std/alloc lowering often materialize administrative `*const`
     // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
     // and then write through them. Preserve the parent's effective write capability so
@@ -5525,13 +5525,23 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
     if !exposed_provenance_root && projected_raw_hint && pointee_addr != 0 {
-        let poisoned_same_addr = tags().lock().unwrap().values().any(|meta| {
-            meta.pointee_addr == pointee_addr
-                && meta.exposed_provenance_root
-                && (alloc_epoch == 0 || meta.alloc_epoch == 0 || meta.alloc_epoch == alloc_epoch)
-        });
-        if poisoned_same_addr {
-            exposed_provenance_root = true;
+        let resolved_parent_is_tracked = if resolved_parent == 0 {
+            false
+        } else {
+            tag_store::get(resolved_parent)
+                .is_some_and(|parent_meta| !rz_has_exposed_provenance_root(resolved_parent, &parent_meta))
+        };
+        if !resolved_parent_is_tracked {
+            let poisoned_same_addr = tags().lock().unwrap().values().any(|meta| {
+                meta.pointee_addr == pointee_addr
+                    && meta.exposed_provenance_root
+                    && (alloc_epoch == 0
+                        || meta.alloc_epoch == 0
+                        || meta.alloc_epoch == alloc_epoch)
+            });
+            if poisoned_same_addr {
+                exposed_provenance_root = true;
+            }
         }
     }
 
@@ -5576,12 +5586,12 @@ pub extern "C" fn __record_raw_ptr_creation(
     // intentionally carry integer metadata in pointer-typed fields and use empty dangling
     // sentinels.
     //
-    // However, deref-based raw creation (`&raw *p`, `&raw (*box_ptr)`) is different: if the
-    // parent lineage is already exposed/no-provenance, forming another raw from that dereference
-    // is already operating on invalid bytes and should be rejected even outside strict
-    // provenance mode.
+    // Projected pointer-field transport inside non-pointer carriers (for example `BytesMut.data`)
+    // is handled by instrumentation and should not set bit7. For the remaining deref-based raw
+    // creations, keep eager no-provenance rejection even outside strict-provenance mode: these
+    // are genuine forged-deref shapes such as `&raw const (*dangling).field`.
     let enforce_no_provenance =
-        rz_strict_provenance_enabled() || deref_creation_no_provenance_check;
+        rz_strict_provenance_enabled() || _deref_creation_no_provenance_check;
     if strict_creation_check || (exposed_provenance_root && rz_strict_provenance_enabled()) {
         if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
             pointee_addr,

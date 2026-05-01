@@ -1865,7 +1865,7 @@ enum InstrKind<'tcx> {
     /// carrier right before `Return`.
     RetLeafPush {
         callee_id: u64,
-        leaf_index: u64,
+        leaf_key: u64,
     },
     /// Callee-side: push the tag for a returned pointer right before `Return`.
     RetPush {
@@ -1887,7 +1887,7 @@ enum InstrKind<'tcx> {
     /// return carrier into the destination slot before control reaches the original call target.
     RetLeafTake {
         callee_id: u64,
-        leaf_index: u64,
+        leaf_key: u64,
     },
     /// Caller-side: seed a fresh family for a returned owner/container carrier whose nested
     /// pointer fields are implementation detail rather than source-level borrow carriers.
@@ -1906,7 +1906,7 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         ptr_local: Local,
-        leaf_index: u64,
+        leaf_key: u64,
     },
     /// Caller-side: take the callee-exported family for a `&mut T` carrier pointee slot.
     MutArgRetTake {
@@ -1921,7 +1921,7 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         local: Local,
-        leaf_index: u64,
+        leaf_key: u64,
     },
     /// Caller-side: take the callee-exported family for a live `&mut T` local when there is no
     /// separate carrier stack slot in this frame to anchor-refresh.
@@ -1954,6 +1954,23 @@ struct InsertPoint<'tcx> {
     source_info: SourceInfo,
     place: Place<'tcx>,
     kind: InstrKind<'tcx>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct ShadowableLeafPtrSpec<'tcx> {
+    place: Place<'tcx>,
+    ty: Ty<'tcx>,
+    byte_offset: Option<u64>,
+    path_key: u64,
+}
+
+impl<'tcx> ShadowableLeafPtrSpec<'tcx> {
+    const PATH_KEY_MARKER: u64 = 1 << 63;
+
+    fn transport_key(self) -> u64 {
+        self.byte_offset
+            .unwrap_or(Self::PATH_KEY_MARKER | (self.path_key & !Self::PATH_KEY_MARKER))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2775,17 +2792,31 @@ impl MyOptimizationPass {
         None
     }
 
-    fn collect_shadowable_leaf_ptr_places_from_place<'tcx>(
+    fn leaf_path_key_child(parent_key: u64, field_idx: usize) -> u64 {
+        parent_key
+            .wrapping_mul(131)
+            .wrapping_add(field_idx as u64 + 1)
+    }
+
+    fn collect_shadowable_leaf_ptr_specs_from_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         base_place: Place<'tcx>,
-        ty: Ty<'tcx>,
         depth: usize,
-        out: &mut Vec<(Place<'tcx>, Ty<'tcx>)>,
+        byte_offset: Option<u64>,
+        path_key: u64,
+        out: &mut Vec<ShadowableLeafPtrSpec<'tcx>>,
     ) {
+        let place_ty = base_place.ty(&body.local_decls, tcx);
+        let ty = place_ty.ty;
         if self.is_shadowable_ptr_ty(tcx, body, ty) {
-            out.push((base_place, ty));
+            out.push(ShadowableLeafPtrSpec {
+                place: base_place,
+                ty,
+                byte_offset,
+                path_key,
+            });
             return;
         }
         if depth == 0 {
@@ -2802,15 +2833,47 @@ impl MyOptimizationPass {
             }
             let field_place =
                 self.pointer_field_place_from_place(tcx, base_place, field_idx, field_ty);
-            self.collect_shadowable_leaf_ptr_places_from_place(
+            let field_offset = self.field_offset_bytes(
+                tcx,
+                body,
+                place_ty.ty,
+                place_ty.variant_index,
+                FieldIdx::from_usize(field_idx),
+            );
+            let child_offset = match (byte_offset, field_offset) {
+                (Some(base), Some(field)) => Some(base.wrapping_add(field)),
+                _ => None,
+            };
+            self.collect_shadowable_leaf_ptr_specs_from_place(
                 tcx,
                 body,
                 field_place,
-                field_ty,
                 depth - 1,
+                child_offset,
+                Self::leaf_path_key_child(path_key, field_idx),
                 out,
             );
         }
+    }
+
+    fn shadowable_leaf_ptr_specs_from_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        base_place: Place<'tcx>,
+        _ty: Ty<'tcx>,
+    ) -> Vec<ShadowableLeafPtrSpec<'tcx>> {
+        let mut out = Vec::new();
+        self.collect_shadowable_leaf_ptr_specs_from_place(
+            tcx,
+            body,
+            base_place,
+            3,
+            Some(0),
+            0,
+            &mut out,
+        );
+        out
     }
 
     fn shadowable_leaf_ptr_places_from_place<'tcx>(
@@ -2820,16 +2883,109 @@ impl MyOptimizationPass {
         base_place: Place<'tcx>,
         ty: Ty<'tcx>,
     ) -> Vec<(Place<'tcx>, Ty<'tcx>)> {
-        let mut out = Vec::new();
-        self.collect_shadowable_leaf_ptr_places_from_place(
-            tcx,
-            body,
-            base_place,
-            ty,
-            3,
-            &mut out,
-        );
-        out
+        self.shadowable_leaf_ptr_specs_from_place(tcx, body, base_place, ty)
+            .into_iter()
+            .map(|spec| (spec.place, spec.ty))
+            .collect()
+    }
+
+    fn raw_creation_allows_no_provenance_transport<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src: Place<'tcx>,
+    ) -> bool {
+        if !matches!(src.projection.first(), Some(ProjectionElem::Deref)) {
+            return false;
+        }
+
+        let mut cur_place = Place::from(src.local);
+        for proj in src.projection.iter() {
+            let cur_ty = cur_place.ty(&body.local_decls, tcx).ty;
+            if let ProjectionElem::Field(_, field_ty) = proj {
+                if !self.is_pointer_ty(cur_ty)
+                    && (self.is_pointer_ty(field_ty)
+                        || self.ty_contains_pointer_fields(tcx, body, field_ty, 2))
+                {
+                    return true;
+                }
+            }
+            cur_place = cur_place.project_deeper(&[proj], tcx);
+        }
+
+        false
+    }
+
+    fn pair_shadowable_leaf_ptr_specs<'tcx>(
+        &self,
+        dst_specs: &[ShadowableLeafPtrSpec<'tcx>],
+        src_specs: &[ShadowableLeafPtrSpec<'tcx>],
+    ) -> Option<Vec<(ShadowableLeafPtrSpec<'tcx>, ShadowableLeafPtrSpec<'tcx>)>> {
+        if dst_specs.is_empty() || dst_specs.len() != src_specs.len() {
+            return None;
+        }
+
+        if dst_specs.iter().all(|spec| spec.byte_offset.is_some())
+            && src_specs.iter().all(|spec| spec.byte_offset.is_some())
+        {
+            let mut src_by_offset: HashMap<u64, ShadowableLeafPtrSpec<'tcx>> = HashMap::new();
+            for src_spec in src_specs.iter().copied() {
+                let offset = src_spec.byte_offset.expect("checked above");
+                if src_by_offset.insert(offset, src_spec).is_some() {
+                    src_by_offset.clear();
+                    break;
+                }
+            }
+            if !src_by_offset.is_empty() {
+                let mut pairs = Vec::with_capacity(dst_specs.len());
+                let mut matched_all = true;
+                for dst_spec in dst_specs.iter().copied() {
+                    let offset = dst_spec.byte_offset.expect("checked above");
+                    let Some(src_spec) = src_by_offset.remove(&offset) else {
+                        matched_all = false;
+                        break;
+                    };
+                    pairs.push((dst_spec, src_spec));
+                }
+                if matched_all && src_by_offset.is_empty() {
+                    return Some(pairs);
+                }
+            }
+        }
+
+        let mut src_by_key: HashMap<u64, ShadowableLeafPtrSpec<'tcx>> = HashMap::new();
+        let mut duplicate_key = false;
+        for src_spec in src_specs.iter().copied() {
+            if src_by_key
+                .insert(src_spec.transport_key(), src_spec)
+                .is_some()
+            {
+                duplicate_key = true;
+                break;
+            }
+        }
+        if !duplicate_key {
+            let mut pairs = Vec::with_capacity(dst_specs.len());
+            let mut matched_all = true;
+            for dst_spec in dst_specs.iter().copied() {
+                let Some(src_spec) = src_by_key.remove(&dst_spec.transport_key()) else {
+                    matched_all = false;
+                    break;
+                };
+                pairs.push((dst_spec, src_spec));
+            }
+            if matched_all && src_by_key.is_empty() {
+                return Some(pairs);
+            }
+        }
+
+        Some(
+            dst_specs
+                .iter()
+                .copied()
+                .zip(src_specs.iter().copied())
+                .collect(),
+        )
     }
 
     /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
@@ -9546,18 +9702,21 @@ impl MyOptimizationPass {
                 field_ty,
             );
             let dst_leafs =
-                self.shadowable_leaf_ptr_places_from_place(tcx, body, field_place, field_ty);
+                self.shadowable_leaf_ptr_specs_from_place(tcx, body, field_place, field_ty);
             if dst_leafs.is_empty() {
                 continue;
             }
             if let Some(src_place) = self.place_from_operand(op) {
                 let src_ty = src_place.ty(&body.local_decls, tcx).ty;
                 let src_leafs =
-                    self.shadowable_leaf_ptr_places_from_place(tcx, body, src_place, src_ty);
-                if !src_leafs.is_empty() && src_leafs.len() == dst_leafs.len() {
-                    for ((dst_leaf, dst_leaf_ty), (src_leaf, _src_leaf_ty)) in
-                        dst_leafs.iter().copied().zip(src_leafs.into_iter())
-                    {
+                    self.shadowable_leaf_ptr_specs_from_place(tcx, body, src_place, src_ty);
+                if let Some(matched_leafs) =
+                    self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                {
+                    for (dst_spec, src_spec) in matched_leafs {
+                        let dst_leaf = dst_spec.place;
+                        let dst_leaf_ty = dst_spec.ty;
+                        let src_leaf = src_spec.place;
                         if src_leaf.projection.is_empty()
                             && self.is_shadowable_ptr_ty(tcx, body, dst_leaf_ty)
                         {
@@ -9624,18 +9783,18 @@ impl MyOptimizationPass {
                 }
             }
 
-            for (dst_leaf, dst_leaf_ty) in dst_leafs {
+            for dst_leaf_spec in dst_leafs {
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx,
                     insert_before: false,
                     source_info,
-                    place: dst_leaf,
+                    place: dst_leaf_spec.place,
                     kind: InstrKind::ShadowKill {
                         size_op: self.size_operand_for_ty(
                             tcx,
                             body,
-                            dst_leaf_ty,
+                            dst_leaf_spec.ty,
                             source_info.span,
                         ),
                     },
@@ -11297,35 +11456,38 @@ impl MyOptimizationPass {
                                 args.get(0).and_then(|arg| self.place_from_operand(&arg.node))
                             {
                                 let src_ty = src_place.ty(&body.local_decls, tcx).ty;
-                                let dst_leafs = self.shadowable_leaf_ptr_places_from_place(
+                                let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
                                     tcx,
                                     body,
                                     Place::from(dst_local),
                                     dst_ty,
                                 );
-                                let src_leafs = self.shadowable_leaf_ptr_places_from_place(
+                                let src_leafs = self.shadowable_leaf_ptr_specs_from_place(
                                     tcx, body, src_place, src_ty,
                                 );
-                                if !dst_leafs.is_empty() && dst_leafs.len() == src_leafs.len() {
-                                    for ((dst_leaf, dst_leaf_ty), (src_leaf, _src_leaf_ty)) in
-                                        dst_leafs.into_iter().zip(src_leafs.into_iter())
-                                    {
-                                        let kind = if src_leaf.projection.is_empty()
-                                            && self.is_shadowable_ptr_ty(tcx, body, dst_leaf_ty)
+                                if let Some(matched_leafs) =
+                                    self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                                {
+                                    for (dst_spec, src_spec) in matched_leafs {
+                                        let kind = if src_spec.place.projection.is_empty()
+                                            && self.is_shadowable_ptr_ty(tcx, body, dst_spec.ty)
                                         {
-                                            ptr_locals_needing_tag.insert(src_leaf.local);
+                                            ptr_locals_needing_tag
+                                                .insert(src_spec.place.local);
                                             InstrKind::ShadowStore {
-                                                src_local: src_leaf.local,
+                                                src_local: src_spec.place.local,
                                             }
                                         } else {
-                                            InstrKind::ShadowCopySlot { src_place: src_leaf }
+                                            InstrKind::ShadowCopySlot {
+                                                src_place: src_spec.place,
+                                            }
                                         };
                                         insert_points.push(InsertPoint {
                                             bb: tgt_bb,
                                             stmt_idx: 0,
                                             insert_before: true,
                                             source_info: term.source_info,
-                                            place: dst_leaf,
+                                            place: dst_spec.place,
                                             kind,
                                         });
                                     }
@@ -11946,27 +12108,25 @@ impl MyOptimizationPass {
                                 },
                             });
                             let pointee_ty = body.local_decls[pointee_local].ty;
-                            for (leaf_index, (dst_leaf, _leaf_ty)) in self
-                                .shadowable_leaf_ptr_places_from_place(
+                            for dst_leaf_spec in self
+                                .shadowable_leaf_ptr_specs_from_place(
                                     tcx,
                                     body,
                                     Place::from(pointee_local),
                                     pointee_ty,
                                 )
-                                .into_iter()
-                                .enumerate()
                             {
                                 insert_points.push(InsertPoint {
                                     bb,
                                     stmt_idx: block_data.statements.len(),
                                     insert_before: true,
                                     source_info: term.source_info,
-                                    place: dst_leaf,
+                                    place: dst_leaf_spec.place,
                                     kind: InstrKind::MutArgRetLeafTake {
                                         callee_id,
                                         arg_index: arg_index as u64,
                                         local: pointee_local,
-                                        leaf_index: leaf_index as u64,
+                                        leaf_key: dst_leaf_spec.transport_key(),
                                     },
                                 });
                             }
@@ -12100,6 +12260,10 @@ impl MyOptimizationPass {
                         matches!(call_effect_opt, Some(CallEffect::BoxIntoRaw))
                             || (matches!(call_effect_opt, Some(CallEffect::PtrDerive))
                                 && local_ptr_derive_emitted)
+                            || matches!(
+                                call_effect_opt,
+                                Some(CallEffect::ExposedProvenanceRoot)
+                            )
                             || (alloc_returns_ptr && !self.heap_allocs_from_mir_enabled())
                             || load_shadow_emitted;
 
@@ -12183,25 +12347,23 @@ impl MyOptimizationPass {
                             local: dst_local,
                         },
                     });
-                    for (leaf_index, (dst_leaf, _leaf_ty)) in self
-                        .shadowable_leaf_ptr_places_from_place(
+                    for dst_leaf_spec in self
+                        .shadowable_leaf_ptr_specs_from_place(
                             tcx,
                             body,
                             Place::from(dst_local),
                             dst_ty,
                         )
-                        .into_iter()
-                        .enumerate()
                     {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
                             insert_before: false,
                             source_info: term.source_info,
-                            place: dst_leaf,
+                            place: dst_leaf_spec.place,
                             kind: InstrKind::RetLeafTake {
                                 callee_id,
-                                leaf_index: leaf_index as u64,
+                                leaf_key: dst_leaf_spec.transport_key(),
                             },
                         });
                     }
@@ -12566,18 +12728,23 @@ impl MyOptimizationPass {
                                 },
                             });
                         }
-                        for (leaf_index, (leaf_place, _leaf_ty)) in
-                            leaf_ptrs.into_iter().enumerate()
+                        for leaf_spec in self
+                            .shadowable_leaf_ptr_specs_from_place(
+                                tcx,
+                                body,
+                                Place::from(RETURN_PLACE),
+                                body.return_ty(),
+                            )
                         {
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
                                 insert_before: false,
                                 source_info: term.source_info,
-                                place: leaf_place,
+                                place: leaf_spec.place,
                                 kind: InstrKind::RetLeafPush {
                                     callee_id,
-                                    leaf_index: leaf_index as u64,
+                                    leaf_key: leaf_spec.transport_key(),
                                 },
                             });
                         }
@@ -12611,27 +12778,25 @@ impl MyOptimizationPass {
                                 ptr_local: arg_local,
                             },
                         });
-                        for (leaf_index, (leaf_place, _leaf_ty)) in self
-                            .shadowable_leaf_ptr_places_from_place(
+                        for leaf_spec in self
+                            .shadowable_leaf_ptr_specs_from_place(
                                 tcx,
                                 body,
                                 Place::from(arg_local).project_deeper(&[PlaceElem::Deref], tcx),
                                 pointee_ty,
                             )
-                            .into_iter()
-                            .enumerate()
                         {
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx: block_data.statements.len(),
                                 insert_before: false,
                                 source_info: term.source_info,
-                                place: leaf_place,
+                                place: leaf_spec.place,
                                 kind: InstrKind::MutArgRetLeafPush {
                                     callee_id,
                                     arg_index: arg_index as u64,
                                     ptr_local: arg_local,
-                                    leaf_index: leaf_index as u64,
+                                    leaf_key: leaf_spec.transport_key(),
                                 },
                             });
                         }
@@ -14815,7 +14980,7 @@ impl MyOptimizationPass {
 
             if let InstrKind::RetLeafTake {
                 callee_id,
-                leaf_index,
+                leaf_key,
             } = creation_kind
             {
                 let (orig_target, call_source, fn_span) = {
@@ -14868,7 +15033,7 @@ impl MyOptimizationPass {
                                 span: source_info.span,
                             },
                             Spanned {
-                                node: self.const_u64(tcx, source_info.span, leaf_index),
+                                node: self.const_u64(tcx, source_info.span, leaf_key),
                                 span: source_info.span,
                             },
                             Spanned {
@@ -15022,7 +15187,7 @@ impl MyOptimizationPass {
                 callee_id,
                 arg_index,
                 local,
-                leaf_index,
+                leaf_key,
             } = creation_kind
             {
                 let (orig_target, call_source, fn_span) = {
@@ -15096,7 +15261,7 @@ impl MyOptimizationPass {
                                 span: source_info.span,
                             },
                             Spanned {
-                                node: self.const_u64(tcx, source_info.span, leaf_index),
+                                node: self.const_u64(tcx, source_info.span, leaf_key),
                                 span: source_info.span,
                             },
                             Spanned {
@@ -15537,7 +15702,7 @@ impl MyOptimizationPass {
                 callee_id,
                 arg_index,
                 ptr_local,
-                leaf_index,
+                leaf_key,
             } = creation_kind
             {
                 let base_addr_local = body
@@ -15587,7 +15752,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u64(tcx, source_info.span, leaf_index),
+                        node: self.const_u64(tcx, source_info.span, leaf_key),
                         span: source_info.span,
                     },
                     Spanned {
@@ -15771,7 +15936,7 @@ impl MyOptimizationPass {
 
             if let InstrKind::RetLeafPush {
                 callee_id,
-                leaf_index,
+                leaf_key,
             } = creation_kind
             {
                 let addr_local = body
@@ -15799,7 +15964,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u64(tcx, source_info.span, leaf_index),
+                        node: self.const_u64(tcx, source_info.span, leaf_key),
                         span: source_info.span,
                     },
                     Spanned {
@@ -18093,7 +18258,11 @@ impl MyOptimizationPass {
                                 flags |= 0b100;
                                 flags |= 0b0100_0000;
                             }
-                            if matches!(src.projection.first(), Some(ProjectionElem::Deref)) {
+                            if matches!(src.projection.first(), Some(ProjectionElem::Deref))
+                                && !self.raw_creation_allows_no_provenance_transport(
+                                    tcx, body, *src,
+                                )
+                            {
                                 flags |= 0b1000_0000;
                             }
                             flags
