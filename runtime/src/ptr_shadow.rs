@@ -1,4 +1,4 @@
-use crate::lookup_alloc_snapshot;
+use crate::{lookup_alloc_snapshot, tag_pruning, tag_store};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -245,6 +245,14 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
     kill_range(addr, PTR_SLOT_BYTES);
     if tag == 0 && ref_ancestor == 0 {
         return;
+    }
+    for stored_tag in [tag, ref_ancestor] {
+        if stored_tag == 0 {
+            continue;
+        }
+        if let Some(tmeta) = tag_store::mark_escaped(stored_tag) {
+            tag_pruning::mark_tag_escaped(stored_tag, &tmeta);
+        }
     }
 
     match slot_loc(addr) {

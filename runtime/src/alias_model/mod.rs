@@ -37,6 +37,12 @@ pub(crate) trait AliasModel: Sync {
 
     fn on_tag_created(&self, _tag: u64, _tmeta: &TagMeta) {}
 
+    /// Called when MIR lifetime/overwrite semantics make an existing pointer/ref local dead.
+    ///
+    /// Alias models can use this to retire temporary tags so later accesses do not conflict with
+    /// aliases that no longer exist in the source program.
+    fn on_tag_killed(&self, _tag: u64) {}
+
     /// Called when a callee consumes a caller-pushed argument tag.
     /// Alias models can use this to seed call-scope metadata (e.g., protectors).
     fn on_call_arg_taken(&self, _callee_id: u64, _parent_tag: u64) {}
@@ -82,6 +88,12 @@ pub(crate) trait AliasModel: Sync {
     /// tag after call-exit teardown has run. Models may use it to revive the exported family so
     /// the caller can immediately reuse it.
     fn on_mut_arg_ret_export(&self, _tag: u64, _addr: usize) {}
+
+    /// Mark a normal return value family as surviving the current call boundary.
+    ///
+    /// Like `on_mut_arg_ret_export`, this compensates for return-edge hook orderings where the
+    /// callee's `FnExit` runs before the return-tag/leaf export hook.
+    fn on_ret_export(&self, _tag: u64, _addr: usize) {}
 
     fn check_access(
         &self,

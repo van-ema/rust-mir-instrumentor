@@ -1,4 +1,4 @@
-use crate::{tag_store, PtrKind, TagMeta};
+use crate::{rz_can_recover_parent_tag, tag_store, PtrKind, TagMeta};
 use std::cell::RefCell;
 
 const LINEAGE_CACHE_SLOTS: usize = 512;
@@ -50,6 +50,9 @@ fn validate_candidate(
     let Some(meta) = tag_store::get(tag) else {
         return false;
     };
+    if !rz_can_recover_parent_tag(tag) {
+        return false;
+    }
     if meta.parent == 0 || meta.pointee_addr != pointee_addr {
         return false;
     }

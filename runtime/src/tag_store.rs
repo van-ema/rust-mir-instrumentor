@@ -28,6 +28,7 @@ static TAG_SHARDS: OnceLock<Vec<TagShard>> = OnceLock::new();
 static HISTORICAL_LIVE_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
 static DEAD_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
 static ALLOC_EPOCH_TAGS: OnceLock<Mutex<HashMap<(usize, u64), Vec<u64>>>> = OnceLock::new();
+static LOCAL_HOLDER_COUNTS: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
 
 #[inline]
 fn shards() -> &'static [TagShard] {
@@ -56,6 +57,11 @@ fn dead_tags() -> &'static Mutex<HashMap<u64, CompactTagMeta>> {
 #[inline]
 fn alloc_epoch_tags() -> &'static Mutex<HashMap<(usize, u64), Vec<u64>>> {
     ALLOC_EPOCH_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn local_holder_counts() -> &'static Mutex<HashMap<u64, u32>> {
+    LOCAL_HOLDER_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[inline]
@@ -142,6 +148,57 @@ pub(crate) fn update(tag: u64, tmeta: TagMeta) {
     let idx = shard_index(tag);
     shards()[idx].map.lock().unwrap().insert(tag, tmeta);
     shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+pub(crate) fn retain_local_holder(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let mut counts = local_holder_counts().lock().unwrap();
+    let entry = counts.entry(tag).or_insert(0);
+    *entry = entry.saturating_add(1);
+}
+
+#[inline]
+pub(crate) fn release_local_holder(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    let mut counts = local_holder_counts().lock().unwrap();
+    let Some(entry) = counts.get_mut(&tag) else {
+        return false;
+    };
+    if *entry > 1 {
+        *entry -= 1;
+        return false;
+    }
+    counts.remove(&tag);
+    true
+}
+
+#[inline]
+pub(crate) fn active_tag_escaped(tag: u64) -> bool {
+    tags()
+        .lock()
+        .unwrap()
+        .get(&tag)
+        .map(|meta| meta.escaped)
+        .unwrap_or(true)
+}
+
+#[inline]
+pub(crate) fn active_tag_has_local_holder(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    local_holder_counts()
+        .lock()
+        .unwrap()
+        .get(&tag)
+        .copied()
+        .unwrap_or(0)
+        != 0
 }
 
 #[inline]

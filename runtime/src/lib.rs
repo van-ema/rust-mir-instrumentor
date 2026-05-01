@@ -603,9 +603,12 @@ fn rz_validate_ref_creation_addr(
                 if parent_meta.as_ref().is_some_and(|parent| {
                     parent.parent != 0
                         && !parent.exposed_provenance_root
-                        && parent.pointee_addr == base
+                        && parent.alloc_epoch == ameta.epoch
+                        && parent.pointee_addr >= base
+                        && (ameta.size == 0
+                            || parent.pointee_addr < base.saturating_add(ameta.size))
                 }) {
-                    // Creating a same-address stack reborrow from an existing live-tag family is
+                    // Creating an interior stack reborrow from an existing live-tag family is
                     // too early to call UAD under optimized MIR. Stack-slot liveness can be more
                     // stale/coarse than the borrow lineage here; defer to the subsequent concrete
                     // read/write checks instead of failing at ref creation.
@@ -647,7 +650,23 @@ fn rz_validate_ref_creation_addr(
         return None;
     }
 
-    None
+    if rz_untracked_region_for_access(pointee_addr, access_len).is_some() {
+        return None;
+    }
+
+    // Best-effort policy: missing stack/TLS alloc metadata is common enough under optimized MIR
+    // that we should not reject current-frame or TLS references purely because the alloc map is
+    // incomplete. Concrete accesses still validate normally once the pointer is used.
+    if rz_stack_addr_hint(pointee_addr) || rz_tls_addr_hint(pointee_addr) {
+        return None;
+    }
+
+    Some((
+        "WILD_POINTER",
+        format!(
+            "{access_name} via root ref create addr=0x{pointee_addr:x} size={access_len}\nreason=REF_CREATE_NO_ALLOC kind={kind:?} parent={parent_tag}"
+        ),
+    ))
 }
 
 #[inline]
@@ -674,9 +693,23 @@ fn rz_validate_strict_raw_creation_addr(
         ));
     }
 
-    let Some(parent_meta) = tag_store::get(parent_tag) else {
+    let Some(mut parent_meta) = tag_store::get(parent_tag) else {
         return None;
     };
+
+    // Parent tags cache allocation-origin bounds at creation time. For same-base realloc growth,
+    // that cached origin can become stale within the same allocation epoch (for example
+    // `BytesMut` growing from 8 to 16 bytes in place). Refresh the parent's origin from the live
+    // alloc map before classifying a raw derive as OOB so we do not reject valid derives against
+    // the resized allocation.
+    if let Some((base, ameta)) = alloc_from_origin_base(&parent_meta) {
+        let epoch_matches = parent_meta.alloc_epoch == 0
+            || ameta.epoch == 0
+            || parent_meta.alloc_epoch == ameta.epoch;
+        if epoch_matches {
+            refresh_tag_origin_cache(parent_tag, &mut parent_meta, base, &ameta);
+        }
+    }
 
     if enforce_no_provenance && rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
         return Some((
@@ -1228,8 +1261,20 @@ pub struct TagMeta {
 
 static ALLOCS: OnceLock<Mutex<BTreeMap<usize, AllocMeta>>> = OnceLock::new();
 static TAGS: OnceLock<Mutex<HashMap<u64, TagMeta>>> = OnceLock::new();
-static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> = OnceLock::new();
+#[derive(Copy, Clone, Debug, Default)]
+struct CallArgTagEntry {
+    tag: u64,
+    flags: u8,
+}
+
+const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
+
+static CALL_ARG_TAGS: OnceLock<
+    Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>,
+> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
+static RET_LEAF_SHADOWS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>>> =
+    OnceLock::new();
 static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> =
     OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
@@ -1378,12 +1423,16 @@ fn rz_check_alignment(
     );
 }
 
-fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
+fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ret_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>> {
+    RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn mut_arg_ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
@@ -1551,11 +1600,11 @@ fn lookup_alloc_origin_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
 }
 
 /// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
-/// If instrumentation emits a root tag (`parent=0`) for an address that already has
-/// same-address non-root tags in the same allocation epoch, attach to the newest one.
 ///
-/// We intentionally do not guess based on overlapping ranges here. Exact same-address repair
-/// covers the real "parent tag was lost" case without introducing range-overlap heuristics.
+/// First try exact same-address recovery from the side indices. If that misses, fall back to the
+/// smallest live enclosing non-root tag in the same allocation epoch. The enclosing-range fallback
+/// is needed for carrier/container writes where optimized MIR materializes an interior byte/field
+/// as a fresh root even though the surrounding object already has a live borrow family.
 #[inline]
 fn recover_parent_for_alloc_root(
     pointee_addr: usize,
@@ -1577,6 +1626,139 @@ fn recover_parent_for_alloc_root(
             lineage_cache::remember_non_root_tag(tag, &meta);
         }
         return tag;
+    }
+
+    recover_enclosing_parent_for_alloc_root(pointee_addr, alloc_epoch, require_mut_parent)
+}
+
+#[inline]
+/// Return the candidate range that should be considered for alloc-root parent repair.
+///
+/// Prefer explicit bounds when available; otherwise fall back to the recorded allocation-origin
+/// range for wider carriers such as `BytesMut`.
+fn repaired_parent_candidate_range(meta: &TagMeta) -> Option<(usize, usize)> {
+    if meta.bounds_len != 0 {
+        let end = meta.pointee_addr.checked_add(meta.bounds_len)?;
+        return Some((meta.pointee_addr, end));
+    }
+    if meta.origin_known && meta.origin_end > meta.origin_base {
+        return Some((meta.origin_base, meta.origin_end));
+    }
+    None
+}
+
+#[inline]
+/// True if `meta` describes a live non-root family that covers `addr`.
+fn repaired_parent_candidate_covers_addr(meta: &TagMeta, addr: usize) -> bool {
+    repaired_parent_candidate_range(meta)
+        .map(|(start, end)| addr >= start && addr < end)
+        .unwrap_or(meta.pointee_addr == addr)
+}
+
+/// Slow-path alloc-root repair for interior addresses.
+///
+/// This handles cases where optimized MIR loses ancestry for a byte/field inside a carrier object.
+/// We choose the smallest enclosing live non-root family in the same allocation epoch so the new
+/// root rejoins the existing borrow tree instead of becoming a detached foreign write.
+fn recover_enclosing_parent_for_alloc_root(
+    pointee_addr: usize,
+    alloc_epoch: u64,
+    require_mut_parent: bool,
+) -> u64 {
+    if pointee_addr == 0 || alloc_epoch == 0 {
+        return 0;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut best_tag = 0u64;
+    let mut best_range_len = usize::MAX;
+    let mut best_exact_start = false;
+    let mut best_mut_like = false;
+
+    for (tag, meta) in tmap.iter() {
+        if meta.parent == 0 || meta.alloc_epoch != alloc_epoch {
+            continue;
+        }
+        if require_mut_parent && !matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
+            continue;
+        }
+        if !rz_can_recover_parent_tag(*tag)
+            || !repaired_parent_candidate_covers_addr(meta, pointee_addr)
+        {
+            continue;
+        }
+
+        let range_len = repaired_parent_candidate_range(meta)
+            .map(|(start, end)| end.saturating_sub(start))
+            .unwrap_or(1);
+        let exact_start = meta.pointee_addr == pointee_addr;
+        let mut_like = matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut);
+
+        let better = range_len < best_range_len
+            || (range_len == best_range_len && exact_start && !best_exact_start)
+            || (range_len == best_range_len
+                && exact_start == best_exact_start
+                && mut_like
+                && !best_mut_like)
+            || (range_len == best_range_len
+                && exact_start == best_exact_start
+                && mut_like == best_mut_like
+                && *tag > best_tag);
+
+        if better {
+            best_tag = *tag;
+            best_range_len = range_len;
+            best_exact_start = exact_start;
+            best_mut_like = mut_like;
+        }
+    }
+
+    if best_tag != 0 {
+        if let Some(meta) = tag_store::get(best_tag) {
+            lineage_cache::remember_non_root_tag(best_tag, &meta);
+        }
+        rz_trace!(
+            "[rusteze-runtime] alloc-root enclosing repair addr=0x{:x} epoch={} require_mut={} -> tag={} range_len={} exact_start={}",
+            pointee_addr,
+            alloc_epoch,
+            require_mut_parent,
+            best_tag,
+            best_range_len,
+            best_exact_start
+        );
+    }
+
+    best_tag
+}
+
+#[inline]
+fn recover_projected_mut_parent_from_const_raw(parent_tag: u64, pointee_addr: usize) -> u64 {
+    if !rz_runtime_lineage_repair_enabled() || parent_tag == 0 || pointee_addr == 0 {
+        return 0;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let Some(parent_meta) = tmap.get(&parent_tag) else {
+        return 0;
+    };
+    if !matches!(parent_meta.kind, PtrKind::RawConst) {
+        return 0;
+    }
+
+    let mut cursor = parent_meta.parent;
+    let mut depth = 0usize;
+    while cursor != 0 && depth < 8 {
+        let Some(meta) = tmap.get(&cursor) else {
+            break;
+        };
+        if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut)
+            && rz_can_recover_parent_tag(cursor)
+            && repaired_parent_candidate_covers_addr(meta, pointee_addr)
+        {
+            return cursor;
+        }
+        cursor = meta.parent;
+        depth += 1;
     }
 
     0
@@ -2372,6 +2554,26 @@ pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
         );
     }
     ptr_shadow::kill_range(slot_addr, size);
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_tag_kill(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let _g = RzRuntimeGuard::enter();
+    if tag_store::release_local_holder(tag) && !tag_store::active_tag_escaped(tag) {
+        active_alias_model().on_tag_killed(tag);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_tag_retain(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let _g = RzRuntimeGuard::enter();
+    tag_store::retain_local_holder(tag);
 }
 
 #[no_mangle]
@@ -3343,9 +3545,14 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
         Some(PtrKind::RefShared | PtrKind::RawConst) => 0,
         _ => tag,
     };
-    let write_tag = __record_ref_creation(addr, 1, parent_tag, 0, size, 0);
+    // This is a concrete write to a real stack slot, not a dereference through the parent's
+    // pointee type. Use the slot's runtime address alignment instead of inheriting the parent's
+    // stronger alignment guarantee, otherwise short-lived scalar locals can spuriously reuse an
+    // outer container's alignment (e.g. `u8` loop items inheriting `IntoIter`'s `align=8`).
+    let slot_align = rz_addr_alignment(addr);
+    let write_tag = __record_ref_creation(addr, 1, parent_tag, 0, size, slot_align);
     let _relax = RelaxEpochGuard::enter();
-    __rz_ptr_write(write_tag, addr, size, 0, 0);
+    __rz_ptr_write(write_tag, addr, size, slot_align, 0);
 }
 
 /// Record/validate a read through a tracked pointer tag.
@@ -3869,6 +4076,13 @@ fn rz_trace_call_tags_enabled() -> bool {
 }
 
 #[inline]
+fn rz_trace_tag_create_enabled() -> bool {
+    std::env::var("RZ_TRACE_TAG_CREATE")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
 pub(crate) fn rz_can_recover_parent_tag(tag: u64) -> bool {
     tag != 0 && active_alias_model().can_recover_parent_tag(tag)
 }
@@ -3942,6 +4156,90 @@ fn recover_call_arg_parent_tag(addr: usize) -> u64 {
         );
     }
     recovered
+}
+
+fn recover_call_arg_parent_tag_for_kind(addr: usize, require_mut: bool) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let tmap = tags().lock().unwrap();
+    let mut latest_any = 0u64;
+    let mut latest_mut = 0u64;
+    let mut latest_nonmut = 0u64;
+    let mut latest_any_epochless = 0u64;
+    let mut latest_mut_epochless = 0u64;
+    let mut latest_nonmut_epochless = 0u64;
+
+    for (tag, meta) in tmap.iter() {
+        if meta.parent == 0 || meta.pointee_addr != addr {
+            continue;
+        }
+        if !rz_can_recover_parent_tag(*tag) {
+            continue;
+        }
+
+        let mut epochless_match = false;
+        if alloc_epoch != 0 {
+            if meta.alloc_epoch != alloc_epoch {
+                if stack_or_tls_addr && meta.alloc_epoch == 0 {
+                    epochless_match = true;
+                } else {
+                    continue;
+                }
+            }
+        } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+            continue;
+        }
+
+        let is_mut_family = matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut);
+        let (any_slot, mut_slot, nonmut_slot) = if epochless_match {
+            (
+                &mut latest_any_epochless,
+                &mut latest_mut_epochless,
+                &mut latest_nonmut_epochless,
+            )
+        } else {
+            (&mut latest_any, &mut latest_mut, &mut latest_nonmut)
+        };
+
+        if *tag > *any_slot {
+            *any_slot = *tag;
+        }
+        if is_mut_family {
+            if *tag > *mut_slot {
+                *mut_slot = *tag;
+            }
+        } else if *tag > *nonmut_slot {
+            *nonmut_slot = *tag;
+        }
+    }
+
+    if require_mut {
+        if latest_mut != 0 {
+            latest_mut
+        } else if latest_any != 0 {
+            latest_any
+        } else if latest_mut_epochless != 0 {
+            latest_mut_epochless
+        } else {
+            latest_any_epochless
+        }
+    } else if latest_nonmut != 0 {
+        latest_nonmut
+    } else if latest_any != 0 {
+        latest_any
+    } else if latest_nonmut_epochless != 0 {
+        latest_nonmut_epochless
+    } else {
+        latest_any_epochless
+    }
 }
 
 fn recover_live_boundary_tag(addr: usize) -> u64 {
@@ -4183,100 +4481,181 @@ fn canonical_mut_arg_ret_tag(addr: usize, tag: u64) -> u64 {
     }
 }
 
+/// Canonicalize a call-boundary argument tag to a surviving family tag for the same address.
+///
+/// Optimized MIR often leaves the caller local holding a transient exact child that TB has
+/// already invalidated by the time we export the argument. Callee retagging wants the nearest
+/// still-live boundary for that pointee slot, not the dead child.
+fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
+    if tag == 0 {
+        return 0;
+    }
+    if addr != 0 {
+        if let Some(meta) = tag_store::get(tag) {
+            if meta.pointee_addr != 0 && meta.pointee_addr != addr {
+                let recovered = recover_call_arg_parent_tag(addr);
+                if recovered != 0 {
+                    return recovered;
+                }
+                if rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr) {
+                    if matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut)
+                        && rz_ref_boundary_tag_is_valid(tag)
+                    {
+                        // By-value wrapper arguments (for example `Newtype(&mut T)` or
+                        // `Option<&T>`) key the side channel by the carrier stack slot, not by the
+                        // inner pointee address. Preserve the exact inner reference tag instead of
+                        // dropping it to zero; the callee anchor/import path expects that tag.
+                        return tag;
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+    if rz_ref_boundary_tag_is_valid(tag) {
+        return tag;
+    }
+
+    let model_tag = active_alias_model().canonicalize_mut_arg_ret_tag(tag, addr);
+    if model_tag != 0 && rz_ref_boundary_tag_is_valid(model_tag) {
+        return model_tag;
+    }
+
+    let valid_lineage_tag = recover_nearest_valid_lineage_boundary_tag(addr, tag);
+    if valid_lineage_tag != 0 {
+        return valid_lineage_tag;
+    }
+
+    let recovered = recover_call_arg_parent_tag(addr);
+    if recovered != 0 && rz_ref_boundary_tag_is_valid(recovered) {
+        return recovered;
+    }
+
+    if rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr) {
+        return 0;
+    }
+
+    tag
+}
+
 /// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
 #[no_mangle]
-pub extern "C" fn __rz_push_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
+pub extern "C" fn __rz_push_call_arg_tag(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    tag: u64,
+    flags: u8,
+) {
     let _g = RzRuntimeGuard::enter();
+    // Validate the exact exported ref first. Canonicalization is only for callee-side retagging;
+    // if we validate the recovered parent instead, we hide invalid shared-ref call arguments.
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
+    let tag = canonical_call_arg_tag(addr, tag);
     if rz_trace_call_tags_enabled() {
         eprintln!(
-            "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} tag={}",
-            callee_id, arg_index, addr, tag
+            "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} tag={} flags=0x{:x}",
+            callee_id, arg_index, addr, tag, flags
         );
     }
     let thread_id = std::thread::current().id();
     call_arg_tags()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, arg_index, addr), tag);
+        .insert(
+            (thread_id, callee_id, arg_index, addr),
+            CallArgTagEntry { tag, flags },
+        );
 }
 
 /// Validate a non-pointer by-value call argument carrier's inner reference tag.
 #[no_mangle]
 pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     let _g = RzRuntimeGuard::enter();
-    if active_alias_model().name() != "sb_lite" {
-        return;
-    }
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
 }
 
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
 #[no_mangle]
-pub extern "C" fn __rz_take_call_arg_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
+pub extern "C" fn __rz_take_call_arg_tag(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    require_mut: u8,
+) -> u64 {
     let _g = RzRuntimeGuard::enter();
+    let require_mut = require_mut != 0;
     let thread_id = std::thread::current().id();
-    let (tag, has_inplace_alias, matched_callee_id) = {
+    let (tag, inplace_alias_parent, matched_callee_id) = {
         let mut tags = call_arg_tags().lock().unwrap();
         let mut matched_callee_id = callee_id;
-        let mut saw_slot_candidate = false;
         let allow_cross_callee_fallback = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
-        let tag = tags
+        let entry = tags
             .remove(&(thread_id, callee_id, arg_index, addr))
             .unwrap_or_else(|| {
                 if !allow_cross_callee_fallback {
-                    return 0;
+                    return CallArgTagEntry::default();
                 }
                 let mut fallback_matches = tags
                     .keys()
                     .filter(|(tid, _cid, idx, other_addr)| {
                         *tid == thread_id && *idx == arg_index && *other_addr == addr
-                    })
+                })
                     .copied();
                 let first = fallback_matches.next();
                 if fallback_matches.next().is_some() {
-                    return 0;
+                    return CallArgTagEntry::default();
                 }
                 if let Some((_, fallback_callee_id, _, _)) = first {
-                    saw_slot_candidate = true;
                     matched_callee_id = fallback_callee_id;
                     return tags
                         .remove(&(thread_id, fallback_callee_id, arg_index, addr))
-                        .unwrap_or(0);
+                        .unwrap_or_default();
                 }
-                0
+                CallArgTagEntry::default()
             });
-        if tag != 0 {
-            saw_slot_candidate = true;
-        }
-        let tag = if tag == 0 && saw_slot_candidate {
-            recover_call_arg_parent_tag(addr)
+        let tag = if entry.tag == 0 && allow_cross_callee_fallback {
+            // Optimized or unresolved stack/TLS calls can skip the exact caller-side push even
+            // though the callee address already has a live family in the current alloc epoch.
+            // Reattach to that exact-address family instead of manufacturing a new root tag.
+            recover_call_arg_parent_tag_for_kind(addr, require_mut)
         } else {
-            tag
+            entry.tag
         };
-        let has_inplace_alias = tag != 0
-            && arg_index > 0
-            && tags
-                .iter()
-                .any(|((tid, cid, other_arg, other_addr), other_tag)| {
+        let inplace_alias_parent = if tag != 0 {
+            tags.iter()
+                .find(|((tid, cid, other_arg, other_addr), other_entry)| {
                     *tid == thread_id
                         && *cid == matched_callee_id
                         && *other_arg != arg_index
                         && *other_addr == addr
-                        && *other_tag == tag
-                });
-        (tag, has_inplace_alias, matched_callee_id)
+                        && (other_entry.flags & CALL_ARG_FLAG_INPLACE_EXACT_SOURCE) != 0
+                })
+                .map(|(_key, other_entry)| other_entry.tag)
+        } else {
+            None
+        };
+        (tag, inplace_alias_parent, matched_callee_id)
     };
     if rz_trace_call_tags_enabled() {
         eprintln!(
-            "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} inplace_alias={}",
-            callee_id, matched_callee_id, arg_index, addr, tag, has_inplace_alias
+            "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} inplace_alias_parent={}",
+            callee_id,
+            matched_callee_id,
+            arg_index,
+            addr,
+            tag,
+            inplace_alias_parent.unwrap_or(0)
         );
     }
     if tag != 0 {
         active_alias_model().on_call_arg_taken(matched_callee_id, tag);
-        if has_inplace_alias {
-            active_alias_model().on_call_arg_inplace_alias(matched_callee_id, tag, addr);
+        if let Some(alias_parent_tag) = inplace_alias_parent {
+            active_alias_model().on_call_arg_inplace_alias(
+                matched_callee_id,
+                alias_parent_tag,
+                addr,
+            );
         }
     }
     tag
@@ -4302,7 +4681,8 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
                     .map(|(key, _)| *key)
                     .and_then(|key| tags.remove(&key))
             })
-            .unwrap_or(0)
+            .unwrap_or_default()
+            .tag
     };
     if tag != 0 {
         active_alias_model().on_call_arg_anchor_taken(callee_id, tag);
@@ -4356,7 +4736,22 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
-    rz_validate_ref_boundary_use(tag, "RET");
+    let kind = tag_store::get(tag).map(|meta| meta.kind);
+    let validate_before_export = active_alias_model().name() != "tb_lite"
+        || matches!(kind, Some(PtrKind::RefShared));
+    if validate_before_export {
+        // Validate the original exported ref before any return-side repair/revival. Otherwise
+        // `on_ret_export` can resurrect an already-invalid family and mask the boundary violation.
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
+    if tag != 0 {
+        active_alias_model().on_ret_export(tag, addr);
+    }
+    if !validate_before_export {
+        // Tree Borrows returned `&mut` values can be repaired by the return-side export hook
+        // before they become caller-visible. Validate the post-export family in that case.
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
     let thread_id = std::thread::current().id();
     ret_tags()
         .lock()
@@ -4364,21 +4759,40 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
         .insert((thread_id, callee_id, addr), tag);
 }
 
+/// Push the exact shadow of one returned carrier leaf so the caller can recreate its slot shadow.
+#[no_mangle]
+pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_index: u64, slot_addr: usize) {
+    let _g = RzRuntimeGuard::enter();
+    let tag = ptr_shadow::load_tag(slot_addr);
+    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    if active_alias_model().name() == "sb_lite" {
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
+    if tag != 0 {
+        active_alias_model().on_ret_export(tag, 0);
+    }
+    let thread_id = std::thread::current().id();
+    ret_leaf_shadows()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, leaf_index), (tag, ref_ancestor));
+}
+
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
 #[no_mangle]
 pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
     let _g = RzRuntimeGuard::enter();
+    if active_alias_model().name() == "sb_lite" {
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
     if tag != 0 {
+        active_alias_model().on_ret_export(tag, 0);
         let thread_id = std::thread::current().id();
         ret_tags()
             .lock()
             .unwrap()
             .insert((thread_id, callee_id, 0), tag);
     }
-    if active_alias_model().name() != "sb_lite" {
-        return;
-    }
-    rz_validate_ref_boundary_use(tag, "RET");
 }
 
 /// Validate a reference tag restored from pointer-shadow memory.
@@ -4413,6 +4827,19 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
         .unwrap()
         .remove(&(thread_id, callee_id, addr))
         .unwrap_or(0)
+}
+
+/// Take one returned carrier-leaf shadow and recreate the caller destination slot shadow.
+#[no_mangle]
+pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_index: u64, slot_addr: usize) {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let (tag, ref_ancestor) = ret_leaf_shadows()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id, leaf_index))
+        .unwrap_or((0, 0));
+    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -4648,7 +5075,7 @@ pub extern "C" fn __record_ref_creation(
     // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
     // that repair even when we reject broader overlap-based guessing.
     let lineage_repair_start = profile.map(|_| Instant::now());
-    if resolved_parent_tag == 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
+    if resolved_parent_tag == 0 && alloc_epoch != 0 {
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
@@ -4678,12 +5105,11 @@ pub extern "C" fn __record_ref_creation(
     if let (Some(p), Some(start)) = (profile, lineage_repair_start) {
         rz_profile_add_elapsed(&p.ref_create_lineage_repair_ns, start);
     }
-
     // Optimized MIR may create `&mut (*raw_root)` or `&(*raw_root)` from a root raw tag that was
     // synthesized only because provenance was temporarily lost while extracting a pointee from a
     // wrapper (e.g. Box/NonNull/Result wrappers). If we can recover a same-address non-root tag
     // in the same allocation epoch, prefer it over the raw root to keep the borrow tree intact.
-    if resolved_parent_tag != 0 && alloc_epoch != 0 && alloc_size >= std::mem::size_of::<usize>() {
+    if resolved_parent_tag != 0 && alloc_epoch != 0 {
         let parent_is_root_raw = tag_store::get(resolved_parent_tag)
             .as_ref()
             .is_some_and(|meta| {
@@ -4792,6 +5218,19 @@ pub extern "C" fn __record_ref_creation(
         pointee_addr,
         kind_str
     );
+    if rz_trace_tag_create_enabled() {
+        eprintln!(
+            "[rusteze-runtime][tag-create][ref] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} align={} epoch={}",
+            tag,
+            parent_tag,
+            resolved_parent_tag,
+            pointee_addr,
+            kind_str,
+            bounds_len,
+            align_req,
+            alloc_epoch
+        );
+    }
     tag
 }
 
@@ -4847,6 +5286,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
     let mut exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
     let strict_creation_check = (alias_exempt & 0b0100_0000) != 0;
+    let deref_creation_no_provenance_check = (alias_exempt & 0b1000_0000) != 0;
     // MIR and optimized std/alloc lowering often materialize administrative `*const`
     // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
     // and then write through them. Preserve the parent's effective write capability so
@@ -4868,6 +5308,20 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
     // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
     let mut resolved_parent = derived_from;
+    if strong_projected_raw_hint && matches!(kind, PtrKind::RawMut) {
+        let repaired_parent =
+            recover_projected_mut_parent_from_const_raw(resolved_parent, pointee_addr);
+        if repaired_parent != 0 && repaired_parent != resolved_parent {
+            rz_trace!(
+                "__record_raw_ptr_creation projected-mut repair: pointee=0x{:x} from={} {}->{}",
+                pointee_addr,
+                derived_from,
+                resolved_parent,
+                repaired_parent
+            );
+            resolved_parent = repaired_parent;
+        }
+    }
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
     let mut parent_alloc_mismatch = false;
@@ -4951,11 +5405,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // `derived_from=0`. When this happens on a tracked allocation, attach to a same-address
     // recent non-root tag in the same epoch to preserve lineage instead of seeding a fresh raw
     // root that can later freeze an otherwise-valid borrow family.
-    if resolved_parent == 0
-        && projected_raw_hint
-        && alloc_epoch != 0
-        && alloc_size >= std::mem::size_of::<usize>()
-    {
+    if resolved_parent == 0 && projected_raw_hint && alloc_epoch != 0 {
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
             alloc_epoch,
@@ -4991,7 +5441,6 @@ pub extern "C" fn __record_raw_ptr_creation(
         && parent_is_root
         && (parent_alloc_mismatch || parent_pointee_addr.map_or(false, |pp| pp != pointee_addr))
         && alloc_epoch != 0
-        && alloc_size >= std::mem::size_of::<usize>()
     {
         let repaired_parent = recover_parent_for_alloc_root(
             pointee_addr,
@@ -5021,7 +5470,6 @@ pub extern "C" fn __record_raw_ptr_creation(
             );
         }
     }
-
     if !exposed_provenance_root && projected_raw_hint && pointee_addr != 0 {
         let poisoned_same_addr = tags().lock().unwrap().values().any(|meta| {
             meta.pointee_addr == pointee_addr
@@ -5033,7 +5481,53 @@ pub extern "C" fn __record_raw_ptr_creation(
         }
     }
 
-    let enforce_no_provenance = strict_creation_check || rz_strict_provenance_enabled();
+    // Projected raw wrappers such as `self.ptr.as_ptr()` on carrier structs can still arrive
+    // with a non-root stack parent even though the derived pointer clearly points into a tracked
+    // heap allocation. In that shape the parent family is definitely wrong: reattach to the
+    // pointee allocation's live non-root family instead of keeping the carrier stack slot as
+    // provenance and later tripping RAW_DERIVE_OOB on the stack-origin range.
+    if projected_raw_hint && resolved_parent != 0 && parent_alloc_mismatch && alloc_epoch != 0 {
+        let repaired_parent = recover_parent_for_alloc_root(
+            pointee_addr,
+            alloc_epoch,
+            matches!(kind, PtrKind::RawMut),
+        );
+        if repaired_parent != 0 && repaired_parent != resolved_parent {
+            let previous_parent = resolved_parent;
+            resolved_parent = repaired_parent;
+            if let Some(parent_meta) = tag_store::get(resolved_parent) {
+                if inherited_bounds_len == 0 {
+                    inherited_bounds_len = parent_meta.bounds_len;
+                }
+                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
+                    alloc_epoch = parent_meta.alloc_epoch;
+                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
+                }
+            }
+            rz_trace!(
+                "__record_raw_ptr_creation projected-parent repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
+                pointee_addr,
+                derived_from,
+                previous_parent,
+                resolved_parent,
+                alloc_epoch,
+                alloc_size
+            );
+        }
+    }
+
+    // `strict_creation_check` is instrumentation's "validate this raw creation eagerly" bit.
+    // In permissive mode we still want the derived-OOB checks, but we do *not* want to reject
+    // no-provenance carrier/sentinel field projections outright. Libraries such as `bytes`
+    // intentionally carry integer metadata in pointer-typed fields and use empty dangling
+    // sentinels.
+    //
+    // However, deref-based raw creation (`&raw *p`, `&raw (*box_ptr)`) is different: if the
+    // parent lineage is already exposed/no-provenance, forming another raw from that dereference
+    // is already operating on invalid bytes and should be rejected even outside strict
+    // provenance mode.
+    let enforce_no_provenance =
+        rz_strict_provenance_enabled() || deref_creation_no_provenance_check;
     if strict_creation_check || (exposed_provenance_root && rz_strict_provenance_enabled()) {
         if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
             pointee_addr,
@@ -5104,6 +5598,20 @@ pub extern "C" fn __record_raw_ptr_creation(
         kind_str,
         bounds_len
     );
+    if rz_trace_tag_create_enabled() {
+        eprintln!(
+            "[rusteze-runtime][tag-create][raw] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} align={} epoch={} hint={}",
+            tag,
+            derived_from,
+            resolved_parent,
+            pointee_addr,
+            kind_str,
+            bounds_len,
+            align_req,
+            alloc_epoch,
+            alias_exempt
+        );
+    }
     tag
 }
 

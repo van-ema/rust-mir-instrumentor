@@ -4,7 +4,7 @@ use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_tags, ret_tags,
-    rz_sb_suppressed, rz_violation, tags, PtrKind, TagMeta,
+    rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -150,6 +150,10 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_on_tag_created(tag, tmeta);
     }
 
+    fn on_tag_killed(&self, tag: u64) {
+        tb_lite_on_tag_killed(tag);
+    }
+
     fn on_call_arg_taken(&self, callee_id: u64, parent_tag: u64) {
         tb_lite_on_call_arg_taken(callee_id, parent_tag);
     }
@@ -179,6 +183,10 @@ impl AliasModel for TreeBorrowsLiteModel {
     }
 
     fn on_mut_arg_ret_export(&self, tag: u64, addr: usize) {
+        tb_lite_on_mut_arg_ret_export(tag, addr);
+    }
+
+    fn on_ret_export(&self, tag: u64, addr: usize) {
         tb_lite_on_mut_arg_ret_export(tag, addr);
     }
 
@@ -373,6 +381,29 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             tb_effective_len(tmeta.bounds_len),
         );
     }
+    for tag in frame.inplace_protected_tags {
+        let Some(tmeta) = tmap.get(&tag) else {
+            continue;
+        };
+        let base = tb_base_for_addr(tmeta.pointee_addr);
+        let Some(tree) = all.get_mut(&base) else {
+            continue;
+        };
+        let descendant_tags: Vec<u64> = tree
+            .nodes
+            .values()
+            .filter(|n| n.tag != tag && tb_is_ancestor(&tree.nodes, tag, n.tag))
+            .map(|n| n.tag)
+            .collect();
+        for descendant in descendant_tags {
+            if let Some(node) = tree.nodes.get_mut(&descendant) {
+                tb_disable_node_for_protector_end(node);
+            }
+        }
+        if let Some(node) = tree.nodes.get_mut(&tag) {
+            tb_disable_node_for_protector_end(node);
+        }
+    }
 }
 
 fn tb_lite_check_protected_dealloc(base_addr: usize) {
@@ -558,6 +589,47 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         poisoned_by_protector_end: false,
     };
     tree.nodes.insert(tag, node.clone());
+    let returned_carrier_reroot = (tmeta.lineage_hint & 0b1000) != 0;
+    if returned_carrier_reroot {
+        let stack_like_root_ref = parent == 0
+            && matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+            && {
+                let amap = allocs().lock().unwrap();
+                find_alloc_containing(&amap, tmeta.pointee_addr)
+                    .map(|(_base, meta)| meta.is_stack)
+                    .unwrap_or(false)
+            };
+        if stack_like_root_ref {
+            let superseded_roots: Vec<u64> = tree
+                .nodes
+                .values()
+                .filter(|n| n.tag != tag)
+                .filter(|n| n.parent == 0)
+                .filter(|n| tb_is_live_node(n))
+                .filter(|n| matches!(n.kind, BorrowKind::Shared | BorrowKind::Unique))
+                .filter(|n| !n.protected)
+                .filter(|n| n.start == node.start && n.len == node.len)
+                .map(|n| n.tag)
+                .collect();
+            if !superseded_roots.is_empty() {
+                let superseded_tags: Vec<u64> = tree
+                    .nodes
+                    .values()
+                    .filter(|n| {
+                        superseded_roots
+                            .iter()
+                            .any(|root| n.tag == *root || tb_is_ancestor(&tree.nodes, *root, n.tag))
+                    })
+                    .map(|n| n.tag)
+                    .collect();
+                for superseded in superseded_tags {
+                    if let Some(old) = tree.nodes.get_mut(&superseded) {
+                        tb_disable_node(old);
+                    }
+                }
+            }
+        }
+    }
     if kind == BorrowKind::Unique && protected {
         tb_shadow_same_slot_protected_unique_ancestors(tree, tag, node.start, node.len);
     }
@@ -729,11 +801,19 @@ fn tb_unshadow_same_slot_protected_unique_ancestors(
 /// already released the callee's protector frame. When that happens, the exported family is the
 /// caller-visible survivor and must be live again before the next call boundary validates it.
 fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
-    if !rz_tb_lite_enabled() || tag == 0 || addr == 0 {
+    if !rz_tb_lite_enabled() || tag == 0 {
         return;
     }
 
-    let base = tb_base_for_addr(addr);
+    let Some(tmeta) = tags().lock().unwrap().get(&tag).copied() else {
+        return;
+    };
+    let addr = if addr != 0 { addr } else { tmeta.pointee_addr };
+    if addr == 0 {
+        return;
+    }
+
+    let base = tb_base_for_addr(tmeta.pointee_addr);
     let mut all = tb_state().lock().unwrap();
     let Some(tree) = all.get_mut(&base) else {
         return;
@@ -742,6 +822,11 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
         return;
     };
     if node.start != addr {
+        return;
+    }
+    if node.poisoned_by_protector_end
+        && matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut)
+    {
         return;
     }
     node.protected = false;
@@ -757,6 +842,30 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     if matches!(node.lazy_perm, TbPerm::Disabled) {
         node.lazy_perm = node.perm;
     }
+}
+
+/// Retire a tag whose MIR local died or was overwritten.
+///
+/// This keeps temporary refs/raws from lingering as live TB siblings after the source local no
+/// longer exists. Descendants remain governed by their own liveness; only the killed local's
+/// exact node is retired here.
+fn tb_lite_on_tag_killed(tag: u64) {
+    if !rz_tb_lite_enabled() || tag == 0 {
+        return;
+    }
+
+    let Some(tmeta) = tags().lock().unwrap().get(&tag).copied() else {
+        return;
+    };
+    let base = tb_base_for_addr(tmeta.pointee_addr);
+    let mut all = tb_state().lock().unwrap();
+    let Some(tree) = all.get_mut(&base) else {
+        return;
+    };
+    let Some(node) = tree.nodes.get_mut(&tag) else {
+        return;
+    };
+    tb_disable_node(node);
 }
 
 fn tb_lite_check(
@@ -1923,6 +2032,11 @@ fn tb_same_lineage_protected_conflict_ok(
     }
     nodes.values().all(|other| {
         if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
+            return true;
+        }
+        if !tag_store::active_tag_escaped(other.tag)
+            && !tag_store::active_tag_has_local_holder(other.tag)
+        {
             return true;
         }
         tb_is_effective_ancestor(nodes, tmap, other.tag, access_tag)
