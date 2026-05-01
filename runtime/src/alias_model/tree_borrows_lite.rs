@@ -3,8 +3,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_tags, ret_tags,
-    rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
+    allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_leaf_shadows,
+    mut_arg_ret_tags, ret_leaf_shadows, ret_tags, rz_sb_suppressed, rz_violation, tag_store,
+    tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -301,6 +302,18 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         })
         .map(|((_ret_thread_id, _ret_callee_id, _addr), tag)| *tag)
         .chain(
+            ret_leaf_shadows()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((ret_thread_id, ret_callee_id, _leaf_index), _shadow)| {
+                    *ret_thread_id == thread_id && *ret_callee_id == callee_id
+                })
+                .map(|((_ret_thread_id, _ret_callee_id, _leaf_index), (tag, _ref_ancestor))| {
+                    *tag
+                }),
+        )
+        .chain(
             mut_arg_ret_tags()
                 .lock()
                 .unwrap()
@@ -311,6 +324,22 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                     },
                 )
                 .map(|((_ret_thread_id, _ret_callee_id, _arg_index, _addr), tag)| *tag),
+        )
+        .chain(
+            mut_arg_ret_leaf_shadows()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(
+                    |((ret_thread_id, ret_callee_id, _arg_index, _addr, _leaf_index), _shadow)| {
+                        *ret_thread_id == thread_id && *ret_callee_id == callee_id
+                    },
+                )
+                .map(
+                    |((_ret_thread_id, _ret_callee_id, _arg_index, _addr, _leaf_index), (tag, _ref_ancestor))| {
+                        *tag
+                    },
+                ),
         )
         .collect();
     let tmap = tags().lock().unwrap();
@@ -1190,7 +1219,14 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                if tb_has_usable_clean_unique_ancestor(
+                if tb_same_lineage_frozen_raw_const_write_ok(
+                    &tree.nodes,
+                    n.tag,
+                    &access_lineage,
+                    addr,
+                    size,
+                    tmeta.alloc_epoch,
+                ) || tb_has_usable_clean_unique_ancestor(
                     &tree.nodes,
                     n.tag,
                     &access_lineage,
@@ -2005,6 +2041,69 @@ fn tb_has_live_unique_lineage_ancestor(
             return true;
         }
     }
+    false
+}
+
+fn tb_same_lineage_frozen_raw_const_write_ok(
+    nodes: &HashMap<u64, TbNode>,
+    frozen_tag: u64,
+    access_lineage: &[u64],
+    addr: usize,
+    size: usize,
+    access_epoch: u64,
+) -> bool {
+    let Some(raw_const) = nodes.get(&frozen_tag) else {
+        return false;
+    };
+    if raw_const.kind != BorrowKind::RawConst {
+        return false;
+    }
+
+    let mut has_mut_ancestor_above = false;
+    let mut cursor = raw_const.parent;
+    for _ in 0..nodes.len().saturating_add(1) {
+        if cursor == 0 {
+            break;
+        }
+        let Some(node) = nodes.get(&cursor) else {
+            break;
+        };
+        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
+            cursor = node.parent;
+            continue;
+        }
+        if tb_is_live_node(node) && matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
+            has_mut_ancestor_above = true;
+            break;
+        }
+        cursor = node.parent;
+    }
+    if !has_mut_ancestor_above {
+        return false;
+    }
+
+    let mut saw_mut_descendant_below = false;
+    for &tag in access_lineage {
+        if tag == frozen_tag {
+            return saw_mut_descendant_below;
+        }
+        let Some(node) = nodes.get(&tag) else {
+            return false;
+        };
+        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
+            continue;
+        }
+        if tb_node_overlaps(node, addr, size)
+            && matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut)
+            && !matches!(
+                node.perm,
+                TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
+            )
+        {
+            saw_mut_descendant_below = true;
+        }
+    }
+
     false
 }
 

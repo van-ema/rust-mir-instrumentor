@@ -1277,6 +1277,9 @@ static RET_LEAF_SHADOWS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)
     OnceLock::new();
 static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> =
     OnceLock::new();
+static MUT_ARG_RET_LEAF_SHADOWS: OnceLock<
+    Mutex<HashMap<(ThreadId, u64, u64, usize, u64), (u64, u64)>>,
+> = OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
@@ -1431,12 +1434,17 @@ pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>>
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ret_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>> {
+pub(crate) fn ret_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>> {
     RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn mut_arg_ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), u64>> {
     MUT_ARG_RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn mut_arg_ret_leaf_shadows(
+) -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize, u64), (u64, u64)>> {
+    MUT_ARG_RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[inline]
@@ -4730,6 +4738,52 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
         );
     }
     tag
+}
+
+/// Push the exact shadow of one internal pointer leaf of a `&mut T` carrier pointee so the
+/// caller can recreate that slot shadow after the call returns.
+#[no_mangle]
+pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    leaf_index: u64,
+    slot_addr: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let tag = ptr_shadow::load_tag(slot_addr);
+    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    if active_alias_model().name() == "sb_lite" {
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
+    if tag != 0 {
+        active_alias_model().on_mut_arg_ret_export(tag, addr);
+    }
+    let thread_id = std::thread::current().id();
+    mut_arg_ret_leaf_shadows()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, arg_index, addr, leaf_index), (tag, ref_ancestor));
+}
+
+/// Take one exported `&mut T` carrier leaf shadow and recreate the caller destination slot
+/// shadow.
+#[no_mangle]
+pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    leaf_index: u64,
+    slot_addr: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let (tag, ref_ancestor) = mut_arg_ret_leaf_shadows()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id, arg_index, addr, leaf_index))
+        .unwrap_or((0, 0));
+    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
 }
 
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
