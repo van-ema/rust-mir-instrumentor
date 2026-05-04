@@ -1946,6 +1946,8 @@ enum InstrKind<'tcx> {
     },
 }
 
+const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
+
 #[derive(Clone, Debug)]
 struct InsertPoint<'tcx> {
     bb: BasicBlock,
@@ -2979,13 +2981,7 @@ impl MyOptimizationPass {
             }
         }
 
-        Some(
-            dst_specs
-                .iter()
-                .copied()
-                .zip(src_specs.iter().copied())
-                .collect(),
-        )
+        None
     }
 
     /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
@@ -8613,18 +8609,18 @@ impl MyOptimizationPass {
                     if src_place.ty(&body.local_decls, tcx).ty == lhs_ty {
                         let lhs_has_ptr_fields =
                             self.ty_contains_pointer_fields(tcx, body, lhs_ty, 3);
-                        let dst_leafs = self.shadowable_leaf_ptr_places_from_place(
-                            tcx, body, *lhs_place, lhs_ty,
-                        );
-                        let src_leafs = self.shadowable_leaf_ptr_places_from_place(
-                            tcx, body, *src_place, lhs_ty,
-                        );
-                        if !dst_leafs.is_empty() && dst_leafs.len() == src_leafs.len() {
-                            for ((dst_field, dst_field_ty), (src_field, _)) in
-                                dst_leafs.into_iter().zip(src_leafs.into_iter())
-                            {
+                        let dst_leafs =
+                            self.shadowable_leaf_ptr_specs_from_place(tcx, body, *lhs_place, lhs_ty);
+                        let src_leafs =
+                            self.shadowable_leaf_ptr_specs_from_place(tcx, body, *src_place, lhs_ty);
+                        if let Some(matched_leafs) =
+                            self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                        {
+                            for (dst_spec, src_spec) in matched_leafs {
+                                let dst_field = dst_spec.place;
+                                let src_field = src_spec.place;
                                 let kind = if src_field.projection.is_empty()
-                                    && self.is_shadowable_ptr_ty(tcx, body, dst_field_ty)
+                                    && self.is_shadowable_ptr_ty(tcx, body, dst_spec.ty)
                                 {
                                     rz_pass_trace!(
                                         self,
@@ -8834,21 +8830,22 @@ impl MyOptimizationPass {
                     {
                         let dst_has_ptr_fields =
                             self.ty_contains_pointer_fields(tcx, body, dst_ty, 3);
-                        let dst_leafs = self.shadowable_leaf_ptr_places_from_place(
+                        let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
                             tcx,
                             body,
                             Place::from(dst_local),
                             dst_ty,
                         );
-                        let src_leafs = self.shadowable_leaf_ptr_places_from_place(
-                            tcx, body, *src_place, dst_ty,
-                        );
-                        if !dst_leafs.is_empty() && dst_leafs.len() == src_leafs.len() {
-                            for ((dst_field, dst_field_ty), (src_field, _)) in
-                                dst_leafs.into_iter().zip(src_leafs.into_iter())
-                            {
+                        let src_leafs =
+                            self.shadowable_leaf_ptr_specs_from_place(tcx, body, *src_place, dst_ty);
+                        if let Some(matched_leafs) =
+                            self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                        {
+                            for (dst_spec, src_spec) in matched_leafs {
+                                let dst_field = dst_spec.place;
+                                let src_field = src_spec.place;
                                 let kind = if src_field.projection.is_empty()
-                                    && self.is_shadowable_ptr_ty(tcx, body, dst_field_ty)
+                                    && self.is_shadowable_ptr_ty(tcx, body, dst_spec.ty)
                                 {
                                     InstrKind::ShadowStore {
                                         src_local: src_field.local,
@@ -8915,7 +8912,7 @@ impl MyOptimizationPass {
             if let Some(dst_local) = dst_place.as_local() {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if !self.is_pointer_ty(dst_ty) {
-                    let dst_leafs = self.shadowable_leaf_ptr_places_from_place(
+                    let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
                         tcx,
                         body,
                         Place::from(dst_local),
@@ -8924,15 +8921,17 @@ impl MyOptimizationPass {
                     if !dst_leafs.is_empty() {
                         if let Some(src_place) = self.place_from_operand(op) {
                             let src_ty = src_place.ty(&body.local_decls, tcx).ty;
-                            let src_leafs = self.shadowable_leaf_ptr_places_from_place(
+                            let src_leafs = self.shadowable_leaf_ptr_specs_from_place(
                                 tcx, body, src_place, src_ty,
                             );
-                            if !src_leafs.is_empty() && src_leafs.len() == dst_leafs.len() {
-                                for ((dst_leaf, dst_leaf_ty), (src_leaf, _)) in
-                                    dst_leafs.into_iter().zip(src_leafs.into_iter())
-                                {
+                            if let Some(matched_leafs) =
+                                self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                            {
+                                for (dst_spec, src_spec) in matched_leafs {
+                                    let dst_leaf = dst_spec.place;
+                                    let src_leaf = src_spec.place;
                                     let kind = if src_leaf.projection.is_empty()
-                                        && self.is_shadowable_ptr_ty(tcx, body, dst_leaf_ty)
+                                        && self.is_shadowable_ptr_ty(tcx, body, dst_spec.ty)
                                     {
                                         ptr_locals_needing_tag.insert(src_leaf.local);
                                         InstrKind::ShadowStore {
@@ -8959,8 +8958,7 @@ impl MyOptimizationPass {
                                     insert_before: false,
                                     source_info: stmt.source_info,
                                     place: Place::from(dst_local),
-                                    kind: InstrKind::ShadowCopyRange {
-                                        src_place,
+                                    kind: InstrKind::ShadowKill {
                                         size_op: self.size_operand_for_ty(
                                             tcx,
                                             body,
@@ -11679,6 +11677,9 @@ impl MyOptimizationPass {
             let dst_ty = body.local_decls[dst_local].ty;
             let src_ty = first_arg.ty(&body.local_decls, tcx).ty;
             if args.len() == 1
+                && callee_path_opt
+                    .as_deref()
+                    .is_some_and(|p| self.is_box_new_wrapper(p))
                 && self.is_box_ty(tcx, dst_ty)
                 && self.is_shadowable_ptr_ty(tcx, body, src_ty)
                 && first_arg.projection.is_empty()
@@ -11720,13 +11721,20 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
-                            flags: if p.projection.len() == 1
+                            flags: (if p.projection.len() == 1
                                 && matches!(p.projection[0], ProjectionElem::Deref)
                             {
                                 1
                             } else {
                                 0
-                            },
+                            }) | (if matches!(
+                                body.local_decls[p.local].ty.kind(),
+                                TyKind::RawPtr(..)
+                            ) {
+                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
+                            } else {
+                                0
+                            }),
                         },
                     });
                 }
@@ -11853,7 +11861,11 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
-                            flags: 0,
+                            flags: if matches!(ty.kind(), TyKind::RawPtr(..)) {
+                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
+                            } else {
+                                0
+                            },
                         },
                     });
                 }
@@ -11917,15 +11929,19 @@ impl MyOptimizationPass {
             {
                 continue;
             }
-            ptr_locals_needing_tag.insert(p.local);
-            insert_points.push(InsertPoint {
-                bb,
-                stmt_idx: block_data.statements.len(),
-                insert_before: false,
-                source_info: term.source_info,
-                place: p,
-                kind: InstrKind::PtrUse { ptr_local: p.local },
-            });
+            let projected_carrier_raw_ptr_use = self.is_raw_pointer_ty(ty)
+                && self.raw_creation_allows_no_provenance_transport(tcx, body, p);
+            if !projected_carrier_raw_ptr_use {
+                ptr_locals_needing_tag.insert(p.local);
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: p,
+                    kind: InstrKind::PtrUse { ptr_local: p.local },
+                });
+            }
         }
 
         if callee_instrumented {
@@ -12454,7 +12470,11 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: 0,
                             ptr_local: place.local,
-                            flags: 0,
+                            flags: if matches!(dropped_ty.kind(), TyKind::RawPtr(..)) {
+                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
+                            } else {
+                                0
+                            },
                         },
                     });
                 }
@@ -17507,8 +17527,15 @@ impl MyOptimizationPass {
                                         .copied()
                                 }
                             });
-                        if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local).copied() {
-                            if let Some(anchor_local) = pointee_anchor_local {
+                        let prefer_pointee_anchor = pointee_anchor_local.is_some()
+                            && matches!(
+                                body.local_decls[ptr_local].ty.kind(),
+                                TyKind::Ref(_, _, Mutability::Mut)
+                            );
+                        if let Some(anchor_local) = pointee_anchor_local {
+                            if prefer_pointee_anchor {
+                                Operand::Copy(Place::from(anchor_local))
+                            } else if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local).copied() {
                                 let tag_is_zero_local = body
                                     .local_decls
                                     .push(LocalDecl::new(tcx.types.bool, source_info.span));
@@ -17608,10 +17635,10 @@ impl MyOptimizationPass {
                                 ]);
                                 Operand::Copy(Place::from(selected_tag_local))
                             } else {
-                                Operand::Copy(Place::from(tl))
+                                Operand::Copy(Place::from(anchor_local))
                             }
-                        } else if let Some(anchor_local) = pointee_anchor_local {
-                            Operand::Copy(Place::from(anchor_local))
+                        } else if let Some(tl) = tag_local_for_ptr_local.get(&ptr_local).copied() {
+                            Operand::Copy(Place::from(tl))
                         } else {
                             self.const_u64(tcx, source_info.span, 0)
                         }

@@ -1268,6 +1268,7 @@ struct CallArgTagEntry {
 }
 
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
+const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
 
 static CALL_ARG_TAGS: OnceLock<
     Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>,
@@ -2502,9 +2503,73 @@ pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
     }
 }
 
+#[inline]
+fn shadow_slot_value_addr(slot_addr: usize) -> usize {
+    if slot_addr == 0 {
+        return 0;
+    }
+    // Shadow hooks run after the MIR assignment to `slot_addr`, so the concrete pointer bits are
+    // already present in memory here.
+    unsafe { ptr::read_unaligned(slot_addr as *const usize) }
+}
+
+#[inline]
+fn shadow_ref_lineage_matches_value(tag: u64, value_addr: usize) -> bool {
+    if tag == 0 || value_addr == 0 {
+        return true;
+    }
+
+    let Some(meta) = tag_store::get(tag) else {
+        return true;
+    };
+    if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return true;
+    }
+    if meta.pointee_addr == 0 || meta.pointee_addr == value_addr {
+        return true;
+    }
+
+    let Some((value_base, value_alloc)) = lookup_alloc_snapshot(value_addr) else {
+        return false;
+    };
+    let Some((meta_base, meta_alloc)) = lookup_alloc_snapshot(meta.pointee_addr) else {
+        return meta.align_req <= 1 || value_addr % meta.align_req == 0;
+    };
+    value_base == meta_base
+        && (value_alloc.epoch == meta_alloc.epoch
+            || value_alloc.epoch == 0
+            || meta_alloc.epoch == 0)
+}
+
+#[inline]
+fn sanitize_shadow_entry_for_slot_value(
+    slot_addr: usize,
+    tag: u64,
+    ref_ancestor: u64,
+) -> (u64, u64) {
+    let value_addr = shadow_slot_value_addr(slot_addr);
+    if shadow_ref_lineage_matches_value(tag, value_addr)
+        && shadow_ref_lineage_matches_value(ref_ancestor, value_addr)
+    {
+        return (tag, ref_ancestor);
+    }
+
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] sanitize slot=0x{:x} value=0x{:x} tag={} ref_ancestor={}",
+            slot_addr, value_addr, tag, ref_ancestor
+        );
+    }
+    (0, 0)
+}
+
 #[no_mangle]
 pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor: u64) {
     let _g = RzRuntimeGuard::enter();
+    let (tag, ref_ancestor) = sanitize_shadow_entry_for_slot_value(slot_addr, tag, ref_ancestor);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
         .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
@@ -2596,7 +2661,11 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
             dst_slot_addr, src_slot_addr
         );
     }
-    ptr_shadow::copy_slot(dst_slot_addr, src_slot_addr);
+    let tag = ptr_shadow::load_tag(src_slot_addr);
+    let ref_ancestor = ptr_shadow::load_ref_ancestor(src_slot_addr);
+    let (tag, ref_ancestor) =
+        sanitize_shadow_entry_for_slot_value(dst_slot_addr, tag, ref_ancestor);
+    ptr_shadow::store_ptr(dst_slot_addr, tag, ref_ancestor);
 }
 
 #[no_mangle]
@@ -4556,10 +4625,24 @@ pub extern "C" fn __rz_push_call_arg_tag(
     flags: u8,
 ) {
     let _g = RzRuntimeGuard::enter();
-    // Validate the exact exported ref first. Canonicalization is only for callee-side retagging;
-    // if we validate the recovered parent instead, we hide invalid shared-ref call arguments.
-    rz_validate_ref_boundary_use(tag, "CALL_ARG");
-    let tag = canonical_call_arg_tag(addr, tag);
+    let canonical_tag = canonical_call_arg_tag(addr, tag);
+    let recoverable_canonical = canonical_tag != 0
+        && canonical_tag != tag
+        && (rz_ref_boundary_tag_is_valid(canonical_tag)
+            || rz_can_recover_parent_tag(canonical_tag));
+    let prefer_canonical_validate = recoverable_canonical
+        && (flags & CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE) != 0;
+    let tag = if prefer_canonical_validate {
+        if rz_ref_boundary_tag_is_valid(canonical_tag) {
+            rz_validate_ref_boundary_use(canonical_tag, "CALL_ARG");
+        }
+        canonical_tag
+    } else {
+        // Validate the exact exported ref first. Canonicalization is only for callee-side
+        // retagging unless we know the caller is exporting a copied/recovered mutable family.
+        rz_validate_ref_boundary_use(tag, "CALL_ARG");
+        canonical_tag
+    };
     if rz_trace_call_tags_enabled() {
         eprintln!(
             "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} tag={} flags=0x{:x}",
