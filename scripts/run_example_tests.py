@@ -208,7 +208,12 @@ def instrument_example(
     profile = "release" if "--release" in instr_cmd else "debug"
 
     if not env_flag_enabled(base_env, "RZ_INTERPROC_UNSAFE_SUMMARIES"):
-        return run_cmd(instr_cmd, base_env, instr_log), repo_root / "target" / profile
+        default_target_dir = run_dir / "_targets" / log_dir_name
+        shutil.rmtree(default_target_dir, ignore_errors=True)
+        default_target_dir.mkdir(parents=True, exist_ok=True)
+        default_env = base_env.copy()
+        default_env["CARGO_TARGET_DIR"] = str(default_target_dir)
+        return run_cmd(instr_cmd, default_env, instr_log), default_target_dir / profile
 
     base_target_dir = run_dir / "_interproc_targets" / log_dir_name
     analyze_target_dir = base_target_dir / "summary-pass"
@@ -309,7 +314,7 @@ def main() -> int:
     if local_cargo_tool.exists() and local_inst_tool.exists():
         env["PATH"] = f"{tool_dir}{os.pathsep}{env.get('PATH', '')}"
 
-    build_cmd = [cargo, "build", "-p", "runtime"] + profile_args
+    build_cmd = [cargo, "build", "-p", "runtime", "-p", "instrument-mir"] + profile_args
     subprocess.run(build_cmd, env=env, check=True)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")

@@ -1813,6 +1813,7 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
         /// Bit 0 marks the custom-MIR exact in-place source shape `Move(*ptr)`.
+        /// Bit 1 requests canonicalize-before-validate for recovered boundary families.
         flags: u8,
     },
     /// Caller-side validation for a by-value argument that is not itself pointer-typed,
@@ -1946,6 +1947,7 @@ enum InstrKind<'tcx> {
     },
 }
 
+const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
 
 #[derive(Clone, Debug)]
@@ -5933,6 +5935,93 @@ impl MyOptimizationPass {
         }
     }
 
+    fn call_arg_push_needs_canonical_boundary_validate<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        boundary_recovered_ptr_locals: &HashSet<Local>,
+    ) -> bool {
+        if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::RawPtr(..)) {
+            return true;
+        }
+        if !matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
+            return false;
+        }
+        if boundary_recovered_ptr_locals.contains(&ptr_local) {
+            return true;
+        }
+        self.backtrack_global_pointer_value_local(body, ptr_local)
+            .is_some_and(|src_local| {
+                src_local != ptr_local && boundary_recovered_ptr_locals.contains(&src_local)
+            })
+    }
+
+    fn call_arg_push_flags_for_ptr_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        ptr_local: Local,
+        exact_inplace_source: bool,
+        boundary_recovered_ptr_locals: &HashSet<Local>,
+    ) -> u8 {
+        let mut flags = if exact_inplace_source {
+            CALL_ARG_FLAG_INPLACE_EXACT_SOURCE
+        } else {
+            0
+        };
+        if self.call_arg_push_needs_canonical_boundary_validate(
+            body,
+            ptr_local,
+            boundary_recovered_ptr_locals,
+        ) {
+            flags |= CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE;
+        }
+        flags
+    }
+
+    fn rhs_carries_boundary_recovered_ptr<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        boundary_recovered_ptr_locals: &HashSet<Local>,
+    ) -> bool {
+        let source_local_is_recovered = |local: Local| {
+            boundary_recovered_ptr_locals.contains(&local)
+                || self
+                    .backtrack_global_pointer_value_local(body, local)
+                    .is_some_and(|src_local| {
+                        src_local != local
+                            && boundary_recovered_ptr_locals.contains(&src_local)
+                    })
+        };
+
+        match rvalue {
+            Rvalue::Use(op) => self
+                .place_from_operand(op)
+                .is_some_and(|src_place| source_local_is_recovered(src_place.local)),
+            Rvalue::CopyForDeref(src_place)
+            | Rvalue::Ref(_, _, src_place)
+            | Rvalue::RawPtr(_, src_place) => source_local_is_recovered(src_place.local),
+            Rvalue::Cast(
+                CastKind::PtrToPtr
+                | CastKind::PointerCoercion(_, _)
+                | CastKind::Transmute
+                | CastKind::PointerWithExposedProvenance,
+                op,
+                _,
+            ) => self
+                .place_from_operand(op)
+                .is_some_and(|src_place| source_local_is_recovered(src_place.local)),
+            Rvalue::Aggregate(_, ops) => ops.iter().any(|op| {
+                self.place_from_operand(op)
+                    .is_some_and(|src_place| source_local_is_recovered(src_place.local))
+            }),
+            Rvalue::BinaryOp(BinOp::Offset, ops) => self
+                .place_from_operand(&ops.0)
+                .is_some_and(|src_place| source_local_is_recovered(src_place.local)),
+            _ => false,
+        }
+    }
+
     /// Best-effort whole-body fallback: if `agg_local` is a non-pointer aggregate local, recover
     /// the single pointer local consistently packed into it across all assignments in the body.
     ///
@@ -6268,6 +6357,7 @@ impl MyOptimizationPass {
             let mut dummy_projected_reborrow_anchor_specs: ReborrowAnchorSpecMap = HashMap::new();
             let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
             let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
+            let mut boundary_recovered_ptr_locals: HashSet<Local> = HashSet::new();
 
             for (stmt_idx, stmt) in block_data.statements.iter().enumerate() {
                 self.scan_statement(
@@ -6283,6 +6373,7 @@ impl MyOptimizationPass {
                     &mut dummy_projected_reborrow_anchor_specs,
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
+                    &mut boundary_recovered_ptr_locals,
                     ptr_locals_with_tag_sources,
                     summary_elidable_shared_call_ref_locals,
                     interesting_stack_locals,
@@ -7467,6 +7558,7 @@ impl MyOptimizationPass {
         projected_reborrow_anchor_specs: &mut ReborrowAnchorSpecMap,
         ptr_locals_needing_tag: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
+        boundary_recovered_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
         summary_elidable_shared_call_ref_locals: &HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
@@ -7621,6 +7713,15 @@ impl MyOptimizationPass {
                 byte_copy_src_for_local.remove(&dst_local);
                 self.invalidate_ssa_anchors_for_local(ssa_anchor_for_expr, dst_local);
                 let dst_ty = body.local_decls[dst_local].ty;
+                if self.is_pointer_ty(dst_ty)
+                    && self.rhs_carries_boundary_recovered_ptr(
+                        body,
+                        rvalue,
+                        boundary_recovered_ptr_locals,
+                    )
+                {
+                    boundary_recovered_ptr_locals.insert(dst_local);
+                }
                 if self.is_one_byte_sized_ty(tcx, dst_ty) {
                     if let Some(src_place) = self.pointer_place_from_rvalue(rvalue) {
                         let src_ty = src_place.ty(&body.local_decls, tcx).ty;
@@ -11063,6 +11164,7 @@ impl MyOptimizationPass {
         destination: &Place<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
+        boundary_recovered_ptr_locals: &mut HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         projectionless_anchor_suppressed_locals: &mut HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
@@ -11510,6 +11612,7 @@ impl MyOptimizationPass {
                             // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
                             if self.is_pointer_ty(dst_ty) {
                                 let mut derive_emitted_here = false;
+                                let mut derived_from_recovered_boundary = false;
                                 let src_arg_index = callee_path_opt
                                     .as_deref()
                                     .map(|p| self.ptr_derive_source_arg_index(p))
@@ -11525,6 +11628,10 @@ impl MyOptimizationPass {
                                     });
                                 if prefer_parent_snapshot {
                                     if let Some(src_place) = src_arg_place {
+                                        if boundary_recovered_ptr_locals.contains(&src_place.local)
+                                        {
+                                            derived_from_recovered_boundary = true;
+                                        }
                                         ptr_locals_needing_tag.insert(dst_local);
                                         insert_points.push(InsertPoint {
                                             bb,
@@ -11563,6 +11670,9 @@ impl MyOptimizationPass {
                                     args,
                                     src_arg_index,
                                 ) {
+                                    if boundary_recovered_ptr_locals.contains(&src_local) {
+                                        derived_from_recovered_boundary = true;
+                                    }
                                     ptr_locals_needing_tag.insert(dst_local);
                                     ptr_locals_needing_tag.insert(src_local);
                                     Self::push_ptr_derive_call(
@@ -11581,6 +11691,9 @@ impl MyOptimizationPass {
                                     );
                                     local_ptr_derive_emitted = true;
                                     derive_emitted_here = true;
+                                }
+                                if derive_emitted_here && derived_from_recovered_boundary {
+                                    boundary_recovered_ptr_locals.insert(dst_local);
                                 }
                                 if derive_emitted_here && self.is_shadowable_ptr_ty(tcx, body, dst_ty)
                                 {
@@ -11711,6 +11824,8 @@ impl MyOptimizationPass {
                 && self.is_pointer_ty(body.local_decls[p.local].ty)
             {
                 if let Some(callee_id) = callee_id_opt {
+                    let exact_inplace_source = p.projection.len() == 1
+                        && matches!(p.projection[0], ProjectionElem::Deref);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -11721,20 +11836,12 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
-                            flags: (if p.projection.len() == 1
-                                && matches!(p.projection[0], ProjectionElem::Deref)
-                            {
-                                1
-                            } else {
-                                0
-                            }) | (if matches!(
-                                body.local_decls[p.local].ty.kind(),
-                                TyKind::RawPtr(..)
-                            ) {
-                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
-                            } else {
-                                0
-                            }),
+                            flags: self.call_arg_push_flags_for_ptr_local(
+                                body,
+                                p.local,
+                                exact_inplace_source,
+                                boundary_recovered_ptr_locals,
+                            ),
                         },
                     });
                 }
@@ -11861,11 +11968,12 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
-                            flags: if matches!(ty.kind(), TyKind::RawPtr(..)) {
-                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
-                            } else {
-                                0
-                            },
+                            flags: self.call_arg_push_flags_for_ptr_local(
+                                body,
+                                p.local,
+                                false,
+                                boundary_recovered_ptr_locals,
+                            ),
                         },
                     });
                 }
@@ -12162,6 +12270,7 @@ impl MyOptimizationPass {
                             ptr_local: p.local,
                         },
                     });
+                    boundary_recovered_ptr_locals.insert(p.local);
                 }
             }
         }
@@ -12248,6 +12357,7 @@ impl MyOptimizationPass {
                                 dst_local,
                             },
                         });
+                        boundary_recovered_ptr_locals.insert(dst_local);
                         if let Some(tgt_bb) = call_target_bb {
                             if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
                                 insert_points.push(InsertPoint {
@@ -12421,6 +12531,7 @@ impl MyOptimizationPass {
         place: Place<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
         ptr_locals_needing_tag: &mut HashSet<Local>,
+        boundary_recovered_ptr_locals: &HashSet<Local>,
         tagged_ptr_locals: &mut HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
     ) {
@@ -12470,11 +12581,12 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: 0,
                             ptr_local: place.local,
-                            flags: if matches!(dropped_ty.kind(), TyKind::RawPtr(..)) {
-                                CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
-                            } else {
-                                0
-                            },
+                            flags: self.call_arg_push_flags_for_ptr_local(
+                                body,
+                                place.local,
+                                false,
+                                boundary_recovered_ptr_locals,
+                            ),
                         },
                     });
                 }
@@ -12522,6 +12634,7 @@ impl MyOptimizationPass {
     ) -> ScanResult<'tcx> {
         let mut insert_points: Vec<InsertPoint<'tcx>> = Vec::new();
         let mut ptr_locals_needing_tag: HashSet<Local> = HashSet::new();
+        let mut boundary_recovered_ptr_locals: HashSet<Local> = HashSet::new();
         let mut tagged_ptr_locals: HashSet<Local> = HashSet::new();
         let mut projectionless_anchor_suppressed_locals: HashSet<Local> = HashSet::new();
         let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
@@ -12611,6 +12724,11 @@ impl MyOptimizationPass {
             &interesting_stack_locals,
             entry_insert_at,
         );
+        for arg_local in body.args_iter() {
+            if self.is_pointer_ty(body.local_decls[arg_local].ty) {
+                boundary_recovered_ptr_locals.insert(arg_local);
+            }
+        }
 
         let mut return_sites: Vec<(BasicBlock, SourceInfo, usize)> = Vec::new();
         let predecessors = body.basic_blocks.predecessors();
@@ -12652,6 +12770,7 @@ impl MyOptimizationPass {
                     &mut bb_projected_reborrow_anchor_specs,
                     &mut ptr_locals_needing_tag,
                     &mut tagged_ptr_locals,
+                    &mut boundary_recovered_ptr_locals,
                     &ptr_locals_with_tag_sources,
                     &summary_elidable_shared_call_ref_locals,
                     &interesting_stack_locals,
@@ -12683,6 +12802,7 @@ impl MyOptimizationPass {
                         destination,
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
+                        &mut boundary_recovered_ptr_locals,
                         &mut tagged_ptr_locals,
                         &mut projectionless_anchor_suppressed_locals,
                         &interesting_stack_locals,
@@ -12706,6 +12826,7 @@ impl MyOptimizationPass {
                         *place,
                         &mut insert_points,
                         &mut ptr_locals_needing_tag,
+                        &boundary_recovered_ptr_locals,
                         &mut tagged_ptr_locals,
                         &interesting_stack_locals,
                     );

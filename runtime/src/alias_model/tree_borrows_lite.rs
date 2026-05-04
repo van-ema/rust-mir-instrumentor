@@ -2133,7 +2133,7 @@ fn tb_same_lineage_protected_conflict_ok(
         if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
             return true;
         }
-        if !tag_store::active_tag_escaped(other.tag)
+        if !tmap.get(&other.tag).map(|meta| meta.escaped).unwrap_or(true)
             && !tag_store::active_tag_has_local_holder(other.tag)
         {
             return true;
