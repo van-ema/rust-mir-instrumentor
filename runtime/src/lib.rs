@@ -4809,15 +4809,16 @@ pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
 pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let tag = mut_arg_ret_tags()
+    let raw_tag = mut_arg_ret_tags()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id, arg_index, addr))
         .unwrap_or(0);
+    let tag = canonical_mut_arg_ret_tag(addr, raw_tag);
     if rz_trace_call_tags_enabled() {
         eprintln!(
-            "[rusteze-runtime][mut-arg-ret] take callee={} arg={} addr=0x{:x} -> {}",
-            callee_id, arg_index, addr, tag
+            "[rusteze-runtime][mut-arg-ret] take callee={} arg={} addr=0x{:x} raw_tag={} tag={}",
+            callee_id, arg_index, addr, raw_tag, tag
         );
     }
     tag

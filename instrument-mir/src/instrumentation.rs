@@ -3837,6 +3837,106 @@ impl MyOptimizationPass {
         eligible
     }
 
+    // Identify one-use shared reborrow temps of the form `_tmp = &(*base); call(move _tmp)`.
+    //
+    // These temps are created only to satisfy a helper call like `self.is_empty()`, but the
+    // later whole-object write in the caller can still see the temp's shared tag as live if we
+    // emit the usual coarse `PtrUse` escape and wait until `StorageDead` to retire it. For this
+    // narrow shape we instead:
+    //  - skip the coarse `PtrUse` call-boundary escape, and
+    //  - insert `TagKill` on the normal return edge of the call.
+    //
+    // This keeps the reborrow fully visible during the call itself, while preventing stale
+    // caller-side temp holders from causing false Tree Borrows protector conflicts afterward.
+    fn compute_summary_noescape_shared_reborrow_call_ref_locals<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+    ) -> HashSet<Local> {
+        let local_stats = self.compute_local_ref_use_stats(body);
+        let mut eligible = HashSet::new();
+
+        for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
+            let Some(term) = &block_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call { func, args, .. } = &term.kind else {
+                continue;
+            };
+
+            let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
+                continue;
+            };
+            let callee_instrumented = self.is_instrumented_callee(tcx, callee_did);
+            let summary = unsafe_dataflow::summary_for_def_id(tcx, callee_did);
+
+            for (arg_index, arg) in args.iter().enumerate() {
+                let Some(place) = self.place_from_operand(&arg.node) else {
+                    continue;
+                };
+                let local = place.local;
+                let Some(stat) = local_stats.get(&local) else {
+                    continue;
+                };
+                if stat.defs != 1 || stat.uses != 1 {
+                    continue;
+                }
+
+                let Some(def_stmt) = body
+                    .basic_blocks
+                    .iter()
+                    .flat_map(|bbd| bbd.statements.iter())
+                    .find(|stmt| matches!(
+                        &stmt.kind,
+                        StatementKind::Assign(box (lhs, Rvalue::Ref(_, BorrowKind::Shared, _)))
+                            if lhs.as_local() == Some(local)
+                    ))
+                else {
+                    continue;
+                };
+
+                let StatementKind::Assign(box (_, Rvalue::Ref(_, BorrowKind::Shared, src_place))) =
+                    &def_stmt.kind
+                else {
+                    continue;
+                };
+
+                let local_ty = body.local_decls[local].ty;
+                if !matches!(local_ty.kind(), TyKind::Ref(_, _, Mutability::Not)) {
+                    continue;
+                }
+
+                if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref)) {
+                    continue;
+                }
+
+                if !callee_instrumented {
+                    let Some(ref summary) = summary else {
+                        continue;
+                    };
+                    let Some(arg_summary) = summary
+                        .ptr_args()
+                        .iter()
+                        .find(|entry| entry.arg_index() == arg_index)
+                    else {
+                        continue;
+                    };
+
+                    if arg_summary.reaches_direct_sink()
+                        || arg_summary.escapes_to_unknown_boundary()
+                        || arg_summary.forwarded_to_return()
+                    {
+                        continue;
+                    }
+                }
+
+                eligible.insert(local);
+            }
+        }
+
+        eligible
+    }
+
     fn normalize_def_path(&self, def_path: &str) -> String {
         normalize_def_path(def_path)
     }
@@ -11168,6 +11268,7 @@ impl MyOptimizationPass {
         tagged_ptr_locals: &mut HashSet<Local>,
         projectionless_anchor_suppressed_locals: &mut HashSet<Local>,
         interesting_stack_locals: &HashSet<Local>,
+        summary_noescape_shared_reborrow_call_ref_locals: &HashSet<Local>,
     ) {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
@@ -12039,7 +12140,9 @@ impl MyOptimizationPass {
             }
             let projected_carrier_raw_ptr_use = self.is_raw_pointer_ty(ty)
                 && self.raw_creation_allows_no_provenance_transport(tcx, body, p);
-            if !projected_carrier_raw_ptr_use {
+            let summary_noescape_shared_reborrow_temp =
+                summary_noescape_shared_reborrow_call_ref_locals.contains(&p.local);
+            if !projected_carrier_raw_ptr_use && !summary_noescape_shared_reborrow_temp {
                 ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
@@ -12254,6 +12357,8 @@ impl MyOptimizationPass {
                                     },
                                 });
                             }
+                            boundary_recovered_ptr_locals.insert(p.local);
+                            boundary_recovered_ptr_locals.insert(pointee_local);
                             continue;
                         }
                     }
@@ -12519,6 +12624,34 @@ impl MyOptimizationPass {
                 !(ip.bb == bb && matches!(ip.kind, InstrKind::HeapAlloc { live: false, .. }))
             });
         }
+
+        if let Some(target_bb) = call_target_bb {
+            let dst_local = destination.as_local();
+            let mut kill_locals: HashSet<Local> = HashSet::new();
+            for arg in args.iter() {
+                let Some(arg_place) = self.place_from_operand(&arg.node) else {
+                    continue;
+                };
+                if dst_local == Some(arg_place.local) {
+                    continue;
+                }
+                if summary_noescape_shared_reborrow_call_ref_locals.contains(&arg_place.local) {
+                    kill_locals.insert(arg_place.local);
+                }
+            }
+            let mut kill_locals: Vec<Local> = kill_locals.into_iter().collect();
+            kill_locals.sort_by_key(|local| local.index());
+            for ptr_local in kill_locals {
+                insert_points.push(InsertPoint {
+                    bb: target_bb,
+                    stmt_idx: 0,
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: Place::from(ptr_local),
+                    kind: InstrKind::TagKill { ptr_local },
+                });
+            }
+        }
     }
 
     fn scan_drop_terminator<'tcx>(
@@ -12640,6 +12773,8 @@ impl MyOptimizationPass {
         let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
         let summary_elidable_shared_call_ref_locals =
             self.compute_summary_elidable_shared_call_ref_locals(tcx, body);
+        let summary_noescape_shared_reborrow_call_ref_locals =
+            self.compute_summary_noescape_shared_reborrow_call_ref_locals(tcx, body);
 
         let mut explicitly_tracked: HashSet<Local> = HashSet::new();
         for block_data in body.basic_blocks.iter() {
@@ -12806,6 +12941,7 @@ impl MyOptimizationPass {
                         &mut tagged_ptr_locals,
                         &mut projectionless_anchor_suppressed_locals,
                         &interesting_stack_locals,
+                        &summary_noescape_shared_reborrow_call_ref_locals,
                     );
                     self.invalidate_ssa_anchors_for_call(
                         body,
@@ -13362,23 +13498,21 @@ impl MyOptimizationPass {
             else {
                 continue;
             };
-            let Some(dst_local) = destination.as_local() else {
-                continue;
-            };
-            let Some(_ptr_local) = ptr_local_for_tag_local.get(&dst_local).copied() else {
-                continue;
-            };
             if let Some(target_bb) = *target {
-                insert_points.push(InsertPoint {
-                    bb: target_bb,
-                    stmt_idx: 0,
-                    insert_before: false,
-                    source_info: term.source_info,
-                    place: *destination,
-                    kind: InstrKind::TagRetain {
-                        tag_local: dst_local,
-                    },
-                });
+                if let Some(dst_local) = destination.as_local() {
+                    if ptr_local_for_tag_local.contains_key(&dst_local) {
+                        insert_points.push(InsertPoint {
+                            bb: target_bb,
+                            stmt_idx: 0,
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: *destination,
+                            kind: InstrKind::TagRetain {
+                                tag_local: dst_local,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
@@ -16974,7 +17108,8 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            let func_operand = self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
+            let func_operand =
+                self.func_operand_for(tcx, hooks, &creation_kind, source_info.span);
 
             let insert_before: bool = ip.insert_before;
 
