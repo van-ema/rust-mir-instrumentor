@@ -6245,6 +6245,160 @@ impl MyOptimizationPass {
         }
     }
 
+    /// Recover the original pointer local behind a reversible exposed-provenance round-trip.
+    ///
+    /// Target shape:
+    /// - `ptr as usize` (`PointerExposeProvenance`)
+    /// - simple forwarding / integer munging with one local input and const operands
+    /// - `usize as *mut T` / `usize as *const T` (`PointerWithExposedProvenance`)
+    ///
+    /// This is intentionally narrow. It exists for patterns such as `bytes::ptr_map`, where the
+    /// native build lowers pointer tagging to exposed-provenance integer casts, but the result is
+    /// still derived from a real pointer input rather than forged from an arbitrary integer.
+    fn backtrack_global_exposed_provenance_source_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        dst_local: Local,
+    ) -> Option<Local> {
+        enum ExposedProvDef<'a, 'tcx> {
+            Rvalue(&'a Rvalue<'tcx>),
+            CallArgs(&'a [Spanned<Operand<'tcx>>]),
+        }
+
+        fn one_local_one_const<'tcx>(
+            pass: &MyOptimizationPass,
+            body: &Body<'tcx>,
+            lhs: &Operand<'tcx>,
+            rhs: &Operand<'tcx>,
+        ) -> Option<Local> {
+            let lhs_local = pass.place_from_operand(lhs).and_then(|p| p.as_local());
+            let rhs_local = pass.place_from_operand(rhs).and_then(|p| p.as_local());
+            match (lhs_local, rhs_local) {
+                (Some(local), None) | (None, Some(local))
+                    if body.local_decls[local].ty.is_integral() =>
+                {
+                    Some(local)
+                }
+                _ => None,
+            }
+        }
+
+        fn inner<'tcx>(
+            pass: &MyOptimizationPass,
+            body: &Body<'tcx>,
+            current_local: Local,
+            visited: &mut HashSet<Local>,
+        ) -> Option<Local> {
+            if !visited.insert(current_local) {
+                return None;
+            }
+
+            let mut found: Option<ExposedProvDef<'_, 'tcx>> = None;
+
+            for block_data in body.basic_blocks.iter() {
+                for stmt in &block_data.statements {
+                    let StatementKind::Assign(box (place, rvalue)) = &stmt.kind else {
+                        continue;
+                    };
+                    if place.as_local() != Some(current_local) {
+                        continue;
+                    }
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(ExposedProvDef::Rvalue(rvalue));
+                }
+
+                if let Some(term) = &block_data.terminator {
+                    if let TerminatorKind::Call {
+                        args, destination, ..
+                    } = &term.kind
+                    {
+                        if destination.as_local() == Some(current_local) {
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some(ExposedProvDef::CallArgs(args));
+                        }
+                    }
+                }
+            }
+
+            match found? {
+                ExposedProvDef::Rvalue(rvalue) => match rvalue {
+                    Rvalue::Use(op) => {
+                        let next_local = pass.place_from_operand(op).and_then(|p| p.as_local())?;
+                        inner(pass, body, next_local, visited)
+                    }
+                    Rvalue::CopyForDeref(place) => {
+                        let next_local = place.as_local()?;
+                        inner(pass, body, next_local, visited)
+                    }
+                    Rvalue::Cast(CastKind::PointerExposeProvenance, op, _) => {
+                        let source_local =
+                            pass.place_from_operand(op).and_then(|p| p.as_local())?;
+                        pass.is_pointer_ty(body.local_decls[source_local].ty)
+                            .then_some(source_local)
+                    }
+                    Rvalue::Cast(
+                        CastKind::IntToInt
+                        | CastKind::Transmute
+                        | CastKind::PointerWithExposedProvenance,
+                        op,
+                        _,
+                    ) => {
+                        let next_local = pass.place_from_operand(op).and_then(|p| p.as_local())?;
+                        inner(pass, body, next_local, visited)
+                    }
+                    Rvalue::BinaryOp(binop, box (lhs, rhs))
+                        if matches!(
+                            binop,
+                            BinOp::BitAnd
+                                | BinOp::BitOr
+                                | BinOp::BitXor
+                                | BinOp::Add
+                                | BinOp::Sub
+                        ) =>
+                    {
+                        let next_local = one_local_one_const(pass, body, lhs, rhs)?;
+                        inner(pass, body, next_local, visited)
+                    }
+                    Rvalue::Aggregate(_, ops) if ops.len() == 1 => {
+                        let next_local = pass
+                            .place_from_operand(ops.iter().next()?)
+                            .and_then(|p| p.as_local())?;
+                        inner(pass, body, next_local, visited)
+                    }
+                    _ => None,
+                },
+                ExposedProvDef::CallArgs(args) => {
+                    let mut recovered: Option<Local> = None;
+                    for arg in args.iter() {
+                        let Some(arg_local) =
+                            pass.place_from_operand(&arg.node).and_then(|p| p.as_local())
+                        else {
+                            continue;
+                        };
+                        let mut branch_visited = visited.clone();
+                        let Some(candidate) = inner(pass, body, arg_local, &mut branch_visited)
+                        else {
+                            continue;
+                        };
+                        match recovered {
+                            Some(existing) if existing != candidate => return None,
+                            Some(_) => {}
+                            None => recovered = Some(candidate),
+                        }
+                    }
+                    recovered
+                }
+            }
+        }
+
+        let mut visited: HashSet<Local> = HashSet::new();
+        inner(self, body, dst_local, &mut visited)
+    }
+
     fn call_arg_push_needs_canonical_boundary_validate<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -9718,7 +9872,36 @@ impl MyOptimizationPass {
                             }
                             let src_local_opt = src_place_opt
                                 .and_then(|src_place| {
-                                    if let Some(src_local) = src_place.as_local() {
+                                    if matches!(
+                                        rvalue,
+                                        Rvalue::Cast(
+                                            CastKind::PointerWithExposedProvenance,
+                                            ..,
+                                        )
+                                    ) {
+                                        self.backtrack_global_exposed_provenance_source_local(
+                                            body, dst_local,
+                                        )
+                                        .or_else(|| {
+                                            src_place.as_local().and_then(|src_local| {
+                                                if self.is_pointer_ty(body.local_decls[src_local].ty)
+                                                {
+                                                    Some(src_local)
+                                                } else {
+                                                    self.backtrack_pointer_source_local(
+                                                        body,
+                                                        src_local,
+                                                        &block_data.statements[..stmt_idx],
+                                                    )
+                                                    .or_else(|| {
+                                                        self.backtrack_global_pointer_value_local(
+                                                            body, src_local,
+                                                        )
+                                                    })
+                                                }
+                                            })
+                                        })
+                                    } else if let Some(src_local) = src_place.as_local() {
                                         if self.is_pointer_ty(body.local_decls[src_local].ty) {
                                             Some(src_local)
                                         } else {
@@ -9727,13 +9910,11 @@ impl MyOptimizationPass {
                                                 src_local,
                                                 &block_data.statements[..stmt_idx],
                                             )
-                                            .or_else(
-                                                || {
-                                                    self.backtrack_global_pointer_value_local(
-                                                        body, src_local,
-                                                    )
-                                                },
-                                            )
+                                            .or_else(|| {
+                                                self.backtrack_global_pointer_value_local(
+                                                    body, src_local,
+                                                )
+                                            })
                                         }
                                     } else {
                                         None
