@@ -6368,6 +6368,7 @@ impl MyOptimizationPass {
             Rvalue::Use(op) => self
                 .place_from_operand(op)
                 .is_some_and(|src_place| source_local_is_recovered(src_place.local)),
+            Rvalue::Ref(_, _, src_place) => source_local_is_recovered(src_place.local),
             Rvalue::CopyForDeref(src_place) | Rvalue::RawPtr(_, src_place) => {
                 source_local_is_recovered(src_place.local)
             }
@@ -20173,11 +20174,12 @@ impl MyOptimizationPass {
                 };
                 if let Some(dst_local) = direct_dst_local {
                     let mut stmts = Vec::new();
+                    let mut recovered_init_local: Option<Local> = None;
                     if let (Some(export_parent_local), Some(dst_tag_local)) = (
                         export_parent_local_for_ptr_local.get(&dst_local).copied(),
                         tag_local_for_ptr_local.get(&dst_local).copied(),
                     ) {
-                        let export_parent_op: Operand<'tcx> = match &creation_kind {
+                        let default_export_parent_op: Operand<'tcx> = match &creation_kind {
                             InstrKind::Ref {
                                 bk,
                                 src,
@@ -20209,6 +20211,114 @@ impl MyOptimizationPass {
                             }
                             _ => Operand::Copy(Place::from(dst_tag_local)),
                         };
+                        let export_parent_op: Operand<'tcx> = match &creation_kind {
+                            InstrKind::Ref { src, .. } => {
+                                if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
+                                    export_parent_local_for_ptr_local.get(&src.local).copied(),
+                                    export_parent_is_recovered_local_for_ptr_local
+                                        .get(&src.local)
+                                        .copied(),
+                                ) {
+                                    recovered_init_local = Some(src_recovered_local);
+                                    let recovered_u64_local = body.local_decls.push(
+                                        LocalDecl::new(tcx.types.u64, source_info.span),
+                                    );
+                                    let not_recovered_u64_local = body.local_decls.push(
+                                        LocalDecl::new(tcx.types.u64, source_info.span),
+                                    );
+                                    let fallback_part_local = body.local_decls.push(
+                                        LocalDecl::new(tcx.types.u64, source_info.span),
+                                    );
+                                    let export_part_local = body.local_decls.push(
+                                        LocalDecl::new(tcx.types.u64, source_info.span),
+                                    );
+                                    let selected_tag_local = body.local_decls.push(
+                                        LocalDecl::new(tcx.types.u64, source_info.span),
+                                    );
+
+                                    stmts.extend([
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(recovered_u64_local),
+                                                Rvalue::Cast(
+                                                    CastKind::IntToInt,
+                                                    Operand::Copy(Place::from(src_recovered_local)),
+                                                    tcx.types.u64,
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(not_recovered_u64_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Sub,
+                                                    Box::new((
+                                                        self.const_u64(tcx, source_info.span, 1),
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(fallback_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            not_recovered_u64_local,
+                                                        )),
+                                                        default_export_parent_op.clone(),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(export_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            src_export_parent_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(selected_tag_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Add,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            fallback_part_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(export_part_local)),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                    ]);
+
+                                    Operand::Copy(Place::from(selected_tag_local))
+                                } else {
+                                    default_export_parent_op
+                                }
+                            }
+                            _ => default_export_parent_op,
+                        };
                         stmts.push(Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
@@ -20225,7 +20335,13 @@ impl MyOptimizationPass {
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(recovered_local),
-                                Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                                Rvalue::Use(
+                                    recovered_init_local
+                                        .map(|local| Operand::Copy(Place::from(local)))
+                                        .unwrap_or_else(|| {
+                                            self.const_u8(tcx, source_info.span, 0)
+                                        }),
+                                ),
                             ))),
                         ));
                     }
