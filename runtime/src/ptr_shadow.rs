@@ -287,6 +287,48 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
 }
 
 #[inline]
+pub(crate) fn store_ptr_local_slot(addr: usize, tag: u64, ref_ancestor: u64) {
+    if addr == 0 {
+        return;
+    }
+
+    kill_range(addr, PTR_SLOT_BYTES);
+    if tag == 0 && ref_ancestor == 0 {
+        return;
+    }
+
+    match slot_loc(addr) {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+        } => {
+            let entry = PtrShadowEntry {
+                tag,
+                ref_ancestor,
+                alloc_base: base,
+                alloc_epoch: epoch,
+            };
+            let mut shadow = alloc_ptr_shadow().lock().unwrap();
+            shadow
+                .entry((base, epoch))
+                .or_default()
+                .insert(offset, entry);
+            abs_ptr_shadow().lock().unwrap().insert(addr, entry);
+        }
+        SlotLoc::Abs { addr } => {
+            let entry = PtrShadowEntry {
+                tag,
+                ref_ancestor,
+                alloc_base: 0,
+                alloc_epoch: 0,
+            };
+            abs_ptr_shadow().lock().unwrap().insert(addr, entry);
+        }
+    }
+}
+
+#[inline]
 fn abs_entry_matches(addr: usize, entry: PtrShadowEntry) -> bool {
     if entry.alloc_epoch == 0 {
         return true;

@@ -2583,6 +2583,22 @@ pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor
 }
 
 #[no_mangle]
+pub extern "C" fn __rz_shadow_store_ptr_local(slot_addr: usize, tag: u64, ref_ancestor: u64) {
+    let _g = RzRuntimeGuard::enter();
+    let (tag, ref_ancestor) = sanitize_shadow_entry_for_slot_value(slot_addr, tag, ref_ancestor);
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] store_local slot=0x{:x} tag={} ref_ancestor={}",
+            slot_addr, tag, ref_ancestor
+        );
+    }
+    ptr_shadow::store_ptr_local_slot(slot_addr, tag, ref_ancestor);
+}
+
+#[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
