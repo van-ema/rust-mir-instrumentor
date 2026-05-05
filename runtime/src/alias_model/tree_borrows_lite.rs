@@ -1239,7 +1239,7 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                ) || (matches!(tmeta.kind, PtrKind::RawMut)
+                ) || (matches!(tmeta.kind, PtrKind::RefMut | PtrKind::RawMut)
                     && tb_has_live_unique_lineage_ancestor(
                         &tree.nodes,
                         &access_lineage,
