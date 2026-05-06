@@ -780,22 +780,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::as_mut_ptr",
         CallEffect::PtrDerive,
     ),
-    // SmallVec pointer extraction wrappers. These are thin wrappers over internal storage and
-    // should preserve provenance like Vec::{as_ptr,as_mut_ptr}.
-    EffectRule::two(
-        MatchKind::Contains,
-        "::SmallVec",
-        MatchKind::EndsWith,
-        "::as_ptr",
-        CallEffect::PtrDerive,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::SmallVec",
-        MatchKind::EndsWith,
-        "::as_mut_ptr",
-        CallEffect::PtrDerive,
-    ),
     // Transmute-style helpers returning pointers should preserve lineage.
     EffectRule::one(
         MatchKind::Contains,
@@ -10562,53 +10546,43 @@ impl MyOptimizationPass {
         CallEffect::Unknown
     }
 
-    fn operand_base_adt_name<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        operand: &Operand<'tcx>,
-    ) -> Option<String> {
-        let mut ty = operand.ty(body, tcx);
-        loop {
-            match ty.kind() {
-                TyKind::Ref(_, inner, _) => ty = *inner,
-                TyKind::RawPtr(inner, _) => ty = *inner,
-                TyKind::Adt(adt, _) => return Some(tcx.def_path_str(adt.did())),
-                _ => return None,
-            }
-        }
-    }
-
-    fn classify_call_effect_from_receiver_type<'tcx>(
+    fn classify_instrumented_call_effect_from_summary<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         args: &Box<[Spanned<Operand<'tcx>>]>,
-        def_path: &str,
+        destination: &Place<'tcx>,
+        summary: &unsafe_dataflow::UnsafeFunctionSummary,
     ) -> Option<CallEffect> {
-        let receiver_name = self.operand_base_adt_name(tcx, body, &args.get(0)?.node)?;
-
-        if (def_path.ends_with("::as_ptr") || def_path.ends_with("::as_mut_ptr"))
-            && receiver_name.ends_with("SmallVec")
-        {
-            return Some(CallEffect::PtrDerive);
+        let dst_ty = destination.ty(&body.local_decls, tcx).ty;
+        if !self.is_pointer_ty(dst_ty) {
+            return None;
         }
 
-        if (def_path.ends_with("::len") || def_path.ends_with("::is_empty"))
-            && receiver_name.ends_with("SmallVec")
-        {
-            return Some(CallEffect::Ignore);
+        if summary.ptr_args().iter().any(|entry| {
+            entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary()
+        }) {
+            return None;
         }
 
-        // `hashbrown::raw::Bucket::{as_ptr,as_mut_ptr}` are thin pointer extraction wrappers
-        // over the bucket handle and should preserve provenance like Vec/SmallVec pointer views.
-        if (def_path.ends_with("::as_ptr") || def_path.ends_with("::as_mut_ptr"))
-            && receiver_name.ends_with("Bucket")
-        {
-            return Some(CallEffect::PtrDerive);
+        let mut forwarded = summary.ptr_args().iter().filter(|entry| entry.forwarded_to_return());
+        let forwarded_arg = forwarded.next()?;
+        if forwarded.next().is_some() {
+            return None;
         }
 
-        None
+        let Some(arg) = args.get(forwarded_arg.arg_index()) else {
+            return None;
+        };
+        let Some(arg_place) = self.place_from_operand(&arg.node) else {
+            return None;
+        };
+        let arg_ty = arg_place.ty(&body.local_decls, tcx).ty;
+        if !self.is_pointer_ty(arg_ty) {
+            return None;
+        }
+
+        Some(CallEffect::PtrDerive)
     }
 
     fn pointer_place_from_rvalue<'tcx>(&self, rvalue: &Rvalue<'tcx>) -> Option<Place<'tcx>> {
@@ -12239,6 +12213,7 @@ impl MyOptimizationPass {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
         let callee_path_opt = callee_opt.map(|(did, _)| tcx.def_path_str(did));
+        let callee_summary_opt = callee_opt.and_then(|(did, _)| unsafe_dataflow::summary_for_def_id(tcx, did));
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
@@ -12250,12 +12225,16 @@ impl MyOptimizationPass {
         let mut call_effect_opt: Option<CallEffect> = callee_path_opt
             .as_deref()
             .map(|p| self.classify_call_effect(p));
-        if matches!(call_effect_opt, None | Some(CallEffect::Unknown)) {
-            if let Some(def_path) = callee_path_opt.as_deref() {
-                if let Some(receiver_effect) =
-                    self.classify_call_effect_from_receiver_type(tcx, body, args, def_path)
-                {
-                    call_effect_opt = Some(receiver_effect);
+        if callee_instrumented && matches!(call_effect_opt, None | Some(CallEffect::Unknown)) {
+            if let Some(summary) = callee_summary_opt.as_ref() {
+                if let Some(summary_effect) = self.classify_instrumented_call_effect_from_summary(
+                    tcx,
+                    body,
+                    args,
+                    destination,
+                    summary,
+                ) {
+                    call_effect_opt = Some(summary_effect);
                 }
             }
         }
@@ -23168,18 +23147,6 @@ mod tests {
         assert_eq!(
             effect_for("core::sync::atomic::AtomicPtr::<T>::new"),
             CallEffect::CarrierCopyArg0
-        );
-        assert_eq!(
-            effect_for("smallvec::SmallVec::<A>::as_mut_ptr"),
-            CallEffect::PtrDerive
-        );
-        assert_eq!(
-            effect_for("smallvec::SmallVec::<A>::as_ptr"),
-            CallEffect::PtrDerive
-        );
-        assert_eq!(
-            effect_for("hashbrown::raw::Bucket::<T>::as_ptr"),
-            CallEffect::PtrDerive
         );
         assert_eq!(effect_for("core::ptr::null"), CallEffect::Ignore);
         assert_eq!(
