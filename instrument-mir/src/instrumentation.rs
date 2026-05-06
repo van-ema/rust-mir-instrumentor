@@ -7025,6 +7025,12 @@ impl MyOptimizationPass {
         anchor_key: Option<&(String, Vec<Local>)>,
         projected_reborrow_anchor_specs: &mut ReborrowAnchorSpecMap,
     ) -> Option<String> {
+        if matches!(
+            self.parent_selection_mode_for_src_place(body, src_place),
+            ParentSelectionMode::ReceiverFamily
+        ) {
+            return None;
+        }
         let (key, deps) = anchor_key?;
         if !self.projected_reborrow_anchor_eligible(body, src_place, deps) {
             return None;
@@ -7803,6 +7809,19 @@ impl MyOptimizationPass {
         projectionless_anchor_suppressed_locals: &HashSet<Local>,
         extra_stmts: &mut Vec<Statement<'tcx>>,
     ) -> Option<Local> {
+        if matches!(
+            self.parent_selection_mode_for_src_place(body, src_place),
+            ParentSelectionMode::ReceiverFamily
+        ) {
+            // Projected reborrow anchors preserve nested pointee lineage across wrapper-heavy
+            // projected accesses. Receiver-family reborrows such as `&(*self_ref)` or
+            // `&(*bytes_ref).field` must stay under the current receiver family instead.
+            // Reusing a nonzero projected anchor here lets nested payload lineage override the
+            // receiver tag and later validates stack-carrier field reads with heap/sentinel
+            // metadata.
+            return None;
+        }
+
         let anchor_local = projected_reborrow_anchor_key
             .and_then(|key| projected_reborrow_anchor_local_for_key.get(key))
             .copied()?;
