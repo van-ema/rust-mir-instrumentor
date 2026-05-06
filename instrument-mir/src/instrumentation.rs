@@ -3886,132 +3886,12 @@ impl MyOptimizationPass {
         eligible
     }
 
-    // Identify one-use shared reborrow temps of the form `_tmp = &(*base); call(move _tmp)`.
-    //
-    // These temps are created only to satisfy a helper call like `self.is_empty()`, but the
-    // later whole-object write in the caller can still see the temp's shared tag as live if we
-    // emit the usual coarse `PtrUse` escape and wait until `StorageDead` to retire it. For this
-    // narrow shape we instead:
-    //  - skip the coarse `PtrUse` call-boundary escape, and
-    //  - insert `TagKill` on the normal return edge of the call.
-    //
-    // This keeps the reborrow fully visible during the call itself, while preventing stale
-    // caller-side temp holders from causing false Tree Borrows protector conflicts afterward.
-    fn compute_summary_noescape_shared_reborrow_call_ref_locals<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-    ) -> HashSet<Local> {
-        let local_stats = self.compute_local_ref_use_stats(body);
-        let mut eligible = HashSet::new();
-
-        for (_bb, block_data) in body.basic_blocks.iter_enumerated() {
-            let Some(term) = &block_data.terminator else {
-                continue;
-            };
-            let TerminatorKind::Call { func, args, .. } = &term.kind else {
-                continue;
-            };
-
-            let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
-                continue;
-            };
-            let callee_instrumented = self.is_instrumented_callee(tcx, callee_did);
-            let summary = unsafe_dataflow::summary_for_def_id(tcx, callee_did);
-
-            for (arg_index, arg) in args.iter().enumerate() {
-                let Some(place) = self.place_from_operand(&arg.node) else {
-                    continue;
-                };
-                let local = place.local;
-                let Some(stat) = local_stats.get(&local) else {
-                    continue;
-                };
-                if stat.defs != 1 || stat.uses != 1 {
-                    continue;
-                }
-
-                let Some(def_stmt) = body
-                    .basic_blocks
-                    .iter()
-                    .flat_map(|bbd| bbd.statements.iter())
-                    .find(|stmt| {
-                        matches!(
-                            &stmt.kind,
-                            StatementKind::Assign(box (lhs, Rvalue::Ref(_, BorrowKind::Shared, _)))
-                                if lhs.as_local() == Some(local)
-                        )
-                    })
-                else {
-                    continue;
-                };
-
-                let StatementKind::Assign(box (_, Rvalue::Ref(_, BorrowKind::Shared, src_place))) =
-                    &def_stmt.kind
-                else {
-                    continue;
-                };
-
-                let local_ty = body.local_decls[local].ty;
-                if !matches!(local_ty.kind(), TyKind::Ref(_, _, Mutability::Not)) {
-                    continue;
-                }
-
-                let whole_place_slot_family_src =
-                    self.is_whole_place_slot_family_source(tcx, body, *src_place);
-                if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                    && !whole_place_slot_family_src
-                {
-                    continue;
-                }
-
-                let summary_allows = summary.as_ref().and_then(|summary| {
-                    summary
-                        .ptr_args()
-                        .iter()
-                        .find(|entry| entry.arg_index() == arg_index)
-                        .map(|arg_summary| {
-                            !arg_summary.reaches_direct_sink()
-                                && !arg_summary.escapes_to_unknown_boundary()
-                                && !arg_summary.forwarded_to_return()
-                        })
-                });
-
-                let def_path = tcx.def_path_str(callee_did);
-                let read_only_effect = matches!(
-                    self.match_call_effect_rule(&def_path).or_else(|| {
-                        self.classify_call_effect_from_receiver_type(tcx, body, args, &def_path)
-                    }),
-                    Some(CallEffect::Load | CallEffect::Ignore)
-                );
-
-                if !callee_instrumented {
-                    if !matches!(summary_allows, Some(true)) {
-                        continue;
-                    }
-                } else if whole_place_slot_family_src
-                    && !matches!(summary_allows, Some(true))
-                    && !read_only_effect
-                {
-                    continue;
-                } else if matches!(summary_allows, Some(false)) {
-                    continue;
-                }
-
-                eligible.insert(local);
-            }
-        }
-
-        eligible
-    }
-
-    fn call_arg_is_noescape_shared_reborrow_temp<'tcx>(
+    fn noescape_shared_reborrow_call_temp_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block_data: &BasicBlockData<'tcx>,
         func: &Operand<'tcx>,
-        args: &Box<[Spanned<Operand<'tcx>>]>,
         local_ref_use_stats: &HashMap<Local, LocalRefUseStats>,
         arg_index: usize,
         arg: &Spanned<Operand<'tcx>>,
@@ -4019,7 +3899,7 @@ impl MyOptimizationPass {
         let Some(place) = self.place_from_operand(&arg.node) else {
             return None;
         };
-        if !matches!(arg.node, Operand::Move(_)) || !place.projection.is_empty() {
+        if !place.projection.is_empty() {
             return None;
         }
         let local = place.local;
@@ -4058,7 +3938,6 @@ impl MyOptimizationPass {
         let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
             return None;
         };
-        let callee_instrumented = self.is_instrumented_callee(tcx, callee_did);
         let summary_allows = unsafe_dataflow::summary_for_def_id(tcx, callee_did).and_then(
             |summary| {
                 summary
@@ -4072,25 +3951,7 @@ impl MyOptimizationPass {
                     })
             },
         );
-
-        let def_path = tcx.def_path_str(callee_did);
-        let read_only_effect = matches!(
-            self.match_call_effect_rule(&def_path).or_else(|| {
-                self.classify_call_effect_from_receiver_type(tcx, body, args, &def_path)
-            }),
-            Some(CallEffect::Load | CallEffect::Ignore)
-        );
-
-        if !callee_instrumented {
-            if !matches!(summary_allows, Some(true)) {
-                return None;
-            }
-        } else if whole_place_slot_family_src
-            && !matches!(summary_allows, Some(true))
-            && !read_only_effect
-        {
-            return None;
-        } else if matches!(summary_allows, Some(false)) {
+        if !matches!(summary_allows, Some(true)) {
             return None;
         }
 
@@ -12374,7 +12235,6 @@ impl MyOptimizationPass {
         interesting_stack_locals: &HashSet<Local>,
         local_slot_shadow_store_locals: &mut HashSet<Local>,
         local_ref_use_stats: &HashMap<Local, LocalRefUseStats>,
-        summary_noescape_shared_reborrow_call_ref_locals: &HashSet<Local>,
     ) {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
@@ -12417,12 +12277,11 @@ impl MyOptimizationPass {
         };
         let mut noescape_shared_reborrow_call_temps: HashSet<Local> = HashSet::new();
         for (arg_index, arg) in args.iter().enumerate() {
-            if let Some(local) = self.call_arg_is_noescape_shared_reborrow_temp(
+            if let Some(local) = self.noescape_shared_reborrow_call_temp_local(
                 tcx,
                 body,
                 block_data,
                 func,
-                args,
                 local_ref_use_stats,
                 arg_index,
                 arg,
@@ -13284,10 +13143,9 @@ impl MyOptimizationPass {
             }
             let projected_carrier_raw_ptr_use = self.is_raw_pointer_ty(ty)
                 && self.raw_creation_allows_no_provenance_transport(tcx, body, p);
-            let summary_noescape_shared_reborrow_temp = noescape_shared_reborrow_call_temps
-                .contains(&p.local)
-                || summary_noescape_shared_reborrow_call_ref_locals.contains(&p.local);
-            if !projected_carrier_raw_ptr_use && !summary_noescape_shared_reborrow_temp {
+            let noescape_shared_reborrow_temp =
+                noescape_shared_reborrow_call_temps.contains(&p.local);
+            if !projected_carrier_raw_ptr_use && !noescape_shared_reborrow_temp {
                 ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
@@ -13794,9 +13652,7 @@ impl MyOptimizationPass {
                 if dst_local == Some(arg_place.local) {
                     continue;
                 }
-                if noescape_shared_reborrow_call_temps.contains(&arg_place.local)
-                    || summary_noescape_shared_reborrow_call_ref_locals.contains(&arg_place.local)
-                {
+                if noescape_shared_reborrow_call_temps.contains(&arg_place.local) {
                     kill_locals.insert(arg_place.local);
                 }
             }
@@ -13936,9 +13792,6 @@ impl MyOptimizationPass {
         let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
         let summary_elidable_shared_call_ref_locals =
             self.compute_summary_elidable_shared_call_ref_locals(tcx, body);
-        let summary_noescape_shared_reborrow_call_ref_locals =
-            self.compute_summary_noescape_shared_reborrow_call_ref_locals(tcx, body);
-
         let mut explicitly_tracked: HashSet<Local> = HashSet::new();
         for block_data in body.basic_blocks.iter() {
             for stmt in block_data.statements.iter() {
@@ -14113,7 +13966,6 @@ impl MyOptimizationPass {
                         &interesting_stack_locals,
                         &mut local_slot_shadow_store_locals,
                         &local_ref_use_stats,
-                        &summary_noescape_shared_reborrow_call_ref_locals,
                     );
                     self.invalidate_ssa_anchors_for_call(
                         body,
