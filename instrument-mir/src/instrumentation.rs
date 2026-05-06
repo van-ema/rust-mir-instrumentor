@@ -496,21 +496,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::deref_mut",
         CallEffect::PtrDerive,
     ),
-    // Iterator adaptors: conservative Ignore to avoid treating &mut self as read/write.
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::traits::iterator::Iterator",
-        MatchKind::EndsWith,
-        "::by_ref",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::traits::iterator::Iterator",
-        MatchKind::EndsWith,
-        "::for_each",
-        CallEffect::Ignore,
-    ),
+    // Iterator metadata helpers.
     EffectRule::two(
         MatchKind::Contains,
         "::iter::traits::iterator::Iterator",
@@ -520,65 +506,9 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     ),
     EffectRule::two(
         MatchKind::Contains,
-        "::iter::traits::iterator::Iterator",
-        MatchKind::EndsWith,
-        "::collect",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::traits::iterator::Iterator",
-        MatchKind::EndsWith,
-        "::next",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::traits::iterator::Iterator",
-        MatchKind::EndsWith,
-        "::nth",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::Iterator",
-        MatchKind::EndsWith,
-        "::by_ref",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::Iterator",
-        MatchKind::EndsWith,
-        "::for_each",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
         "::iter::Iterator",
         MatchKind::EndsWith,
         "::size_hint",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::Iterator",
-        MatchKind::EndsWith,
-        "::collect",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::Iterator",
-        MatchKind::EndsWith,
-        "::next",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::Iterator",
-        MatchKind::EndsWith,
-        "::nth",
         CallEffect::Ignore,
     ),
     // Slice helpers.
@@ -915,13 +845,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::is_ok",
         CallEffect::Ignore,
     ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::convert::Into",
-        MatchKind::EndsWith,
-        "::into",
-        CallEffect::Ignore,
-    ),
     EffectRule::one(
         MatchKind::Contains,
         "::mem::size_of_val",
@@ -934,7 +857,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::panicking::assert_failed",
         CallEffect::Ignore,
     ),
-    EffectRule::one(MatchKind::Contains, "::fmt::", CallEffect::Ignore),
     EffectRule::two(
         MatchKind::Contains,
         "::cmp::PartialEq",
@@ -1117,13 +1039,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::ptr::slice_from_raw_parts_mut",
         CallEffect::PtrDerive,
     ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::iter::IntoIterator",
-        MatchKind::EndsWith,
-        "::into_iter",
-        CallEffect::Ignore,
-    ),
     // Vec helpers (metadata + length management).
     EffectRule::two(
         MatchKind::Contains,
@@ -1151,48 +1066,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::vec::Vec",
         MatchKind::EndsWith,
         "::set_len",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::reserve",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::reserve_exact",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::try_reserve",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::try_reserve_exact",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::extend_from_slice",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::vec::Vec",
-        MatchKind::EndsWith,
-        "::resize",
         CallEffect::Ignore,
     ),
     EffectRule::two(
@@ -1236,13 +1109,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::collections::VecDeque",
         MatchKind::EndsWith,
         "::as_slices",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "::collections::VecDeque",
-        MatchKind::EndsWith,
-        "::drain",
         CallEffect::Ignore,
     ),
     // String / str helpers.
@@ -23082,10 +22948,6 @@ mod tests {
         assert_eq!(effect_for("core::ptr::null"), CallEffect::Ignore);
         assert_eq!(
             effect_for("std::io::Cursor::<T>::position"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("core::fmt::Formatter::<'a>::write_fmt"),
             CallEffect::Ignore
         );
         assert_eq!(
