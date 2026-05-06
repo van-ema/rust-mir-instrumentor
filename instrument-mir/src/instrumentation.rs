@@ -2743,7 +2743,7 @@ impl MyOptimizationPass {
         if !local_ty.is_sized(tcx, body.typing_env(tcx)) {
             return false;
         }
-        if !self.ty_contains_pointer_fields(tcx, body, local_ty, 4) {
+        if !self.ty_contains_pointer_fields(tcx, body, local_ty, 8) {
             return false;
         }
 
@@ -3926,28 +3926,46 @@ impl MyOptimizationPass {
                     continue;
                 }
 
-                if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref)) {
+                let projectionless_carrier_src = src_place.projection.is_empty()
+                    && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+                    && self.supports_arg_anchor_take_local(tcx, body, src_place.local);
+                if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+                    && !projectionless_carrier_src
+                {
                     continue;
                 }
 
-                if !callee_instrumented {
-                    let Some(ref summary) = summary else {
-                        continue;
-                    };
-                    let Some(arg_summary) = summary
+                let summary_allows = summary.as_ref().and_then(|summary| {
+                    summary
                         .ptr_args()
                         .iter()
                         .find(|entry| entry.arg_index() == arg_index)
-                    else {
-                        continue;
-                    };
+                        .map(|arg_summary| {
+                            !arg_summary.reaches_direct_sink()
+                                && !arg_summary.escapes_to_unknown_boundary()
+                                && !arg_summary.forwarded_to_return()
+                        })
+                });
 
-                    if arg_summary.reaches_direct_sink()
-                        || arg_summary.escapes_to_unknown_boundary()
-                        || arg_summary.forwarded_to_return()
-                    {
+                let def_path = tcx.def_path_str(callee_did);
+                let read_only_effect = matches!(
+                    self.match_call_effect_rule(&def_path).or_else(|| {
+                        self.classify_call_effect_from_receiver_type(tcx, body, args, &def_path)
+                    }),
+                    Some(CallEffect::Load | CallEffect::Ignore)
+                );
+
+                if !callee_instrumented {
+                    if !matches!(summary_allows, Some(true)) {
                         continue;
                     }
+                } else if projectionless_carrier_src
+                    && !matches!(summary_allows, Some(true))
+                    && !read_only_effect
+                {
+                    continue;
+                } else if matches!(summary_allows, Some(false)) {
+                    continue;
                 }
 
                 eligible.insert(local);
@@ -3961,9 +3979,9 @@ impl MyOptimizationPass {
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
-        bb: BasicBlock,
         block_data: &BasicBlockData<'tcx>,
         func: &Operand<'tcx>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
         local_ref_use_stats: &HashMap<Local, LocalRefUseStats>,
         arg_index: usize,
         arg: &Spanned<Operand<'tcx>>,
@@ -3999,25 +4017,52 @@ impl MyOptimizationPass {
             }
         }
         let src_place = def_src_place?;
-        if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref)) {
+        let projectionless_carrier_src = src_place.projection.is_empty()
+            && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+            && self.supports_arg_anchor_take_local(tcx, body, src_place.local);
+        if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && !projectionless_carrier_src
+        {
             return None;
         }
 
         let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
             return None;
         };
-        if !self.is_instrumented_callee(tcx, callee_did) {
-            let summary = unsafe_dataflow::summary_for_def_id(tcx, callee_did)?;
-            let arg_summary = summary
-                .ptr_args()
-                .iter()
-                .find(|entry| entry.arg_index() == arg_index)?;
-            if arg_summary.reaches_direct_sink()
-                || arg_summary.escapes_to_unknown_boundary()
-                || arg_summary.forwarded_to_return()
-            {
+        let callee_instrumented = self.is_instrumented_callee(tcx, callee_did);
+        let summary_allows = unsafe_dataflow::summary_for_def_id(tcx, callee_did).and_then(
+            |summary| {
+                summary
+                    .ptr_args()
+                    .iter()
+                    .find(|entry| entry.arg_index() == arg_index)
+                    .map(|arg_summary| {
+                        !arg_summary.reaches_direct_sink()
+                            && !arg_summary.escapes_to_unknown_boundary()
+                            && !arg_summary.forwarded_to_return()
+                    })
+            },
+        );
+
+        let def_path = tcx.def_path_str(callee_did);
+        let read_only_effect = matches!(
+            self.match_call_effect_rule(&def_path).or_else(|| {
+                self.classify_call_effect_from_receiver_type(tcx, body, args, &def_path)
+            }),
+            Some(CallEffect::Load | CallEffect::Ignore)
+        );
+
+        if !callee_instrumented {
+            if !matches!(summary_allows, Some(true)) {
                 return None;
             }
+        } else if projectionless_carrier_src
+            && !matches!(summary_allows, Some(true))
+            && !read_only_effect
+        {
+            return None;
+        } else if matches!(summary_allows, Some(false)) {
+            return None;
         }
 
         Some(local)
@@ -10511,6 +10556,12 @@ impl MyOptimizationPass {
             return Some(CallEffect::PtrDerive);
         }
 
+        if (def_path.ends_with("::len") || def_path.ends_with("::is_empty"))
+            && receiver_name.ends_with("SmallVec")
+        {
+            return Some(CallEffect::Ignore);
+        }
+
         // `hashbrown::raw::Bucket::{as_ptr,as_mut_ptr}` are thin pointer extraction wrappers
         // over the bucket handle and should preserve provenance like Vec/SmallVec pointer views.
         if (def_path.ends_with("::as_ptr") || def_path.ends_with("::as_mut_ptr"))
@@ -12192,9 +12243,9 @@ impl MyOptimizationPass {
             if let Some(local) = self.call_arg_is_noescape_shared_reborrow_temp(
                 tcx,
                 body,
-                bb,
                 block_data,
                 func,
+                args,
                 local_ref_use_stats,
                 arg_index,
                 arg,
@@ -20873,6 +20924,114 @@ impl MyOptimizationPass {
                         };
                         let export_parent_op: Operand<'tcx> = match &creation_kind {
                             InstrKind::Ref { src, .. } => {
+                                let src_local = src.local;
+                                if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
+                                    export_parent_local_for_ptr_local.get(&src_local).copied(),
+                                    export_parent_is_recovered_local_for_ptr_local
+                                        .get(&src_local)
+                                        .copied(),
+                                ) {
+                                    recovered_init_local = Some(src_recovered_local);
+                                    let recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let not_recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let fallback_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let export_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let selected_tag_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+                                    stmts.extend([
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(recovered_u64_local),
+                                                Rvalue::Cast(
+                                                    CastKind::IntToInt,
+                                                    Operand::Copy(Place::from(src_recovered_local)),
+                                                    tcx.types.u64,
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(not_recovered_u64_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Sub,
+                                                    Box::new((
+                                                        self.const_u64(tcx, source_info.span, 1),
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(fallback_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            not_recovered_u64_local,
+                                                        )),
+                                                        default_export_parent_op.clone(),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(export_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            src_export_parent_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(selected_tag_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Add,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            fallback_part_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            export_part_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                    ]);
+
+                                    Operand::Copy(Place::from(selected_tag_local))
+                                } else {
+                                    default_export_parent_op
+                                }
+                            }
+                            InstrKind::Raw { src, .. } => {
                                 let src_local = src.local;
                                 if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
                                     export_parent_local_for_ptr_local.get(&src_local).copied(),
