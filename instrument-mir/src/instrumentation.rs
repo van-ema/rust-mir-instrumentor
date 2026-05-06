@@ -956,21 +956,21 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::get",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::get_mut",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::last_mut",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -1124,7 +1124,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::str::<impl str>",
         MatchKind::EndsWith,
         "::as_bytes",
-        CallEffect::Ignore,
+        CallEffect::PtrDerive,
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -1139,7 +1139,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::io::Cursor",
         MatchKind::EndsWith,
         "::get_ref",
-        CallEffect::Ignore,
+        CallEffect::PtrDerive,
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -22885,7 +22885,7 @@ mod tests {
     fn classify_common_helpers() {
         assert_eq!(
             effect_for("core::slice::<impl [T]>::get"),
-            CallEffect::Ignore
+            CallEffect::CarrierCopyArg0
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::is_empty"),
@@ -22894,6 +22894,10 @@ mod tests {
         assert_eq!(
             effect_for("core::slice::<impl [T]>::len"),
             CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("core::str::<impl str>::as_bytes"),
+            CallEffect::PtrDerive
         );
         assert_eq!(
             effect_for("core::slice::index::<impl core::ops::Index<I> for [T]>::index"),
@@ -22946,6 +22950,10 @@ mod tests {
             CallEffect::CarrierCopyArg0
         );
         assert_eq!(effect_for("core::ptr::null"), CallEffect::Ignore);
+        assert_eq!(
+            effect_for("std::io::Cursor::<T>::get_ref"),
+            CallEffect::PtrDerive
+        );
         assert_eq!(
             effect_for("std::io::Cursor::<T>::position"),
             CallEffect::Ignore
