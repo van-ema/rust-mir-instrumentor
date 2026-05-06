@@ -2741,14 +2741,14 @@ impl MyOptimizationPass {
         Some((slot_ptr_stmt, addr_stmt))
     }
 
-    /// Return whether `local` is a non-pointer carrier whose whole-slot borrow family can be
-    /// imported/exported via the anchor side channel at call entry / return edges.
+    /// Return whether `local` has an explicit slot-family channel.
     ///
     /// Unlike `ty_contains_direct_pointer_fields`, this is allowed to recurse through owner or
-    /// container internals. The anchor models the borrow family of the outer slot `T` itself, not
-    /// the ABI transport of any specific nested raw field. Types like `BytesMut` therefore need
-    /// this path even though they do not store a source-level reference/raw directly.
-    fn supports_arg_anchor_take_local<'tcx>(
+    /// container internals. The slot-family models the borrow family of the outer slot `T`
+    /// itself, not the ABI transport of any specific nested raw field. Types like `BytesMut`
+    /// therefore need this path even though they do not store a source-level reference/raw
+    /// directly.
+    fn supports_slot_family_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -2756,6 +2756,9 @@ impl MyOptimizationPass {
     ) -> bool {
         let local_ty = body.local_decls[local].ty;
         if !local_ty.is_sized(tcx, body.typing_env(tcx)) {
+            return false;
+        }
+        if self.is_pointer_ty(local_ty) {
             return false;
         }
         if !self.ty_contains_pointer_fields(tcx, body, local_ty, 8) {
@@ -2780,16 +2783,29 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         local: Local,
     ) -> bool {
-        let local_ty = body.local_decls[local].ty;
-        if !local_ty.is_sized(tcx, body.typing_env(tcx)) {
+        if !self.supports_slot_family_local(tcx, body, local) {
             return false;
         }
+        let local_ty = body.local_decls[local].ty;
         if !self.ty_contains_direct_pointer_fields(tcx, body, local_ty) {
             return false;
         }
 
         let raw_ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
+    }
+
+    fn is_whole_place_slot_family_source<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+    ) -> bool {
+        src_place.projection.is_empty()
+            && matches!(
+                self.creation_parent_selection_mode_for_src_place(tcx, body, src_place, true),
+                ParentSelectionMode::SlotFamily
+            )
     }
 
     fn first_direct_ref_field_place<'tcx>(
@@ -3941,11 +3957,10 @@ impl MyOptimizationPass {
                     continue;
                 }
 
-                let projectionless_carrier_src = src_place.projection.is_empty()
-                    && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
-                    && self.supports_arg_anchor_take_local(tcx, body, src_place.local);
+                let whole_place_slot_family_src =
+                    self.is_whole_place_slot_family_source(tcx, body, *src_place);
                 if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                    && !projectionless_carrier_src
+                    && !whole_place_slot_family_src
                 {
                     continue;
                 }
@@ -3974,7 +3989,7 @@ impl MyOptimizationPass {
                     if !matches!(summary_allows, Some(true)) {
                         continue;
                     }
-                } else if projectionless_carrier_src
+                } else if whole_place_slot_family_src
                     && !matches!(summary_allows, Some(true))
                     && !read_only_effect
                 {
@@ -4032,11 +4047,10 @@ impl MyOptimizationPass {
             }
         }
         let src_place = def_src_place?;
-        let projectionless_carrier_src = src_place.projection.is_empty()
-            && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
-            && self.supports_arg_anchor_take_local(tcx, body, src_place.local);
+        let whole_place_slot_family_src =
+            self.is_whole_place_slot_family_source(tcx, body, src_place);
         if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-            && !projectionless_carrier_src
+            && !whole_place_slot_family_src
         {
             return None;
         }
@@ -4071,7 +4085,7 @@ impl MyOptimizationPass {
             if !matches!(summary_allows, Some(true)) {
                 return None;
             }
-        } else if projectionless_carrier_src
+        } else if whole_place_slot_family_src
             && !matches!(summary_allows, Some(true))
             && !read_only_effect
         {
@@ -7936,7 +7950,7 @@ impl MyOptimizationPass {
 
         if use_projectionless_anchor
             && src_place.projection.is_empty()
-            && self.supports_arg_anchor_take_local(tcx, body, src_place.local)
+            && self.supports_slot_family_local(tcx, body, src_place.local)
         {
             return ParentSelectionMode::SlotFamily;
         }
@@ -9991,7 +10005,7 @@ impl MyOptimizationPass {
                 {
                     if !self.is_pointer_ty(dst_ty)
                         && !src_place.projection.is_empty()
-                        && self.supports_arg_anchor_take_local(tcx, body, dst_local)
+                        && self.supports_slot_family_local(tcx, body, dst_local)
                     {
                         if let Some(recovered_src_local) = self
                             .backtrack_same_typed_call_result_source_local(
@@ -11472,7 +11486,7 @@ impl MyOptimizationPass {
                 if arg_ty != wanted_ty || self.is_pointer_ty(arg_ty) {
                     continue;
                 }
-                if !self.supports_arg_anchor_take_local(tcx, body, arg_place.local) {
+                if !self.supports_slot_family_local(tcx, body, arg_place.local) {
                     continue;
                 }
                 candidates.insert(arg_place.local);
@@ -13970,7 +13984,7 @@ impl MyOptimizationPass {
         for arg_local in body.args_iter() {
             let arg_ty = body.local_decls[arg_local].ty;
             if !self.is_pointer_ty(arg_ty)
-                && self.supports_arg_anchor_take_local(tcx, body, arg_local)
+                && self.supports_slot_family_local(tcx, body, arg_local)
             {
                 interesting_stack_locals.insert(arg_local);
             }
@@ -13987,7 +14001,7 @@ impl MyOptimizationPass {
             };
             let dst_ty = body.local_decls[dst_local].ty;
             if !self.is_pointer_ty(dst_ty)
-                && self.supports_arg_anchor_take_local(tcx, body, dst_local)
+                && self.supports_slot_family_local(tcx, body, dst_local)
             {
                 interesting_stack_locals.insert(dst_local);
             }
@@ -14532,7 +14546,7 @@ impl MyOptimizationPass {
                 let dst_ty = body.local_decls[dst_local].ty;
                 if !self.is_pointer_ty(dst_ty)
                     && !src_place.projection.is_empty()
-                    && self.supports_arg_anchor_take_local(tcx, body, dst_local)
+                    && self.supports_slot_family_local(tcx, body, dst_local)
                 {
                     if let Some(recovered_src_local) = self
                         .backtrack_same_typed_call_result_source_local(tcx, body, src_local, dst_ty)
@@ -14558,7 +14572,7 @@ impl MyOptimizationPass {
                     let src_ty = src_place.ty(&body.local_decls, tcx).ty;
                     if !self.is_pointer_ty(dst_ty)
                         && !src_place.projection.is_empty()
-                        && self.supports_arg_anchor_take_local(tcx, body, dst_local)
+                        && self.supports_slot_family_local(tcx, body, dst_local)
                     {
                         if let Some(recovered_src_local) = self
                             .backtrack_same_typed_call_result_source_local(
