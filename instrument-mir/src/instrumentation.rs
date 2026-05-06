@@ -834,64 +834,6 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     EffectRule::one(MatchKind::EndsWith, "::write_bytes", CallEffect::MemSet),
     // Plain wrappers.
     // Use suffix matching for `read`/`write` so we don't accidentally match `write_bytes`/`read_bytes`.
-    // `rkyv::place::Place<T>` is a write-capability wrapper around an internal raw pointer, not a
-    // normal shared-reference write target.
-    EffectRule::two(
-        MatchKind::Contains,
-        "rkyv::place::Place",
-        MatchKind::EndsWith,
-        "::write",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "rkyv::place::Place",
-        MatchKind::EndsWith,
-        "::write_unchecked",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "rkyv::place::<impl Place",
-        MatchKind::EndsWith,
-        "::write",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "rkyv::place::<impl Place",
-        MatchKind::EndsWith,
-        "::write_unchecked",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "place::Place",
-        MatchKind::EndsWith,
-        "::write",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "place::Place",
-        MatchKind::EndsWith,
-        "::write_unchecked",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "place::<impl Place",
-        MatchKind::EndsWith,
-        "::write",
-        CallEffect::Ignore,
-    ),
-    EffectRule::two(
-        MatchKind::Contains,
-        "place::<impl Place",
-        MatchKind::EndsWith,
-        "::write_unchecked",
-        CallEffect::Ignore,
-    ),
     EffectRule::one(
         MatchKind::Contains,
         "::ptr::read_unaligned",
@@ -10526,9 +10468,6 @@ impl MyOptimizationPass {
     /// This MUST be kept consistent with instrumentation emission so that
     /// `warn_unknown_call_if_needed` does not drift from actual handling.
     fn classify_call_effect(&self, def_path: &str) -> CallEffect {
-        if def_path.contains("decompress::Decompressor") && def_path.ends_with("::is_done") {
-            return CallEffect::Ignore;
-        }
         if def_path.contains("::black_box") {
             return CallEffect::PtrDerive;
         }
@@ -22520,14 +22459,6 @@ impl MyOptimizationPass {
             );
         }
 
-        // Some helpers are intentionally classified as pure scalar queries. Instrumenting their
-        // bodies only materializes administrative borrows that can outlive the query and create
-        // false Tree Borrows freezes in callers. `fdeflate::Decompressor::is_done` is the current
-        // concrete case in the PNG decode path.
-        if def_path.contains("decompress::Decompressor") && def_path.ends_with("::is_done") {
-            return;
-        }
-
         if self.analyze_unsafe_summaries_only_enabled() {
             let unsafe_influence = unsafe_dataflow::compute_unsafe_influence(
                 tcx,
@@ -23184,39 +23115,6 @@ mod tests {
         assert_eq!(
             effect_for("<alloc::vec::Vec<T, A> as core::ops::Index<I>>::index"),
             CallEffect::PtrDerive
-        );
-        assert_eq!(
-            MyOptimizationPass.classify_call_effect("decompress::Decompressor::is_done"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("rkyv::place::Place::<u32>::write"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("rkyv::place::Place::<u32>::write_unchecked"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("rkyv::place::<impl Place<u32>>::write"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("rkyv::place::<impl Place<u32>>::write_unchecked"),
-            CallEffect::Ignore
-        );
-        assert_eq!(effect_for("place::Place::<u32>::write"), CallEffect::Ignore);
-        assert_eq!(
-            effect_for("place::Place::<u32>::write_unchecked"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("place::<impl Place<u32>>::write"),
-            CallEffect::Ignore
-        );
-        assert_eq!(
-            effect_for("place::<impl Place<u32>>::write_unchecked"),
-            CallEffect::Ignore
         );
     }
 }
