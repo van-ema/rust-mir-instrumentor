@@ -1958,6 +1958,7 @@ enum InstrKind<'tcx> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParentSelectionMode {
     ReceiverFamily,
+    SlotFamily,
     PointeeFamily,
 }
 
@@ -7919,6 +7920,30 @@ impl MyOptimizationPass {
         }
     }
 
+    fn creation_parent_selection_mode_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+        use_projectionless_anchor: bool,
+    ) -> ParentSelectionMode {
+        if matches!(
+            self.parent_selection_mode_for_src_place(body, src_place),
+            ParentSelectionMode::ReceiverFamily
+        ) {
+            return ParentSelectionMode::ReceiverFamily;
+        }
+
+        if use_projectionless_anchor
+            && src_place.projection.is_empty()
+            && self.supports_arg_anchor_take_local(tcx, body, src_place.local)
+        {
+            return ParentSelectionMode::SlotFamily;
+        }
+
+        ParentSelectionMode::PointeeFamily
+    }
+
     /// Choose the parent-family operand for a new ref/raw creation from `src_place`.
     ///
     /// For plain pointers this prefers the source local's concrete tag. For projected accesses
@@ -7963,8 +7988,17 @@ impl MyOptimizationPass {
         } else {
             None
         };
+        let slot_parent = if matches!(mode, ParentSelectionMode::SlotFamily) {
+            self.slot_family_parent_operand_for_local(
+                src_place.local,
+                reborrow_anchor_local_for_stack_local,
+            )
+        } else {
+            None
+        };
 
         receiver_parent
+            .or(slot_parent)
             .or_else(|| {
                 self.projectionless_slot_parent_operand_for_src_place(
                     src_place,
@@ -18485,7 +18519,12 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             is_raw_creation,
                             true,
-                            self.parent_selection_mode_for_src_place(body, src),
+                            self.creation_parent_selection_mode_for_src_place(
+                                tcx,
+                                body,
+                                src,
+                                true,
+                            ),
                         )),
                     ))),
                 );
@@ -20569,7 +20608,12 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     use_projectionless_anchor,
-                                    self.parent_selection_mode_for_src_place(body, *src),
+                                    self.creation_parent_selection_mode_for_src_place(
+                                        tcx,
+                                        body,
+                                        *src,
+                                        use_projectionless_anchor,
+                                    ),
                                 )
                             }
                         }
@@ -20602,7 +20646,12 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     true,
                                     true,
-                                    self.parent_selection_mode_for_src_place(body, *src),
+                                    self.creation_parent_selection_mode_for_src_place(
+                                        tcx,
+                                        body,
+                                        *src,
+                                        true,
+                                    ),
                                 )
                             }
                         }
@@ -20927,7 +20976,12 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     use_projectionless_anchor,
-                                    self.parent_selection_mode_for_src_place(body, *src),
+                                    self.creation_parent_selection_mode_for_src_place(
+                                        tcx,
+                                        body,
+                                        *src,
+                                        use_projectionless_anchor,
+                                    ),
                                 )
                             };
                             Some(Statement::new(
