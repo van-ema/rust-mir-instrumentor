@@ -27,7 +27,7 @@ use rustc_middle::ty::{
     ConstKind as TyConstKind, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv,
 };
 use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use rustc_span::{source_map::Spanned, Span};
+use rustc_span::{Span, source_map::Spanned};
 
 pub(crate) struct MyOptimizationPass;
 
@@ -3150,10 +3150,14 @@ impl MyOptimizationPass {
             stats.ptr_locals_total,
             stats.access_hooks_before,
             stats.access_hooks_after,
-            stats.access_hooks_before.saturating_sub(stats.access_hooks_after),
+            stats
+                .access_hooks_before
+                .saturating_sub(stats.access_hooks_after),
             stats.hooks_total_before,
             stats.hooks_total_after,
-            stats.hooks_total_before.saturating_sub(stats.hooks_total_after)
+            stats
+                .hooks_total_before
+                .saturating_sub(stats.hooks_total_after)
         );
     }
 
@@ -3231,10 +3235,7 @@ impl MyOptimizationPass {
             {
                 eprintln!(
                     "[rusteze][unsafe-call][unknown] crate={} callee={} seed_arg_unknown={} backward_dst_unknown={}",
-                    crate_name,
-                    callee,
-                    seed_unknown,
-                    backward_unknown,
+                    crate_name, callee, seed_unknown, backward_unknown,
                 );
             }
         }
@@ -3629,7 +3630,9 @@ impl MyOptimizationPass {
             };
             eprintln!("  - {} ({})", name, flag);
         }
-        eprintln!("[rusteze] note: current crate is always treated as instrumented; set RZ_INSTRUMENTED_CRATES or RZ_INSTRUMENT_ALL_DEPS=1 to include dependencies.");
+        eprintln!(
+            "[rusteze] note: current crate is always treated as instrumented; set RZ_INSTRUMENTED_CRATES or RZ_INSTRUMENT_ALL_DEPS=1 to include dependencies."
+        );
     }
 
     fn is_instrumented_callee<'tcx>(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
@@ -4032,11 +4035,7 @@ impl MyOptimizationPass {
                 // Only treat it as a trailing monomorphization if there is no further module separator
                 // after the `::<` (excluding the `::` in the `::<` itself).
                 let after = &s[(pos + 3)..];
-                if after.contains("::") {
-                    s
-                } else {
-                    &s[..pos]
-                }
+                if after.contains("::") { s } else { &s[..pos] }
             } else {
                 s
             }
@@ -7041,6 +7040,17 @@ impl MyOptimizationPass {
         Some(key.clone())
     }
 
+    fn projected_reborrow_anchor_allowed_for_src_place<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+    ) -> bool {
+        matches!(
+            self.parent_selection_mode_for_src_place(body, src_place),
+            ParentSelectionMode::PointeeFamily
+        )
+    }
+
     fn normalized_ptr_rvalue_key<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -8958,7 +8968,10 @@ impl MyOptimizationPass {
                                         dst_local,
                                         anchor_state.local,
                                         anchor_state.source,
-                                        anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                        anchor_key
+                                            .as_ref()
+                                            .map(|(key, _)| key.as_str())
+                                            .unwrap_or("<none>")
                                     );
                                 }
                                 insert_points.push(InsertPoint {
@@ -9046,21 +9059,22 @@ impl MyOptimizationPass {
                         _ => None,
                     };
 
+                    let projected_ptr_place = match rvalue {
+                        Rvalue::Use(op) => self.place_from_operand(op),
+                        Rvalue::BinaryOp(BinOp::Offset, ops) => self.place_from_operand(&ops.0),
+                        Rvalue::Cast(
+                            CastKind::PtrToPtr
+                            | CastKind::PointerCoercion(_, _)
+                            | CastKind::Transmute
+                            | CastKind::PointerWithExposedProvenance,
+                            op,
+                            _,
+                        ) => self.place_from_operand(op),
+                        _ => None,
+                    };
+
                     let mut src_local_opt = src_local_opt;
                     if src_local_opt.is_none() {
-                        let projected_ptr_place = match rvalue {
-                            Rvalue::Use(op) => self.place_from_operand(op),
-                            Rvalue::BinaryOp(BinOp::Offset, ops) => self.place_from_operand(&ops.0),
-                            Rvalue::Cast(
-                                CastKind::PtrToPtr
-                                | CastKind::PointerCoercion(_, _)
-                                | CastKind::Transmute
-                                | CastKind::PointerWithExposedProvenance,
-                                op,
-                                _,
-                            ) => self.place_from_operand(op),
-                            _ => None,
-                        };
                         if let Some(p) = projected_ptr_place {
                             src_local_opt = self.recover_pointer_source_local_for_projected_place(
                                 tcx, body, bb, stmt_idx, p, false,
@@ -9107,13 +9121,21 @@ impl MyOptimizationPass {
                                 };
 
                                 if rhs_requires_retag {
-                                    let anchor_key = self.normalized_ptr_copy_anchor_key(
-                                        tcx,
-                                        body,
-                                        rvalue,
-                                        &block_data.statements,
-                                        stmt_idx,
-                                    );
+                                    let anchor_key = projected_ptr_place.and_then(|src_place| {
+                                        self.projected_reborrow_anchor_allowed_for_src_place(
+                                            body, src_place,
+                                        )
+                                        .then(|| {
+                                            self.normalized_ptr_copy_anchor_key(
+                                                tcx,
+                                                body,
+                                                rvalue,
+                                                &block_data.statements,
+                                                stmt_idx,
+                                            )
+                                        })
+                                        .flatten()
+                                    });
                                     let reused_anchor_state =
                                         anchor_key.as_ref().and_then(|(key, _deps)| {
                                             self.reusable_ssa_anchor_for_expr(
@@ -9133,7 +9155,10 @@ impl MyOptimizationPass {
                                                 dst_local,
                                                 anchor_state.local,
                                                 anchor_state.source,
-                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                                anchor_key
+                                                    .as_ref()
+                                                    .map(|(key, _)| key.as_str())
+                                                    .unwrap_or("<none>")
                                             );
                                         }
                                         insert_points.push(InsertPoint {
@@ -9163,7 +9188,10 @@ impl MyOptimizationPass {
                                                 self,
                                                 "[rusteze][ssa-anchor] store ptr-derive dst={:?} key={}",
                                                 dst_local,
-                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                                anchor_key
+                                                    .as_ref()
+                                                    .map(|(key, _)| key.as_str())
+                                                    .unwrap_or("<none>")
                                             );
                                         }
                                         insert_points.push(InsertPoint {
@@ -9263,12 +9291,12 @@ impl MyOptimizationPass {
                                 && self.log_enabled(PassLogLevel::Trace)
                             {
                                 rz_pass_trace!(
-                                self,
-                                "CopyForDeref dst_local={:?} dst_ty={:?} rhs_is_projected_ptr={}",
-                                dst_local,
-                                dst_ty,
-                                rhs_is_projected_ptr
-                            );
+                                    self,
+                                    "CopyForDeref dst_local={:?} dst_ty={:?} rhs_is_projected_ptr={}",
+                                    dst_local,
+                                    dst_ty,
+                                    rhs_is_projected_ptr
+                                );
                             }
 
                             if rhs_is_projected_ptr {
@@ -9320,7 +9348,10 @@ impl MyOptimizationPass {
                                                 dst_local,
                                                 anchor_state.local,
                                                 anchor_state.source,
-                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                                anchor_key
+                                                    .as_ref()
+                                                    .map(|(key, _)| key.as_str())
+                                                    .unwrap_or("<none>")
                                             );
                                         }
                                         insert_points.push(InsertPoint {
@@ -9359,7 +9390,10 @@ impl MyOptimizationPass {
                                                 self,
                                                 "[rusteze][ssa-anchor] store projected-root dst={:?} key={}",
                                                 dst_local,
-                                                anchor_key.as_ref().map(|(key, _)| key.as_str()).unwrap_or("<none>")
+                                                anchor_key
+                                                    .as_ref()
+                                                    .map(|(key, _)| key.as_str())
+                                                    .unwrap_or("<none>")
                                             );
                                         }
                                         insert_points.push(InsertPoint {
@@ -10239,14 +10273,20 @@ impl MyOptimizationPass {
                     && !summary_elidable_shared_call_ref_locals.contains(&lhs_local)
                     && !black_box_sink_ref_temp
                 {
-                    let anchor_key = self.normalized_ptr_expr_key_for_ref_source_place(
-                        body,
-                        *src_place,
-                        &block_data.statements,
-                        stmt_idx,
-                    );
-                    let reused_anchor_state = if self
-                        .allow_ssa_anchor_reuse_for_ref_source_place(body, *bk, *src_place)
+                    let allow_projected_anchor =
+                        self.projected_reborrow_anchor_allowed_for_src_place(body, *src_place);
+                    let anchor_key = allow_projected_anchor
+                        .then(|| {
+                            self.normalized_ptr_expr_key_for_ref_source_place(
+                                body,
+                                *src_place,
+                                &block_data.statements,
+                                stmt_idx,
+                            )
+                        })
+                        .flatten();
+                    let reused_anchor_state = if allow_projected_anchor
+                        && self.allow_ssa_anchor_reuse_for_ref_source_place(body, *bk, *src_place)
                     {
                         anchor_key.as_ref().and_then(|(key, _deps)| {
                             self.reusable_ssa_anchor_for_ref_source_expr(
@@ -11204,11 +11244,7 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call {
-            recovered
-        } else {
-            None
-        }
+        if matched_call { recovered } else { None }
     }
 
     /// Recover a pointer lineage source when a call writes an aggregate result into `agg_local`
@@ -11275,11 +11311,7 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call {
-            recovered
-        } else {
-            None
-        }
+        if matched_call { recovered } else { None }
     }
 
     /// Conservative global recovery for aggregate locals produced by a call result where the
@@ -11338,11 +11370,7 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call {
-            recovered
-        } else {
-            None
-        }
+        if matched_call { recovered } else { None }
     }
 
     fn ptr_derive_source_arg_index(&self, def_path: &str) -> usize {
@@ -22387,7 +22415,9 @@ mod tests {
             CallEffect::PtrDerive
         );
         assert_eq!(
-            effect_for("core::slice::index::<impl std::slice::SliceIndex<[u8]> for std::ops::Range<usize>>::index_mut"),
+            effect_for(
+                "core::slice::index::<impl std::slice::SliceIndex<[u8]> for std::ops::Range<usize>>::index_mut"
+            ),
             CallEffect::PtrDerive
         );
         assert_eq!(
