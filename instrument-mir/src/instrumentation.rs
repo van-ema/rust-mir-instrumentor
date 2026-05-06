@@ -1774,12 +1774,15 @@ enum InstrKind<'tcx> {
     /// Reset a non-pointer local's exact-place reborrow anchor.
     ReborrowAnchorZero {
         anchor_local: Local,
+        anchor_state_local: Option<Local>,
     },
     /// Initialize a non-pointer local's exact-place reborrow anchor from the first
     /// freshly-created ref tag for that place. Later reborrows must keep the original
     /// family anchor instead of overwriting it with newer child tags.
     ReborrowAnchorSet {
+        dst_local: Local,
         anchor_local: Local,
+        anchor_state_local: Option<Local>,
         src_ptr_local: Local,
     },
     /// Seed a non-pointer local's exact-place reborrow anchor from a recovered lineage source.
@@ -14162,6 +14165,7 @@ impl MyOptimizationPass {
         &self,
         body: &Body<'tcx>,
         reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        anchor_is_slot_family_local_for_stack_local: &HashMap<Local, Local>,
         reborrow_anchor_specs: &ReborrowAnchorSpecMap,
         reborrow_anchor_local_for_key: &HashMap<String, Local>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
@@ -14180,13 +14184,19 @@ impl MyOptimizationPass {
                     if let Some(anchor_local) =
                         reborrow_anchor_local_for_stack_local.get(&local).copied()
                     {
+                        let anchor_state_local = anchor_is_slot_family_local_for_stack_local
+                            .get(&local)
+                            .copied();
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx,
                             insert_before: false,
                             source_info,
                             place: Place::from(anchor_local),
-                            kind: InstrKind::ReborrowAnchorZero { anchor_local },
+                            kind: InstrKind::ReborrowAnchorZero {
+                                anchor_local,
+                                anchor_state_local,
+                            },
                         });
                     }
                     for (key, deps) in reborrow_anchor_specs.iter() {
@@ -14200,7 +14210,10 @@ impl MyOptimizationPass {
                                     insert_before: false,
                                     source_info,
                                     place: Place::from(anchor_local),
-                                    kind: InstrKind::ReborrowAnchorZero { anchor_local },
+                                    kind: InstrKind::ReborrowAnchorZero {
+                                        anchor_local,
+                                        anchor_state_local: None,
+                                    },
                                 });
                             }
                         }
@@ -14215,6 +14228,7 @@ impl MyOptimizationPass {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        anchor_is_slot_family_local_for_stack_local: &HashMap<Local, Local>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
     ) {
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
@@ -14305,7 +14319,11 @@ impl MyOptimizationPass {
                             source_info: stmt.source_info,
                             place: Place::from(dst_local),
                             kind: InstrKind::ReborrowAnchorSet {
+                                dst_local,
                                 anchor_local,
+                                anchor_state_local: anchor_is_slot_family_local_for_stack_local
+                                    .get(&dst_local)
+                                    .copied(),
                                 src_ptr_local: src_local,
                             },
                         });
@@ -17911,26 +17929,41 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::ReborrowAnchorZero { anchor_local } = creation_kind {
-                let zero_stmt = Statement::new(
+            if let InstrKind::ReborrowAnchorZero {
+                anchor_local,
+                anchor_state_local,
+            } = creation_kind
+            {
+                let mut zero_stmts = vec![Statement::new(
                     source_info,
                     StatementKind::Assign(Box::new((
                         Place::from(anchor_local),
                         Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
                     ))),
-                );
+                )];
+                if let Some(anchor_state_local) = anchor_state_local {
+                    zero_stmts.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_state_local),
+                            Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                        ))),
+                    ));
+                }
                 let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
                 let insert_at = if stmt_idx >= bd.statements.len() {
                     bd.statements.len()
                 } else {
                     stmt_idx + 1
                 };
-                bd.statements.insert(insert_at, zero_stmt);
+                bd.statements.splice(insert_at..insert_at, zero_stmts);
                 continue;
             }
 
             if let InstrKind::ReborrowAnchorSet {
+                dst_local: _dst_local,
                 anchor_local,
+                anchor_state_local,
                 src_ptr_local,
             } = creation_kind
             {
@@ -18022,16 +18055,23 @@ impl MyOptimizationPass {
                 } else {
                     stmt_idx + 1
                 };
-                bd.statements.splice(
-                    insert_at..insert_at,
-                    [
-                        anchor_is_zero_stmt,
-                        anchor_should_init_stmt,
-                        anchor_new_part_stmt,
-                        anchor_selected_stmt,
-                        set_stmt,
-                    ],
-                );
+                let mut stmts = vec![
+                    anchor_is_zero_stmt,
+                    anchor_should_init_stmt,
+                    anchor_new_part_stmt,
+                    anchor_selected_stmt,
+                    set_stmt,
+                ];
+                if let Some(anchor_state_local) = anchor_state_local {
+                    stmts.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_state_local),
+                            Rvalue::Use(self.const_u8(tcx, source_info.span, 1)),
+                        ))),
+                    ));
+                }
+                bd.statements.splice(insert_at..insert_at, stmts);
                 continue;
             }
 
@@ -18165,7 +18205,13 @@ impl MyOptimizationPass {
                             ))),
                         )
                     } else {
-                        continue;
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(dst_anchor_state_local),
+                                Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                            ))),
+                        )
                     };
                     bd.statements.insert(insert_at + 5, state_stmt);
                 }
@@ -22575,6 +22621,7 @@ impl MyOptimizationPass {
         self.schedule_reborrow_anchor_resets(
             body,
             &reborrow_anchor_local_for_stack_local,
+            &anchor_is_slot_family_local_for_stack_local,
             &scan.projected_reborrow_anchor_specs,
             &projected_reborrow_anchor_local_for_key,
             &mut insert_points,
@@ -22583,6 +22630,7 @@ impl MyOptimizationPass {
             tcx,
             body,
             &reborrow_anchor_local_for_stack_local,
+            &anchor_is_slot_family_local_for_stack_local,
             &mut insert_points,
         );
 
