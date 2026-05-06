@@ -1270,16 +1270,17 @@ struct CallArgTagEntry {
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
 
-static CALL_ARG_TAGS: OnceLock<
-    Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>,
-> = OnceLock::new();
+static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
+    OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
-static RET_LEAF_SHADOWS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>>> =
+type PtrShadowTransport = (u64, u64, u64, u8);
+
+static RET_LEAF_SHADOWS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64), PtrShadowTransport>>> =
     OnceLock::new();
 static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64>>> =
     OnceLock::new();
 static MUT_ARG_RET_LEAF_SHADOWS: OnceLock<
-    Mutex<HashMap<(ThreadId, u64, u64, usize, u64), (u64, u64)>>,
+    Mutex<HashMap<(ThreadId, u64, u64, usize, u64), PtrShadowTransport>>,
 > = OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
@@ -1435,7 +1436,8 @@ pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>>
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn ret_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64), (u64, u64)>> {
+pub(crate) fn ret_leaf_shadows(
+) -> &'static Mutex<HashMap<(ThreadId, u64, u64), PtrShadowTransport>> {
     RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1444,7 +1446,7 @@ pub(crate) fn mut_arg_ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, 
 }
 
 pub(crate) fn mut_arg_ret_leaf_shadows(
-) -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize, u64), (u64, u64)>> {
+) -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize, u64), PtrShadowTransport>> {
     MUT_ARG_RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2546,12 +2548,15 @@ fn sanitize_shadow_entry_for_slot_value(
     slot_addr: usize,
     tag: u64,
     ref_ancestor: u64,
-) -> (u64, u64) {
+    export_parent: u64,
+    export_parent_recovered: u8,
+) -> PtrShadowTransport {
     let value_addr = shadow_slot_value_addr(slot_addr);
     if shadow_ref_lineage_matches_value(tag, value_addr)
         && shadow_ref_lineage_matches_value(ref_ancestor, value_addr)
+        && shadow_ref_lineage_matches_value(export_parent, value_addr)
     {
-        return (tag, ref_ancestor);
+        return (tag, ref_ancestor, export_parent, export_parent_recovered);
     }
 
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -2559,43 +2564,81 @@ fn sanitize_shadow_entry_for_slot_value(
         .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
     {
         eprintln!(
-            "[rusteze-runtime][ptr-shadow] sanitize slot=0x{:x} value=0x{:x} tag={} ref_ancestor={}",
-            slot_addr, value_addr, tag, ref_ancestor
+            "[rusteze-runtime][ptr-shadow] sanitize slot=0x{:x} value=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
+            slot_addr, value_addr, tag, ref_ancestor, export_parent, export_parent_recovered
         );
     }
-    (0, 0)
+    (0, 0, 0, 0)
 }
 
 #[no_mangle]
-pub extern "C" fn __rz_shadow_store_ptr(slot_addr: usize, tag: u64, ref_ancestor: u64) {
+pub extern "C" fn __rz_shadow_store_ptr(
+    slot_addr: usize,
+    tag: u64,
+    ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+) {
     let _g = RzRuntimeGuard::enter();
-    let (tag, ref_ancestor) = sanitize_shadow_entry_for_slot_value(slot_addr, tag, ref_ancestor);
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        sanitize_shadow_entry_for_slot_value(
+            slot_addr,
+            tag,
+            ref_ancestor,
+            export_parent,
+            export_parent_recovered,
+        );
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
         .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
     {
         eprintln!(
-            "[rusteze-runtime][ptr-shadow] store slot=0x{:x} tag={} ref_ancestor={}",
-            slot_addr, tag, ref_ancestor
+            "[rusteze-runtime][ptr-shadow] store slot=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
+            slot_addr, tag, ref_ancestor, export_parent, export_parent_recovered
         );
     }
-    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
+    ptr_shadow::store_ptr(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 #[no_mangle]
-pub extern "C" fn __rz_shadow_store_ptr_local(slot_addr: usize, tag: u64, ref_ancestor: u64) {
+pub extern "C" fn __rz_shadow_store_ptr_local(
+    slot_addr: usize,
+    tag: u64,
+    ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+) {
     let _g = RzRuntimeGuard::enter();
-    let (tag, ref_ancestor) = sanitize_shadow_entry_for_slot_value(slot_addr, tag, ref_ancestor);
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        sanitize_shadow_entry_for_slot_value(
+            slot_addr,
+            tag,
+            ref_ancestor,
+            export_parent,
+            export_parent_recovered,
+        );
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
         .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
     {
         eprintln!(
-            "[rusteze-runtime][ptr-shadow] store_local slot=0x{:x} tag={} ref_ancestor={}",
-            slot_addr, tag, ref_ancestor
+            "[rusteze-runtime][ptr-shadow] store_local slot=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
+            slot_addr, tag, ref_ancestor, export_parent, export_parent_recovered
         );
     }
-    ptr_shadow::store_ptr_local_slot(slot_addr, tag, ref_ancestor);
+    ptr_shadow::store_ptr_local_slot(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 #[no_mangle]
@@ -2628,6 +2671,38 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
         );
     }
     ref_ancestor
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_load_export_parent(slot_addr: usize) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let export_parent = ptr_shadow::load_export_parent(slot_addr);
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] load_export_parent slot=0x{:x} -> {}",
+            slot_addr, export_parent
+        );
+    }
+    export_parent
+}
+
+#[no_mangle]
+pub extern "C" fn __rz_shadow_load_export_parent_recovered(slot_addr: usize) -> u8 {
+    let _g = RzRuntimeGuard::enter();
+    let recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] load_export_parent_recovered slot=0x{:x} -> {}",
+            slot_addr, recovered
+        );
+    }
+    recovered
 }
 
 #[no_mangle]
@@ -2679,9 +2754,23 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
     }
     let tag = ptr_shadow::load_tag(src_slot_addr);
     let ref_ancestor = ptr_shadow::load_ref_ancestor(src_slot_addr);
-    let (tag, ref_ancestor) =
-        sanitize_shadow_entry_for_slot_value(dst_slot_addr, tag, ref_ancestor);
-    ptr_shadow::store_ptr(dst_slot_addr, tag, ref_ancestor);
+    let export_parent = ptr_shadow::load_export_parent(src_slot_addr);
+    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(src_slot_addr);
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        sanitize_shadow_entry_for_slot_value(
+            dst_slot_addr,
+            tag,
+            ref_ancestor,
+            export_parent,
+            export_parent_recovered,
+        );
+    ptr_shadow::store_ptr(
+        dst_slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 #[no_mangle]
@@ -4646,8 +4735,8 @@ pub extern "C" fn __rz_push_call_arg_tag(
         && canonical_tag != tag
         && (rz_ref_boundary_tag_is_valid(canonical_tag)
             || rz_can_recover_parent_tag(canonical_tag));
-    let prefer_canonical_validate = recoverable_canonical
-        && (flags & CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE) != 0;
+    let prefer_canonical_validate =
+        recoverable_canonical && (flags & CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE) != 0;
     let tag = if prefer_canonical_validate {
         if rz_ref_boundary_tag_is_valid(canonical_tag) {
             rz_validate_ref_boundary_use(canonical_tag, "CALL_ARG");
@@ -4666,13 +4755,10 @@ pub extern "C" fn __rz_push_call_arg_tag(
         );
     }
     let thread_id = std::thread::current().id();
-    call_arg_tags()
-        .lock()
-        .unwrap()
-        .insert(
-            (thread_id, callee_id, arg_index, addr),
-            CallArgTagEntry { tag, flags },
-        );
+    call_arg_tags().lock().unwrap().insert(
+        (thread_id, callee_id, arg_index, addr),
+        CallArgTagEntry { tag, flags },
+    );
 }
 
 /// Validate a non-pointer by-value call argument carrier's inner reference tag.
@@ -4707,7 +4793,7 @@ pub extern "C" fn __rz_take_call_arg_tag(
                     .keys()
                     .filter(|(tid, _cid, idx, other_addr)| {
                         *tid == thread_id && *idx == arg_index && *other_addr == addr
-                })
+                    })
                     .copied();
                 let first = fallback_matches.next();
                 if fallback_matches.next().is_some() {
@@ -4853,6 +4939,8 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    let export_parent = ptr_shadow::load_export_parent(slot_addr);
+    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
     if active_alias_model().name() == "sb_lite" {
         rz_validate_ref_boundary_use(tag, "RET");
     }
@@ -4860,10 +4948,10 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
         active_alias_model().on_mut_arg_ret_export(tag, addr);
     }
     let thread_id = std::thread::current().id();
-    mut_arg_ret_leaf_shadows()
-        .lock()
-        .unwrap()
-        .insert((thread_id, callee_id, arg_index, addr, leaf_key), (tag, ref_ancestor));
+    mut_arg_ret_leaf_shadows().lock().unwrap().insert(
+        (thread_id, callee_id, arg_index, addr, leaf_key),
+        (tag, ref_ancestor, export_parent, export_parent_recovered),
+    );
 }
 
 /// Take one exported `&mut T` carrier leaf shadow and recreate the caller destination slot
@@ -4878,12 +4966,19 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor) = mut_arg_ret_leaf_shadows()
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        mut_arg_ret_leaf_shadows()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id, arg_index, addr, leaf_key))
-        .unwrap_or((0, 0));
-    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
+        .unwrap_or((0, 0, 0, 0));
+    ptr_shadow::store_ptr(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
@@ -4891,8 +4986,8 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     let kind = tag_store::get(tag).map(|meta| meta.kind);
-    let validate_before_export = active_alias_model().name() != "tb_lite"
-        || matches!(kind, Some(PtrKind::RefShared));
+    let validate_before_export =
+        active_alias_model().name() != "tb_lite" || matches!(kind, Some(PtrKind::RefShared));
     if validate_before_export {
         // Validate the original exported ref before any return-side repair/revival. Otherwise
         // `on_ret_export` can resurrect an already-invalid family and mask the boundary violation.
@@ -4919,6 +5014,8 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    let export_parent = ptr_shadow::load_export_parent(slot_addr);
+    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
     if active_alias_model().name() == "sb_lite" {
         rz_validate_ref_boundary_use(tag, "RET");
     }
@@ -4929,7 +5026,10 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
     ret_leaf_shadows()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, leaf_key), (tag, ref_ancestor));
+        .insert(
+            (thread_id, callee_id, leaf_key),
+            (tag, ref_ancestor, export_parent, export_parent_recovered),
+        );
 }
 
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
@@ -4988,12 +5088,18 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
 pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor) = ret_leaf_shadows()
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) = ret_leaf_shadows()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id, leaf_key))
-        .unwrap_or((0, 0));
-    ptr_shadow::store_ptr(slot_addr, tag, ref_ancestor);
+        .unwrap_or((0, 0, 0, 0));
+    ptr_shadow::store_ptr(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -5628,8 +5734,9 @@ pub extern "C" fn __record_raw_ptr_creation(
         let resolved_parent_is_tracked = if resolved_parent == 0 {
             false
         } else {
-            tag_store::get(resolved_parent)
-                .is_some_and(|parent_meta| !rz_has_exposed_provenance_root(resolved_parent, &parent_meta))
+            tag_store::get(resolved_parent).is_some_and(|parent_meta| {
+                !rz_has_exposed_provenance_root(resolved_parent, &parent_meta)
+            })
         };
         if !resolved_parent_is_tracked {
             let poisoned_same_addr = tags().lock().unwrap().values().any(|meta| {

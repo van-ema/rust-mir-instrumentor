@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_leaf_shadows,
-    mut_arg_ret_tags, ret_leaf_shadows, ret_tags, rz_sb_suppressed, rz_violation, tag_store,
-    tags, PtrKind, TagMeta,
+    mut_arg_ret_tags, ret_leaf_shadows, ret_tags, rz_sb_suppressed, rz_violation, tag_store, tags,
+    PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -309,9 +309,12 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                 .filter(|((ret_thread_id, ret_callee_id, _leaf_index), _shadow)| {
                     *ret_thread_id == thread_id && *ret_callee_id == callee_id
                 })
-                .map(|((_ret_thread_id, _ret_callee_id, _leaf_index), (tag, _ref_ancestor))| {
-                    *tag
-                }),
+                .map(
+                    |(
+                        (_ret_thread_id, _ret_callee_id, _leaf_index),
+                        (tag, _ref_ancestor, _export_parent, _export_parent_recovered),
+                    )| *tag,
+                ),
         )
         .chain(
             mut_arg_ret_tags()
@@ -336,9 +339,10 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                     },
                 )
                 .map(
-                    |((_ret_thread_id, _ret_callee_id, _arg_index, _addr, _leaf_index), (tag, _ref_ancestor))| {
-                        *tag
-                    },
+                    |(
+                        (_ret_thread_id, _ret_callee_id, _arg_index, _addr, _leaf_index),
+                        (tag, _ref_ancestor, _export_parent, _export_parent_recovered),
+                    )| { *tag },
                 ),
         )
         .collect();
@@ -620,9 +624,8 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     tree.nodes.insert(tag, node.clone());
     let returned_carrier_reroot = (tmeta.lineage_hint & 0b1000) != 0;
     if returned_carrier_reroot {
-        let stack_like_root_ref = parent == 0
-            && matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
-            && {
+        let stack_like_root_ref =
+            parent == 0 && matches!(kind, BorrowKind::Shared | BorrowKind::Unique) && {
                 let amap = allocs().lock().unwrap();
                 find_alloc_containing(&amap, tmeta.pointee_addr)
                     .map(|(_base, meta)| meta.is_stack)
@@ -2133,7 +2136,10 @@ fn tb_same_lineage_protected_conflict_ok(
         if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
             return true;
         }
-        if !tmap.get(&other.tag).map(|meta| meta.escaped).unwrap_or(true)
+        if !tmap
+            .get(&other.tag)
+            .map(|meta| meta.escaped)
+            .unwrap_or(true)
             && !tag_store::active_tag_has_local_holder(other.tag)
         {
             return true;

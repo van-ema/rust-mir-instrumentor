@@ -2060,6 +2060,8 @@ struct Hooks {
     def_id_shadow_store_ptr_local: DefId,
     def_id_shadow_load_tag: DefId,
     def_id_shadow_load_ref_ancestor: DefId,
+    def_id_shadow_load_export_parent: DefId,
+    def_id_shadow_load_export_parent_recovered: DefId,
     def_id_shadow_kill_range: DefId,
     def_id_tag_kill: DefId,
     def_id_tag_retain: DefId,
@@ -12591,17 +12593,25 @@ impl MyOptimizationPass {
                 CallEffect::PtrDerive => {
                     // Pointer-result handling for ptr-derivation wrappers (add/sub/offset/as_ptr...).
                     //
-                    // Even when the callee is instrumented, modeling these wrappers locally is
-                    // more robust than relying on call-boundary return tags alone. Tiny wrappers
-                    // like `as_mut_ptr` often return a projected pointer value, and if return-tag
-                    // recovery is skipped or the callee never materializes a precise return tag,
-                    // later dereferences degrade into UNKNOWN_TAG. A local PtrDerive keeps the
-                    // derived pointer connected to its base pointer provenance directly.
+                    // For raw-pointer wrappers, local PtrDerive is more robust than relying on
+                    // return-boundary transport alone: tiny helpers like `as_mut_ptr` often return
+                    // a projected pointer value, and if the callee never materializes a precise
+                    // return tag, later dereferences degrade into UNKNOWN_TAG.
+                    //
+                    // Shared-ref wrappers are different. If an instrumented callee returns `&T`,
+                    // the return-boundary transport (`RetPush`/`RetTake`) is the principled model:
+                    // it preserves the boundary parent that the next call should retag from. A
+                    // local PtrDerive on the caller side collapses that boundary state back onto
+                    // the receiver/source tag and can produce stale shared children at the next
+                    // call boundary (for example `Bytes::as_ref()` -> subslice -> `slice_ref`).
                     if !call_is_black_box {
                         if let Some(dst_local) = destination.as_local() {
                             let dst_ty = body.local_decls[dst_local].ty;
+                            let prefer_return_boundary_for_ref = callee_instrumented
+                                && ret_take_enabled
+                                && matches!(dst_ty.kind(), TyKind::Ref(..));
                             // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
-                            if self.is_pointer_ty(dst_ty) {
+                            if self.is_pointer_ty(dst_ty) && !prefer_return_boundary_for_ref {
                                 let mut derive_emitted_here = false;
                                 let mut derived_from_recovered_boundary = false;
                                 let src_arg_index = callee_path_opt
@@ -14912,6 +14922,11 @@ impl MyOptimizationPass {
                 else {
                     continue;
                 };
+                let dst_export_parent_local =
+                    export_parent_local_for_ptr_local.get(&dst_local).copied();
+                let dst_recovered_local = export_parent_is_recovered_local_for_ptr_local
+                    .get(&dst_local)
+                    .copied();
 
                 let addr_local = body
                     .local_decls
@@ -15000,18 +15015,92 @@ impl MyOptimizationPass {
                 }]
                 .into_boxed_slice();
 
+                let export_parent_func = dst_export_parent_local.map(|_| {
+                    Operand::function_handle(
+                        tcx,
+                        hooks.def_id_shadow_load_export_parent,
+                        std::iter::empty(),
+                        source_info.span,
+                    )
+                });
+                let export_parent_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: Operand::Copy(Place::from(addr_local)),
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+
+                let recovered_func = dst_recovered_local.map(|_| {
+                    Operand::function_handle(
+                        tcx,
+                        hooks.def_id_shadow_load_export_parent_recovered,
+                        std::iter::empty(),
+                        source_info.span,
+                    )
+                });
+                let recovered_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                    node: Operand::Copy(Place::from(addr_local)),
+                    span: source_info.span,
+                }]
+                .into_boxed_slice();
+
+                let final_post_load_block = post_load_block;
+                let recovered_block = dst_recovered_local.map(|_| {
+                    body.basic_blocks_mut()
+                        .push(BasicBlockData::new(None, is_cleanup))
+                });
+                let export_parent_target = recovered_block.unwrap_or(final_post_load_block);
+                let export_parent_block = dst_export_parent_local.map(|_| {
+                    body.basic_blocks_mut()
+                        .push(BasicBlockData::new(None, is_cleanup))
+                });
+                let ref_target = export_parent_block.unwrap_or(export_parent_target);
+
                 body.basic_blocks_mut()[ref_block].terminator = Some(Terminator {
                     source_info,
                     kind: TerminatorKind::Call {
                         func: ref_func,
                         args: ref_args,
                         destination: Place::from(dst_ref_ancestor_local),
-                        target: Some(post_load_block),
+                        target: Some(ref_target),
                         unwind: UnwindAction::Continue,
                         call_source: CallSource::Misc,
                         fn_span: source_info.span,
                     },
                 });
+
+                if let (Some(export_parent_block), Some(export_parent_local), Some(export_parent_func)) =
+                    (export_parent_block, dst_export_parent_local, export_parent_func)
+                {
+                    body.basic_blocks_mut()[export_parent_block].terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: export_parent_func,
+                            args: export_parent_args,
+                            destination: Place::from(export_parent_local),
+                            target: Some(export_parent_target),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                }
+
+                if let (Some(recovered_block), Some(recovered_local), Some(recovered_func)) =
+                    (recovered_block, dst_recovered_local, recovered_func)
+                {
+                    body.basic_blocks_mut()[recovered_block].terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Call {
+                            func: recovered_func,
+                            args: recovered_args,
+                            destination: Place::from(recovered_local),
+                            target: Some(final_post_load_block),
+                            unwind: UnwindAction::Continue,
+                            call_source: CallSource::Misc,
+                            fn_span: source_info.span,
+                        },
+                    });
+                }
 
                 if let Some(anchor_local) = projected_carrier_anchor {
                     let tag_is_zero_local = body
@@ -15036,6 +15125,28 @@ impl MyOptimizationPass {
                                 Rvalue::Use(Operand::Copy(Place::from(anchor_local))),
                             ))),
                         ));
+                    if let Some(dst_export_parent_local) = dst_export_parent_local {
+                        body.basic_blocks_mut()[repair_cont_block]
+                            .statements
+                            .push(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_export_parent_local),
+                                    Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                ))),
+                            ));
+                    }
+                    if let Some(dst_recovered_local) = dst_recovered_local {
+                        body.basic_blocks_mut()[repair_cont_block]
+                            .statements
+                            .push(Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(dst_recovered_local),
+                                    Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                                ))),
+                            ));
+                    }
 
                     let repair_call_block = body
                         .basic_blocks_mut()
@@ -15461,6 +15572,20 @@ impl MyOptimizationPass {
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
                     };
+                let export_parent_op: Operand<'tcx> = if let Some(tl) =
+                    export_parent_local_for_ptr_local.get(&src_local)
+                {
+                    Operand::Copy(Place::from(*tl))
+                } else {
+                    tag_op.clone()
+                };
+                let recovered_op: Operand<'tcx> = if let Some(tl) =
+                    export_parent_is_recovered_local_for_ptr_local.get(&src_local)
+                {
+                    Operand::Copy(Place::from(*tl))
+                } else {
+                    self.const_u8(tcx, source_info.span, 0)
+                };
                 let store_func = Operand::function_handle(
                     tcx,
                     hooks.def_id_shadow_store_ptr,
@@ -15478,6 +15603,14 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: ref_ancestor_op,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: export_parent_op,
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: recovered_op,
                         span: source_info.span,
                     },
                 ]
@@ -17330,6 +17463,97 @@ impl MyOptimizationPass {
                     std::iter::empty(),
                     source_info.span,
                 );
+                let selected_tag_local = if let (Some(export_parent_local), Some(recovered_local)) = (
+                    export_parent_local_for_ptr_local.get(&ptr_local).copied(),
+                    export_parent_is_recovered_local_for_ptr_local
+                        .get(&ptr_local)
+                        .copied(),
+                ) {
+                    let recovered_u64_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let not_recovered_u64_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let fallback_part_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let export_part_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let selected_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    bd.statements.extend([
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(recovered_u64_local),
+                                Rvalue::Cast(
+                                    CastKind::IntToInt,
+                                    Operand::Copy(Place::from(recovered_local)),
+                                    tcx.types.u64,
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(not_recovered_u64_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Sub,
+                                    Box::new((
+                                        self.const_u64(tcx, source_info.span, 1),
+                                        Operand::Copy(Place::from(recovered_u64_local)),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(fallback_part_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Mul,
+                                    Box::new((
+                                        Operand::Copy(Place::from(not_recovered_u64_local)),
+                                        Operand::Copy(Place::from(tag_local)),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(export_part_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Mul,
+                                    Box::new((
+                                        Operand::Copy(Place::from(recovered_u64_local)),
+                                        Operand::Copy(Place::from(export_parent_local)),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(selected_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Add,
+                                    Box::new((
+                                        Operand::Copy(Place::from(fallback_part_local)),
+                                        Operand::Copy(Place::from(export_part_local)),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                    ]);
+                    Some(selected_local)
+                } else {
+                    None
+                };
 
                 let args_push: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
@@ -17341,7 +17565,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: Operand::Copy(Place::from(tag_local)),
+                        node: Operand::Copy(Place::from(selected_tag_local.unwrap_or(tag_local))),
                         span: source_info.span,
                     },
                 ]
@@ -18212,13 +18436,21 @@ impl MyOptimizationPass {
                 if let Some(export_parent_local) =
                     export_parent_local_for_ptr_local.get(&ptr_local).copied()
                 {
+                    let export_parent_value = match body.local_decls[ptr_local].ty.kind() {
+                        // Shared refs at function entry are boundary-recovered values. Preserve
+                        // the incoming boundary parent for later call/return transport.
+                        TyKind::Ref(_, _, Mutability::Not) => {
+                            Operand::Copy(Place::from(parent_tag_local))
+                        }
+                        _ => Operand::Copy(Place::from(tag_local)),
+                    };
                     body.basic_blocks_mut()[cont_block].statements.insert(
                         0,
                         Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(export_parent_local),
-                                Rvalue::Use(Operand::Copy(Place::from(tag_local))),
+                                Rvalue::Use(export_parent_value),
                             ))),
                         ),
                     );
@@ -18227,13 +18459,21 @@ impl MyOptimizationPass {
                     .get(&ptr_local)
                     .copied()
                 {
+                    let recovered_value = match body.local_decls[ptr_local].ty.kind() {
+                        TyKind::Ref(_, _, Mutability::Not) => 1,
+                        _ => 0,
+                    };
                     body.basic_blocks_mut()[cont_block].statements.insert(
                         0,
                         Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(recovered_local),
-                                Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                                Rvalue::Use(self.const_u8(
+                                    tcx,
+                                    source_info.span,
+                                    recovered_value,
+                                )),
                             ))),
                         ),
                     );
@@ -19728,6 +19968,20 @@ impl MyOptimizationPass {
                         } else {
                             self.const_u64(tcx, source_info.span, 0)
                         };
+                    let export_parent_op: Operand<'tcx> = if let Some(tl) =
+                        export_parent_local_for_ptr_local.get(&src_local)
+                    {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        tag_op.clone()
+                    };
+                    let recovered_op: Operand<'tcx> = if let Some(tl) =
+                        export_parent_is_recovered_local_for_ptr_local.get(&src_local)
+                    {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        self.const_u8(tcx, source_info.span, 0)
+                    };
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
                             node: arg_addr,
@@ -19739,6 +19993,14 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: ref_ancestor_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: export_parent_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: recovered_op,
                             span: source_info.span,
                         },
                     ]
@@ -20565,10 +20827,122 @@ impl MyOptimizationPass {
                         };
                         let export_parent_op: Operand<'tcx> = match &creation_kind {
                             InstrKind::Ref { src, .. } => {
+                                let src_local = src.local;
                                 if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
-                                    export_parent_local_for_ptr_local.get(&src.local).copied(),
+                                    export_parent_local_for_ptr_local.get(&src_local).copied(),
                                     export_parent_is_recovered_local_for_ptr_local
-                                        .get(&src.local)
+                                        .get(&src_local)
+                                        .copied(),
+                                ) {
+                                    recovered_init_local = Some(src_recovered_local);
+                                    let recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let not_recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let fallback_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let export_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let selected_tag_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+                                    stmts.extend([
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(recovered_u64_local),
+                                                Rvalue::Cast(
+                                                    CastKind::IntToInt,
+                                                    Operand::Copy(Place::from(src_recovered_local)),
+                                                    tcx.types.u64,
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(not_recovered_u64_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Sub,
+                                                    Box::new((
+                                                        self.const_u64(tcx, source_info.span, 1),
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(fallback_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            not_recovered_u64_local,
+                                                        )),
+                                                        default_export_parent_op.clone(),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(export_part_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Mul,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            recovered_u64_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            src_export_parent_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                        Statement::new(
+                                            source_info,
+                                            StatementKind::Assign(Box::new((
+                                                Place::from(selected_tag_local),
+                                                Rvalue::BinaryOp(
+                                                    BinOp::Add,
+                                                    Box::new((
+                                                        Operand::Copy(Place::from(
+                                                            fallback_part_local,
+                                                        )),
+                                                        Operand::Copy(Place::from(
+                                                            export_part_local,
+                                                        )),
+                                                    )),
+                                                ),
+                                            ))),
+                                        ),
+                                    ]);
+
+                                    Operand::Copy(Place::from(selected_tag_local))
+                                } else {
+                                    default_export_parent_op
+                                }
+                            }
+                            InstrKind::PtrDerive {
+                                src,
+                                is_ref: true,
+                                ..
+                            } => {
+                                if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
+                                    export_parent_local_for_ptr_local.get(src).copied(),
+                                    export_parent_is_recovered_local_for_ptr_local
+                                        .get(src)
                                         .copied(),
                                 ) {
                                     recovered_init_local = Some(src_recovered_local);
@@ -21242,6 +21616,49 @@ impl MyOptimizationPass {
                     body.basic_blocks_mut()[cont_block]
                         .statements
                         .insert(0, ref_ancestor_stmt);
+                }
+                if let Some(export_parent_local) =
+                    export_parent_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    let export_parent_value = match body.local_decls[ptr_local].ty.kind() {
+                        TyKind::Ref(_, _, Mutability::Not) => {
+                            Operand::Copy(Place::from(parent_tag_local))
+                        }
+                        _ => Operand::Copy(Place::from(tag_local)),
+                    };
+                    body.basic_blocks_mut()[cont_block].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(export_parent_local),
+                                Rvalue::Use(export_parent_value),
+                            ))),
+                        ),
+                    );
+                }
+                if let Some(recovered_local) = export_parent_is_recovered_local_for_ptr_local
+                    .get(&ptr_local)
+                    .copied()
+                {
+                    let recovered_value = match body.local_decls[ptr_local].ty.kind() {
+                        TyKind::Ref(_, _, Mutability::Not) => 1,
+                        _ => 0,
+                    };
+                    body.basic_blocks_mut()[cont_block].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(recovered_local),
+                                Rvalue::Use(self.const_u8(
+                                    tcx,
+                                    source_info.span,
+                                    recovered_value,
+                                )),
+                            ))),
+                        ),
+                    );
                 }
 
                 body.basic_blocks_mut()[cont_block]
@@ -21942,10 +22359,10 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_exit_fn", 1)
             .expect("missing '__rz_exit_fn' definition");
         let def_id_shadow_store_ptr = self
-            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr", 5)
             .expect("missing '__rz_shadow_store_ptr' definition");
         let def_id_shadow_store_ptr_local = self
-            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr_local", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr_local", 5)
             .expect("missing '__rz_shadow_store_ptr_local' definition");
         let def_id_shadow_load_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_tag", 1)
@@ -21953,6 +22370,12 @@ impl MyOptimizationPass {
         let def_id_shadow_load_ref_ancestor = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_ref_ancestor", 1)
             .expect("missing '__rz_shadow_load_ref_ancestor' definition");
+        let def_id_shadow_load_export_parent = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent", 1)
+            .expect("missing '__rz_shadow_load_export_parent' definition");
+        let def_id_shadow_load_export_parent_recovered = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent_recovered", 1)
+            .expect("missing '__rz_shadow_load_export_parent_recovered' definition");
         let def_id_shadow_kill_range = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_kill_range", 2)
             .expect("missing '__rz_shadow_kill_range' definition");
@@ -22001,6 +22424,8 @@ impl MyOptimizationPass {
             def_id_shadow_store_ptr_local,
             def_id_shadow_load_tag,
             def_id_shadow_load_ref_ancestor,
+            def_id_shadow_load_export_parent,
+            def_id_shadow_load_export_parent_recovered,
             def_id_shadow_kill_range,
             def_id_tag_kill,
             def_id_tag_retain,

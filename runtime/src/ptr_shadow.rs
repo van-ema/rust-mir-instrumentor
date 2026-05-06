@@ -13,6 +13,8 @@ const FULL_MASK: u128 = if PTR_SLOT_BYTES >= 128 {
 struct PtrShadowEntry {
     tag: u64,
     ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
     alloc_base: usize,
     alloc_epoch: u64,
 }
@@ -21,6 +23,8 @@ struct PtrShadowEntry {
 struct PartialPtrShadowEntry {
     tag: u64,
     ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
     valid_mask: u128,
     poisoned: bool,
 }
@@ -237,16 +241,22 @@ pub(crate) fn kill_range(addr: usize, size: usize) {
 }
 
 #[inline]
-pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
+pub(crate) fn store_ptr(
+    addr: usize,
+    tag: u64,
+    ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+) {
     if addr == 0 {
         return;
     }
 
     kill_range(addr, PTR_SLOT_BYTES);
-    if tag == 0 && ref_ancestor == 0 {
+    if tag == 0 && ref_ancestor == 0 && export_parent == 0 && export_parent_recovered == 0 {
         return;
     }
-    for stored_tag in [tag, ref_ancestor] {
+    for stored_tag in [tag, ref_ancestor, export_parent] {
         if stored_tag == 0 {
             continue;
         }
@@ -264,6 +274,8 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
             let entry = PtrShadowEntry {
                 tag,
                 ref_ancestor,
+                export_parent,
+                export_parent_recovered,
                 alloc_base: base,
                 alloc_epoch: epoch,
             };
@@ -278,6 +290,8 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
             let entry = PtrShadowEntry {
                 tag,
                 ref_ancestor,
+                export_parent,
+                export_parent_recovered,
                 alloc_base: 0,
                 alloc_epoch: 0,
             };
@@ -287,13 +301,19 @@ pub(crate) fn store_ptr(addr: usize, tag: u64, ref_ancestor: u64) {
 }
 
 #[inline]
-pub(crate) fn store_ptr_local_slot(addr: usize, tag: u64, ref_ancestor: u64) {
+pub(crate) fn store_ptr_local_slot(
+    addr: usize,
+    tag: u64,
+    ref_ancestor: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+) {
     if addr == 0 {
         return;
     }
 
     kill_range(addr, PTR_SLOT_BYTES);
-    if tag == 0 && ref_ancestor == 0 {
+    if tag == 0 && ref_ancestor == 0 && export_parent == 0 && export_parent_recovered == 0 {
         return;
     }
 
@@ -306,6 +326,8 @@ pub(crate) fn store_ptr_local_slot(addr: usize, tag: u64, ref_ancestor: u64) {
             let entry = PtrShadowEntry {
                 tag,
                 ref_ancestor,
+                export_parent,
+                export_parent_recovered,
                 alloc_base: base,
                 alloc_epoch: epoch,
             };
@@ -320,6 +342,8 @@ pub(crate) fn store_ptr_local_slot(addr: usize, tag: u64, ref_ancestor: u64) {
             let entry = PtrShadowEntry {
                 tag,
                 ref_ancestor,
+                export_parent,
+                export_parent_recovered,
                 alloc_base: 0,
                 alloc_epoch: 0,
             };
@@ -431,6 +455,20 @@ pub(crate) fn load_ref_ancestor(addr: usize) -> u64 {
 }
 
 #[inline]
+pub(crate) fn load_export_parent(addr: usize) -> u64 {
+    load_entry(addr)
+        .map(|entry| entry.export_parent)
+        .unwrap_or(0)
+}
+
+#[inline]
+pub(crate) fn load_export_parent_recovered(addr: usize) -> u8 {
+    load_entry(addr)
+        .map(|entry| entry.export_parent_recovered)
+        .unwrap_or(0)
+}
+
+#[inline]
 pub(crate) fn copy_slot(dst_addr: usize, src_addr: usize) {
     if dst_addr == 0 || src_addr == 0 {
         return;
@@ -438,7 +476,13 @@ pub(crate) fn copy_slot(dst_addr: usize, src_addr: usize) {
     let entry = load_entry(src_addr);
     kill_range(dst_addr, PTR_SLOT_BYTES);
     if let Some(entry) = entry {
-        store_ptr(dst_addr, entry.tag, entry.ref_ancestor);
+        store_ptr(
+            dst_addr,
+            entry.tag,
+            entry.ref_ancestor,
+            entry.export_parent,
+            entry.export_parent_recovered,
+        );
     }
 }
 
@@ -474,11 +518,16 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                 .or_insert(PartialPtrShadowEntry {
                     tag: src_entry.tag,
                     ref_ancestor: src_entry.ref_ancestor,
+                    export_parent: src_entry.export_parent,
+                    export_parent_recovered: src_entry.export_parent_recovered,
                     valid_mask: 0,
                     poisoned: false,
                 });
-            if !slot.poisoned
-                && (slot.tag != src_entry.tag || slot.ref_ancestor != src_entry.ref_ancestor)
+                if !slot.poisoned
+                && (slot.tag != src_entry.tag
+                    || slot.ref_ancestor != src_entry.ref_ancestor
+                    || slot.export_parent != src_entry.export_parent
+                    || slot.export_parent_recovered != src_entry.export_parent_recovered)
             {
                 slot.poisoned = true;
                 slot.valid_mask = 0;
@@ -503,6 +552,8 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                 let full = PtrShadowEntry {
                     tag: slot.tag,
                     ref_ancestor: slot.ref_ancestor,
+                    export_parent: slot.export_parent,
+                    export_parent_recovered: slot.export_parent_recovered,
                     alloc_base: base,
                     alloc_epoch: epoch,
                 };
@@ -533,11 +584,16 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
             let slot = partial.entry(slot_start).or_insert(PartialPtrShadowEntry {
                 tag: src_entry.tag,
                 ref_ancestor: src_entry.ref_ancestor,
+                export_parent: src_entry.export_parent,
+                export_parent_recovered: src_entry.export_parent_recovered,
                 valid_mask: 0,
                 poisoned: false,
             });
             if !slot.poisoned
-                && (slot.tag != src_entry.tag || slot.ref_ancestor != src_entry.ref_ancestor)
+                && (slot.tag != src_entry.tag
+                    || slot.ref_ancestor != src_entry.ref_ancestor
+                    || slot.export_parent != src_entry.export_parent
+                    || slot.export_parent_recovered != src_entry.export_parent_recovered)
             {
                 slot.poisoned = true;
                 slot.valid_mask = 0;
@@ -562,6 +618,8 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                 let full = PtrShadowEntry {
                     tag: slot.tag,
                     ref_ancestor: slot.ref_ancestor,
+                    export_parent: slot.export_parent,
+                    export_parent_recovered: slot.export_parent_recovered,
                     alloc_base: 0,
                     alloc_epoch: 0,
                 };
