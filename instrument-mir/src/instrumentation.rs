@@ -2824,6 +2824,12 @@ impl MyOptimizationPass {
         None
     }
 
+    /// Pair return-value shadow leaves with the pointer/view provenance of `arg0`.
+    ///
+    /// This handles view constructors like `split_at{,_mut}` and `VecDeque::as_slices`, where
+    /// one pointer-bearing input produces an aggregate return with multiple pointer/view leaves.
+    /// We first try the normal 1:1 structural pairing. If that fails and `arg0` contributes a
+    /// single shadowable leaf, we fan that one source leaf out to every returned leaf.
     fn pair_shadowable_leaf_ptr_specs_from_arg0<'tcx>(
         &self,
         dst_specs: &[ShadowableLeafPtrSpec<'tcx>],

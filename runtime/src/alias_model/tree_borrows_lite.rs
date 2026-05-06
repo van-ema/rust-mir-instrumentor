@@ -999,26 +999,6 @@ fn tb_lite_check(
         }
     }
     if !tb_is_live_node(&node) {
-        if matches!(tmeta.kind, PtrKind::RawMut) && matches!(access, AliasAccessKind::Write) {
-            let tmap = tags().lock().unwrap();
-            if tb_lite_reactivatable_missing_parent_raw_mut(
-                tree,
-                &tmap,
-                access_tag,
-                &node,
-                addr,
-                size,
-                tmeta.alloc_epoch,
-            ) {
-                drop(tmap);
-                if let Some(n) = tree.nodes.get_mut(&access_tag) {
-                    n.perm = TbPerm::Active;
-                    n.alive = true;
-                    n.poisoned_by_protector_end = false;
-                }
-                return None;
-            }
-        }
         if matches!(tmeta.kind, PtrKind::RefMut) {
             if let Some(descendants) =
                 tb_lite_reactivatable_same_lineage(tree, access_tag, addr, size, tmeta.alloc_epoch)
@@ -1118,28 +1098,7 @@ fn tb_lite_check(
                     addr,
                     size,
                     tmeta.alloc_epoch,
-                ) || tb_has_usable_clean_unique_ancestor(
-                    &tree.nodes,
-                    n.tag,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || tb_only_unique_ancestor_overlap(
-                    &tree.nodes,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || (matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst)
-                    && tb_only_same_family_overlap(
-                        &tree.nodes,
-                        &access_lineage,
-                        addr,
-                        size,
-                        tmeta.alloc_epoch,
-                    ))
-                {
+                ) {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -1179,23 +1138,12 @@ fn tb_lite_check(
                 }
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
-                if tb_has_usable_clean_unique_ancestor(
-                    &tree.nodes,
-                    n.tag,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) {
-                    old_perm
-                } else {
-                    let mut msg = format!(
-                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
-                        access_tag, addr, size, tmeta.kind, n.tag
-                    );
-                    msg.push_str(&dump);
-                    return Some(msg);
-                }
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",
+                    access_tag, addr, size, tmeta.kind, n.tag
+                );
+                msg.push_str(&dump);
+                return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
@@ -1222,27 +1170,7 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                if tb_same_lineage_frozen_raw_const_write_ok(
-                    &tree.nodes,
-                    n.tag,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || tb_has_usable_clean_unique_ancestor(
-                    &tree.nodes,
-                    n.tag,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || tb_only_unique_ancestor_overlap(
-                    &tree.nodes,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || (matches!(tmeta.kind, PtrKind::RefMut | PtrKind::RawMut)
+                let same_family_refmut_or_rawmut = matches!(tmeta.kind, PtrKind::RefMut | PtrKind::RawMut)
                     && tb_has_live_unique_lineage_ancestor(
                         &tree.nodes,
                         &access_lineage,
@@ -1256,9 +1184,9 @@ fn tb_lite_check(
                         addr,
                         size,
                         tmeta.alloc_epoch,
-                    ))
-                    || (matches!(tmeta.kind, PtrKind::RawMut) && !covered)
-                {
+                    );
+                let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut) && !covered;
+                if same_family_refmut_or_rawmut || rawmut_uncovered {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -1270,29 +1198,12 @@ fn tb_lite_check(
                 }
             }
             (AliasAccessKind::Write, true, TbPerm::Disabled, _) => {
-                if tb_has_usable_clean_unique_ancestor(
-                    &tree.nodes,
-                    n.tag,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) || tb_only_unique_ancestor_overlap(
-                    &tree.nodes,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) {
-                    n.perm
-                } else {
-                    let mut msg = format!(
-                        "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_WRITE",
-                        access_tag, addr, size, tmeta.kind
-                    );
-                    msg.push_str(&dump);
-                    return Some(msg);
-                }
+                let mut msg = format!(
+                    "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_WRITE",
+                    access_tag, addr, size, tmeta.kind
+                );
+                msg.push_str(&dump);
+                return Some(msg);
             }
 
             // Foreign write: preserve the original raw-const family when we reinterpret
@@ -1790,63 +1701,6 @@ fn tb_lite_reactivatable_same_lineage(
     Some(descendants_to_disable)
 }
 
-fn tb_lite_reactivatable_missing_parent_raw_mut(
-    tree: &TbAllocState,
-    tmap: &HashMap<u64, TagMeta>,
-    access_tag: u64,
-    access_node: &TbNode,
-    addr: usize,
-    size: usize,
-    alloc_epoch: u64,
-) -> bool {
-    if access_node.parent == 0 || tree.nodes.contains_key(&access_node.parent) {
-        return false;
-    }
-
-    let access_end = addr.saturating_add(size);
-    let mut cur = access_node.parent;
-    let mut unique_ancestor = None;
-    for _ in 0..tmap.len().saturating_add(1) {
-        if let Some(node) = tree.nodes.get(&cur) {
-            if tb_is_live_node(node)
-                && matches!(node.kind, BorrowKind::Unique)
-                && (alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch)
-            {
-                let node_end = node.start.saturating_add(node.len);
-                if node.len != 0 && addr >= node.start && access_end <= node_end {
-                    unique_ancestor = Some(node.tag);
-                    break;
-                }
-            }
-        }
-
-        let Some(meta) = tmap.get(&cur) else {
-            return false;
-        };
-        if meta.parent == 0 {
-            return false;
-        }
-        cur = meta.parent;
-    }
-
-    let Some(unique_ancestor) = unique_ancestor else {
-        return false;
-    };
-
-    tree.nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
-            return true;
-        }
-        if alloc_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != alloc_epoch {
-            return true;
-        }
-        tb_is_effective_ancestor(&tree.nodes, tmap, unique_ancestor, other.tag)
-            || tb_is_effective_ancestor(&tree.nodes, tmap, other.tag, unique_ancestor)
-            || tb_is_effective_ancestor(&tree.nodes, tmap, access_tag, other.tag)
-            || tb_is_effective_ancestor(&tree.nodes, tmap, other.tag, access_tag)
-    })
-}
-
 #[inline]
 fn tb_is_ancestor(nodes: &HashMap<u64, TbNode>, ancestor: u64, mut tag: u64) -> bool {
     if ancestor == tag {
@@ -1892,81 +1746,6 @@ fn tb_is_effective_ancestor(
         tag = t.parent;
     }
     false
-}
-
-fn tb_has_usable_clean_unique_ancestor(
-    nodes: &HashMap<u64, TbNode>,
-    conflicted_tag: u64,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    access_epoch: u64,
-) -> bool {
-    let Some(conflicted) = nodes.get(&conflicted_tag) else {
-        return false;
-    };
-    let conflicted_end = conflicted.start.saturating_add(conflicted.len);
-    let access_end = addr.saturating_add(size);
-    for &cur in access_lineage {
-        if cur == conflicted_tag {
-            break;
-        }
-        let Some(node) = nodes.get(&cur) else {
-            return false;
-        };
-        let node_end = node.start.saturating_add(node.len);
-        if node.len != 0
-            && addr >= node.start
-            && access_end <= node_end
-            && node.start >= conflicted.start
-            && node_end <= conflicted_end
-            && (access_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == access_epoch)
-            && matches!(node.kind, BorrowKind::Unique)
-            && !matches!(
-                node.perm,
-                TbPerm::Reserved { conflicted: true } | TbPerm::Disabled
-            )
-        {
-            let has_foreign_overlap = nodes.values().any(|other| {
-                tb_is_live_node(other)
-                    && other.tag != node.tag
-                    && (access_epoch == 0
-                        || other.alloc_epoch == 0
-                        || other.alloc_epoch == access_epoch)
-                    && tb_ranges_overlap(addr, size, other.start, other.len)
-                    && !tb_is_ancestor(nodes, other.tag, node.tag)
-                    && !tb_is_ancestor(nodes, node.tag, other.tag)
-            });
-            if has_foreign_overlap {
-                return false;
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn tb_only_unique_ancestor_overlap(
-    nodes: &HashMap<u64, TbNode>,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    access_epoch: u64,
-) -> bool {
-    nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
-            return true;
-        }
-        if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
-            return true;
-        }
-        tb_lineage_contains(access_lineage, other.tag)
-            && matches!(other.kind, BorrowKind::Unique)
-            && !matches!(
-                other.perm,
-                TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
-            )
-    })
 }
 
 fn tb_only_same_family_overlap(
@@ -2044,69 +1823,6 @@ fn tb_has_live_unique_lineage_ancestor(
             return true;
         }
     }
-    false
-}
-
-fn tb_same_lineage_frozen_raw_const_write_ok(
-    nodes: &HashMap<u64, TbNode>,
-    frozen_tag: u64,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    access_epoch: u64,
-) -> bool {
-    let Some(raw_const) = nodes.get(&frozen_tag) else {
-        return false;
-    };
-    if raw_const.kind != BorrowKind::RawConst {
-        return false;
-    }
-
-    let mut has_mut_ancestor_above = false;
-    let mut cursor = raw_const.parent;
-    for _ in 0..nodes.len().saturating_add(1) {
-        if cursor == 0 {
-            break;
-        }
-        let Some(node) = nodes.get(&cursor) else {
-            break;
-        };
-        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
-            cursor = node.parent;
-            continue;
-        }
-        if tb_is_live_node(node) && matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
-            has_mut_ancestor_above = true;
-            break;
-        }
-        cursor = node.parent;
-    }
-    if !has_mut_ancestor_above {
-        return false;
-    }
-
-    let mut saw_mut_descendant_below = false;
-    for &tag in access_lineage {
-        if tag == frozen_tag {
-            return saw_mut_descendant_below;
-        }
-        let Some(node) = nodes.get(&tag) else {
-            return false;
-        };
-        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
-            continue;
-        }
-        if tb_node_overlaps(node, addr, size)
-            && matches!(node.kind, BorrowKind::Unique | BorrowKind::RawMut)
-            && !matches!(
-                node.perm,
-                TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
-            )
-        {
-            saw_mut_descendant_below = true;
-        }
-    }
-
     false
 }
 
