@@ -7695,27 +7695,6 @@ impl MyOptimizationPass {
                 .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
     }
 
-    fn projectionless_slot_parent_operand_for_src_place<'tcx>(
-        &self,
-        src_place: Place<'tcx>,
-        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
-        projectionless_anchor_suppressed_locals: &HashSet<Local>,
-        use_projectionless_anchor: bool,
-        projectionless_raw_direct_pointer_carrier: bool,
-    ) -> Option<Operand<'tcx>> {
-        if use_projectionless_anchor
-            && src_place.projection.is_empty()
-            && !projectionless_raw_direct_pointer_carrier
-            && !projectionless_anchor_suppressed_locals.contains(&src_place.local)
-        {
-            return self.slot_family_parent_operand_for_local(
-                src_place.local,
-                reborrow_anchor_local_for_stack_local,
-            );
-        }
-        None
-    }
-
     fn projected_slot_family_parent_operand_for_src_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -7984,6 +7963,7 @@ impl MyOptimizationPass {
         use_projectionless_anchor: bool,
         mode: ParentSelectionMode,
     ) -> Operand<'tcx> {
+        let _ = (projectionless_anchor_suppressed_locals, use_projectionless_anchor);
         let src_local_ty = body.local_decls[src_place.local].ty;
         let projectionless_raw_direct_pointer_carrier = is_raw_creation
             && src_place.projection.is_empty()
@@ -8013,15 +7993,6 @@ impl MyOptimizationPass {
 
         receiver_parent
             .or(slot_parent)
-            .or_else(|| {
-                self.projectionless_slot_parent_operand_for_src_place(
-                    src_place,
-                    reborrow_anchor_local_for_stack_local,
-                    projectionless_anchor_suppressed_locals,
-                    use_projectionless_anchor,
-                    projectionless_raw_direct_pointer_carrier,
-                )
-            })
             .or_else(|| {
                 self.projected_fast_path_pointee_parent_operand_for_src_place(
                     tcx,
