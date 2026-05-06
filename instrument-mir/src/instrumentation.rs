@@ -991,14 +991,14 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::split_at",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::split_at_mut",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -1109,7 +1109,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::collections::VecDeque",
         MatchKind::EndsWith,
         "::as_slices",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     // String / str helpers.
     EffectRule::two(
@@ -2822,6 +2822,29 @@ impl MyOptimizationPass {
         }
 
         None
+    }
+
+    fn pair_shadowable_leaf_ptr_specs_from_arg0<'tcx>(
+        &self,
+        dst_specs: &[ShadowableLeafPtrSpec<'tcx>],
+        src_specs: &[ShadowableLeafPtrSpec<'tcx>],
+    ) -> Option<Vec<(ShadowableLeafPtrSpec<'tcx>, ShadowableLeafPtrSpec<'tcx>)>> {
+        if let Some(pairs) = self.pair_shadowable_leaf_ptr_specs(dst_specs, src_specs) {
+            return Some(pairs);
+        }
+
+        if dst_specs.is_empty() || src_specs.len() != 1 {
+            return None;
+        }
+
+        let src_spec = src_specs[0];
+        Some(
+            dst_specs
+                .iter()
+                .copied()
+                .map(|dst_spec| (dst_spec, src_spec))
+                .collect(),
+        )
     }
 
     /// Compute MIR statements that recover the heap payload address stored inside a `Box<T>` local.
@@ -12434,7 +12457,10 @@ impl MyOptimizationPass {
                                     tcx, body, src_place, src_ty,
                                 );
                                 if let Some(matched_leafs) =
-                                    self.pair_shadowable_leaf_ptr_specs(&dst_leafs, &src_leafs)
+                                    self.pair_shadowable_leaf_ptr_specs_from_arg0(
+                                        &dst_leafs,
+                                        &src_leafs,
+                                    )
                                 {
                                     for (dst_spec, src_spec) in matched_leafs {
                                         let kind = if src_spec.place.projection.is_empty()
@@ -22896,6 +22922,14 @@ mod tests {
             CallEffect::Ignore
         );
         assert_eq!(
+            effect_for("core::slice::<impl [T]>::split_at"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::slice::<impl [T]>::split_at_mut"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
             effect_for("core::str::<impl str>::as_bytes"),
             CallEffect::PtrDerive
         );
@@ -22957,6 +22991,10 @@ mod tests {
         assert_eq!(
             effect_for("std::io::Cursor::<T>::position"),
             CallEffect::Ignore
+        );
+        assert_eq!(
+            effect_for("alloc::collections::VecDeque::<T>::as_slices"),
+            CallEffect::CarrierCopyArg0
         );
         assert_eq!(
             effect_for("core::sync::atomic::AtomicUsize::load"),
