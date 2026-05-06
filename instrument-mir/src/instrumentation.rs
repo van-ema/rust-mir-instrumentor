@@ -1952,6 +1952,12 @@ enum InstrKind<'tcx> {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentSelectionMode {
+    ReceiverFamily,
+    PointeeFamily,
+}
+
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
 const CALL_ARG_FLAG_USE_EXPORT_PARENT: u8 = 1 << 7;
@@ -6353,11 +6359,7 @@ impl MyOptimizationPass {
                     Rvalue::BinaryOp(binop, box (lhs, rhs))
                         if matches!(
                             binop,
-                            BinOp::BitAnd
-                                | BinOp::BitOr
-                                | BinOp::BitXor
-                                | BinOp::Add
-                                | BinOp::Sub
+                            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Add | BinOp::Sub
                         ) =>
                     {
                         let next_local = one_local_one_const(pass, body, lhs, rhs)?;
@@ -6374,8 +6376,9 @@ impl MyOptimizationPass {
                 ExposedProvDef::CallArgs(args) => {
                     let mut recovered: Option<Local> = None;
                     for arg in args.iter() {
-                        let Some(arg_local) =
-                            pass.place_from_operand(&arg.node).and_then(|p| p.as_local())
+                        let Some(arg_local) = pass
+                            .place_from_operand(&arg.node)
+                            .and_then(|p| p.as_local())
                         else {
                             continue;
                         };
@@ -7472,6 +7475,99 @@ impl MyOptimizationPass {
         src_local_opt
     }
 
+    fn receiver_family_base_local_for_place<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+    ) -> Option<Local> {
+        if src_place.projection.is_empty() {
+            return None;
+        }
+
+        let base_local = src_place.local;
+        let base_ty = body.local_decls[base_local].ty;
+        let mut projection = src_place.projection.as_ref();
+
+        if matches!(projection.first(), Some(ProjectionElem::Deref)) {
+            let pointee_ty = match base_ty.kind() {
+                TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
+                _ => return None,
+            };
+            if self.is_pointer_ty(pointee_ty) {
+                return None;
+            }
+            projection = &projection[1..];
+        } else if self.is_pointer_ty(base_ty) {
+            return None;
+        }
+
+        if projection.is_empty()
+            || projection
+                .iter()
+                .any(|pe| matches!(pe, ProjectionElem::Deref))
+        {
+            return None;
+        }
+
+        if !projection.iter().any(|pe| {
+            matches!(
+                pe,
+                ProjectionElem::Field(_, _)
+                    | ProjectionElem::Downcast(..)
+                    | ProjectionElem::OpaqueCast(_)
+            )
+        }) {
+            return None;
+        }
+
+        Some(base_local)
+    }
+
+    fn receiver_family_parent_operand_for_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        source_info: SourceInfo,
+        src_place: Place<'tcx>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+    ) -> Option<Operand<'tcx>> {
+        let base_local = self.receiver_family_base_local_for_place(body, src_place)?;
+
+        if let Some(tag_local) = tag_local_for_ptr_local.get(&base_local).copied() {
+            return Some(Operand::Copy(Place::from(tag_local)));
+        }
+        if let Some(ref_ancestor_local) = ref_ancestor_local_for_ptr_local.get(&base_local).copied()
+        {
+            return Some(Operand::Copy(Place::from(ref_ancestor_local)));
+        }
+        if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
+            .get(&base_local)
+            .copied()
+        {
+            return Some(Operand::Copy(Place::from(anchor_local)));
+        }
+
+        let _ = (tcx, source_info);
+        None
+    }
+
+    fn parent_selection_mode_for_src_place<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+    ) -> ParentSelectionMode {
+        if self
+            .receiver_family_base_local_for_place(body, src_place)
+            .is_some()
+        {
+            ParentSelectionMode::ReceiverFamily
+        } else {
+            ParentSelectionMode::PointeeFamily
+        }
+    }
+
     /// Choose the parent-family operand for a new ref/raw creation from `src_place`.
     ///
     /// For plain pointers this prefers the source local's concrete tag. For projected accesses
@@ -7496,7 +7592,22 @@ impl MyOptimizationPass {
         projectionless_anchor_suppressed_locals: &HashSet<Local>,
         is_raw_creation: bool,
         use_projectionless_anchor: bool,
+        mode: ParentSelectionMode,
     ) -> Operand<'tcx> {
+        if matches!(mode, ParentSelectionMode::ReceiverFamily) {
+            if let Some(op) = self.receiver_family_parent_operand_for_place(
+                tcx,
+                body,
+                source_info,
+                src_place,
+                tag_local_for_ptr_local,
+                ref_ancestor_local_for_ptr_local,
+                reborrow_anchor_local_for_stack_local,
+            ) {
+                return op;
+            }
+        }
+
         let src_local_ty = body.local_decls[src_place.local].ty;
         let projectionless_raw_direct_pointer_carrier = is_raw_creation
             && src_place.projection.is_empty()
@@ -7708,6 +7819,7 @@ impl MyOptimizationPass {
             projectionless_anchor_suppressed_locals,
             false,
             true,
+            self.parent_selection_mode_for_src_place(body, src_place),
         );
 
         let fallback_local = body
@@ -7867,6 +7979,7 @@ impl MyOptimizationPass {
             matches!(borrow_kind, BorrowKind::Mut { .. })
                 || self.compile_alias_model_is_sb_like()
                 || !self.is_pointer_ty(src_ty),
+            self.parent_selection_mode_for_src_place(body, src_place),
         );
 
         let fallback_local = body
@@ -9874,17 +9987,15 @@ impl MyOptimizationPass {
                                 .and_then(|src_place| {
                                     if matches!(
                                         rvalue,
-                                        Rvalue::Cast(
-                                            CastKind::PointerWithExposedProvenance,
-                                            ..,
-                                        )
+                                        Rvalue::Cast(CastKind::PointerWithExposedProvenance, ..,)
                                     ) {
                                         self.backtrack_global_exposed_provenance_source_local(
                                             body, dst_local,
                                         )
                                         .or_else(|| {
                                             src_place.as_local().and_then(|src_local| {
-                                                if self.is_pointer_ty(body.local_decls[src_local].ty)
+                                                if self
+                                                    .is_pointer_ty(body.local_decls[src_local].ty)
                                                 {
                                                     Some(src_local)
                                                 } else {
@@ -9910,11 +10021,13 @@ impl MyOptimizationPass {
                                                 src_local,
                                                 &block_data.statements[..stmt_idx],
                                             )
-                                            .or_else(|| {
-                                                self.backtrack_global_pointer_value_local(
-                                                    body, src_local,
-                                                )
-                                            })
+                                            .or_else(
+                                                || {
+                                                    self.backtrack_global_pointer_value_local(
+                                                        body, src_local,
+                                                    )
+                                                },
+                                            )
                                         }
                                     } else {
                                         None
@@ -17237,6 +17350,7 @@ impl MyOptimizationPass {
                     projectionless_anchor_suppressed_locals,
                     false,
                     true,
+                    ParentSelectionMode::PointeeFamily,
                 );
                 let validate_func = Operand::function_handle(
                     tcx,
@@ -17813,6 +17927,7 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             is_raw_creation,
                             true,
+                            self.parent_selection_mode_for_src_place(body, src),
                         )),
                     ))),
                 );
@@ -18795,6 +18910,7 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             false,
                             true,
+                            self.parent_selection_mode_for_src_place(body, place),
                         )
                     };
                     let tmp_unit = body
@@ -18978,6 +19094,7 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             false,
                             true,
+                            self.parent_selection_mode_for_src_place(body, place),
                         )
                     };
                     let tmp_unit = body
@@ -19237,6 +19354,7 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     true,
+                                    ParentSelectionMode::PointeeFamily,
                                 )
                             }
                         } else {
@@ -19253,6 +19371,7 @@ impl MyOptimizationPass {
                                 projectionless_anchor_suppressed_locals,
                                 false,
                                 true,
+                                ParentSelectionMode::PointeeFamily,
                             )
                         }
                     };
@@ -19411,6 +19530,7 @@ impl MyOptimizationPass {
                         projectionless_anchor_suppressed_locals,
                         false,
                         true,
+                        ParentSelectionMode::PointeeFamily,
                     );
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
@@ -19452,6 +19572,7 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             false,
                             true,
+                            ParentSelectionMode::PointeeFamily,
                         )
                     };
                     let tmp_unit = body
@@ -19852,6 +19973,7 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     use_projectionless_anchor,
+                                    self.parent_selection_mode_for_src_place(body, *src),
                                 )
                             }
                         }
@@ -19884,6 +20006,7 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     true,
                                     true,
+                                    self.parent_selection_mode_for_src_place(body, *src),
                                 )
                             }
                         }
@@ -20208,6 +20331,7 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     use_projectionless_anchor,
+                                    self.parent_selection_mode_for_src_place(body, *src),
                                 )
                             };
                             Some(Statement::new(
@@ -20401,21 +20525,21 @@ impl MyOptimizationPass {
                                         .copied(),
                                 ) {
                                     recovered_init_local = Some(src_recovered_local);
-                                    let recovered_u64_local = body.local_decls.push(
-                                        LocalDecl::new(tcx.types.u64, source_info.span),
-                                    );
-                                    let not_recovered_u64_local = body.local_decls.push(
-                                        LocalDecl::new(tcx.types.u64, source_info.span),
-                                    );
-                                    let fallback_part_local = body.local_decls.push(
-                                        LocalDecl::new(tcx.types.u64, source_info.span),
-                                    );
-                                    let export_part_local = body.local_decls.push(
-                                        LocalDecl::new(tcx.types.u64, source_info.span),
-                                    );
-                                    let selected_tag_local = body.local_decls.push(
-                                        LocalDecl::new(tcx.types.u64, source_info.span),
-                                    );
+                                    let recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let not_recovered_u64_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let fallback_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let export_part_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
+                                    let selected_tag_local = body
+                                        .local_decls
+                                        .push(LocalDecl::new(tcx.types.u64, source_info.span));
 
                                     stmts.extend([
                                         Statement::new(
@@ -20486,7 +20610,9 @@ impl MyOptimizationPass {
                                                         Operand::Copy(Place::from(
                                                             fallback_part_local,
                                                         )),
-                                                        Operand::Copy(Place::from(export_part_local)),
+                                                        Operand::Copy(Place::from(
+                                                            export_part_local,
+                                                        )),
                                                     )),
                                                 ),
                                             ))),
@@ -20519,9 +20645,7 @@ impl MyOptimizationPass {
                                 Rvalue::Use(
                                     recovered_init_local
                                         .map(|local| Operand::Copy(Place::from(local)))
-                                        .unwrap_or_else(|| {
-                                            self.const_u8(tcx, source_info.span, 0)
-                                        }),
+                                        .unwrap_or_else(|| self.const_u8(tcx, source_info.span, 0)),
                                 ),
                             ))),
                         ));
