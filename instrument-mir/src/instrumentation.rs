@@ -7448,16 +7448,9 @@ impl MyOptimizationPass {
         is_raw_creation: bool,
     ) -> Option<Local> {
         let block_data = &body.basic_blocks[bb];
-        let projected_carrier_raw_field_load = is_raw_creation
-            && !src_place.projection.is_empty()
-            && !self.is_pointer_ty(body.local_decls[src_place.local].ty);
-        let projected_raw_field_load = is_raw_creation
-            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-            && src_place
-                .projection
-                .iter()
-                .skip(1)
-                .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
+        let projected_carrier_raw_field_load =
+            self.is_projected_carrier_raw_field_load(body, src_place, is_raw_creation);
+        let projected_raw_field_load = self.is_projected_raw_field_load(src_place, is_raw_creation);
         let mut src_local_opt = self.recover_parent_source_local_for_place(
             tcx,
             body,
@@ -7615,22 +7608,300 @@ impl MyOptimizationPass {
     ) -> Option<Operand<'tcx>> {
         let base_local = self.receiver_family_base_local_for_place(body, src_place)?;
 
-        if let Some(tag_local) = tag_local_for_ptr_local.get(&base_local).copied() {
-            return Some(Operand::Copy(Place::from(tag_local)));
+        if let Some(op) = self.exact_or_ref_ancestor_parent_operand_for_local(
+            base_local,
+            tag_local_for_ptr_local,
+            ref_ancestor_local_for_ptr_local,
+        ) {
+            return Some(op);
         }
-        if let Some(ref_ancestor_local) = ref_ancestor_local_for_ptr_local.get(&base_local).copied()
-        {
-            return Some(Operand::Copy(Place::from(ref_ancestor_local)));
-        }
-        if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-            .get(&base_local)
-            .copied()
-        {
-            return Some(Operand::Copy(Place::from(anchor_local)));
+        if let Some(op) = self.slot_family_parent_operand_for_local(
+            base_local,
+            reborrow_anchor_local_for_stack_local,
+        ) {
+            return Some(op);
         }
 
         let _ = (tcx, source_info);
         None
+    }
+
+    fn exact_or_ref_ancestor_parent_operand_for_local<'tcx>(
+        &self,
+        local: Local,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+    ) -> Option<Operand<'tcx>> {
+        tag_local_for_ptr_local
+            .get(&local)
+            .copied()
+            .map(|tag_local| Operand::Copy(Place::from(tag_local)))
+            .or_else(|| {
+                ref_ancestor_local_for_ptr_local
+                    .get(&local)
+                    .copied()
+                    .map(|tag_local| Operand::Copy(Place::from(tag_local)))
+            })
+    }
+
+    fn slot_family_parent_operand_for_local<'tcx>(
+        &self,
+        local: Local,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+    ) -> Option<Operand<'tcx>> {
+        reborrow_anchor_local_for_stack_local
+            .get(&local)
+            .copied()
+            .map(|anchor_local| Operand::Copy(Place::from(anchor_local)))
+    }
+
+    fn is_projected_carrier_raw_field_load<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+        is_raw_creation: bool,
+    ) -> bool {
+        is_raw_creation
+            && !src_place.projection.is_empty()
+            && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+    }
+
+    fn is_projected_raw_field_load(
+        &self,
+        src_place: Place<'_>,
+        is_raw_creation: bool,
+    ) -> bool {
+        is_raw_creation
+            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && src_place
+                .projection
+                .iter()
+                .skip(1)
+                .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
+    }
+
+    fn projectionless_slot_parent_operand_for_src_place<'tcx>(
+        &self,
+        src_place: Place<'tcx>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        projectionless_anchor_suppressed_locals: &HashSet<Local>,
+        use_projectionless_anchor: bool,
+        projectionless_raw_direct_pointer_carrier: bool,
+    ) -> Option<Operand<'tcx>> {
+        if use_projectionless_anchor
+            && src_place.projection.is_empty()
+            && !projectionless_raw_direct_pointer_carrier
+            && !projectionless_anchor_suppressed_locals.contains(&src_place.local)
+        {
+            return self.slot_family_parent_operand_for_local(
+                src_place.local,
+                reborrow_anchor_local_for_stack_local,
+            );
+        }
+        None
+    }
+
+    fn projected_slot_family_parent_operand_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        src_place: Place<'tcx>,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        is_raw_creation: bool,
+    ) -> Option<Operand<'tcx>> {
+        if src_place.projection.is_empty() {
+            return None;
+        }
+
+        let base_local = src_place.local;
+        let base_ty = body.local_decls[base_local].ty;
+        let projected_raw_field_load = self.is_projected_raw_field_load(src_place, is_raw_creation);
+
+        if self.is_pointer_ty(base_ty)
+            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && !projected_raw_field_load
+        {
+            let block_stmts = &body.basic_blocks[bb].statements;
+            let upto = stmt_idx.min(block_stmts.len());
+            if let Some(pointee_local) =
+                self.backtrack_pointer_pointee_local(body, base_local, &block_stmts[..upto])
+            {
+                if !self.is_pointer_ty(body.local_decls[pointee_local].ty) {
+                    if let Some(op) = self.slot_family_parent_operand_for_local(
+                        pointee_local,
+                        reborrow_anchor_local_for_stack_local,
+                    ) {
+                        return Some(op);
+                    }
+                }
+            }
+        }
+
+        if !is_raw_creation
+            && !self.is_pointer_ty(base_ty)
+            && self.ty_contains_pointer_fields(tcx, body, base_ty, 4)
+        {
+            return self.slot_family_parent_operand_for_local(
+                base_local,
+                reborrow_anchor_local_for_stack_local,
+            );
+        }
+
+        None
+    }
+
+    fn projected_fast_path_pointee_parent_operand_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        is_raw_creation: bool,
+    ) -> Option<Operand<'tcx>> {
+        if src_place.projection.is_empty() {
+            return None;
+        }
+
+        let base_local = src_place.local;
+        let base_ty = body.local_decls[base_local].ty;
+        let projected_raw_field_load = self.is_projected_raw_field_load(src_place, is_raw_creation);
+
+        if self.is_pointer_ty(base_ty)
+            && !self.is_thin_ptr_ty(tcx, body, base_ty)
+            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && src_place.projection.iter().skip(1).all(|pe| {
+                matches!(
+                    pe,
+                    ProjectionElem::Index(_)
+                        | ProjectionElem::ConstantIndex { .. }
+                        | ProjectionElem::Subslice { .. }
+                        | ProjectionElem::OpaqueCast(_)
+                )
+            })
+        {
+            return self.exact_or_ref_ancestor_parent_operand_for_local(
+                base_local,
+                tag_local_for_ptr_local,
+                ref_ancestor_local_for_ptr_local,
+            );
+        }
+
+        if self.is_pointer_ty(base_ty)
+            && src_place.projection.len() == 1
+            && matches!(src_place.projection[0], ProjectionElem::Deref)
+        {
+            return self.exact_or_ref_ancestor_parent_operand_for_local(
+                base_local,
+                tag_local_for_ptr_local,
+                ref_ancestor_local_for_ptr_local,
+            );
+        }
+
+        if self.is_pointer_ty(base_ty)
+            && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+            && src_place
+                .projection
+                .iter()
+                .skip(1)
+                .any(|pe| matches!(pe, ProjectionElem::Field(_, _)))
+            && !projected_raw_field_load
+        {
+            return self.exact_or_ref_ancestor_parent_operand_for_local(
+                base_local,
+                tag_local_for_ptr_local,
+                ref_ancestor_local_for_ptr_local,
+            );
+        }
+
+        None
+    }
+
+    fn candidate_parent_source_local_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        src_place: Place<'tcx>,
+        is_raw_creation: bool,
+        projectionless_raw_direct_pointer_carrier: bool,
+    ) -> Option<Local> {
+        let candidate_local = if src_place.projection.is_empty() {
+            let block_stmts = &body.basic_blocks[bb].statements;
+            let upto = stmt_idx.min(block_stmts.len());
+            let src_local = src_place.local;
+            let src_ty = body.local_decls[src_local].ty;
+            if self.is_pointer_ty(src_ty) {
+                if self.is_projected_raw_field_load(src_place, is_raw_creation) {
+                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
+                } else {
+                    Some(src_local)
+                }
+            } else if self.ty_contains_direct_pointer_fields(tcx, body, src_ty) {
+                None
+            } else {
+                self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
+                    .or_else(|| {
+                        self.backtrack_single_pointer_carrier_local(
+                            body,
+                            src_local,
+                            &block_stmts[..upto],
+                        )
+                    })
+            }
+        } else {
+            self.recover_pointer_source_local_for_projected_place(
+                tcx,
+                body,
+                bb,
+                stmt_idx,
+                src_place,
+                is_raw_creation,
+            )
+        };
+
+        candidate_local.or_else(|| {
+            if src_place.projection.is_empty()
+                && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
+                && !projectionless_raw_direct_pointer_carrier
+            {
+                self.backtrack_global_single_pointer_carrier_local(body, src_place.local)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn pointee_family_parent_operand_for_src_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        src_place: Place<'tcx>,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        is_raw_creation: bool,
+        projectionless_raw_direct_pointer_carrier: bool,
+    ) -> Option<Operand<'tcx>> {
+        let candidate_local = self.candidate_parent_source_local_for_src_place(
+            tcx,
+            body,
+            bb,
+            stmt_idx,
+            src_place,
+            is_raw_creation,
+            projectionless_raw_direct_pointer_carrier,
+        )?;
+
+        self.exact_or_ref_ancestor_parent_operand_for_local(
+            candidate_local,
+            tag_local_for_ptr_local,
+            ref_ancestor_local_for_ptr_local,
+        )
     }
 
     fn parent_selection_mode_for_src_place<'tcx>(
@@ -7674,8 +7945,13 @@ impl MyOptimizationPass {
         use_projectionless_anchor: bool,
         mode: ParentSelectionMode,
     ) -> Operand<'tcx> {
-        if matches!(mode, ParentSelectionMode::ReceiverFamily) {
-            if let Some(op) = self.receiver_family_parent_operand_for_place(
+        let src_local_ty = body.local_decls[src_place.local].ty;
+        let projectionless_raw_direct_pointer_carrier = is_raw_creation
+            && src_place.projection.is_empty()
+            && !self.is_pointer_ty(src_local_ty)
+            && self.ty_contains_direct_pointer_fields(tcx, body, src_local_ty);
+        let receiver_parent = if matches!(mode, ParentSelectionMode::ReceiverFamily) {
+            self.receiver_family_parent_operand_for_place(
                 tcx,
                 body,
                 source_info,
@@ -7683,188 +7959,56 @@ impl MyOptimizationPass {
                 tag_local_for_ptr_local,
                 ref_ancestor_local_for_ptr_local,
                 reborrow_anchor_local_for_stack_local,
-            ) {
-                return op;
-            }
-        }
-
-        let src_local_ty = body.local_decls[src_place.local].ty;
-        let projectionless_raw_direct_pointer_carrier = is_raw_creation
-            && src_place.projection.is_empty()
-            && !self.is_pointer_ty(src_local_ty)
-            && self.ty_contains_direct_pointer_fields(tcx, body, src_local_ty);
-        if use_projectionless_anchor
-            && src_place.projection.is_empty()
-            && !projectionless_raw_direct_pointer_carrier
-            && !projectionless_anchor_suppressed_locals.contains(&src_place.local)
-        {
-            if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-                .get(&src_place.local)
-                .copied()
-            {
-                return Operand::Copy(Place::from(anchor_local));
-            }
-        }
-
-        if !src_place.projection.is_empty() {
-            let base_local = src_place.local;
-            let base_ty = body.local_decls[base_local].ty;
-            let projected_raw_field_load = is_raw_creation
-                && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                && src_place
-                    .projection
-                    .iter()
-                    .skip(1)
-                    .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
-            if self.is_pointer_ty(base_ty)
-                && !self.is_thin_ptr_ty(tcx, body, base_ty)
-                && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                && src_place.projection.iter().skip(1).all(|pe| {
-                    matches!(
-                        pe,
-                        ProjectionElem::Index(_)
-                            | ProjectionElem::ConstantIndex { .. }
-                            | ProjectionElem::Subslice { .. }
-                            | ProjectionElem::OpaqueCast(_)
-                    )
-                })
-            {
-                // `&slice[a..b]` / `&slice[i]` should derive from the current wide slice/str
-                // local, not from an older carrier that produced that slice. Backtracking a
-                // returned `&[u8]` through `Bytes::as_ref()` resurrects the outer `&Bytes`
-                // family and mis-parents empty-subslice sentinels such as `0x1`.
-                if let Some(tag_local) = tag_local_for_ptr_local.get(&base_local).copied() {
-                    return Operand::Copy(Place::from(tag_local));
-                }
-                if let Some(ref_ancestor_local) =
-                    ref_ancestor_local_for_ptr_local.get(&base_local).copied()
-                {
-                    return Operand::Copy(Place::from(ref_ancestor_local));
-                }
-            }
-            if self.is_pointer_ty(base_ty)
-                && src_place.projection.len() == 1
-                && matches!(src_place.projection[0], ProjectionElem::Deref)
-            {
-                if let Some(tag_local) = tag_local_for_ptr_local.get(&base_local).copied() {
-                    return Operand::Copy(Place::from(tag_local));
-                }
-                if let Some(ref_ancestor_local) =
-                    ref_ancestor_local_for_ptr_local.get(&base_local).copied()
-                {
-                    return Operand::Copy(Place::from(ref_ancestor_local));
-                }
-            }
-            if self.is_pointer_ty(base_ty)
-                && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                && !projected_raw_field_load
-            {
-                let block_stmts = &body.basic_blocks[bb].statements;
-                let upto = stmt_idx.min(block_stmts.len());
-                if let Some(pointee_local) =
-                    self.backtrack_pointer_pointee_local(body, base_local, &block_stmts[..upto])
-                {
-                    if !self.is_pointer_ty(body.local_decls[pointee_local].ty) {
-                        if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-                            .get(&pointee_local)
-                            .copied()
-                        {
-                            return Operand::Copy(Place::from(anchor_local));
-                        }
-                    }
-                }
-            }
-            if !is_raw_creation
-                && !self.is_pointer_ty(base_ty)
-                && self.ty_contains_pointer_fields(tcx, body, base_ty, 4)
-            {
-                if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-                    .get(&base_local)
-                    .copied()
-                {
-                    return Operand::Copy(Place::from(anchor_local));
-                }
-            }
-        }
-
-        let candidate_local = if src_place.projection.is_empty() {
-            let block_stmts = &body.basic_blocks[bb].statements;
-            let upto = stmt_idx.min(block_stmts.len());
-            let src_local = src_place.local;
-            let src_ty = body.local_decls[src_local].ty;
-            if self.is_pointer_ty(src_ty) {
-                let projected_raw_field_load = is_raw_creation
-                    && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-                    && src_place
-                        .projection
-                        .iter()
-                        .skip(1)
-                        .any(|pe| matches!(pe, ProjectionElem::Field(_, _)));
-                if projected_raw_field_load {
-                    self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
-                } else {
-                    Some(src_local)
-                }
-            } else if self.ty_contains_direct_pointer_fields(tcx, body, src_ty) {
-                None
-            } else {
-                self.backtrack_pointer_source_local(body, src_local, &block_stmts[..upto])
-                    .or_else(|| {
-                        self.backtrack_single_pointer_carrier_local(
-                            body,
-                            src_local,
-                            &block_stmts[..upto],
-                        )
-                    })
-            }
-        } else {
-            self.recover_pointer_source_local_for_projected_place(
-                tcx,
-                body,
-                bb,
-                stmt_idx,
-                src_place,
-                is_raw_creation,
             )
+        } else {
+            None
         };
 
-        let candidate_local = candidate_local.or_else(|| {
-            if src_place.projection.is_empty()
-                && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
-                && !projectionless_raw_direct_pointer_carrier
-            {
-                self.backtrack_global_single_pointer_carrier_local(body, src_place.local)
-            } else {
-                None
-            }
-        });
-
-        if let Some(local) = candidate_local {
-            // Prefer the source local's concrete tag first.
-            // The ref-ancestor slot may hold a synthetic zero in valid flows
-            // (e.g., after RawRoot), and using it first drops provenance.
-            if let Some(tl) = tag_local_for_ptr_local.get(&local) {
-                return Operand::Copy(Place::from(*tl));
-            }
-            if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&local) {
-                return Operand::Copy(Place::from(*tl));
-            }
-        }
-
-        if !is_raw_creation
-            && !src_place.projection.is_empty()
-            && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
-            && self.ty_contains_pointer_fields(tcx, body, body.local_decls[src_place.local].ty, 4)
-        {
-            if let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-                .get(&src_place.local)
-                .copied()
-            {
-                return Operand::Copy(Place::from(anchor_local));
-            }
-        }
-
-        self.const_u64(tcx, source_info.span, 0)
+        receiver_parent
+            .or_else(|| {
+                self.projectionless_slot_parent_operand_for_src_place(
+                    src_place,
+                    reborrow_anchor_local_for_stack_local,
+                    projectionless_anchor_suppressed_locals,
+                    use_projectionless_anchor,
+                    projectionless_raw_direct_pointer_carrier,
+                )
+            })
+            .or_else(|| {
+                self.projected_fast_path_pointee_parent_operand_for_src_place(
+                    tcx,
+                    body,
+                    src_place,
+                    tag_local_for_ptr_local,
+                    ref_ancestor_local_for_ptr_local,
+                    is_raw_creation,
+                )
+            })
+            .or_else(|| {
+                self.projected_slot_family_parent_operand_for_src_place(
+                    tcx,
+                    body,
+                    bb,
+                    stmt_idx,
+                    src_place,
+                    reborrow_anchor_local_for_stack_local,
+                    is_raw_creation,
+                )
+            })
+            .or_else(|| {
+                self.pointee_family_parent_operand_for_src_place(
+                    tcx,
+                    body,
+                    bb,
+                    stmt_idx,
+                    src_place,
+                    tag_local_for_ptr_local,
+                    ref_ancestor_local_for_ptr_local,
+                    is_raw_creation,
+                    projectionless_raw_direct_pointer_carrier,
+                )
+            })
+            .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0))
     }
 
     fn materialize_projected_reborrow_parent_local<'tcx>(
