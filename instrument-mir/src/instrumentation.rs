@@ -1961,6 +1961,20 @@ enum ParentSelectionMode {
     PointeeFamily,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PtrStateLocals {
+    tag_local: Local,
+    ref_ancestor_local: Option<Local>,
+    boundary_parent_local: Option<Local>,
+    boundary_recovered_local: Option<Local>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CarrierSlotLocals {
+    anchor_local: Local,
+    slot_family_valid_local: Option<Local>,
+}
+
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
 const CALL_ARG_FLAG_USE_EXPORT_PARENT: u8 = 1 << 7;
@@ -14212,6 +14226,38 @@ impl MyOptimizationPass {
         anchor_local_for_key
     }
 
+    fn ptr_state_locals_for_ptr_local(
+        &self,
+        ptr_local: Local,
+        tag_local_for_ptr_local: &HashMap<Local, Local>,
+        ref_ancestor_local_for_ptr_local: &HashMap<Local, Local>,
+        export_parent_local_for_ptr_local: &HashMap<Local, Local>,
+        export_parent_is_recovered_local_for_ptr_local: &HashMap<Local, Local>,
+    ) -> Option<PtrStateLocals> {
+        Some(PtrStateLocals {
+            tag_local: tag_local_for_ptr_local.get(&ptr_local).copied()?,
+            ref_ancestor_local: ref_ancestor_local_for_ptr_local.get(&ptr_local).copied(),
+            boundary_parent_local: export_parent_local_for_ptr_local.get(&ptr_local).copied(),
+            boundary_recovered_local: export_parent_is_recovered_local_for_ptr_local
+                .get(&ptr_local)
+                .copied(),
+        })
+    }
+
+    fn carrier_slot_locals_for_local(
+        &self,
+        local: Local,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+        anchor_is_slot_family_local_for_stack_local: &HashMap<Local, Local>,
+    ) -> Option<CarrierSlotLocals> {
+        Some(CarrierSlotLocals {
+            anchor_local: reborrow_anchor_local_for_stack_local.get(&local).copied()?,
+            slot_family_valid_local: anchor_is_slot_family_local_for_stack_local
+                .get(&local)
+                .copied(),
+        })
+    }
+
     fn schedule_reborrow_anchor_resets<'tcx>(
         &self,
         body: &Body<'tcx>,
@@ -14232,21 +14278,20 @@ impl MyOptimizationPass {
                     _ => None,
                 };
                 if let Some(local) = touched_local {
-                    if let Some(anchor_local) =
-                        reborrow_anchor_local_for_stack_local.get(&local).copied()
-                    {
-                        let anchor_state_local = anchor_is_slot_family_local_for_stack_local
-                            .get(&local)
-                            .copied();
+                    if let Some(slot_state) = self.carrier_slot_locals_for_local(
+                        local,
+                        reborrow_anchor_local_for_stack_local,
+                        anchor_is_slot_family_local_for_stack_local,
+                    ) {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx,
                             insert_before: false,
                             source_info,
-                            place: Place::from(anchor_local),
+                            place: Place::from(slot_state.anchor_local),
                             kind: InstrKind::ReborrowAnchorZero {
-                                anchor_local,
-                                anchor_state_local,
+                                anchor_local: slot_state.anchor_local,
+                                anchor_state_local: slot_state.slot_family_valid_local,
                             },
                         });
                     }
@@ -14290,9 +14335,13 @@ impl MyOptimizationPass {
                 let Some(dst_local) = dst_place.as_local() else {
                     continue;
                 };
-                if !reborrow_anchor_local_for_stack_local.contains_key(&dst_local) {
+                let Some(dst_slot_state) = self.carrier_slot_locals_for_local(
+                    dst_local,
+                    reborrow_anchor_local_for_stack_local,
+                    anchor_is_slot_family_local_for_stack_local,
+                ) else {
                     continue;
-                }
+                };
                 let src_place = match rvalue {
                     Rvalue::Use(Operand::Copy(src_place))
                     | Rvalue::Use(Operand::Move(src_place)) => *src_place,
@@ -14357,12 +14406,6 @@ impl MyOptimizationPass {
                         && self.is_pointer_ty(body.local_decls[src_local].ty)
                         && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
                     {
-                        let Some(anchor_local) = reborrow_anchor_local_for_stack_local
-                            .get(&dst_local)
-                            .copied()
-                        else {
-                            continue;
-                        };
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx,
@@ -14371,10 +14414,8 @@ impl MyOptimizationPass {
                             place: Place::from(dst_local),
                             kind: InstrKind::ReborrowAnchorSet {
                                 dst_local,
-                                anchor_local,
-                                anchor_state_local: anchor_is_slot_family_local_for_stack_local
-                                    .get(&dst_local)
-                                    .copied(),
+                                anchor_local: dst_slot_state.anchor_local,
+                                anchor_state_local: dst_slot_state.slot_family_valid_local,
                                 src_ptr_local: src_local,
                             },
                         });
@@ -14983,19 +15024,20 @@ impl MyOptimizationPass {
                 validate_ref,
             } = creation_kind.clone()
             {
-                let Some(dst_tag_local) = tag_local_for_ptr_local.get(&dst_local).copied() else {
+                let Some(dst_ptr_state) = self.ptr_state_locals_for_ptr_local(
+                    dst_local,
+                    tag_local_for_ptr_local,
+                    ref_ancestor_local_for_ptr_local,
+                    export_parent_local_for_ptr_local,
+                    export_parent_is_recovered_local_for_ptr_local,
+                ) else {
                     continue;
                 };
-                let Some(dst_ref_ancestor_local) =
-                    ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
-                else {
+                let Some(dst_ref_ancestor_local) = dst_ptr_state.ref_ancestor_local else {
                     continue;
                 };
-                let dst_export_parent_local =
-                    export_parent_local_for_ptr_local.get(&dst_local).copied();
-                let dst_recovered_local = export_parent_is_recovered_local_for_ptr_local
-                    .get(&dst_local)
-                    .copied();
+                let dst_export_parent_local = dst_ptr_state.boundary_parent_local;
+                let dst_recovered_local = dst_ptr_state.boundary_recovered_local;
 
                 let addr_local = body
                     .local_decls
@@ -15201,7 +15243,9 @@ impl MyOptimizationPass {
                                 source_info,
                                 StatementKind::Assign(Box::new((
                                     Place::from(dst_export_parent_local),
-                                    Rvalue::Use(Operand::Copy(Place::from(dst_tag_local))),
+                                    Rvalue::Use(Operand::Copy(Place::from(
+                                        dst_ptr_state.tag_local,
+                                    ))),
                                 ))),
                             ));
                     }
@@ -15304,7 +15348,7 @@ impl MyOptimizationPass {
                         kind: TerminatorKind::Call {
                             func: repair_ref_func,
                             args: repair_ref_args,
-                            destination: Place::from(dst_tag_local),
+                            destination: Place::from(dst_ptr_state.tag_local),
                             target: Some(repair_cont_block),
                             unwind: UnwindAction::Continue,
                             call_source: CallSource::Misc,
@@ -15321,7 +15365,7 @@ impl MyOptimizationPass {
                                 Rvalue::BinaryOp(
                                     BinOp::Eq,
                                     Box::new((
-                                        Operand::Copy(Place::from(dst_tag_local)),
+                                        Operand::Copy(Place::from(dst_ptr_state.tag_local)),
                                         self.const_u64(tcx, source_info.span, 0),
                                     )),
                                 ),
@@ -15352,7 +15396,7 @@ impl MyOptimizationPass {
                         source_info.span,
                     );
                     let validate_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                        node: Operand::Copy(Place::from(dst_tag_local)),
+                        node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
                         span: source_info.span,
                     }]
                     .into_boxed_slice();
@@ -15391,7 +15435,7 @@ impl MyOptimizationPass {
                         kind: TerminatorKind::Call {
                             func: tag_func,
                             args: tag_args,
-                            destination: Place::from(dst_tag_local),
+                            destination: Place::from(dst_ptr_state.tag_local),
                             target: Some(ref_block),
                             unwind: UnwindAction::Continue,
                             call_source: CallSource::Misc,
@@ -15928,13 +15972,13 @@ impl MyOptimizationPass {
                 ptr_local,
             } = creation_kind
             {
-                let Some(anchor_local) = reborrow_anchor_local_for_stack_local.get(&local).copied()
-                else {
+                let Some(slot_state) = self.carrier_slot_locals_for_local(
+                    local,
+                    reborrow_anchor_local_for_stack_local,
+                    anchor_is_slot_family_local_for_stack_local,
+                ) else {
                     continue;
                 };
-                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
-                    .get(&local)
-                    .copied();
 
                 let (orig_target, call_source, fn_span) = {
                     let term = body.basic_blocks_mut()[bb]
@@ -16114,7 +16158,7 @@ impl MyOptimizationPass {
                                     BinOp::Mul,
                                     Box::new((
                                         Operand::Copy(Place::from(is_zero_u64_local)),
-                                        Operand::Copy(Place::from(anchor_local)),
+                                        Operand::Copy(Place::from(slot_state.anchor_local)),
                                     )),
                                 ),
                             ))),
@@ -16148,13 +16192,13 @@ impl MyOptimizationPass {
                         Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
-                                Place::from(anchor_local),
+                                Place::from(slot_state.anchor_local),
                                 Rvalue::Use(Operand::Copy(Place::from(selected_local))),
                             ))),
                         ),
                     ],
                 );
-                if let Some(anchor_state_local) = anchor_state_local {
+                if let Some(anchor_state_local) = slot_state.slot_family_valid_local {
                     body.basic_blocks_mut()[ret_take_cont_bb].statements.insert(
                         7,
                         Statement::new(
@@ -16535,12 +16579,13 @@ impl MyOptimizationPass {
             }
 
             if let InstrKind::RetAnchorTake { callee_id, local } = creation_kind {
-                let anchor_local = *reborrow_anchor_local_for_stack_local
-                    .get(&local)
-                    .expect("missing anchor local for RetAnchorTake");
-                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
-                    .get(&local)
-                    .copied();
+                let slot_state = self
+                    .carrier_slot_locals_for_local(
+                        local,
+                        reborrow_anchor_local_for_stack_local,
+                        anchor_is_slot_family_local_for_stack_local,
+                    )
+                    .expect("missing carrier-slot locals for RetAnchorTake");
 
                 let (orig_target, call_source, fn_span) = {
                     let term = body.basic_blocks_mut()[bb]
@@ -16561,7 +16606,7 @@ impl MyOptimizationPass {
                     }
                 };
                 let is_cleanup = body.basic_blocks[orig_target].is_cleanup;
-                let ret_take_cont_bb = if anchor_state_local.is_some() {
+                let ret_take_cont_bb = if slot_state.slot_family_valid_local.is_some() {
                     let goto_term = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Goto {
@@ -16594,7 +16639,7 @@ impl MyOptimizationPass {
                             },
                         ]
                         .into_boxed_slice(),
-                        destination: Place::from(anchor_local),
+                        destination: Place::from(slot_state.anchor_local),
                         target: Some(ret_take_cont_bb),
                         unwind: UnwindAction::Continue,
                         call_source,
@@ -16619,7 +16664,7 @@ impl MyOptimizationPass {
                         _ => panic!("RetAnchorTake expected a Call terminator"),
                     }
                 }
-                if let Some(anchor_state_local) = anchor_state_local {
+                if let Some(anchor_state_local) = slot_state.slot_family_valid_local {
                     body.basic_blocks_mut()[ret_take_cont_bb].statements.insert(
                         0,
                         Statement::new(
@@ -16729,12 +16774,13 @@ impl MyOptimizationPass {
             }
 
             if let InstrKind::RetAnchorRoot { local } = creation_kind {
-                let anchor_local = *reborrow_anchor_local_for_stack_local
-                    .get(&local)
-                    .expect("missing anchor local for RetAnchorRoot");
-                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
-                    .get(&local)
-                    .copied();
+                let slot_state = self
+                    .carrier_slot_locals_for_local(
+                        local,
+                        reborrow_anchor_local_for_stack_local,
+                        anchor_is_slot_family_local_for_stack_local,
+                    )
+                    .expect("missing carrier-slot locals for RetAnchorRoot");
                 let local_ty = body.local_decls[local].ty;
                 let (orig_target, call_source, fn_span) = {
                     let term = body.basic_blocks_mut()[bb]
@@ -16755,7 +16801,7 @@ impl MyOptimizationPass {
                     }
                 };
                 let is_cleanup = body.basic_blocks[orig_target].is_cleanup;
-                let ret_take_cont_bb = if anchor_state_local.is_some() {
+                let ret_take_cont_bb = if slot_state.slot_family_valid_local.is_some() {
                     let goto_term = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Goto {
@@ -16821,7 +16867,7 @@ impl MyOptimizationPass {
                             },
                         ]
                         .into_boxed_slice(),
-                        destination: Place::from(anchor_local),
+                        destination: Place::from(slot_state.anchor_local),
                         target: Some(ret_take_cont_bb),
                         unwind: UnwindAction::Continue,
                         call_source,
@@ -16851,7 +16897,7 @@ impl MyOptimizationPass {
                         _ => panic!("RetAnchorRoot expected a Call terminator"),
                     }
                 }
-                if let Some(anchor_state_local) = anchor_state_local {
+                if let Some(anchor_state_local) = slot_state.slot_family_valid_local {
                     body.basic_blocks_mut()[ret_take_cont_bb].statements.insert(
                         0,
                         Statement::new(
