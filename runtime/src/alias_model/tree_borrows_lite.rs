@@ -999,23 +999,6 @@ fn tb_lite_check(
         }
     }
     if !tb_is_live_node(&node) {
-        if matches!(tmeta.kind, PtrKind::RefMut) {
-            if let Some(descendants) =
-                tb_lite_reactivatable_same_lineage(tree, access_tag, addr, size, tmeta.alloc_epoch)
-            {
-                for tag in descendants {
-                    if let Some(n) = tree.nodes.get_mut(&tag) {
-                        tb_disable_node(n);
-                    }
-                }
-                if let Some(n) = tree.nodes.get_mut(&access_tag) {
-                    n.perm = TbPerm::Active;
-                    n.alive = true;
-                    n.poisoned_by_protector_end = false;
-                }
-                return None;
-            }
-        }
         // Invalidated-reference accesses are always reported in TB-lite.
         let mut msg = format!(
             "{} via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
@@ -1638,56 +1621,6 @@ fn tb_lite_canonicalize_mut_arg_ret_tag(tag: u64, addr: usize) -> u64 {
     } else {
         tag
     }
-}
-
-fn tb_lite_reactivatable_same_lineage(
-    tree: &TbAllocState,
-    access_tag: u64,
-    addr: usize,
-    size: usize,
-    alloc_epoch: u64,
-) -> Option<Vec<u64>> {
-    let access_node = tree.nodes.get(&access_tag)?;
-    if access_node.parent == 0 || !access_node.protected {
-        return None;
-    }
-    let overlapping_live: Vec<u64> = tree
-        .nodes
-        .values()
-        .filter(|n| tb_is_live_node(n))
-        .filter(|n| tb_ranges_overlap(addr, size, n.start, n.len))
-        .filter(|n| alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == alloc_epoch)
-        .map(|n| n.tag)
-        .collect();
-    if overlapping_live.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut descendants_to_disable = Vec::new();
-    for tag in overlapping_live {
-        if tag == access_tag {
-            return None;
-        }
-        let Some(node) = tree.nodes.get(&tag) else {
-            return None;
-        };
-        if tb_is_ancestor(&tree.nodes, tag, access_tag) {
-            if !matches!(node.kind, BorrowKind::Unique)
-                || matches!(
-                    node.perm,
-                    TbPerm::Disabled | TbPerm::Reserved { conflicted: true }
-                )
-            {
-                return None;
-            }
-            continue;
-        }
-        if tb_is_ancestor(&tree.nodes, access_tag, tag) {
-            descendants_to_disable.push(tag);
-            continue;
-        }
-        return None;
-    }
-    Some(descendants_to_disable)
 }
 
 #[inline]
