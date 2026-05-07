@@ -20341,6 +20341,7 @@ impl MyOptimizationPass {
                     // - bit0: alias-exempt pointee classification (existing behavior)
                     // - bit1: projected-source creation hint (used by runtime lineage repair)
                     // - bit2: stronger root-origin repair hint (bounded overlap recovery)
+                    // - bit4: TB-lite raw should reuse the parent family until first write
                     // - bit6: strict creation-time provenance check for projected/derived raws
                     // - bit7: deref-based raw creation must reject exposed/no-provenance parents
                     let alias_flags: u8 = match &creation_kind {
@@ -20381,6 +20382,18 @@ impl MyOptimizationPass {
                             // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
                             // raw creations as eligible for runtime best-effort repair.
                             flags |= 0b10;
+                            let src_local_ty = body.local_decls[src.local].ty;
+                            let direct_ref_view = matches!(src_local_ty.kind(), TyKind::Ref(..))
+                                && (src.projection.is_empty()
+                                    || (src.projection.len() == 1
+                                        && matches!(src.projection[0], ProjectionElem::Deref)));
+                            if direct_ref_view {
+                                // Miri Tree Borrows keeps direct local ref-to-raw views in the
+                                // same family until a later write makes the raw path semantically
+                                // distinct. Mark these narrow shapes so TB-lite can defer
+                                // materializing a separate raw node until the first write.
+                                flags |= 0b0001_0000;
+                            }
                             // For projected raw sources (`(*p).field`, etc.) also allow strong
                             // bounded-overlap parent recovery in the runtime repair path.
                             if !src.projection.is_empty() {

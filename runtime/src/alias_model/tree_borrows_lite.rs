@@ -11,6 +11,7 @@ use crate::{
 use super::{AliasAccessKind, AliasModel};
 
 pub(crate) struct TreeBorrowsLiteModel;
+const TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BorrowKind {
@@ -558,52 +559,58 @@ fn tb_lite_validate_ref_creation(
     None
 }
 
-fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
-    if !rz_tb_lite_enabled() {
-        return;
+#[inline]
+fn tb_lite_should_defer_raw_family(tmeta: &TagMeta, kind: BorrowKind) -> bool {
+    matches!(kind, BorrowKind::RawConst | BorrowKind::RawMut)
+        && tmeta.parent != 0
+        && (tmeta.lineage_hint & TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY) != 0
+}
+
+fn tb_lite_resolve_parent_for_new_node(
+    tree: &TbAllocState,
+    tmeta: &TagMeta,
+    kind: BorrowKind,
+) -> u64 {
+    if tmeta.parent == 0 {
+        return 0;
     }
-
-    let kind = match tmeta.kind {
-        PtrKind::RefShared => BorrowKind::Shared,
-        PtrKind::RefMut => BorrowKind::Unique,
-        PtrKind::RawConst => BorrowKind::RawConst,
-        PtrKind::RawMut => BorrowKind::RawMut,
-        _ => return,
+    let tmap = tags().lock().unwrap();
+    let projected_helper_ref_parent = matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+        && (tmeta.lineage_hint & 0b0000_0100) != 0
+        && tmap.get(&tmeta.parent).is_some_and(|meta| {
+            meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        });
+    let effective_parent = if projected_helper_ref_parent {
+        tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(0)
+    } else {
+        tmeta.parent
     };
+    match kind {
+        BorrowKind::Shared | BorrowKind::Unique => tb_lite_find_materialized_ref_ancestor_tag(
+            &tmap,
+            &tree.nodes,
+            effective_parent,
+        )
+        .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
+        .unwrap_or(effective_parent),
+        BorrowKind::RawConst | BorrowKind::RawMut => {
+            tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
+        }
+    }
+}
 
-    let base = tb_base_for_addr(tmeta.pointee_addr);
+fn tb_lite_insert_tag_node(
+    tree: &mut TbAllocState,
+    tag: u64,
+    tmeta: &TagMeta,
+    kind: BorrowKind,
+) -> TbNode {
     let perm = match kind {
         BorrowKind::Unique => TbPerm::Reserved { conflicted: false },
         BorrowKind::RawMut => TbPerm::Active,
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
-    let mut all = tb_state().lock().unwrap();
-    let tree = all.entry(base).or_default();
-    let parent = if tmeta.parent == 0 {
-        0
-    } else {
-        let tmap = tags().lock().unwrap();
-        let projected_helper_ref_parent = matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
-            && (tmeta.lineage_hint & 0b0000_0100) != 0
-            && tmap.get(&tmeta.parent).is_some_and(|meta| {
-                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
-            });
-        let effective_parent = if projected_helper_ref_parent {
-            tb_lite_find_ref_ancestor_tag(&tmap, tmeta.parent).unwrap_or(0)
-        } else {
-            tmeta.parent
-        };
-        match kind {
-            BorrowKind::Shared | BorrowKind::Unique => {
-                tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
-                    .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
-                    .unwrap_or(effective_parent)
-            }
-            BorrowKind::RawConst | BorrowKind::RawMut => {
-                tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
-            }
-        }
-    };
+    let parent = tb_lite_resolve_parent_for_new_node(tree, tmeta, kind);
     let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
     tb_lite_mark_inplace_protected_if_pending(tag, parent, tmeta.parent, tmeta.pointee_addr, kind);
     let node = TbNode {
@@ -622,6 +629,80 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
         poisoned_by_protector_end: false,
     };
     tree.nodes.insert(tag, node.clone());
+    node
+}
+
+fn tb_lite_materialize_deferred_raw_node(
+    tree: &mut TbAllocState,
+    tag: u64,
+    tmeta: &TagMeta,
+) -> Option<TbNode> {
+    let kind = match tmeta.kind {
+        PtrKind::RawConst => BorrowKind::RawConst,
+        PtrKind::RawMut => BorrowKind::RawMut,
+        _ => return None,
+    };
+    if !tb_lite_should_defer_raw_family(tmeta, kind) {
+        return None;
+    }
+    if let Some(existing) = tree.nodes.get(&tag).cloned() {
+        return Some(existing);
+    }
+    Some(tb_lite_insert_tag_node(tree, tag, tmeta, kind))
+}
+
+fn tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(
+    tree: &mut TbAllocState,
+    tmeta: &TagMeta,
+) {
+    if !matches!(tmeta.kind, PtrKind::RefMut) || tmeta.parent == 0 || tree.nodes.contains_key(&tmeta.parent)
+    {
+        return;
+    }
+    let Some(parent_meta) = tag_store::get(tmeta.parent) else {
+        return;
+    };
+    if !matches!(parent_meta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        || (parent_meta.lineage_hint & TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY) == 0
+    {
+        return;
+    }
+    if let Some(raw_node) = tb_lite_materialize_deferred_raw_node(tree, tmeta.parent, &parent_meta)
+    {
+        let protected_parent_family = tree
+            .nodes
+            .get(&raw_node.parent)
+            .is_some_and(tb_protector_active);
+        if !protected_parent_family {
+            if let Some(parent_node) = tree.nodes.get_mut(&tmeta.parent) {
+            tb_disable_node(parent_node);
+        }
+        }
+    }
+}
+
+fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
+    if !rz_tb_lite_enabled() {
+        return;
+    }
+
+    let kind = match tmeta.kind {
+        PtrKind::RefShared => BorrowKind::Shared,
+        PtrKind::RefMut => BorrowKind::Unique,
+        PtrKind::RawConst => BorrowKind::RawConst,
+        PtrKind::RawMut => BorrowKind::RawMut,
+        _ => return,
+    };
+
+    let base = tb_base_for_addr(tmeta.pointee_addr);
+    let mut all = tb_state().lock().unwrap();
+    let tree = all.entry(base).or_default();
+    if tb_lite_should_defer_raw_family(tmeta, kind) {
+        return;
+    }
+    let node = tb_lite_insert_tag_node(tree, tag, tmeta, kind);
+    let parent = node.parent;
+    let protected = node.protected;
     let returned_carrier_reroot = (tmeta.lineage_hint & 0b1000) != 0;
     if returned_carrier_reroot {
         let stack_like_root_ref =
@@ -928,6 +1009,10 @@ fn tb_lite_check(
         return None;
     };
 
+    if matches!(access, AliasAccessKind::Write) {
+        tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(tree, tmeta);
+    }
+
     // Use the original tag when TB tracked it (notably raw tags); otherwise fall back to
     // the nearest-ref tag used by the generic fast path.
     let mut access_tag = if tree.nodes.contains_key(&orig_tag) {
@@ -1037,6 +1122,21 @@ fn tb_lite_check(
         }
     }
 
+    if matches!(access, AliasAccessKind::Write)
+        && matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        && (tmeta.lineage_hint & TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY) != 0
+        && !tree.nodes.contains_key(&orig_tag)
+    {
+        let _ = tb_lite_materialize_deferred_raw_node(tree, orig_tag, tmeta);
+        if access_tag != orig_tag && tree.nodes.contains_key(&orig_tag) {
+            access_tag = orig_tag;
+            if let Some(materialized_node) = tree.nodes.get(&access_tag).cloned() {
+                node = materialized_node;
+                access_lineage = tb_collect_lineage(&tree.nodes, access_tag);
+            }
+        }
+    }
+
     // Apply a TB-lite transition to all nodes of the allocation.
     // For locations outside the node's currently accessed ranges, `lazy_perm`
     // approximates the "future initial permission" from the TB state machine.
@@ -1142,7 +1242,7 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                let same_family_refmut_or_rawmut = matches!(tmeta.kind, PtrKind::RefMut | PtrKind::RawMut)
+                let same_family_rawmut = matches!(tmeta.kind, PtrKind::RawMut)
                     && tb_has_live_unique_lineage_ancestor(
                         &tree.nodes,
                         &access_lineage,
@@ -1158,7 +1258,7 @@ fn tb_lite_check(
                         tmeta.alloc_epoch,
                     );
                 let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut) && !covered;
-                if same_family_refmut_or_rawmut || rawmut_uncovered {
+                if same_family_rawmut || rawmut_uncovered {
                     n.perm
                 } else {
                     let mut msg = format!(

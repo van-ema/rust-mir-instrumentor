@@ -1238,10 +1238,11 @@ pub struct TagMeta {
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
-    /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
-    /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source.
-    /// bit5=internal runtime normalization for const refs materialized at alloc end.
-    pub lineage_hint: u8,
+/// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
+/// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
+/// bit4=TB-lite raw should reuse parent family until a write materializes it,
+/// bit5=internal runtime normalization for const refs materialized at alloc end.
+pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
     pub exposed_provenance_root: bool,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
@@ -2348,6 +2349,7 @@ fn normalize_const_end_ref_pointee(
 }
 
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
+const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
 
 #[inline]
 fn normalize_const_end_ref_access_addr(
@@ -3288,7 +3290,16 @@ pub fn __rz_ptr_write(
             // Tree Borrows tracks raws as first-class nodes in the tree.
             // Rewriting them to a reference ancestor skips state transitions
             // that should happen on the raw itself.
-            "tb_lite" => Some(tag),
+            "tb_lite" => {
+                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+                    let tmap = tags().lock().unwrap();
+                    active_alias_model()
+                        .find_ref_ancestor_tag(&tmap, tag)
+                        .or(Some(tag))
+                } else {
+                    Some(tag)
+                }
+            }
             "sb_lite" => {
                 let tmap = tags().lock().unwrap();
                 active_alias_model()
@@ -3822,7 +3833,16 @@ pub fn __rz_ptr_read(
             // Tree Borrows tracks raws as first-class nodes in the tree.
             // Rewriting them to a reference ancestor skips state transitions
             // that should happen on the raw itself.
-            "tb_lite" => Some(tag),
+            "tb_lite" => {
+                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+                    let tmap = tags().lock().unwrap();
+                    active_alias_model()
+                        .find_ref_ancestor_tag(&tmap, tag)
+                        .or(Some(tag))
+                } else {
+                    Some(tag)
+                }
+            }
             "sb_lite" => {
                 let tmap = tags().lock().unwrap();
                 active_alias_model()
@@ -5597,6 +5617,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
+    // - bit4: TB-lite raw should reuse parent family until first write materializes it
     // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
     // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
     let mut resolved_parent = derived_from;
@@ -5869,7 +5890,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: alias_exempt & 0b0000_1110,
+        lineage_hint: alias_exempt & 0b0001_1110,
         exposed_provenance_root,
         bounds_len,
         align_req,
