@@ -903,11 +903,13 @@ fn tb_unshadow_same_slot_protected_unique_ancestors(
     }
 }
 
-/// Re-enable a family exported through the mut-arg-ret side channel after call-exit teardown.
+/// Re-enable a family exported after call-exit teardown.
 ///
-/// Today the return-side hook ordering can still publish the exported tag after `FnExit` has
-/// already released the callee's protector frame. When that happens, the exported family is the
-/// caller-visible survivor and must be live again before the next call boundary validates it.
+/// Return-side export hooks can still publish the caller-visible surviving family after `FnExit`
+/// has already released the callee's protector frame. When that happens, we must revive not only
+/// the exported exact tag but also any protector-end-disabled ancestors on its lineage; otherwise
+/// a returned reference can remain stuck behind a dead frame-local node and require a read-side
+/// recovery hatch.
 fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     if !rz_tb_lite_enabled() || tag == 0 {
         return;
@@ -937,18 +939,27 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     {
         return;
     }
-    node.protected = false;
-    node.protector_shadow_depth = 0;
-    node.poisoned_by_protector_end = false;
-    node.alive = true;
-    if matches!(node.perm, TbPerm::Disabled) {
-        node.perm = match node.kind {
-            BorrowKind::Unique | BorrowKind::RawMut => TbPerm::Active,
-            BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
-        };
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        tb_reenable_exported_exact_node(node);
+        return;
     }
-    if matches!(node.lazy_perm, TbPerm::Disabled) {
-        node.lazy_perm = node.perm;
+    let revive_reserved_ancestors = matches!(node.perm, TbPerm::Reserved { .. });
+    tb_reenable_exported_exact_node(node);
+    if !revive_reserved_ancestors {
+        return;
+    }
+
+    let mut cur = tree.nodes.get(&tag).map(|node| node.parent).unwrap_or(0);
+    while cur != 0 {
+        let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
+        if let Some(node) = tree.nodes.get_mut(&cur) {
+            if node.poisoned_by_protector_end
+                && matches!(node.lazy_perm, TbPerm::Reserved { .. })
+            {
+                tb_revive_node_after_protector_end(node);
+            }
+        }
+        cur = next;
     }
 }
 
@@ -1164,22 +1175,12 @@ fn tb_lite_check(
         let next = match (access, child, old_perm, tb_protector_active(&n)) {
             // Child/local read: everything except Disabled is unchanged.
             (AliasAccessKind::Read, true, TbPerm::Disabled, _) => {
-                if tb_has_live_unique_lineage_ancestor(
-                    &tree.nodes,
-                    &access_lineage,
-                    addr,
-                    size,
-                    tmeta.alloc_epoch,
-                ) {
-                    n.perm
-                } else {
-                    let mut msg = format!(
-                        "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
-                        access_tag, addr, size, tmeta.kind, n.tag
-                    );
-                    msg.push_str(&dump);
-                    return Some(msg);
-                }
+                let mut msg = format!(
+                    "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
+                    access_tag, addr, size, tmeta.kind, n.tag
+                );
+                msg.push_str(&dump);
+                return Some(msg);
             }
             (AliasAccessKind::Read, true, perm, _) => perm,
 
@@ -1622,6 +1623,47 @@ fn tb_disable_node_for_protector_end(n: &mut TbNode) {
     n.poisoned_by_protector_end = true;
 }
 
+#[inline]
+fn tb_revive_node_after_protector_end(n: &mut TbNode) {
+    if !n.poisoned_by_protector_end {
+        return;
+    }
+    n.protected = false;
+    n.protector_shadow_depth = 0;
+    n.poisoned_by_protector_end = false;
+    n.alive = true;
+    if matches!(n.perm, TbPerm::Disabled) {
+        n.perm = if matches!(n.lazy_perm, TbPerm::Disabled) {
+            match n.kind {
+                BorrowKind::Unique | BorrowKind::RawMut => TbPerm::Active,
+                BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
+            }
+        } else {
+            n.lazy_perm
+        };
+    }
+    if matches!(n.lazy_perm, TbPerm::Disabled) {
+        n.lazy_perm = n.perm;
+    }
+}
+
+#[inline]
+fn tb_reenable_exported_exact_node(n: &mut TbNode) {
+    n.protected = false;
+    n.protector_shadow_depth = 0;
+    n.poisoned_by_protector_end = false;
+    n.alive = true;
+    if matches!(n.perm, TbPerm::Disabled) {
+        n.perm = match n.kind {
+            BorrowKind::Unique | BorrowKind::RawMut => TbPerm::Active,
+            BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
+        };
+    }
+    if matches!(n.lazy_perm, TbPerm::Disabled) {
+        n.lazy_perm = n.perm;
+    }
+}
+
 fn tb_collect_lineage(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> Vec<u64> {
     let mut lineage = Vec::new();
     for _ in 0..nodes.len().saturating_add(1) {
@@ -1778,32 +1820,6 @@ fn tb_is_effective_ancestor(
             return true;
         }
         tag = t.parent;
-    }
-    false
-}
-
-fn tb_has_live_unique_lineage_ancestor(
-    nodes: &HashMap<u64, TbNode>,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    access_epoch: u64,
-) -> bool {
-    let access_end = addr.saturating_add(size);
-    for &tag in access_lineage {
-        let Some(node) = nodes.get(&tag) else {
-            return false;
-        };
-        if access_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != access_epoch {
-            continue;
-        }
-        if !tb_is_live_node(node) || !matches!(node.kind, BorrowKind::Unique) {
-            continue;
-        }
-        let node_end = node.start.saturating_add(node.len);
-        if node.len != 0 && addr >= node.start && access_end <= node_end {
-            return true;
-        }
     }
     false
 }
