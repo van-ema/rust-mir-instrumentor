@@ -4926,6 +4926,38 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
     tag
 }
 
+/// Consume the callee-exported family for a pointer-only `&mut T` writeback after a call returns.
+///
+/// Unlike `__rz_take_mut_arg_ret_tag`, a missing side-channel export is meaningful here:
+/// the caller must keep its existing local tag. Preserve `0` instead of recovering a new local
+/// family from the address.
+#[no_mangle]
+pub extern "C" fn __rz_take_mut_arg_ret_tag_or_zero(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let raw_tag = mut_arg_ret_tags()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id, arg_index, addr))
+        .unwrap_or(0);
+    let tag = if raw_tag == 0 {
+        0
+    } else {
+        canonical_mut_arg_ret_tag(addr, raw_tag)
+    };
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][mut-arg-ret] take-or-zero callee={} arg={} addr=0x{:x} raw_tag={} tag={}",
+            callee_id, arg_index, addr, raw_tag, tag
+        );
+    }
+    tag
+}
+
 /// Push the exact shadow of one internal pointer leaf of a `&mut T` carrier pointee so the
 /// caller can recreate that slot shadow after the call returns.
 #[no_mangle]

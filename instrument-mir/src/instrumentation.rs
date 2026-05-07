@@ -1863,6 +1863,7 @@ struct Hooks {
     def_id_take_ret_tag_or_root: DefId,
     def_id_push_mut_arg_ret_tag: DefId,
     def_id_take_mut_arg_ret_tag: DefId,
+    def_id_take_mut_arg_ret_tag_or_zero: DefId,
     def_id_push_mut_arg_ret_leaf_shadow: DefId,
     def_id_take_mut_arg_ret_leaf_shadow: DefId,
     def_id_exit_fn: DefId,
@@ -14620,9 +14621,8 @@ impl MyOptimizationPass {
             InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
             InstrKind::MutArgRetPush { .. } => hooks.def_id_push_mut_arg_ret_tag,
             InstrKind::MutArgRetLeafPush { .. } => hooks.def_id_push_mut_arg_ret_leaf_shadow,
-            InstrKind::MutArgRetTake { .. } | InstrKind::MutArgRetTakePtrOnly { .. } => {
-                hooks.def_id_take_mut_arg_ret_tag
-            }
+            InstrKind::MutArgRetTake { .. } => hooks.def_id_take_mut_arg_ret_tag,
+            InstrKind::MutArgRetTakePtrOnly { .. } => hooks.def_id_take_mut_arg_ret_tag_or_zero,
             InstrKind::MutArgRetLeafTake { .. } => hooks.def_id_take_mut_arg_ret_leaf_shadow,
             InstrKind::FnExit { .. } => hooks.def_id_exit_fn,
         };
@@ -15851,7 +15851,7 @@ impl MyOptimizationPass {
 
                 let take_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_take_mut_arg_ret_tag,
+                    hooks.def_id_take_mut_arg_ret_tag_or_zero,
                     std::iter::empty(),
                     source_info.span,
                 );
@@ -22443,6 +22443,9 @@ impl MyOptimizationPass {
         let def_id_take_mut_arg_ret_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_take_mut_arg_ret_tag", 3)
             .expect("missing '__rz_take_mut_arg_ret_tag' definition");
+        let def_id_take_mut_arg_ret_tag_or_zero = self
+            .find_runtime_fn_def_id(tcx, "__rz_take_mut_arg_ret_tag_or_zero", 3)
+            .expect("missing '__rz_take_mut_arg_ret_tag_or_zero' definition");
         let def_id_push_mut_arg_ret_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_push_mut_arg_ret_leaf_shadow", 5)
             .expect("missing '__rz_push_mut_arg_ret_leaf_shadow' definition");
@@ -22511,6 +22514,7 @@ impl MyOptimizationPass {
             def_id_take_ret_tag_or_root,
             def_id_push_mut_arg_ret_tag,
             def_id_take_mut_arg_ret_tag,
+            def_id_take_mut_arg_ret_tag_or_zero,
             def_id_push_mut_arg_ret_leaf_shadow,
             def_id_take_mut_arg_ret_leaf_shadow,
             def_id_exit_fn,

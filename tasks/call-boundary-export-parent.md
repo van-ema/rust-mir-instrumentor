@@ -34,6 +34,44 @@ This should make call-boundary retagging more Miri-like:
 - direct exact refs export their exact parent
 - recovered refs export the live family that callee `FnEntry` retagging should inherit
 
+## What "canonicalization" means
+
+In this design, **canonicalization** does not mean "invent some plausible live tag for this
+address".
+
+It means:
+
+- start from a tag that was **actually exported or imported** through a call boundary
+- walk back from that exact transient tag to the nearest **live same-address family** that should
+  survive helper teardown
+- use that surviving family as the boundary parent
+
+Typical safe shape:
+
+```rust
+fn helper(b: &mut BytesMut) { /* helper-heavy local reborrows */ }
+helper(&mut bytes);
+```
+
+Inside `helper`, the newest exact tag on the `BytesMut` slot may be a transient child created by
+local reborrows. Exporting that exact child back to the caller is wrong if it will be disabled at
+call exit. Canonicalization maps that transient exact child back to the live family that the
+caller should keep using after the call returns.
+
+Important non-example:
+
+- if a side channel exported **nothing** and returns `0`
+- canonicalization must **not** recover some unrelated live same-address tag just because one
+  exists locally
+
+`0` is semantic information:
+
+- "no export happened"
+
+For pointer-only mut-arg writeback, that means the caller should keep its existing exact tag and
+boundary parent. Turning `0` into a recovered family is not canonicalization; it is local tag
+recovery, and it can import dead intermediate lineage back into the caller.
+
 ## Why the current design is insufficient
 
 Today, one local tag is reused for two different jobs:
