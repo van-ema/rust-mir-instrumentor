@@ -1242,23 +1242,8 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                let same_family_rawmut = matches!(tmeta.kind, PtrKind::RawMut)
-                    && tb_has_live_unique_lineage_ancestor(
-                        &tree.nodes,
-                        &access_lineage,
-                        addr,
-                        size,
-                        tmeta.alloc_epoch,
-                    )
-                    && tb_only_same_family_overlap(
-                        &tree.nodes,
-                        &access_lineage,
-                        addr,
-                        size,
-                        tmeta.alloc_epoch,
-                    );
                 let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut) && !covered;
-                if same_family_rawmut || rawmut_uncovered {
+                if rawmut_uncovered {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -1766,58 +1751,6 @@ fn tb_is_effective_ancestor(
             return true;
         }
         tag = t.parent;
-    }
-    false
-}
-
-fn tb_only_same_family_overlap(
-    nodes: &HashMap<u64, TbNode>,
-    access_lineage: &[u64],
-    addr: usize,
-    size: usize,
-    access_epoch: u64,
-) -> bool {
-    nodes.values().all(|other| {
-        if !tb_is_live_node(other) || !tb_node_overlaps(other, addr, size) {
-            return true;
-        }
-        if access_epoch != 0 && other.alloc_epoch != 0 && other.alloc_epoch != access_epoch {
-            return true;
-        }
-        tb_lineage_contains(access_lineage, other.tag)
-            || access_lineage
-                .iter()
-                .copied()
-                .any(|ancestor| tb_is_ancestor(nodes, ancestor, other.tag))
-            || access_lineage
-                .iter()
-                .copied()
-                .any(|ancestor| ancestor != 0 && tb_is_ancestor(nodes, ancestor, other.tag))
-            || tb_shares_nonroot_ancestor(nodes, access_lineage, other.tag)
-    })
-}
-
-fn tb_shares_nonroot_ancestor(
-    nodes: &HashMap<u64, TbNode>,
-    access_lineage: &[u64],
-    other_tag: u64,
-) -> bool {
-    let mut cur = other_tag;
-    for _ in 0..nodes.len().saturating_add(1) {
-        if cur == 0 {
-            return false;
-        }
-        if access_lineage
-            .iter()
-            .copied()
-            .any(|ancestor| ancestor == cur && ancestor != 0)
-        {
-            return true;
-        }
-        let Some(node) = nodes.get(&cur) else {
-            return false;
-        };
-        cur = node.parent;
     }
     false
 }
