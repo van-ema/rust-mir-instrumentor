@@ -592,13 +592,11 @@ fn tb_lite_resolve_parent_for_new_node(
         tmeta.parent
     };
     match kind {
-        BorrowKind::Shared | BorrowKind::Unique => tb_lite_find_materialized_ref_ancestor_tag(
-            &tmap,
-            &tree.nodes,
-            effective_parent,
-        )
-        .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
-        .unwrap_or(effective_parent),
+        BorrowKind::Shared | BorrowKind::Unique => {
+            tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
+                .unwrap_or(effective_parent)
+        }
         BorrowKind::RawConst | BorrowKind::RawMut => {
             tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
         }
@@ -661,7 +659,9 @@ fn tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(
     tree: &mut TbAllocState,
     tmeta: &TagMeta,
 ) {
-    if !matches!(tmeta.kind, PtrKind::RefMut) || tmeta.parent == 0 || tree.nodes.contains_key(&tmeta.parent)
+    if !matches!(tmeta.kind, PtrKind::RefMut)
+        || tmeta.parent == 0
+        || tree.nodes.contains_key(&tmeta.parent)
     {
         return;
     }
@@ -681,8 +681,8 @@ fn tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(
             .is_some_and(tb_protector_active);
         if !protected_parent_family {
             if let Some(parent_node) = tree.nodes.get_mut(&tmeta.parent) {
-            tb_disable_node(parent_node);
-        }
+                tb_disable_node(parent_node);
+            }
         }
     }
 }
@@ -1248,8 +1248,12 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
-                let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut) && !covered;
-                if rawmut_uncovered {
+                let rawmut_interior_mut_extent =
+                    tb_raw_write_interior_mut_extent_covers(tmeta, addr, size);
+                let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut)
+                    && !covered
+                    && !rawmut_interior_mut_extent;
+                if rawmut_interior_mut_extent || rawmut_uncovered {
                     n.perm
                 } else {
                     let mut msg = format!(
@@ -1571,6 +1575,29 @@ fn tb_ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize)
     let a_end = a_start.saturating_add(a_len);
     let b_end = b_start.saturating_add(b_len);
     a_start < b_end && b_start < a_end
+}
+
+#[inline]
+fn tb_range_covers(cover_start: usize, cover_len: usize, addr: usize, size: usize) -> bool {
+    if cover_len == 0 || size == 0 {
+        return false;
+    }
+    let cover_end = cover_start.saturating_add(cover_len);
+    let access_end = addr.saturating_add(size);
+    cover_start <= addr && access_end <= cover_end
+}
+
+#[inline]
+fn tb_raw_write_interior_mut_extent_covers(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
+    if rz_tb_no_precise_interior_mut_enabled() || !matches!(tmeta.kind, PtrKind::RawMut) {
+        return false;
+    }
+    tb_range_covers(
+        tmeta.interior_mut_extent_base,
+        tmeta.interior_mut_extent_len,
+        addr,
+        size,
+    )
 }
 
 #[inline]

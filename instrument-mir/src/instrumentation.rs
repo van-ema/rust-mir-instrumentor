@@ -27,7 +27,7 @@ use rustc_middle::ty::{
     ConstKind as TyConstKind, GenericArgsRef, Instance, PseudoCanonicalInput, Ty, TyCtxt, TypingEnv,
 };
 use rustc_middle::ty::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use rustc_span::{Span, source_map::Spanned};
+use rustc_span::{source_map::Spanned, Span};
 
 pub(crate) struct MyOptimizationPass;
 
@@ -1840,6 +1840,7 @@ struct ConstAllocInfo {
 #[derive(Copy, Clone, Debug)]
 struct Hooks {
     def_id_ref: DefId,
+    def_id_ref_with_extent: DefId,
     def_id_debug_ref: DefId,
     def_id_raw: DefId,
     def_id_alloc: DefId,
@@ -3760,8 +3761,8 @@ impl MyOptimizationPass {
         let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
             return None;
         };
-        let summary_allows = unsafe_dataflow::summary_for_def_id(tcx, callee_did).and_then(
-            |summary| {
+        let summary_allows =
+            unsafe_dataflow::summary_for_def_id(tcx, callee_did).and_then(|summary| {
                 summary
                     .ptr_args()
                     .iter()
@@ -3771,8 +3772,7 @@ impl MyOptimizationPass {
                             && !arg_summary.escapes_to_unknown_boundary()
                             && !arg_summary.forwarded_to_return()
                     })
-            },
-        );
+            });
         if !matches!(summary_allows, Some(true)) {
             return None;
         }
@@ -3797,7 +3797,11 @@ impl MyOptimizationPass {
                 // Only treat it as a trailing monomorphization if there is no further module separator
                 // after the `::<` (excluding the `::` in the `::<` itself).
                 let after = &s[(pos + 3)..];
-                if after.contains("::") { s } else { &s[..pos] }
+                if after.contains("::") {
+                    s
+                } else {
+                    &s[..pos]
+                }
             } else {
                 s
             }
@@ -4878,6 +4882,56 @@ impl MyOptimizationPass {
             TyKind::RawPtr(pointee, _) => self.alias_exempt_root_for_ty(tcx, body, *pointee),
             _ => false,
         }
+    }
+
+    fn interior_mut_array_extent_for_source_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        src: Place<'tcx>,
+    ) -> Option<(Operand<'tcx>, SizeOperand<'tcx>, Vec<Statement<'tcx>>)> {
+        let src_ty = src.ty(&body.local_decls, tcx).ty;
+        if !self.alias_exempt_root_for_ty(tcx, body, src_ty) {
+            return None;
+        }
+
+        match src.projection.last()? {
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {}
+            _ => return None,
+        }
+
+        let base_place = PlaceRef {
+            local: src.local,
+            projection: &src.projection[..src.projection.len() - 1],
+        }
+        .to_place(tcx);
+        let base_ty = base_place.ty(&body.local_decls, tcx).ty;
+        let TyKind::Array(elem_ty, _) = base_ty.kind() else {
+            return None;
+        };
+        if *elem_ty != src_ty {
+            return None;
+        }
+
+        let extent_addr_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.usize, source_info.span));
+        let (extent_addr_stmt1, extent_addr_stmt2) = self.slot_addr_stmts_for_place(
+            tcx,
+            body,
+            source_info,
+            base_place,
+            extent_addr_local,
+            false,
+        )?;
+        let extent_len = self.size_operand_for_ty(tcx, body, base_ty, source_info.span);
+
+        Some((
+            Operand::Copy(Place::from(extent_addr_local)),
+            extent_len,
+            vec![extent_addr_stmt1, extent_addr_stmt2],
+        ))
     }
 
     fn tb_call_arg_protector_supported_for_ty<'tcx>(
@@ -7313,10 +7367,9 @@ impl MyOptimizationPass {
         ) {
             return Some(op);
         }
-        if let Some(op) = self.slot_family_parent_operand_for_local(
-            base_local,
-            reborrow_anchor_local_for_stack_local,
-        ) {
+        if let Some(op) = self
+            .slot_family_parent_operand_for_local(base_local, reborrow_anchor_local_for_stack_local)
+        {
             return Some(op);
         }
 
@@ -7364,11 +7417,7 @@ impl MyOptimizationPass {
             && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
     }
 
-    fn is_projected_raw_field_load(
-        &self,
-        src_place: Place<'_>,
-        is_raw_creation: bool,
-    ) -> bool {
+    fn is_projected_raw_field_load(&self, src_place: Place<'_>, is_raw_creation: bool) -> bool {
         is_raw_creation
             && matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
             && src_place
@@ -7646,7 +7695,10 @@ impl MyOptimizationPass {
         use_projectionless_anchor: bool,
         mode: ParentSelectionMode,
     ) -> Operand<'tcx> {
-        let _ = (projectionless_anchor_suppressed_locals, use_projectionless_anchor);
+        let _ = (
+            projectionless_anchor_suppressed_locals,
+            use_projectionless_anchor,
+        );
         let src_local_ty = body.local_decls[src_place.local].ty;
         let projectionless_raw_direct_pointer_carrier = is_raw_creation
             && src_place.projection.is_empty()
@@ -10394,13 +10446,18 @@ impl MyOptimizationPass {
             return None;
         }
 
-        if summary.ptr_args().iter().any(|entry| {
-            entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary()
-        }) {
+        if summary
+            .ptr_args()
+            .iter()
+            .any(|entry| entry.reaches_direct_sink() || entry.escapes_to_unknown_boundary())
+        {
             return None;
         }
 
-        let mut forwarded = summary.ptr_args().iter().filter(|entry| entry.forwarded_to_return());
+        let mut forwarded = summary
+            .ptr_args()
+            .iter()
+            .filter(|entry| entry.forwarded_to_return());
         let forwarded_arg = forwarded.next()?;
         if forwarded.next().is_some() {
             return None;
@@ -11147,7 +11204,11 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call { recovered } else { None }
+        if matched_call {
+            recovered
+        } else {
+            None
+        }
     }
 
     /// Recover a pointer lineage source when a call writes an aggregate result into `agg_local`
@@ -11214,7 +11275,11 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call { recovered } else { None }
+        if matched_call {
+            recovered
+        } else {
+            None
+        }
     }
 
     /// Conservative global recovery for aggregate locals produced by a call result where the
@@ -11273,7 +11338,11 @@ impl MyOptimizationPass {
             }
         }
 
-        if matched_call { recovered } else { None }
+        if matched_call {
+            recovered
+        } else {
+            None
+        }
     }
 
     fn ptr_derive_source_arg_index(&self, def_path: &str) -> usize {
@@ -12048,7 +12117,8 @@ impl MyOptimizationPass {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
         let callee_path_opt = callee_opt.map(|(did, _)| tcx.def_path_str(did));
-        let callee_summary_opt = callee_opt.and_then(|(did, _)| unsafe_dataflow::summary_for_def_id(tcx, did));
+        let callee_summary_opt =
+            callee_opt.and_then(|(did, _)| unsafe_dataflow::summary_for_def_id(tcx, did));
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
@@ -12463,10 +12533,9 @@ impl MyOptimizationPass {
                                 let src_leafs = self.shadowable_leaf_ptr_specs_from_place(
                                     tcx, body, src_place, src_ty,
                                 );
-                                if let Some(matched_leafs) =
-                                    self.pair_shadowable_leaf_ptr_specs_from_arg0(
-                                        &dst_leafs,
-                                        &src_leafs,
+                                if let Some(matched_leafs) = self
+                                    .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                        &dst_leafs, &src_leafs,
                                     )
                                 {
                                     for (dst_spec, src_spec) in matched_leafs {
@@ -13624,8 +13693,7 @@ impl MyOptimizationPass {
         let mut interesting_stack_locals = self.compute_interesting_stack_locals(tcx, body);
         for arg_local in body.args_iter() {
             let arg_ty = body.local_decls[arg_local].ty;
-            if !self.is_pointer_ty(arg_ty)
-                && self.supports_slot_family_local(tcx, body, arg_local)
+            if !self.is_pointer_ty(arg_ty) && self.supports_slot_family_local(tcx, body, arg_local)
             {
                 interesting_stack_locals.insert(arg_local);
             }
@@ -13641,8 +13709,7 @@ impl MyOptimizationPass {
                 continue;
             };
             let dst_ty = body.local_decls[dst_local].ty;
-            if !self.is_pointer_ty(dst_ty)
-                && self.supports_slot_family_local(tcx, body, dst_local)
+            if !self.is_pointer_ty(dst_ty) && self.supports_slot_family_local(tcx, body, dst_local)
             {
                 interesting_stack_locals.insert(dst_local);
             }
@@ -15010,9 +15077,15 @@ impl MyOptimizationPass {
                     },
                 });
 
-                if let (Some(export_parent_block), Some(export_parent_local), Some(export_parent_func)) =
-                    (export_parent_block, dst_export_parent_local, export_parent_func)
-                {
+                if let (
+                    Some(export_parent_block),
+                    Some(export_parent_local),
+                    Some(export_parent_func),
+                ) = (
+                    export_parent_block,
+                    dst_export_parent_local,
+                    export_parent_func,
+                ) {
                     body.basic_blocks_mut()[export_parent_block].terminator = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Call {
@@ -15516,13 +15589,12 @@ impl MyOptimizationPass {
                     } else {
                         self.const_u64(tcx, source_info.span, 0)
                     };
-                let export_parent_op: Operand<'tcx> = if let Some(tl) =
-                    export_parent_local_for_ptr_local.get(&src_local)
-                {
-                    Operand::Copy(Place::from(*tl))
-                } else {
-                    tag_op.clone()
-                };
+                let export_parent_op: Operand<'tcx> =
+                    if let Some(tl) = export_parent_local_for_ptr_local.get(&src_local) {
+                        Operand::Copy(Place::from(*tl))
+                    } else {
+                        tag_op.clone()
+                    };
                 let recovered_op: Operand<'tcx> = if let Some(tl) =
                     export_parent_is_recovered_local_for_ptr_local.get(&src_local)
                 {
@@ -18172,12 +18244,7 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             is_raw_creation,
                             true,
-                            self.creation_parent_selection_mode_for_src_place(
-                                tcx,
-                                body,
-                                src,
-                                true,
-                            ),
+                            self.creation_parent_selection_mode_for_src_place(tcx, body, src, true),
                         )),
                     ))),
                 );
@@ -18448,11 +18515,7 @@ impl MyOptimizationPass {
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(recovered_local),
-                                Rvalue::Use(self.const_u8(
-                                    tcx,
-                                    source_info.span,
-                                    recovered_value,
-                                )),
+                                Rvalue::Use(self.const_u8(tcx, source_info.span, recovered_value)),
                             ))),
                         ),
                     );
@@ -19947,13 +20010,12 @@ impl MyOptimizationPass {
                         } else {
                             self.const_u64(tcx, source_info.span, 0)
                         };
-                    let export_parent_op: Operand<'tcx> = if let Some(tl) =
-                        export_parent_local_for_ptr_local.get(&src_local)
-                    {
-                        Operand::Copy(Place::from(*tl))
-                    } else {
-                        tag_op.clone()
-                    };
+                    let export_parent_op: Operand<'tcx> =
+                        if let Some(tl) = export_parent_local_for_ptr_local.get(&src_local) {
+                            Operand::Copy(Place::from(*tl))
+                        } else {
+                            tag_op.clone()
+                        };
                     let recovered_op: Operand<'tcx> = if let Some(tl) =
                         export_parent_is_recovered_local_for_ptr_local.get(&src_local)
                     {
@@ -20300,10 +20362,7 @@ impl MyOptimizationPass {
                                     true,
                                     true,
                                     self.creation_parent_selection_mode_for_src_place(
-                                        tcx,
-                                        body,
-                                        *src,
-                                        true,
+                                        tcx, body, *src, true,
                                     ),
                                 )
                             }
@@ -20497,7 +20556,38 @@ impl MyOptimizationPass {
                         self.materialize_size_operand(tcx, body, source_info, &align_op);
                     extra_stmts.append(&mut align_stmts);
 
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    let mut explicit_extent: Option<(Operand<'tcx>, Operand<'tcx>)> = None;
+                    if let InstrKind::Ref { bk, src, .. } = &creation_kind {
+                        if !matches!(bk, BorrowKind::Mut { .. }) {
+                            if let Some((arg_extent_base, extent_len_op, mut extent_stmts)) = self
+                                .interior_mut_array_extent_for_source_place(
+                                    tcx,
+                                    body,
+                                    source_info,
+                                    *src,
+                                )
+                            {
+                                extra_stmts.append(&mut extent_stmts);
+                                let (arg_extent_len, mut extent_len_stmts) = self
+                                    .materialize_size_operand(
+                                        tcx,
+                                        body,
+                                        source_info,
+                                        &extent_len_op,
+                                    );
+                                extra_stmts.append(&mut extent_len_stmts);
+                                func_operand = Operand::function_handle(
+                                    tcx,
+                                    hooks.def_id_ref_with_extent,
+                                    std::iter::empty(),
+                                    source_info.span,
+                                );
+                                explicit_extent = Some((arg_extent_base, arg_extent_len));
+                            }
+                        }
+                    }
+
+                    let mut args = vec![
                         Spanned {
                             node: arg_addr,
                             span: source_info.span,
@@ -20522,8 +20612,18 @@ impl MyOptimizationPass {
                             node: arg_align,
                             span: source_info.span,
                         },
-                    ]
-                    .into_boxed_slice();
+                    ];
+                    if let Some((arg_extent_base, arg_extent_len)) = explicit_extent {
+                        args.push(Spanned {
+                            node: arg_extent_base,
+                            span: source_info.span,
+                        });
+                        args.push(Spanned {
+                            node: arg_extent_len,
+                            span: source_info.span,
+                        });
+                    }
+                    let args: Box<[Spanned<Operand<'tcx>>]> = args.into_boxed_slice();
 
                     let dst = tag_local.expect("missing tag_local for ref/raw creation");
                     (args, Place::from(dst))
@@ -21050,9 +21150,7 @@ impl MyOptimizationPass {
                                 }
                             }
                             InstrKind::PtrDerive {
-                                src,
-                                is_ref: true,
-                                ..
+                                src, is_ref: true, ..
                             } => {
                                 if let (Some(src_export_parent_local), Some(src_recovered_local)) = (
                                     export_parent_local_for_ptr_local.get(src).copied(),
@@ -21766,11 +21864,7 @@ impl MyOptimizationPass {
                             source_info,
                             StatementKind::Assign(Box::new((
                                 Place::from(recovered_local),
-                                Rvalue::Use(self.const_u8(
-                                    tcx,
-                                    source_info.span,
-                                    recovered_value,
-                                )),
+                                Rvalue::Use(self.const_u8(tcx, source_info.span, recovered_value)),
                             ))),
                         ),
                     );
@@ -22387,6 +22481,9 @@ impl MyOptimizationPass {
         let def_id_ref = self
             .find_runtime_fn_def_id(tcx, "__record_ref_creation", 6)
             .expect("missing '__record_ref_creation' definition");
+        let def_id_ref_with_extent = self
+            .find_runtime_fn_def_id(tcx, "__record_ref_creation_with_extent", 8)
+            .expect("missing '__record_ref_creation_with_extent' definition");
         let def_id_debug_ref = self
             .find_runtime_fn_def_id(tcx, "__record_debug_ref_creation", 7)
             .expect("missing '__record_debug_ref_creation' definition");
@@ -22504,6 +22601,7 @@ impl MyOptimizationPass {
 
         let hooks = Hooks {
             def_id_ref,
+            def_id_ref_with_extent,
             def_id_debug_ref,
             def_id_raw,
             def_id_alloc,

@@ -1238,16 +1238,21 @@ pub struct TagMeta {
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
-/// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
-/// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
-/// bit4=TB-lite raw should reuse parent family until a write materializes it,
-/// bit5=internal runtime normalization for const refs materialized at alloc end.
-pub lineage_hint: u8,
+    /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
+    /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
+    /// bit4=TB-lite raw should reuse parent family until a write materializes it,
+    /// bit5=internal runtime normalization for const refs materialized at alloc end.
+    pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
     pub exposed_provenance_root: bool,
     /// Optional bounds length in bytes for wide pointers (slice/str metadata).
     /// 0 means unknown / not provided.
     pub bounds_len: usize,
+    /// Optional writable extent for pointers derived from shared interior-mutability roots.
+    /// When nonzero, raw writes may extend beyond the exact pointee bounds but must stay inside
+    /// this explicit enclosing extent.
+    pub interior_mut_extent_base: usize,
+    pub interior_mut_extent_len: usize,
     /// Best-effort required alignment for this pointer/reference in bytes.
     /// 0 means unknown and falls back to parent/access-specific metadata.
     pub align_req: usize,
@@ -1437,8 +1442,8 @@ pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>>
     RET_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn ret_leaf_shadows(
-) -> &'static Mutex<HashMap<(ThreadId, u64, u64), PtrShadowTransport>> {
+pub(crate) fn ret_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64), PtrShadowTransport>>
+{
     RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -5018,8 +5023,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
-        mut_arg_ret_leaf_shadows()
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) = mut_arg_ret_leaf_shadows()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id, arg_index, addr, leaf_key))
@@ -5075,13 +5079,10 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
         active_alias_model().on_ret_export(tag, 0);
     }
     let thread_id = std::thread::current().id();
-    ret_leaf_shadows()
-        .lock()
-        .unwrap()
-        .insert(
-            (thread_id, callee_id, leaf_key),
-            (tag, ref_ancestor, export_parent, export_parent_recovered),
-        );
+    ret_leaf_shadows().lock().unwrap().insert(
+        (thread_id, callee_id, leaf_key),
+        (tag, ref_ancestor, export_parent, export_parent_recovered),
+    );
 }
 
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
@@ -5207,6 +5208,29 @@ pub extern "C" fn __record_ref_creation(
     alias_exempt: u8,
     bounds_len: usize,
     align_req: usize,
+) -> u64 {
+    __record_ref_creation_with_extent(
+        pointee_addr,
+        is_mut,
+        parent_tag,
+        alias_exempt,
+        bounds_len,
+        align_req,
+        0,
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn __record_ref_creation_with_extent(
+    pointee_addr: usize,
+    is_mut: u8,
+    parent_tag: u64,
+    alias_exempt: u8,
+    bounds_len: usize,
+    align_req: usize,
+    interior_mut_extent_base: usize,
+    interior_mut_extent_len: usize,
 ) -> u64 {
     let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
     let _profile_guard = HookProfileGuard::ref_create(profile);
@@ -5463,6 +5487,14 @@ pub extern "C" fn __record_ref_creation(
     } else {
         inherited_bounds_len
     };
+    let mut interior_mut_extent_base = interior_mut_extent_base;
+    let mut interior_mut_extent_len = interior_mut_extent_len;
+    if interior_mut_extent_len == 0 && resolved_parent_tag != 0 {
+        if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
+            interior_mut_extent_base = parent_meta.interior_mut_extent_base;
+            interior_mut_extent_len = parent_meta.interior_mut_extent_len;
+        }
+    }
     let insert_start = profile.map(|_| Instant::now());
     let (origin_known, origin_base, origin_end) =
         snapshot_tag_origin(pointee_addr, resolved_parent_tag);
@@ -5483,6 +5515,8 @@ pub extern "C" fn __record_ref_creation(
             },
         exposed_provenance_root: false,
         bounds_len,
+        interior_mut_extent_base,
+        interior_mut_extent_len,
         align_req,
         origin_known,
         origin_base,
@@ -5532,13 +5566,15 @@ pub extern "C" fn __record_ref_creation(
     );
     if rz_trace_tag_create_enabled() {
         eprintln!(
-            "[rusteze-runtime][tag-create][ref] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} align={} epoch={}",
+            "[rusteze-runtime][tag-create][ref] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} extent=[0x{:x},+{}] align={} epoch={}",
             tag,
             parent_tag,
             resolved_parent_tag,
             pointee_addr,
             kind_str,
             bounds_len,
+            interior_mut_extent_base,
+            interior_mut_extent_len,
             align_req,
             alloc_epoch
         );
@@ -5871,6 +5907,18 @@ pub extern "C" fn __record_raw_ptr_creation(
     } else {
         0
     };
+    let (interior_mut_extent_base, interior_mut_extent_len) = if resolved_parent != 0 {
+        if let Some(parent_meta) = tag_store::get(resolved_parent) {
+            (
+                parent_meta.interior_mut_extent_base,
+                parent_meta.interior_mut_extent_len,
+            )
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
     let (origin_known, origin_base, origin_end) = if exposed_provenance_root {
         (false, 0, 0)
     } else if resolved_parent != 0 {
@@ -5893,6 +5941,8 @@ pub extern "C" fn __record_raw_ptr_creation(
         lineage_hint: alias_exempt & 0b0001_1110,
         exposed_provenance_root,
         bounds_len,
+        interior_mut_extent_base,
+        interior_mut_extent_len,
         align_req,
         origin_known,
         origin_base,
@@ -5924,13 +5974,15 @@ pub extern "C" fn __record_raw_ptr_creation(
     );
     if rz_trace_tag_create_enabled() {
         eprintln!(
-            "[rusteze-runtime][tag-create][raw] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} align={} epoch={} hint={}",
+            "[rusteze-runtime][tag-create][raw] tag={} parent={} resolved_parent={} pointee=0x{:x} kind={} bounds={} extent=[0x{:x},+{}] align={} epoch={} hint={}",
             tag,
             derived_from,
             resolved_parent,
             pointee_addr,
             kind_str,
             bounds_len,
+            interior_mut_extent_base,
+            interior_mut_extent_len,
             align_req,
             alloc_epoch,
             alias_exempt

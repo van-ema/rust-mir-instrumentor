@@ -14,6 +14,8 @@ const EMPTY_TAG_META: TagMeta = TagMeta {
     lineage_hint: 0,
     exposed_provenance_root: false,
     bounds_len: 0,
+    interior_mut_extent_base: 0,
+    interior_mut_extent_len: 0,
     align_req: 0,
     origin_known: false,
     origin_base: 0,
