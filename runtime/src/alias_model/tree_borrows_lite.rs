@@ -178,11 +178,11 @@ impl AliasModel for TreeBorrowsLiteModel {
     }
 
     fn on_mut_arg_ret_export(&self, tag: u64, addr: usize) {
-        tb_lite_on_mut_arg_ret_export(tag, addr);
+        tb_lite_on_ret_family_export(tag, addr);
     }
 
     fn on_ret_export(&self, tag: u64, addr: usize) {
-        tb_lite_on_mut_arg_ret_export(tag, addr);
+        tb_lite_on_ret_family_export(tag, addr);
     }
 
     fn check_access(
@@ -903,14 +903,19 @@ fn tb_unshadow_same_slot_protected_unique_ancestors(
     }
 }
 
-/// Re-enable a family exported after call-exit teardown.
+/// Re-enable a family that is exported after call-exit teardown has already run.
 ///
-/// Return-side export hooks can still publish the caller-visible surviving family after `FnExit`
-/// has already released the callee's protector frame. When that happens, we must revive not only
-/// the exported exact tag but also any protector-end-disabled ancestors on its lineage; otherwise
-/// a returned reference can remain stuck behind a dead frame-local node and require a read-side
-/// recovery hatch.
-fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
+/// Both normal return export hooks and mut-arg-ret export hooks can publish the caller-visible
+/// surviving family after `FnExit` has released the callee's protector frame. By the time the
+/// export becomes visible, the exact returned tag or one of its reserved ancestors may already
+/// have been disabled as frame-local state. This helper repairs that producer-side damage before
+/// the caller observes the lineage:
+/// - always re-enable the exported exact tag itself
+/// - additionally revive protector-end-disabled reserved ancestors for returned refs
+///
+/// That keeps caller-visible returned lineages attached to a live family without reviving
+/// unrelated poisoned raw ancestors or reintroducing a read-side recovery hatch.
+fn tb_lite_on_ret_family_export(tag: u64, addr: usize) {
     if !rz_tb_lite_enabled() || tag == 0 {
         return;
     }
@@ -1623,6 +1628,12 @@ fn tb_disable_node_for_protector_end(n: &mut TbNode) {
     n.poisoned_by_protector_end = true;
 }
 
+/// Revive a node that was disabled specifically by protector release.
+///
+/// This is narrower than exported-tag re-enable. It only applies to nodes marked
+/// `poisoned_by_protector_end`, clears the protector bookkeeping, and restores the best surviving
+/// permission from `lazy_perm` when that still carries useful state. We use it for reserved
+/// ancestors that must stay live because a returned descendant still depends on their lineage.
 #[inline]
 fn tb_revive_node_after_protector_end(n: &mut TbNode) {
     if !n.poisoned_by_protector_end {
@@ -1647,6 +1658,12 @@ fn tb_revive_node_after_protector_end(n: &mut TbNode) {
     }
 }
 
+/// Re-enable the exact tag that is being exported back to the caller.
+///
+/// Exported exact tags are caller-visible by definition, so once an export hook publishes them we
+/// must drop any frame-local protector bookkeeping and give them a live permission again. Unlike
+/// `tb_revive_node_after_protector_end`, this helper is intentionally broader: it repairs the
+/// exported exact node even when it was disabled for reasons other than protector-end poison.
 #[inline]
 fn tb_reenable_exported_exact_node(n: &mut TbNode) {
     n.protected = false;
@@ -1729,14 +1746,14 @@ fn tb_lite_can_recover_parent_tag(tag: u64) -> bool {
     true
 }
 
-/// Collapse a callee-exported exact-slot tag back to the nearest live `Unique` family that
-/// survives helper teardown at call exit.
+/// Canonicalize a mut-arg-ret export back to the stable live family that should survive the call.
 ///
-/// For nested `&mut self` helpers the newest exact-slot tag is often a temporary Shared child
-/// (or a protected Unique that will be disabled at call exit). The caller must not refresh its
-/// carrier anchor to an older root family like `50`, but it also must not import a dead inner
-/// helper tag. Choosing the nearest live exact-slot Unique ancestor preserves the post-call
-/// family that remains valid after the helper frame ends.
+/// Mut-arg-ret writeback is different from normal return export: the caller is refreshing the tag
+/// attached to an existing `&mut T` carrier, not importing a brand-new returned reference. The
+/// raw exported tag can therefore be a transient helper child that was valid inside the callee but
+/// should not survive as the caller's long-lived carrier anchor. We walk upward and choose the
+/// nearest live `Unique` family at the same exact place, falling back to the nearest live ref if
+/// no such `Unique` survives.
 fn tb_lite_canonicalize_mut_arg_ret_tag(tag: u64, addr: usize) -> u64 {
     if !rz_tb_lite_enabled() || tag == 0 || addr == 0 {
         return tag;
