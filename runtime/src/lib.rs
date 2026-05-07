@@ -1274,7 +1274,7 @@ struct CallArgTagEntry {
 }
 
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
-const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
+const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
     OnceLock::new();
@@ -4745,38 +4745,43 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
     tag
 }
 
-/// Push a pointer-argument tag into a runtime side-channel so callees can retag on entry.
+/// Push explicit call-boundary pointer state so callees can retag on entry.
+///
+/// `exact_tag` is the caller local's current tag. `boundary_parent_tag` is the family the callee
+/// should inherit when the local came from an earlier boundary import/recovery. Exact-origin
+/// locals validate the exact tag first; recovered-origin locals validate/export the boundary
+/// parent instead of a transient local child.
 #[no_mangle]
-pub extern "C" fn __rz_push_call_arg_tag(
+pub extern "C" fn __rz_push_call_arg_boundary_tag(
     callee_id: u64,
     arg_index: u64,
     addr: usize,
-    tag: u64,
+    exact_tag: u64,
+    boundary_parent_tag: u64,
+    boundary_origin: u8,
     flags: u8,
 ) {
     let _g = RzRuntimeGuard::enter();
-    let canonical_tag = canonical_call_arg_tag(addr, tag);
-    let recoverable_canonical = canonical_tag != 0
-        && canonical_tag != tag
-        && (rz_ref_boundary_tag_is_valid(canonical_tag)
-            || rz_can_recover_parent_tag(canonical_tag));
-    let prefer_canonical_validate =
-        recoverable_canonical && (flags & CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE) != 0;
-    let tag = if prefer_canonical_validate {
+    let recovered_origin = boundary_origin != CALL_ARG_BOUNDARY_ORIGIN_EXACT;
+    let boundary_parent_tag = if boundary_parent_tag != 0 {
+        boundary_parent_tag
+    } else {
+        exact_tag
+    };
+    let tag = if recovered_origin {
+        let canonical_tag = canonical_call_arg_tag(addr, boundary_parent_tag);
         if rz_ref_boundary_tag_is_valid(canonical_tag) {
             rz_validate_ref_boundary_use(canonical_tag, "CALL_ARG");
         }
         canonical_tag
     } else {
-        // Validate the exact exported ref first. Canonicalization is only for callee-side
-        // retagging unless we know the caller is exporting a copied/recovered mutable family.
-        rz_validate_ref_boundary_use(tag, "CALL_ARG");
-        canonical_tag
+        rz_validate_ref_boundary_use(exact_tag, "CALL_ARG");
+        canonical_call_arg_tag(addr, exact_tag)
     };
     if rz_trace_call_tags_enabled() {
         eprintln!(
-            "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} tag={} flags=0x{:x}",
-            callee_id, arg_index, addr, tag, flags
+            "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
+            callee_id, arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, tag, flags
         );
     }
     let thread_id = std::thread::current().id();

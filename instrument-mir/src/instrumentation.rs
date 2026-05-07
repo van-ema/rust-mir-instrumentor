@@ -1613,7 +1613,6 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
         /// Bit 0 marks the custom-MIR exact in-place source shape `Move(*ptr)`.
-        /// Bit 1 requests canonicalize-before-validate for recovered boundary families.
         flags: u8,
     },
     /// Caller-side validation for a by-value argument that is not itself pointer-typed,
@@ -1769,8 +1768,7 @@ struct CarrierSlotLocals {
 }
 
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
-const CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE: u8 = 1 << 1;
-const CALL_ARG_FLAG_USE_EXPORT_PARENT: u8 = 1 << 7;
+const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 #[derive(Clone, Debug)]
 struct InsertPoint<'tcx> {
@@ -6217,83 +6215,12 @@ impl MyOptimizationPass {
         inner(self, body, dst_local, &mut visited)
     }
 
-    fn call_arg_push_needs_canonical_boundary_validate<'tcx>(
-        &self,
-        body: &Body<'tcx>,
-        ptr_local: Local,
-        boundary_recovered_ptr_locals: &HashSet<Local>,
-    ) -> bool {
-        if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::RawPtr(..)) {
-            return true;
-        }
-        if !matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
-            return false;
-        }
-        if boundary_recovered_ptr_locals.contains(&ptr_local) {
-            return true;
-        }
-        self.backtrack_global_pointer_value_local(body, ptr_local)
-            .is_some_and(|src_local| {
-                src_local != ptr_local && boundary_recovered_ptr_locals.contains(&src_local)
-            })
-    }
-
-    fn call_arg_push_flags_for_ptr_local<'tcx>(
-        &self,
-        body: &Body<'tcx>,
-        ptr_local: Local,
-        exact_inplace_source: bool,
-        boundary_recovered_ptr_locals: &HashSet<Local>,
-    ) -> u8 {
-        let mut flags = if exact_inplace_source {
+    fn call_arg_push_flags(&self, exact_inplace_source: bool) -> u8 {
+        if exact_inplace_source {
             CALL_ARG_FLAG_INPLACE_EXACT_SOURCE
         } else {
             0
-        };
-        if self.call_arg_push_needs_canonical_boundary_validate(
-            body,
-            ptr_local,
-            boundary_recovered_ptr_locals,
-        ) {
-            flags |= CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE;
         }
-        if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..))
-            && self.rhs_or_local_carries_boundary_recovered_ptr(
-                body,
-                ptr_local,
-                boundary_recovered_ptr_locals,
-            )
-        {
-            flags |= CALL_ARG_FLAG_USE_EXPORT_PARENT;
-        }
-        if matches!(
-            body.local_decls[ptr_local].ty.kind(),
-            TyKind::Ref(_, pointee_ty, Mutability::Mut)
-                if !self.is_pointer_ty(*pointee_ty)
-        ) {
-            flags |= CALL_ARG_FLAG_USE_EXPORT_PARENT;
-        }
-        flags
-    }
-
-    fn local_is_direct_mut_ref_of_nonpointer_local<'tcx>(
-        &self,
-        body: &Body<'tcx>,
-        local: Local,
-    ) -> bool {
-        body.basic_blocks.iter().any(|block_data| {
-            block_data.statements.iter().any(|stmt| {
-                matches!(
-                    &stmt.kind,
-                    StatementKind::Assign(box (
-                        lhs,
-                        Rvalue::Ref(_, BorrowKind::Mut { .. }, src_place)
-                    )) if lhs.as_local() == Some(local)
-                        && src_place.projection.is_empty()
-                        && !self.is_pointer_ty(body.local_decls[src_place.local].ty)
-                )
-            })
-        })
     }
 
     fn shadow_store_uses_local_slot_store<'tcx>(
@@ -6305,20 +6232,6 @@ impl MyOptimizationPass {
         place.as_local() == Some(src_local)
             && place.projection.is_empty()
             && local_slot_shadow_store_locals.contains(&src_local)
-    }
-
-    fn rhs_or_local_carries_boundary_recovered_ptr<'tcx>(
-        &self,
-        body: &Body<'tcx>,
-        local: Local,
-        boundary_recovered_ptr_locals: &HashSet<Local>,
-    ) -> bool {
-        boundary_recovered_ptr_locals.contains(&local)
-            || self
-                .backtrack_global_pointer_value_local(body, local)
-                .is_some_and(|src_local| {
-                    src_local != local && boundary_recovered_ptr_locals.contains(&src_local)
-                })
     }
 
     fn rhs_carries_boundary_recovered_ptr<'tcx>(
@@ -12808,15 +12721,7 @@ impl MyOptimizationPass {
                 if let Some(callee_id) = callee_id_opt {
                     let exact_inplace_source =
                         p.projection.len() == 1 && matches!(p.projection[0], ProjectionElem::Deref);
-                    let mut flags = self.call_arg_push_flags_for_ptr_local(
-                        body,
-                        p.local,
-                        exact_inplace_source,
-                        boundary_recovered_ptr_locals,
-                    );
-                    if self.local_is_direct_mut_ref_of_nonpointer_local(body, p.local) {
-                        flags &= !CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE;
-                    }
+                    let flags = self.call_arg_push_flags(exact_inplace_source);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -12944,15 +12849,7 @@ impl MyOptimizationPass {
             if callee_instrumented && self.tb_call_arg_protector_supported_for_ty(tcx, body, ty) {
                 if let Some(callee_id) = callee_id_opt {
                     ptr_locals_needing_tag.insert(p.local);
-                    let mut flags = self.call_arg_push_flags_for_ptr_local(
-                        body,
-                        p.local,
-                        false,
-                        boundary_recovered_ptr_locals,
-                    );
-                    if self.local_is_direct_mut_ref_of_nonpointer_local(body, p.local) {
-                        flags &= !CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE;
-                    }
+                    let flags = self.call_arg_push_flags(false);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -13067,21 +12964,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
-                            flags: if let Some(anchor_ptr_local_ty) =
-                                Some(body.local_decls[p.local].ty)
-                            {
-                                if matches!(
-                                    anchor_ptr_local_ty.kind(),
-                                    TyKind::Ref(_, pointee_ty, Mutability::Mut)
-                                        if !self.is_pointer_ty(*pointee_ty)
-                                ) {
-                                    CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE
-                                } else {
-                                    0
-                                }
-                            } else {
-                                0
-                            },
+                            flags: 0,
                         },
                     });
                     if let Some(tgt_bb) = call_target_bb {
@@ -13617,12 +13500,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: 0,
                             ptr_local: place.local,
-                            flags: self.call_arg_push_flags_for_ptr_local(
-                                body,
-                                place.local,
-                                false,
-                                boundary_recovered_ptr_locals,
-                            ),
+                            flags: self.call_arg_push_flags(false),
                         },
                     });
                 }
@@ -19704,112 +19582,28 @@ impl MyOptimizationPass {
                             )
                         }
                     };
-                    let tag_op: Operand<'tcx> = if (flags & CALL_ARG_FLAG_USE_EXPORT_PARENT) != 0 {
+                    let exact_tag_op = fallback_tag_op;
+                    let (boundary_parent_op, boundary_origin_op): (Operand<'tcx>, Operand<'tcx>) =
                         if let (Some(export_parent_local), Some(recovered_local)) = (
                             export_parent_local_for_ptr_local.get(&ptr_local).copied(),
                             export_parent_is_recovered_local_for_ptr_local
                                 .get(&ptr_local)
                                 .copied(),
                         ) {
-                            let fallback_tag_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                            let recovered_u64_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                            let not_recovered_u64_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                            let fallback_part_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                            let export_part_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-                            let selected_tag_local = body
-                                .local_decls
-                                .push(LocalDecl::new(tcx.types.u64, source_info.span));
-
-                            extra_stmts.extend([
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(fallback_tag_local),
-                                        Rvalue::Use(fallback_tag_op.clone()),
-                                    ))),
-                                ),
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(recovered_u64_local),
-                                        Rvalue::Cast(
-                                            CastKind::IntToInt,
-                                            Operand::Copy(Place::from(recovered_local)),
-                                            tcx.types.u64,
-                                        ),
-                                    ))),
-                                ),
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(not_recovered_u64_local),
-                                        Rvalue::BinaryOp(
-                                            BinOp::Sub,
-                                            Box::new((
-                                                self.const_u64(tcx, source_info.span, 1),
-                                                Operand::Copy(Place::from(recovered_u64_local)),
-                                            )),
-                                        ),
-                                    ))),
-                                ),
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(fallback_part_local),
-                                        Rvalue::BinaryOp(
-                                            BinOp::Mul,
-                                            Box::new((
-                                                Operand::Copy(Place::from(not_recovered_u64_local)),
-                                                Operand::Copy(Place::from(fallback_tag_local)),
-                                            )),
-                                        ),
-                                    ))),
-                                ),
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(export_part_local),
-                                        Rvalue::BinaryOp(
-                                            BinOp::Mul,
-                                            Box::new((
-                                                Operand::Copy(Place::from(recovered_u64_local)),
-                                                Operand::Copy(Place::from(export_parent_local)),
-                                            )),
-                                        ),
-                                    ))),
-                                ),
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(selected_tag_local),
-                                        Rvalue::BinaryOp(
-                                            BinOp::Add,
-                                            Box::new((
-                                                Operand::Copy(Place::from(fallback_part_local)),
-                                                Operand::Copy(Place::from(export_part_local)),
-                                            )),
-                                        ),
-                                    ))),
-                                ),
-                            ]);
-
-                            Operand::Copy(Place::from(selected_tag_local))
+                            (
+                                Operand::Copy(Place::from(export_parent_local)),
+                                Operand::Copy(Place::from(recovered_local)),
+                            )
                         } else {
-                            fallback_tag_op
-                        }
-                    } else {
-                        fallback_tag_op
-                    };
+                            (
+                                exact_tag_op.clone(),
+                                self.const_u8(
+                                    tcx,
+                                    source_info.span,
+                                    CALL_ARG_BOUNDARY_ORIGIN_EXACT,
+                                ),
+                            )
+                        };
 
                     let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
                     let arg_index = self.const_u64(tcx, source_info.span, arg_index);
@@ -19828,7 +19622,15 @@ impl MyOptimizationPass {
                             span: source_info.span,
                         },
                         Spanned {
-                            node: tag_op,
+                            node: exact_tag_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: boundary_parent_op,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: boundary_origin_op,
                             span: source_info.span,
                         },
                         Spanned {
@@ -22512,8 +22314,8 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_ptr_use", 2)
             .expect("missing '__rz_ptr_use' definition");
         let def_id_push_call_arg_tag = self
-            .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_tag", 5)
-            .expect("missing '__rz_push_call_arg_tag' definition");
+            .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_boundary_tag", 7)
+            .expect("missing '__rz_push_call_arg_boundary_tag' definition");
         let def_id_validate_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
             .expect("missing '__rz_validate_call_arg_tag' definition");

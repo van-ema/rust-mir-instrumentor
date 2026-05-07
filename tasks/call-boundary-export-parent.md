@@ -2,24 +2,19 @@
 
 ## Context
 
-Current short-term behavior for pointer call arguments is:
+Pointer call arguments now carry explicit boundary export state:
 
-- caller exports one tag through `__rz_push_call_arg_tag`
+- caller exports an exact tag, a boundary-parent tag, and an origin through
+  `__rz_push_call_arg_boundary_tag`
 - callee imports it through `__rz_take_call_arg_tag`
 - callee entry retags from that imported parent
 
 This is close to Miri's `FnEntry` retag intent, but not identical.
 
-The main remaining gap is that rusteze currently exports the caller local's **exact current tag**
-for most pointer args. That is wrong for refs that were already imported/recovered from a prior
-call boundary, because the current exact tag can be a transient child that is already invalidated
-while the correct same-address family is still live.
-
-The current short-term fix therefore uses
-`CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE` for recovered boundary refs.
-
-That patch is intentionally narrow, but it is still a policy flag rather than a principled
-representation of boundary state.
+The important semantic split is that direct refs validate/export their exact local tag, while
+refs imported or recovered from a prior boundary validate/export the recorded boundary parent.
+That replaces the older policy flag that asked the runtime to infer whether it should
+canonicalize before validation.
 
 ## Goal
 
@@ -100,7 +95,7 @@ Conceptually:
 - the next call should still retag from the live same-address boundary family, not that transient
   child
 
-## Long-term design
+## Design
 
 ### 1. Add explicit boundary-export state for pointer locals
 
@@ -108,14 +103,15 @@ For each pointer local, track:
 
 - `exact_tag`
 - `boundary_parent_tag`
-- optional `boundary_origin`
+- `boundary_origin`
 
-Suggested origin classes:
+The first implementation uses a binary origin:
 
 - `Exact`
-- `RecoveredReturn`
-- `RecoveredMutArg`
-- `RecoveredCarrier`
+- `RecoveredBoundary`
+
+The origin can be split later into more specific classes if diagnostics or policy need to
+distinguish return imports from mut-arg writeback or carrier reconstruction.
 
 The key semantic rule:
 
@@ -193,15 +189,14 @@ Option 1 is more principled but has higher runtime and instrumentation complexit
 4. **Runtime metadata growth**
    - if we push this into shadow/runtime state, it becomes another hot-path channel
 
-## Short-term status
+## Implementation Status
 
-The short-term patch in the current branch does **not** implement this full design.
+The current branch implements the first explicit-state slice:
 
-It does only this:
+- call-arg export passes `exact_tag`, `boundary_parent_tag`, and `boundary_origin`
+- direct exact locals validate exact-first
+- recovered boundary locals validate/export the boundary parent
+- the old `CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE` policy flag is removed
 
-- mark pointer locals recovered via `RetTake` / pointer-only mut-arg writeback
-- recognize simple forwarded copies/transmutes of those locals
-- set `CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE` for those exports
-
-That is enough to fix the current `bytes` false-positive class while keeping the blast radius
-small.
+The remaining open part is precision, not representation: recovered origin is still binary, and
+memory round-trips depend on the existing pointer-shadow export-parent channel.
