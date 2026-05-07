@@ -97,13 +97,6 @@ fn rz_tb_trace_enabled() -> bool {
         .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
 }
 
-#[inline]
-fn rz_tb_no_precise_interior_mut_enabled() -> bool {
-    std::env::var("RZ_TB_NO_PRECISE_INTERIOR_MUT")
-        .ok()
-        .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
-}
-
 #[cfg(feature = "runtime_lineage_repair")]
 #[inline]
 fn rz_tb_runtime_lineage_repair_enabled() -> bool {
@@ -489,11 +482,7 @@ fn tb_lite_validate_ref_creation(
     alias_exempt: bool,
     bounds_len: usize,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled()
-        || rz_tb_no_precise_interior_mut_enabled()
-        || alias_exempt
-        || rz_sb_suppressed()
-    {
+    if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
         return None;
     }
     if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
@@ -995,11 +984,7 @@ fn tb_lite_check(
     size: usize,
     access: AliasAccessKind,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled()
-        || rz_tb_no_precise_interior_mut_enabled()
-        || tmeta.alias_exempt
-        || rz_sb_suppressed()
-    {
+    if !rz_tb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
         return None;
     }
     if !matches!(
@@ -1249,7 +1234,7 @@ fn tb_lite_check(
             }
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
                 let rawmut_interior_mut_extent =
-                    tb_raw_write_interior_mut_extent_covers(tmeta, addr, size);
+                    tb_raw_write_within_explicit_interior_mut_extent(tmeta, addr, size);
                 if rawmut_interior_mut_extent {
                     n.perm
                 } else {
@@ -1585,8 +1570,20 @@ fn tb_range_covers(cover_start: usize, cover_len: usize, addr: usize, size: usiz
 }
 
 #[inline]
-fn tb_raw_write_interior_mut_extent_covers(tmeta: &TagMeta, addr: usize, size: usize) -> bool {
-    if rz_tb_no_precise_interior_mut_enabled() || !matches!(tmeta.kind, PtrKind::RawMut) {
+/// Allow a frozen `RawMut` write only when instrumentation/runtime attached an
+/// explicit writable extent for surrounding interior-mutable bytes and the
+/// write stays inside that extent.
+///
+/// This is the principled replacement for the old `rawmut_uncovered` fallback:
+/// writes do not become okay merely because the blocking node's covered range
+/// is narrower than the written bytes. They are okay only when we can point to
+/// an explicit permission region carried in tag metadata.
+fn tb_raw_write_within_explicit_interior_mut_extent(
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(tmeta.kind, PtrKind::RawMut) {
         return false;
     }
     tb_range_covers(
