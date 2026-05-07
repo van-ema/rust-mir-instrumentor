@@ -402,9 +402,15 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                 }
             }
         }
+        let returned_descendant = returned_tags
+            .iter()
+            .copied()
+            .any(|ret_tag| ret_tag != tag && tb_is_ancestor(&tree.nodes, tag, ret_tag));
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
-            if !returned_tags.contains(&tag) {
+            if !returned_tags.contains(&tag)
+                && !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant)
+            {
                 tb_disable_node_for_protector_end(node);
             }
         }
