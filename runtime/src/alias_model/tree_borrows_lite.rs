@@ -1084,8 +1084,6 @@ fn tb_lite_check(
             continue;
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
-        let child_unique_ref_ancestor =
-            child && n.tag != access_tag && matches!(n.kind, BorrowKind::Unique);
         let covered = tb_node_overlaps(&n, addr, size);
         let old_perm = if covered { n.perm } else { n.lazy_perm };
 
@@ -1128,15 +1126,6 @@ fn tb_lite_check(
             // - Reserved(conflicted) while protected is UB (2-phase noalias violation)
             // - Reserved/Active activate to Active
             // - Frozen/Disabled cannot be written through
-            (AliasAccessKind::Write, true, _, _)
-                if child_unique_ref_ancestor && matches!(tmeta.kind, PtrKind::RefMut) =>
-            {
-                if n.start == addr && n.len <= tb_effective_len(size) {
-                    TbPerm::Disabled
-                } else {
-                    old_perm
-                }
-            }
             (AliasAccessKind::Write, true, TbPerm::Reserved { conflicted: true }, true) => {
                 let mut msg = format!(
                     "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_2PHASE_CONFLICT tag={}",

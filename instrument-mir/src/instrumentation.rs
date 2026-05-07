@@ -15851,7 +15851,7 @@ impl MyOptimizationPass {
 
                 let take_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_take_mut_arg_ret_tag_or_zero,
+                    hooks.def_id_take_mut_arg_ret_tag,
                     std::iter::empty(),
                     source_info.span,
                 );
@@ -16911,7 +16911,7 @@ impl MyOptimizationPass {
 
                 let take_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_take_mut_arg_ret_tag,
+                    hooks.def_id_take_mut_arg_ret_tag_or_zero,
                     std::iter::empty(),
                     source_info.span,
                 );
