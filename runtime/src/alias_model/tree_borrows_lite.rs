@@ -1250,10 +1250,7 @@ fn tb_lite_check(
             (AliasAccessKind::Write, true, TbPerm::Frozen, _) => {
                 let rawmut_interior_mut_extent =
                     tb_raw_write_interior_mut_extent_covers(tmeta, addr, size);
-                let rawmut_uncovered = matches!(tmeta.kind, PtrKind::RawMut)
-                    && !covered
-                    && !rawmut_interior_mut_extent;
-                if rawmut_interior_mut_extent || rawmut_uncovered {
+                if rawmut_interior_mut_extent {
                     n.perm
                 } else {
                     let mut msg = format!(

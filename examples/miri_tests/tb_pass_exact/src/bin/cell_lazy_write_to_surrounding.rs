@@ -15,9 +15,8 @@ fn main() {
     foo(&arr[0]);
 
     let pair = (Cell::new(1), 1);
-    // TODO: Ideally, this would result in UB since the second element
-    // in `pair` is Frozen.  We would need some way to express a
-    // "shared reference with permission to access surrounding
-    // interior mutable data".
+    // Principled TB-lite now rejects this: `&pair.0` does not carry any
+    // writable surrounding extent for `pair.1`, so the raw write remains
+    // frozen outside the interior-mutable root.
     foo(&pair.0);
 }
