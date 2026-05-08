@@ -143,5 +143,7 @@ be missed.
 
 - `CallArgValidate` handles non-pointer argument carriers with inner refs
 - `RetValidate` handles non-pointer return carriers with inner refs
+- caller-side anchor import for those return carriers is handled separately by
+  `RetAnchorTake`
 - both exist to catch invalid references crossing boundaries inside wrappers like `Option<&T>` or
   tuples
