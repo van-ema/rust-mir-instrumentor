@@ -1275,6 +1275,9 @@ struct CallArgTagEntry {
 }
 
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
+// A callee still consumes the explicit boundary parent, but TB-lite must not
+// turn that parent into a protected child for unresolved/generic `&mut Self`.
+const CALL_ARG_FLAG_NO_PROTECTOR: u8 = 1 << 1;
 const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
@@ -4725,7 +4728,7 @@ pub extern "C" fn __rz_take_call_arg_tag(
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, inplace_alias_parent, matched_callee_id) = {
+    let (tag, protect_arg, inplace_alias_parent, matched_callee_id) = {
         let mut tags = call_arg_tags().lock().unwrap();
         let mut matched_callee_id = callee_id;
         let allow_cross_callee_fallback = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
@@ -4754,7 +4757,8 @@ pub extern "C" fn __rz_take_call_arg_tag(
                 CallArgTagEntry::default()
             });
         let tag = entry.tag;
-        let inplace_alias_parent = if tag != 0 {
+        let protect_arg = (entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0;
+        let inplace_alias_parent = if tag != 0 && protect_arg {
             tags.iter()
                 .find(|((tid, cid, other_arg, other_addr), other_entry)| {
                     *tid == thread_id
@@ -4762,25 +4766,27 @@ pub extern "C" fn __rz_take_call_arg_tag(
                         && *other_arg != arg_index
                         && *other_addr == addr
                         && (other_entry.flags & CALL_ARG_FLAG_INPLACE_EXACT_SOURCE) != 0
+                        && (other_entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0
                 })
                 .map(|(_key, other_entry)| other_entry.tag)
         } else {
             None
         };
-        (tag, inplace_alias_parent, matched_callee_id)
+        (tag, protect_arg, inplace_alias_parent, matched_callee_id)
     };
     if rz_trace_call_tags_enabled() {
         eprintln!(
-            "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} inplace_alias_parent={}",
+            "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} protector={} inplace_alias_parent={}",
             callee_id,
             matched_callee_id,
             arg_index,
             addr,
             tag,
+            protect_arg,
             inplace_alias_parent.unwrap_or(0)
         );
     }
-    if tag != 0 {
+    if tag != 0 && protect_arg {
         active_alias_model().on_call_arg_taken(matched_callee_id, tag);
         if let Some(alias_parent_tag) = inplace_alias_parent {
             active_alias_model().on_call_arg_inplace_alias(

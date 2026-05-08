@@ -1769,6 +1769,9 @@ struct CarrierSlotLocals {
 }
 
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
+// Boundary transport and TB-lite protector activation are separate: generic `&mut Self`
+// calls still need a parent tag even when we cannot soundly attach a function protector.
+const CALL_ARG_FLAG_NO_PROTECTOR: u8 = 1 << 1;
 const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 #[derive(Clone, Debug)]
@@ -6252,12 +6255,15 @@ impl MyOptimizationPass {
         inner(self, body, dst_local, &mut visited)
     }
 
-    fn call_arg_push_flags(&self, exact_inplace_source: bool) -> u8 {
+    fn call_arg_push_flags(&self, exact_inplace_source: bool, suppress_protector: bool) -> u8 {
+        let mut flags = 0;
         if exact_inplace_source {
-            CALL_ARG_FLAG_INPLACE_EXACT_SOURCE
-        } else {
-            0
+            flags |= CALL_ARG_FLAG_INPLACE_EXACT_SOURCE;
         }
+        if suppress_protector {
+            flags |= CALL_ARG_FLAG_NO_PROTECTOR;
+        }
+        flags
     }
 
     fn shadow_store_uses_local_slot_store<'tcx>(
@@ -12771,7 +12777,12 @@ impl MyOptimizationPass {
                 if let Some(callee_id) = callee_id_opt {
                     let exact_inplace_source =
                         p.projection.len() == 1 && matches!(p.projection[0], ProjectionElem::Deref);
-                    let flags = self.call_arg_push_flags(exact_inplace_source);
+                    let suppress_protector = !self.tb_call_arg_protector_supported_for_ty(
+                        tcx,
+                        body,
+                        body.local_decls[p.local].ty,
+                    );
+                    let flags = self.call_arg_push_flags(exact_inplace_source, suppress_protector);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -12897,10 +12908,12 @@ impl MyOptimizationPass {
             }
 
             // Inter-procedural: push argument tag to callee if instrumented.
-            if callee_instrumented && self.tb_call_arg_protector_supported_for_ty(tcx, body, ty) {
+            if callee_instrumented {
                 if let Some(callee_id) = callee_id_opt {
                     ptr_locals_needing_tag.insert(p.local);
-                    let flags = self.call_arg_push_flags(false);
+                    let suppress_protector =
+                        !self.tb_call_arg_protector_supported_for_ty(tcx, body, ty);
+                    let flags = self.call_arg_push_flags(false, suppress_protector);
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -13539,25 +13552,25 @@ impl MyOptimizationPass {
         }
 
         if self.is_pointer_ty(dropped_ty) {
-            if self.tb_call_arg_protector_supported_for_ty(tcx, body, dropped_ty) {
-                ptr_locals_needing_tag.insert(place.local);
-                tagged_ptr_locals.insert(place.local);
-                for callee_id in callee_ids {
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place,
-                        kind: InstrKind::CallArgPush {
-                            callee_id,
-                            arg_index: 0,
-                            ptr_local: place.local,
-                            parent_mode: ParentSelectionMode::PointeeFamily,
-                            flags: self.call_arg_push_flags(false),
-                        },
-                    });
-                }
+            ptr_locals_needing_tag.insert(place.local);
+            tagged_ptr_locals.insert(place.local);
+            let suppress_protector =
+                !self.tb_call_arg_protector_supported_for_ty(tcx, body, dropped_ty);
+            for callee_id in callee_ids {
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place,
+                    kind: InstrKind::CallArgPush {
+                        callee_id,
+                        arg_index: 0,
+                        ptr_local: place.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags: self.call_arg_push_flags(false, suppress_protector),
+                    },
+                });
             }
             return;
         }
@@ -13578,6 +13591,11 @@ impl MyOptimizationPass {
         {
             ptr_locals_needing_tag.insert(place.local);
             tagged_ptr_locals.insert(place.local);
+            let suppress_protector = !self.tb_call_arg_protector_supported_for_ty(
+                tcx,
+                body,
+                body.local_decls[place.local].ty,
+            );
             for callee_id in callee_ids {
                 insert_points.push(InsertPoint {
                     bb,
@@ -13590,7 +13608,7 @@ impl MyOptimizationPass {
                         arg_index: 0,
                         ptr_local: place.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
-                        flags: self.call_arg_push_flags(false),
+                        flags: self.call_arg_push_flags(false, suppress_protector),
                     },
                 });
             }
