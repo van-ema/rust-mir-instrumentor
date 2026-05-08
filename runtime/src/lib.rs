@@ -4366,90 +4366,6 @@ fn recover_call_arg_parent_tag(addr: usize) -> u64 {
     recovered
 }
 
-fn recover_call_arg_parent_tag_for_kind(addr: usize, require_mut: bool) -> u64 {
-    if addr == 0 {
-        return 0;
-    }
-
-    let alloc_epoch = lookup_alloc_snapshot(addr)
-        .map(|(_base, meta)| meta.epoch)
-        .unwrap_or(0);
-    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
-    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
-
-    let tmap = tags().lock().unwrap();
-    let mut latest_any = 0u64;
-    let mut latest_mut = 0u64;
-    let mut latest_nonmut = 0u64;
-    let mut latest_any_epochless = 0u64;
-    let mut latest_mut_epochless = 0u64;
-    let mut latest_nonmut_epochless = 0u64;
-
-    for (tag, meta) in tmap.iter() {
-        if meta.parent == 0 || meta.pointee_addr != addr {
-            continue;
-        }
-        if !rz_can_recover_parent_tag(*tag) {
-            continue;
-        }
-
-        let mut epochless_match = false;
-        if alloc_epoch != 0 {
-            if meta.alloc_epoch != alloc_epoch {
-                if stack_or_tls_addr && meta.alloc_epoch == 0 {
-                    epochless_match = true;
-                } else {
-                    continue;
-                }
-            }
-        } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
-            continue;
-        }
-
-        let is_mut_family = matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut);
-        let (any_slot, mut_slot, nonmut_slot) = if epochless_match {
-            (
-                &mut latest_any_epochless,
-                &mut latest_mut_epochless,
-                &mut latest_nonmut_epochless,
-            )
-        } else {
-            (&mut latest_any, &mut latest_mut, &mut latest_nonmut)
-        };
-
-        if *tag > *any_slot {
-            *any_slot = *tag;
-        }
-        if is_mut_family {
-            if *tag > *mut_slot {
-                *mut_slot = *tag;
-            }
-        } else if *tag > *nonmut_slot {
-            *nonmut_slot = *tag;
-        }
-    }
-
-    if require_mut {
-        if latest_mut != 0 {
-            latest_mut
-        } else if latest_any != 0 {
-            latest_any
-        } else if latest_mut_epochless != 0 {
-            latest_mut_epochless
-        } else {
-            latest_any_epochless
-        }
-    } else if latest_nonmut != 0 {
-        latest_nonmut
-    } else if latest_any != 0 {
-        latest_any
-    } else if latest_nonmut_epochless != 0 {
-        latest_nonmut_epochless
-    } else {
-        latest_any_epochless
-    }
-}
-
 fn recover_live_boundary_tag(addr: usize) -> u64 {
     if addr == 0 {
         return 0;
@@ -4805,10 +4721,9 @@ pub extern "C" fn __rz_take_call_arg_tag(
     callee_id: u64,
     arg_index: u64,
     addr: usize,
-    require_mut: u8,
+    _require_mut: u8,
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    let require_mut = require_mut != 0;
     let thread_id = std::thread::current().id();
     let (tag, inplace_alias_parent, matched_callee_id) = {
         let mut tags = call_arg_tags().lock().unwrap();
@@ -4838,14 +4753,7 @@ pub extern "C" fn __rz_take_call_arg_tag(
                 }
                 CallArgTagEntry::default()
             });
-        let tag = if entry.tag == 0 && allow_cross_callee_fallback {
-            // Optimized or unresolved stack/TLS calls can skip the exact caller-side push even
-            // though the callee address already has a live family in the current alloc epoch.
-            // Reattach to that exact-address family instead of manufacturing a new root tag.
-            recover_call_arg_parent_tag_for_kind(addr, require_mut)
-        } else {
-            entry.tag
-        };
+        let tag = entry.tag;
         let inplace_alias_parent = if tag != 0 {
             tags.iter()
                 .find(|((tid, cid, other_arg, other_addr), other_entry)| {

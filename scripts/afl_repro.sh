@@ -29,7 +29,11 @@ while [[ $# -gt 0 ]]; do
 Usage: scripts/afl_repro.sh [--input <file>]
 
 Options:
-  --input <file>   Repro only this crash file (path or filename under crashes/)
+  --input <file>   Repro only this crash file (path or filename under crashes/).
+                   Files ending in .hex are decoded as AFL input bytes.
+
+Environment:
+  AFL_REPRO_STRICT=1  Exit non-zero if the harness rejects an input.
 EOF
       exit 0
       ;;
@@ -64,7 +68,7 @@ case "$TARGET" in
 esac
 
 CRASH_DIR="${OUT_DIR}/default/crashes"
-if [[ ! -d "$CRASH_DIR" ]]; then
+if [[ -z "$ONLY" && ! -d "$CRASH_DIR" ]]; then
   echo "missing crash dir: $CRASH_DIR" >&2
   exit 2
 fi
@@ -87,11 +91,23 @@ if [[ -n "$ONLY" ]]; then
   if [[ -f "$ONLY" ]]; then
     files=("$ONLY")
   else
+    if [[ ! -d "$CRASH_DIR" ]]; then
+      echo "missing crash dir: $CRASH_DIR" >&2
+      exit 2
+    fi
     files=("${CRASH_DIR}/${ONLY}")
   fi
 else
   files=("$CRASH_DIR"/*)
 fi
+
+tmp_inputs=()
+cleanup_tmp_inputs() {
+  for tmp in "${tmp_inputs[@]:-}"; do
+    rm -f "$tmp"
+  done
+}
+trap cleanup_tmp_inputs EXIT
 
 for f in "${files[@]}"; do
   if [[ "$(basename "$f")" == "README.txt" ]]; then
@@ -101,10 +117,21 @@ for f in "${files[@]}"; do
     echo "missing crash file: $f" >&2
     exit 2
   fi
+  run_input="$f"
+  if [[ "$f" == *.hex ]]; then
+    run_input="$(mktemp)"
+    tmp_inputs+=("$run_input")
+    tr -d '[:space:]' < "$f" | xxd -r -p > "$run_input"
+  fi
+
   echo "=== repro: $f ==="
   alias_model="${RZ_ALIAS_MODEL:-tb_lite}"
   sb_lite="${RZ_SB_LITE:-1}"
-  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} RZ_SB_LITE=${sb_lite} \"$BIN_PATH\" \"$f\""
-  RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL="${alias_model}" RZ_SB_LITE="${sb_lite}" "$BIN_PATH" "$f" || true
+  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} RZ_SB_LITE=${sb_lite} \"$BIN_PATH\" \"$run_input\""
+  if ! RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL="${alias_model}" RZ_SB_LITE="${sb_lite}" "$BIN_PATH" "$run_input"; then
+    if [[ "${AFL_REPRO_STRICT:-0}" == "1" ]]; then
+      exit 1
+    fi
+  fi
   echo
 done

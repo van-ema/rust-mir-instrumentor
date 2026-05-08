@@ -1612,6 +1612,7 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         ptr_local: Local,
+        parent_mode: ParentSelectionMode,
         /// Bit 0 marks the custom-MIR exact in-place source shape `Move(*ptr)`.
         flags: u8,
     },
@@ -1914,27 +1915,61 @@ impl MyOptimizationPass {
         block_data: &BasicBlockData<'tcx>,
         local: Local,
     ) -> Option<DefId> {
-        // Best-effort recovery for calls like:
-        //   _f = copy ((*_vtable).0: fn(...));
-        //   _0 = _f(args...);
-        for stmt in block_data.statements.iter().rev() {
-            let StatementKind::Assign(box (dst, rvalue)) = &stmt.kind else {
-                continue;
-            };
-            if dst.as_local() != Some(local) {
-                continue;
-            }
-            let def_id_opt = match rvalue {
-                Rvalue::Use(op) => self.fn_def_id_from_operand(tcx, body, op),
-                Rvalue::Cast(_, op, _) => self.fn_def_id_from_operand(tcx, body, op),
-                Rvalue::CopyForDeref(p) => self.fn_def_id_from_place(tcx, body, *p),
-                _ => None,
-            };
-            if def_id_opt.is_some() {
-                return def_id_opt;
+        fn local_from_operand<'tcx>(op: &Operand<'tcx>) -> Option<Local> {
+            match op {
+                Operand::Copy(place) | Operand::Move(place) => place.as_local(),
+                Operand::Constant(_) => None,
             }
         }
-        None
+
+        fn inner<'tcx>(
+            pass: &MyOptimizationPass,
+            tcx: TyCtxt<'tcx>,
+            body: &Body<'tcx>,
+            block_data: &BasicBlockData<'tcx>,
+            local: Local,
+            visited: &mut HashSet<Local>,
+        ) -> Option<DefId> {
+            if !visited.insert(local) {
+                return None;
+            }
+
+            // Best-effort recovery for calls like:
+            //   _f0 = safe as fn(&T, &mut T);
+            //   _f1 = move _f0 as fn(*const T, *mut T) (Transmute);
+            //   _0 = _f1(args...);
+            for stmt in block_data.statements.iter().rev() {
+                let StatementKind::Assign(box (dst, rvalue)) = &stmt.kind else {
+                    continue;
+                };
+                if dst.as_local() != Some(local) {
+                    continue;
+                }
+                match rvalue {
+                    Rvalue::Use(op) | Rvalue::Cast(_, op, _) => {
+                        if let Some(def_id) = pass.fn_def_id_from_operand(tcx, body, op) {
+                            return Some(def_id);
+                        }
+                        if let Some(src_local) = local_from_operand(op) {
+                            return inner(pass, tcx, body, block_data, src_local, visited);
+                        }
+                    }
+                    Rvalue::CopyForDeref(place) => {
+                        if let Some(def_id) = pass.fn_def_id_from_place(tcx, body, *place) {
+                            return Some(def_id);
+                        }
+                        if let Some(src_local) = place.as_local() {
+                            return inner(pass, tcx, body, block_data, src_local, visited);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        let mut visited = HashSet::new();
+        inner(self, tcx, body, block_data, local, &mut visited)
     }
     /// Best-effort check: does this span come from the Rust std/core/alloc sources?
     /// This is used to suppress noisy PtrUse hooks for std wrappers (e.g. println!).
@@ -12747,6 +12782,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
+                            parent_mode: ParentSelectionMode::PointeeFamily,
                             flags,
                         },
                     });
@@ -12875,6 +12911,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
+                            parent_mode: ParentSelectionMode::PointeeFamily,
                             flags,
                         },
                     });
@@ -12979,6 +13016,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
+                            parent_mode: ParentSelectionMode::SlotFamily,
                             flags: 0,
                         },
                     });
@@ -13515,6 +13553,7 @@ impl MyOptimizationPass {
                             callee_id,
                             arg_index: 0,
                             ptr_local: place.local,
+                            parent_mode: ParentSelectionMode::PointeeFamily,
                             flags: self.call_arg_push_flags(false),
                         },
                     });
@@ -13534,6 +13573,30 @@ impl MyOptimizationPass {
             });
         }
 
+        if matches!(place.projection.first(), Some(ProjectionElem::Deref))
+            && self.is_pointer_ty(body.local_decls[place.local].ty)
+        {
+            ptr_locals_needing_tag.insert(place.local);
+            tagged_ptr_locals.insert(place.local);
+            for callee_id in callee_ids {
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place,
+                    kind: InstrKind::CallArgPush {
+                        callee_id,
+                        arg_index: 0,
+                        ptr_local: place.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags: self.call_arg_push_flags(false),
+                    },
+                });
+            }
+            return;
+        }
+
         if !self.supports_call_boundary_anchor_local(tcx, body, place.local) {
             return;
         }
@@ -13549,6 +13612,7 @@ impl MyOptimizationPass {
                     callee_id,
                     arg_index: 0,
                     ptr_local: place.local,
+                    parent_mode: ParentSelectionMode::SlotFamily,
                     flags: 0,
                 },
             });
@@ -13605,6 +13669,23 @@ impl MyOptimizationPass {
             if !self.is_pointer_ty(dst_ty) && self.supports_slot_family_local(tcx, body, dst_local)
             {
                 interesting_stack_locals.insert(dst_local);
+            }
+        }
+        for block_data in body.basic_blocks.iter() {
+            for stmt in block_data.statements.iter() {
+                let StatementKind::Assign(box (dst_place, Rvalue::Aggregate(_, _))) = &stmt.kind
+                else {
+                    continue;
+                };
+                let Some(dst_local) = dst_place.as_local() else {
+                    continue;
+                };
+                let dst_ty = body.local_decls[dst_local].ty;
+                if !self.is_pointer_ty(dst_ty)
+                    && self.supports_slot_family_local(tcx, body, dst_local)
+                {
+                    interesting_stack_locals.insert(dst_local);
+                }
             }
         }
         for local in interesting_stack_locals.iter().copied() {
@@ -14134,6 +14215,49 @@ impl MyOptimizationPass {
                 ) else {
                     continue;
                 };
+                if let Rvalue::Aggregate(_, operands) = rvalue {
+                    let mut unique_src_local: Option<Local> = None;
+                    let mut ambiguous = false;
+                    for operand in operands.iter() {
+                        let Some(src_place) = self.place_from_operand(operand) else {
+                            continue;
+                        };
+                        if !src_place.projection.is_empty() {
+                            continue;
+                        }
+                        let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                        if !self.is_pointer_ty(src_ty)
+                            && !reborrow_anchor_local_for_stack_local.contains_key(&src_place.local)
+                        {
+                            continue;
+                        }
+                        match unique_src_local {
+                            Some(existing) if existing != src_place.local => {
+                                ambiguous = true;
+                                break;
+                            }
+                            Some(_) => {}
+                            None => unique_src_local = Some(src_place.local),
+                        }
+                    }
+                    if let (Some(src_local), false) = (unique_src_local, ambiguous) {
+                        if src_local != dst_local {
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::ReborrowAnchorSeed {
+                                    dst_local,
+                                    src_local,
+                                    mark_slot_family: false,
+                                },
+                            });
+                            continue;
+                        }
+                    }
+                }
                 let src_place = match rvalue {
                     Rvalue::Use(Operand::Copy(src_place))
                     | Rvalue::Use(Operand::Move(src_place)) => *src_place,
@@ -19411,6 +19535,7 @@ impl MyOptimizationPass {
                     callee_id,
                     arg_index,
                     ptr_local,
+                    parent_mode,
                     flags,
                 } => {
                     let tmp_unit = body
@@ -19582,7 +19707,7 @@ impl MyOptimizationPass {
                                     projectionless_anchor_suppressed_locals,
                                     false,
                                     true,
-                                    ParentSelectionMode::PointeeFamily,
+                                    parent_mode,
                                 )
                             }
                         } else {
@@ -19599,7 +19724,7 @@ impl MyOptimizationPass {
                                 projectionless_anchor_suppressed_locals,
                                 false,
                                 true,
-                                ParentSelectionMode::PointeeFamily,
+                                parent_mode,
                             )
                         }
                     };
