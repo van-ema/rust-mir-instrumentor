@@ -586,12 +586,16 @@ fn rz_validate_ref_creation_addr(
         ));
     }
 
-    let alloc_opt = {
+    let (covering_alloc_opt, containing_alloc_opt) = {
         let amap = allocs().lock().unwrap();
-        find_alloc_containing(&amap, pointee_addr).map(|(base, meta)| (base, *meta))
+        (
+            find_alloc_covering_range(&amap, pointee_addr, access_len)
+                .map(|(base, meta)| (base, *meta)),
+            find_alloc_containing(&amap, pointee_addr).map(|(base, meta)| (base, *meta)),
+        )
     };
 
-    if let Some((base, ameta)) = alloc_opt {
+    if let Some((base, ameta)) = covering_alloc_opt.or(containing_alloc_opt) {
         if !ameta.live {
             // Epoch bumps on every live/dead transition, so the natural sequence for a
             // single allocation is: N (live) -> N+1 (dead). When `ameta.epoch == parent.alloc_epoch + 1`
@@ -614,14 +618,10 @@ fn rz_validate_ref_creation_addr(
                     // read/write checks instead of failing at ref creation.
                     return None;
                 }
-                let parent_epoch = parent_meta.map(|p| p.alloc_epoch).unwrap_or(0);
-                // If we don't have a parent epoch to correlate against (root creation
-                // or untagged parent), fall back to the conservative old behavior and
-                // skip the UAD report — we cannot distinguish real UAD from stack-slot
-                // reuse in that case.
-                if parent_epoch == 0 || ameta.epoch > parent_epoch + 1 {
-                    return None;
-                }
+                // Stack-slot live/dead metadata is too coarse under optimized MIR to treat ref
+                // creation itself as a definitive UAD signal. Defer stack cases to later concrete
+                // accesses instead of reporting from this boundary check.
+                return None;
             }
             return Some((
                 "USE_AFTER_DEAD",
@@ -637,6 +637,19 @@ fn rz_validate_ref_creation_addr(
             let access_end = pointee_addr.saturating_add(access_len);
             let alloc_end = base.saturating_add(ameta.size);
             if access_end > alloc_end {
+                if parent_tag == 0
+                    && (ameta.is_stack
+                        || rz_stack_addr_hint(pointee_addr)
+                        || rz_tls_addr_hint(pointee_addr))
+                    && base != pointee_addr
+                {
+                    // Root stack/TLS ref creation sometimes only sees a partially overlapping slot
+                    // in optimized MIR. Without a full-covering tracked allocation, treat that as
+                    // missing metadata and defer to later concrete accesses. If the tracked slot
+                    // starts exactly at the pointee address, keep the OOB: that is the normal
+                    // exact-allocation case rather than a neighboring-slot artifact.
+                    return None;
+                }
                 return Some((
                     "OUT_OF_BOUNDS",
                     format!(
@@ -1536,6 +1549,60 @@ fn find_alloc_containing<'a>(
         };
 
         if addr < end {
+            let slot = if meta.live {
+                &mut best_live
+            } else {
+                &mut best_dead
+            };
+            match slot {
+                None => *slot = Some((*base, meta, end)),
+                Some((_b, _m, best_end)) => {
+                    if end > *best_end {
+                        *slot = Some((*base, meta, end));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((b, m, _end)) = best_live {
+        return Some((b, m));
+    }
+    if let Some((b, m, _end)) = best_dead {
+        return Some((b, m));
+    }
+    best_unknown
+}
+
+#[inline]
+fn find_alloc_covering_range<'a>(
+    amap: &'a BTreeMap<usize, AllocMeta>,
+    addr: usize,
+    size: usize,
+) -> Option<(usize, &'a AllocMeta)> {
+    // Like `find_alloc_containing`, but require full coverage of the requested range. This keeps
+    // root ref creation from spuriously binding to a smaller overlapping stack slot.
+    let access_end = addr.checked_add(size)?;
+    let mut best_live: Option<(usize, &'a AllocMeta, usize)> = None;
+    let mut best_dead: Option<(usize, &'a AllocMeta, usize)> = None;
+    let mut best_unknown: Option<(usize, &'a AllocMeta)> = None;
+
+    for (base, meta) in amap.range(..=addr).rev() {
+        let alloc_size = meta.size;
+
+        if alloc_size == 0 {
+            if *base == addr && size == 0 && best_live.is_none() && best_dead.is_none() {
+                best_unknown = Some((*base, meta));
+            }
+            continue;
+        }
+
+        let end = match base.checked_add(alloc_size) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        if access_end <= end {
             let slot = if meta.live {
                 &mut best_live
             } else {

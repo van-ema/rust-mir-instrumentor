@@ -2080,13 +2080,12 @@ impl MyOptimizationPass {
         })
     }
 
-    /// Shallow boundary-carrier check for source-level wrapper values that directly store a
-    /// reference/raw pointer, such as `Option<&T>`, tuples of pointers, or small newtypes.
+    /// Shallow structural check for non-pointer values that directly store pointer data.
     ///
-    /// This intentionally does *not* recurse through arbitrary nested ADTs like `Vec`, `RawVec`,
-    /// `IntoIter`, or `NonNull`. Treating those owner/container internals as call-boundary
-    /// borrow carriers produces false positives by transporting allocator/internal raw tags across
-    /// moves and ABI copies where no source-level borrow is being passed.
+    /// This is used for leaf shadow transport and similar structural handling. It intentionally
+    /// does *not* imply that the outer value is a borrow carrier at call boundaries; raw-owner
+    /// aggregates such as `Bytes`, `BytesMut`, `Vec`, or `Box` can satisfy this check while still
+    /// being ineligible for ref-style boundary validation/export.
     fn ty_contains_direct_pointer_fields<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -2114,6 +2113,60 @@ impl MyOptimizationPass {
             TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
                 self.is_pointer_ty(*elem_ty)
                     || self.ty_is_direct_pointer_wrapper(tcx, body, *elem_ty, 3)
+            }
+            _ => false,
+        }
+    }
+
+    fn ty_is_direct_ref_wrapper<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        depth: usize,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let TyKind::Adt(adt, args) = ty.kind() else {
+            return false;
+        };
+        let path = tcx.def_path_str(adt.did());
+        let is_wrapper = path.contains("::cell::UnsafeCell")
+            || path.contains("::cell::SyncUnsafeCell")
+            || path.contains("::mem::MaybeUninit")
+            || path.contains("::mem::ManuallyDrop")
+            || path.contains("::cell::Cell");
+        if !is_wrapper {
+            return false;
+        }
+        adt.non_enum_variant().fields.iter().any(|field| {
+            let field_ty = field.ty(tcx, args);
+            matches!(field_ty.kind(), TyKind::Ref(..))
+                || self.ty_is_direct_ref_wrapper(tcx, field_ty, depth - 1)
+        })
+    }
+
+    /// Shallow boundary-carrier check for non-pointer values that directly carry a source-level
+    /// reference. Raw-only owner/control aggregates are intentionally excluded.
+    fn ty_contains_direct_ref_fields<'tcx>(&self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+        if matches!(ty.kind(), TyKind::Ref(..)) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Tuple(field_tys) => field_tys.iter().any(|field_ty| {
+                matches!(field_ty.kind(), TyKind::Ref(..))
+                    || self.ty_is_direct_ref_wrapper(tcx, field_ty, 3)
+            }),
+            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
+                variant.fields.iter().any(|field| {
+                    let field_ty = field.ty(tcx, args);
+                    matches!(field_ty.kind(), TyKind::Ref(..))
+                        || self.ty_is_direct_ref_wrapper(tcx, field_ty, 3)
+                })
+            }),
+            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
+                matches!(elem_ty.kind(), TyKind::Ref(..))
+                    || self.ty_is_direct_ref_wrapper(tcx, *elem_ty, 3)
             }
             _ => false,
         }
@@ -2599,14 +2652,13 @@ impl MyOptimizationPass {
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
     }
 
-    /// Return whether `local` should participate in by-value call/return carrier transport.
+    /// Return whether `local` should participate in ref-style by-value carrier transport.
     ///
-    /// This is intentionally narrower than `supports_arg_anchor_take_local`: only direct pointer
-    /// carriers (for example `BytesMut`, `Option<&T>`, tuples/newtypes of pointers) qualify.
-    /// Recursive owner/container internals like `Vec`, `Box`, `RawVec`, or `NonNull`-based
-    /// wrappers are excluded here because transporting their allocator/raw internals across
-    /// ordinary by-value calls can create false positives and, in optimized MIR, unstable
-    /// call-boundary scaffolding.
+    /// This is intentionally narrower than `supports_arg_anchor_take_local`: only values that
+    /// structurally carry a source-level reference qualify. Raw-owner/container aggregates like
+    /// `BytesMut`, `Vec`, `Box`, `RawVec`, or `NonNull`-based wrappers are excluded here because
+    /// transporting them as slot-level references creates false positives at ordinary by-value
+    /// call boundaries.
     fn supports_call_boundary_anchor_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -2617,7 +2669,7 @@ impl MyOptimizationPass {
             return false;
         }
         let local_ty = body.local_decls[local].ty;
-        if !self.ty_contains_direct_pointer_fields(tcx, body, local_ty) {
+        if !self.ty_contains_direct_ref_fields(tcx, local_ty) {
             return false;
         }
 
@@ -12799,7 +12851,7 @@ impl MyOptimizationPass {
                     });
                 }
             }
-            if !self.is_pointer_ty(ty) && self.ty_contains_direct_pointer_fields(tcx, body, ty) {
+            if !self.is_pointer_ty(ty) && self.ty_contains_direct_ref_fields(tcx, ty) {
                 insert_points.push(InsertPoint {
                     bb,
                     stmt_idx: block_data.statements.len(),
@@ -13575,7 +13627,7 @@ impl MyOptimizationPass {
             return;
         }
 
-        if self.ty_contains_direct_pointer_fields(tcx, body, dropped_ty) {
+        if self.ty_contains_direct_ref_fields(tcx, dropped_ty) {
             insert_points.push(InsertPoint {
                 bb,
                 stmt_idx: block_data.statements.len(),
@@ -22002,36 +22054,29 @@ impl MyOptimizationPass {
                             false,
                         )
                         .expect("ArgAnchorTake on unsupported local");
-                    let direct_ref_field = self.first_direct_ref_field_place(tcx, body, local);
+                    let Some((field_place, pointee_ty, is_mut)) =
+                        self.first_direct_ref_field_place(tcx, body, local)
+                    else {
+                        // By-value call-boundary anchors are only valid for aggregates that
+                        // structurally carry a source-level reference. If we cannot recover such a
+                        // field, skip the synthetic root ref instead of inventing one for the
+                        // whole slot.
+                        continue;
+                    };
                     let record_addr_local = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.usize, source_info.span));
-                    let (record_addr_stmt1_opt, record_addr_stmt2, record_is_mut, record_ty) =
-                        if let Some((field_place, pointee_ty, is_mut)) = direct_ref_field {
-                            let (field_addr_stmt1_opt, field_addr_stmt2) = self
-                                .addr_stmts_for_place(
-                                    tcx,
-                                    body,
-                                    source_info,
-                                    field_place,
-                                    record_addr_local,
-                                )
-                                .expect("ArgAnchorTake direct ref field address");
-                            (field_addr_stmt1_opt, field_addr_stmt2, is_mut, pointee_ty)
-                        } else {
-                            (
-                                None,
-                                Statement::new(
-                                    source_info,
-                                    StatementKind::Assign(Box::new((
-                                        Place::from(record_addr_local),
-                                        Rvalue::Use(Operand::Copy(Place::from(take_addr_local))),
-                                    ))),
-                                ),
-                                true,
-                                local_ty,
-                            )
-                        };
+                    let (record_addr_stmt1_opt, record_addr_stmt2) = self
+                        .addr_stmts_for_place(
+                            tcx,
+                            body,
+                            source_info,
+                            field_place,
+                            record_addr_local,
+                        )
+                        .expect("ArgAnchorTake direct ref field address");
+                    let record_is_mut = is_mut;
+                    let record_ty = pointee_ty;
                     let parent_tag_local = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.u64, source_info.span));
