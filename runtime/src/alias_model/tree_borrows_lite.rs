@@ -580,6 +580,20 @@ fn tb_lite_resolve_parent_for_new_node(
     } else {
         tmeta.parent
     };
+    let exact_new_len = tb_effective_len(tmeta.bounds_len);
+    let effective_parent = if matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+        && effective_parent != 0
+        && tree.nodes.get(&effective_parent).is_some_and(|node| {
+            !tb_is_live_node(node)
+                && node.parent == 0
+                && matches!(node.kind, BorrowKind::Shared | BorrowKind::Unique)
+                && node.start == tmeta.pointee_addr
+                && node.len == exact_new_len
+        }) {
+        0
+    } else {
+        effective_parent
+    };
     match kind {
         BorrowKind::Shared | BorrowKind::Unique => {
             tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
@@ -972,9 +986,7 @@ fn tb_lite_on_ret_family_export(tag: u64, addr: usize) {
     while cur != 0 {
         let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
         if let Some(node) = tree.nodes.get_mut(&cur) {
-            if node.poisoned_by_protector_end
-                && matches!(node.lazy_perm, TbPerm::Reserved { .. })
-            {
+            if node.poisoned_by_protector_end && matches!(node.lazy_perm, TbPerm::Reserved { .. }) {
                 tb_revive_node_after_protector_end(node);
             }
         }

@@ -3888,17 +3888,28 @@ impl MyOptimizationPass {
             }
         }
         let src_place = def_src_place?;
+        let same_family_ref_reborrow_src =
+            matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
+                && matches!(body.local_decls[src_place.local].ty.kind(), TyKind::Ref(..));
         let whole_place_slot_family_src =
             self.is_whole_place_slot_family_source(tcx, body, src_place);
-        if !matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
-            && !whole_place_slot_family_src
-        {
+        if !same_family_ref_reborrow_src && !whole_place_slot_family_src {
             return None;
         }
 
         let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
             return None;
         };
+        if self.is_instrumented_callee(tcx, callee_did)
+            && (same_family_ref_reborrow_src || whole_place_slot_family_src)
+        {
+            // This caller-side `&*base`/same-family shared temp is administrative: the
+            // call-boundary import creates the callee-side child that actually models any real
+            // escape or later return. Marking the caller temp as escaped via `PtrUse` keeps a
+            // frozen sibling alive past the call and diverges from TB/Miri's transient reborrow
+            // behavior for helper receivers like `len`, `capacity`, and `as_ptr`.
+            return Some(local);
+        }
         let summary_allows =
             unsafe_dataflow::summary_for_def_id(tcx, callee_did).and_then(|summary| {
                 summary
@@ -18883,6 +18894,7 @@ impl MyOptimizationPass {
                 let mut next_target = body
                     .basic_blocks_mut()
                     .push(BasicBlockData::new(orig_term, is_cleanup));
+                let cont_block = next_target;
                 for kill_local in tag_locals.into_iter().rev() {
                     let tmp_unit = body
                         .local_decls
@@ -18912,6 +18924,51 @@ impl MyOptimizationPass {
                         .basic_blocks_mut()
                         .push(BasicBlockData::new(Some(call_term), is_cleanup));
                 }
+                let mut reset_stmts = Vec::new();
+                reset_stmts.push(Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(tag_local),
+                        Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                    ))),
+                ));
+                if let Some(ref_ancestor_local) =
+                    ref_ancestor_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    reset_stmts.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(ref_ancestor_local),
+                            Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                        ))),
+                    ));
+                }
+                if let Some(export_parent_local) =
+                    export_parent_local_for_ptr_local.get(&ptr_local).copied()
+                {
+                    reset_stmts.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(export_parent_local),
+                            Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                        ))),
+                    ));
+                }
+                if let Some(recovered_local) = export_parent_is_recovered_local_for_ptr_local
+                    .get(&ptr_local)
+                    .copied()
+                {
+                    reset_stmts.push(Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(recovered_local),
+                            Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                        ))),
+                    ));
+                }
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .splice(0..0, reset_stmts);
                 body.basic_blocks_mut()[bb].terminator = Some(Terminator {
                     source_info,
                     kind: TerminatorKind::Goto {
