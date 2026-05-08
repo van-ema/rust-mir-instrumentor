@@ -1630,6 +1630,15 @@ enum InstrKind<'tcx> {
     CallArgValidate {
         local: Local,
     },
+    /// Caller-side: export one exact pointer-leaf shadow from a by-value raw-owner aggregate.
+    ///
+    /// This is structural transport, not borrow transport: the callee restores the same leaf
+    /// shadow into its copied argument slot instead of synthesizing a whole-slot reference family.
+    CallArgLeafPush {
+        callee_id: u64,
+        arg_index: u64,
+        leaf_key: u64,
+    },
     /// Callee-side retagging of pointer arguments from the runtime side-channel.
     ArgRetag {
         callee_id: u64,
@@ -1648,6 +1657,14 @@ enum InstrKind<'tcx> {
         arg_index: u64,
         local: Local,
     }, // Callee-side validation for a return value that is not itself pointer-typed,
+    /// Callee-side: restore one exact pointer-leaf shadow into a by-value raw-owner aggregate
+    /// argument slot.
+    ArgLeafTake {
+        callee_id: u64,
+        arg_index: u64,
+        leaf_key: u64,
+    },
+    // Callee-side validation for a return value that is not itself pointer-typed,
     /// but carries a reference inside an aggregate/container.
     ///
     /// Examples:
@@ -1856,6 +1873,8 @@ struct Hooks {
     def_id_validate_call_arg_tag: DefId,
     def_id_take_call_arg_tag: DefId,
     def_id_take_call_arg_tag_anchor: DefId,
+    def_id_push_call_arg_leaf_shadow: DefId,
+    def_id_take_call_arg_leaf_shadow: DefId,
     def_id_push_ret_tag: DefId,
     def_id_validate_ret_tag: DefId,
     def_id_take_ret_tag: DefId,
@@ -2675,6 +2694,35 @@ impl MyOptimizationPass {
 
         let raw_ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
+    }
+
+    /// Return whether `ty` should use structural leaf-shadow transport at by-value call
+    /// boundaries.
+    ///
+    /// This is the raw-owner/container path: the value carries pointer bytes that should survive
+    /// the ABI move into the callee, but it does not itself represent a source-level borrow
+    /// carrier.
+    fn supports_call_boundary_leaf_shadow_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        !self.is_pointer_ty(ty)
+            && self.ty_contains_direct_pointer_fields(tcx, body, ty)
+            && !self.ty_contains_direct_ref_fields(tcx, ty)
+    }
+
+    fn supports_call_boundary_leaf_shadow_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        if !self.supports_slot_family_local(tcx, body, local) {
+            return false;
+        }
+        self.supports_call_boundary_leaf_shadow_ty(tcx, body, body.local_decls[local].ty)
     }
 
     fn is_whole_place_slot_family_source<'tcx>(
@@ -8336,6 +8384,26 @@ impl MyOptimizationPass {
                         local: arg_local,
                     },
                 });
+            } else if self.supports_call_boundary_leaf_shadow_local(tcx, body, arg_local) {
+                for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                    tcx,
+                    body,
+                    Place::from(arg_local),
+                    arg_ty,
+                ) {
+                    insert_points.push(InsertPoint {
+                        bb: entry_bb,
+                        stmt_idx: entry_stmt_idx,
+                        insert_before: false,
+                        source_info: entry_source_info,
+                        place: leaf_spec.place,
+                        kind: InstrKind::ArgLeafTake {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            leaf_key: leaf_spec.transport_key(),
+                        },
+                    });
+                }
             }
         }
     }
@@ -13069,6 +13137,24 @@ impl MyOptimizationPass {
                         continue;
                     }
                     if !self.supports_call_boundary_anchor_local(tcx, body, p.local) {
+                        if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
+                            for leaf_spec in
+                                self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty)
+                            {
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: leaf_spec.place,
+                                    kind: InstrKind::CallArgLeafPush {
+                                        callee_id,
+                                        arg_index: arg_index as u64,
+                                        leaf_key: leaf_spec.transport_key(),
+                                    },
+                                });
+                            }
+                        }
                         continue;
                     }
                     insert_points.push(InsertPoint {
@@ -14763,9 +14849,11 @@ impl MyOptimizationPass {
             }
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
+            InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
                 hooks.def_id_take_call_arg_tag
             }
+            InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
             InstrKind::RetLeafPush { .. } => hooks.def_id_push_ret_leaf_shadow,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
@@ -14886,6 +14974,7 @@ impl MyOptimizationPass {
                 | InstrKind::RawRoot { .. }
                 | InstrKind::ArgRetag { .. }
                 | InstrKind::ArgAnchorTake { .. }
+                | InstrKind::ArgLeafTake { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. }
                 | InstrKind::PtrDeriveParent { .. } => 0,
@@ -14926,6 +15015,7 @@ impl MyOptimizationPass {
                 | InstrKind::ShadowCopyRange { .. } => 3,
                 InstrKind::CallArgPush { .. }
                 | InstrKind::CallArgValidate { .. }
+                | InstrKind::CallArgLeafPush { .. }
                 | InstrKind::PtrUse { .. }
                 | InstrKind::RetValidate { .. }
                 | InstrKind::RetAnchorTake { .. }
@@ -19139,6 +19229,19 @@ impl MyOptimizationPass {
                         (Some(slot_stmt1), slot_stmt2)
                     }
                 }
+                InstrKind::CallArgLeafPush { .. } | InstrKind::ArgLeafTake { .. } => {
+                    let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        place,
+                        addr_local,
+                        false,
+                    ) else {
+                        continue;
+                    };
+                    (Some(slot_stmt1), slot_stmt2)
+                }
                 InstrKind::CallArgValidate { .. } | InstrKind::RetValidate { .. } => (
                     None,
                     Statement::new(
@@ -19887,6 +19990,42 @@ impl MyOptimizationPass {
                     .into_boxed_slice();
 
                     let _ = local;
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::CallArgLeafPush {
+                    callee_id,
+                    arg_index,
+                    leaf_key,
+                }
+                | InstrKind::ArgLeafTake {
+                    callee_id,
+                    arg_index,
+                    leaf_key,
+                } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned {
+                            node: self.const_u64(tcx, source_info.span, callee_id),
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: self.const_u64(tcx, source_info.span, arg_index),
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: self.const_u64(tcx, source_info.span, leaf_key),
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
+
                     (args, Place::from(tmp_unit))
                 }
 
@@ -22544,6 +22683,12 @@ impl MyOptimizationPass {
         let def_id_take_call_arg_tag_anchor = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag_anchor", 3)
             .expect("missing '__rz_take_call_arg_tag_anchor' definition");
+        let def_id_push_call_arg_leaf_shadow = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_leaf_shadow", 4)
+            .expect("missing '__rz_push_call_arg_leaf_shadow' definition");
+        let def_id_take_call_arg_leaf_shadow = self
+            .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_leaf_shadow", 4)
+            .expect("missing '__rz_take_call_arg_leaf_shadow' definition");
         let def_id_push_ret_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_ret_tag", 3)
             .expect("missing '__rz_push_ret_tag' definition");
@@ -22636,6 +22781,8 @@ impl MyOptimizationPass {
             def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
             def_id_take_call_arg_tag_anchor,
+            def_id_push_call_arg_leaf_shadow,
+            def_id_take_call_arg_leaf_shadow,
             def_id_push_ret_tag,
             def_id_validate_ret_tag,
             def_id_take_ret_tag,

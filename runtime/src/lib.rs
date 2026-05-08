@@ -1310,6 +1310,9 @@ const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
     OnceLock::new();
+static CALL_ARG_LEAF_SHADOWS: OnceLock<
+    Mutex<HashMap<(ThreadId, u64, u64, u64), PtrShadowTransport>>,
+> = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
 type PtrShadowTransport = (u64, u64, u64, u8);
 
@@ -1468,6 +1471,11 @@ fn rz_check_alignment(
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn call_arg_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64, u64), PtrShadowTransport>>
+{
+    CALL_ARG_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
@@ -4815,6 +4823,27 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
 }
 
+/// Push the exact shadow of one internal pointer leaf of a by-value raw-owner aggregate argument.
+#[no_mangle]
+pub extern "C" fn __rz_push_call_arg_leaf_shadow(
+    callee_id: u64,
+    arg_index: u64,
+    leaf_key: u64,
+    slot_addr: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    call_arg_leaf_shadows().lock().unwrap().insert(
+        (thread_id, callee_id, arg_index, leaf_key),
+        (
+            ptr_shadow::load_tag(slot_addr),
+            ptr_shadow::load_ref_ancestor(slot_addr),
+            ptr_shadow::load_export_parent(slot_addr),
+            ptr_shadow::load_export_parent_recovered(slot_addr),
+        ),
+    );
+}
+
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_tag(
@@ -4923,6 +4952,30 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
         active_alias_model().on_call_arg_anchor_taken(callee_id, tag);
     }
     tag
+}
+
+/// Restore one exact pointer-leaf shadow into a by-value raw-owner aggregate argument slot.
+#[no_mangle]
+pub extern "C" fn __rz_take_call_arg_leaf_shadow(
+    callee_id: u64,
+    arg_index: u64,
+    leaf_key: u64,
+    slot_addr: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) = call_arg_leaf_shadows()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id, arg_index, leaf_key))
+        .unwrap_or((0, 0, 0, 0));
+    ptr_shadow::store_ptr(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
 }
 
 /// Export the post-call family for a non-pointer carrier pointee mutated through `&mut T`.
