@@ -689,6 +689,7 @@ fn rz_validate_strict_raw_creation_addr(
     parent_tag: u64,
     exposed_provenance_root: bool,
     enforce_no_provenance: bool,
+    bounds_len: usize,
 ) -> Option<(&'static str, String)> {
     // Raw-pointer creation should reject missing provenance, and should still catch the common
     // case of deriving an out-of-bounds raw from an in-bounds parent. However, some libraries
@@ -709,6 +710,19 @@ fn rz_validate_strict_raw_creation_addr(
     let Some(mut parent_meta) = tag_store::get(parent_tag) else {
         return None;
     };
+
+    if bounds_len == 0
+        && parent_meta.bounds_len == 0
+        && parent_meta.pointee_addr == pointee_addr
+        && !rz_has_exposed_provenance_root(parent_tag, &parent_meta)
+    {
+        // Extending the same zero-length family at the same address is how empty views/sentinels
+        // move through helper plumbing in crates like `bytes`. That is not a concrete access and
+        // should not be rejected as no-provenance derive. Real zero-length forgeries still fail:
+        // roots/exposed-provenance pointers do not hit this path, and changing the address leaves
+        // the normal strict checks in place.
+        return None;
+    }
 
     // Parent tags cache allocation-origin bounds at creation time. For same-base realloc growth,
     // that cached origin can become stale within the same allocation epoch (for example
@@ -1255,7 +1269,8 @@ pub struct TagMeta {
     /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
     /// bit4=TB-lite raw is a derived same-family view; keep it out of the borrow tree
     /// until an actual raw write needs access-local raw state,
-    /// bit5=internal runtime normalization for const refs materialized at alloc end.
+    /// bit5=internal runtime normalization for const refs materialized at alloc end,
+    /// bit6=reference had precise wide-pointer bounds metadata at creation time.
     pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
     pub exposed_provenance_root: bool,
@@ -2426,6 +2441,7 @@ fn normalize_const_end_ref_pointee(
 
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
 const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
+const LINEAGE_HINT_PRECISE_WIDE_BOUNDS: u8 = 0b0100_0000;
 
 #[inline]
 fn normalize_const_end_ref_access_addr(
@@ -4297,6 +4313,12 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
         return;
     }
 
+    if rz_ref_boundary_is_empty_precise_view(&tmeta) {
+        // Empty slice/str-style views do not perform a boundary read. Keep the tag/family, but
+        // defer any actual provenance/alignment decision until a later concrete non-empty access.
+        return;
+    }
+
     let access_size = tmeta.bounds_len.min(1).max(1);
     let Some(msg) = active_alias_model().check_access(
         tag,
@@ -4333,6 +4355,10 @@ fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
         return true;
     }
 
+    if rz_ref_boundary_is_empty_precise_view(&tmeta) {
+        return true;
+    }
+
     let access_size = tmeta.bounds_len.min(1).max(1);
     active_alias_model()
         .check_access(
@@ -4344,6 +4370,10 @@ fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
             alias_model::AliasAccessKind::Read,
         )
         .is_none()
+}
+
+fn rz_ref_boundary_is_empty_precise_view(tmeta: &TagMeta) -> bool {
+    tmeta.bounds_len == 0 && (tmeta.lineage_hint & LINEAGE_HINT_PRECISE_WIDE_BOUNDS) != 0
 }
 
 #[inline]
@@ -5494,7 +5524,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: (alias_exempt & 0b0000_1110)
+        lineage_hint: (alias_exempt & (0b0000_1110 | LINEAGE_HINT_PRECISE_WIDE_BOUNDS))
             | if normalized_const_end_ref {
                 LINEAGE_HINT_CONST_END_REF_NORMALIZED
             } else {
@@ -5882,6 +5912,13 @@ pub extern "C" fn __record_raw_ptr_creation(
             resolved_parent,
             exposed_provenance_root,
             enforce_no_provenance,
+            if bounds_len != 0 {
+                bounds_len
+            } else if carry_bounds_from_source {
+                inherited_bounds_len
+            } else {
+                0
+            },
         ) {
             rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
         }

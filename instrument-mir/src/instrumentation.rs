@@ -20420,7 +20420,9 @@ impl MyOptimizationPass {
                     // - bit1: projected-source creation hint (used by runtime lineage repair)
                     // - bit2: stronger root-origin repair hint (bounded overlap recovery)
                     // - bit4: TB-lite raw is a derived same-family view
-                    // - bit6: strict creation-time provenance check for projected/derived raws
+                    // - bit6: hook-specific marker:
+                    //   * ref creation had precise wide-pointer bounds metadata
+                    //   * raw creation should validate projected/derived provenance immediately
                     // - bit7: deref-based raw creation must reject exposed/no-provenance parents
                     let alias_flags: u8 = match &creation_kind {
                         InstrKind::Ref { src, .. } => {
@@ -20451,6 +20453,10 @@ impl MyOptimizationPass {
                                 // in TB-lite. Mark only this path so ordinary repeated `&mut`
                                 // call arguments do not invalidate each other.
                                 flags |= 0b1000;
+                            }
+                            let dst_ty = place.ty(&body.local_decls, tcx).ty;
+                            if self.ptr_ty_has_precise_wide_bounds(tcx, body, dst_ty) {
+                                flags |= 0b0100_0000;
                             }
                             flags
                         }
@@ -20497,6 +20503,12 @@ impl MyOptimizationPass {
                             // synthesize a fresh root for a pointer that should remain attached to
                             // an existing live lineage at the same address.
                             flags |= 0b10;
+                            let dst_ty = body.local_decls[*dst_local].ty;
+                            if matches!(dst_ty.kind(), TyKind::Ref(..))
+                                && self.ptr_ty_has_precise_wide_bounds(tcx, body, dst_ty)
+                            {
+                                flags |= 0b0100_0000;
+                            }
                             flags
                         }
                         _ => {
