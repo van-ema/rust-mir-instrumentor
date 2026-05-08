@@ -96,3 +96,25 @@ during the call and only fixes the stale local-holder lifetime afterward.
 
 This optimization is higher risk because it changes the call-time semantics by removing the child
 tag entirely. It should stay as a follow-up once the summary conditions and TB proof are explicit.
+
+## TODO
+
+- [x] Keep the post-call `TagKill` fallback for non-proven cases.
+  This preserves call-time alias-model behavior and only fixes stale local-holder lifetime after
+  the helper returns.
+
+- [ ] Extend `compute_summary_elidable_shared_call_ref_locals`.
+  Recognize simple call-only shared reborrow temps such as `&(*base)` when they have one
+  meaningful use at the call terminator.
+
+- [ ] Require a safe callee-argument summary.
+  The callee must not store, return, escape, write through, or create relevant descendants from
+  the temporary shared ref.
+
+- [ ] Skip tag materialization only for proven call-only temps.
+  Suppress `InstrKind::Ref`, hidden tag-local allocation, and `CallArgPush` for eligible temps.
+
+- [ ] Add targeted tests for `BytesMut::unsplit`-style helpers.
+  Include both a pure-helper pass case and negative cases where the temp escapes or is returned.
+
+- [ ] Run the full default and interproc example suites before committing any implementation.

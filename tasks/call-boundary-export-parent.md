@@ -189,14 +189,43 @@ Option 1 is more principled but has higher runtime and instrumentation complexit
 4. **Runtime metadata growth**
    - if we push this into shadow/runtime state, it becomes another hot-path channel
 
-## Implementation Status
+## TODO
 
-The current branch implements the first explicit-state slice:
+- [x] Implement the first explicit-state slice.
+  Commit `a2d01f4` on `codex/call-boundary-export-parent`.
 
-- call-arg export passes `exact_tag`, `boundary_parent_tag`, and `boundary_origin`
-- direct exact locals validate exact-first
-- recovered boundary locals validate/export the boundary parent
-- the old `CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE` policy flag is removed
+- [x] Lower `CallArgPush` to `__rz_push_call_arg_boundary_tag(...)`.
 
-The remaining open part is precision, not representation: recovered origin is still binary, and
-memory round-trips depend on the existing pointer-shadow export-parent channel.
+- [x] Pass `exact_tag`, `boundary_parent_tag`, and `boundary_origin` explicitly from the caller.
+
+- [x] Validate direct exact locals exact-first, then export the canonical call parent.
+
+- [x] Validate/export recovered boundary locals through the recorded boundary parent instead of a
+  transient exact child.
+
+- [x] Remove `CALL_ARG_FLAG_CANONICALIZE_BEFORE_VALIDATE`.
+
+- [x] Remove `CALL_ARG_FLAG_USE_EXPORT_PARENT`; boundary parent is now an explicit operand.
+
+- [x] Delete the MIR-shape helpers that guessed canonicalize-before-validate policy at call sites.
+
+- [x] Validate commit `a2d01f4` with the full gates:
+  default, interproc, post-commit default, and post-commit interproc suites were green.
+
+- [ ] Split recovered origin if a concrete case needs it.
+  `boundary_origin` is currently binary: `Exact` or `RecoveredBoundary`. If future behavior needs
+  finer policy or diagnostics, split `RecoveredBoundary` into `RecoveredReturn`,
+  `RecoveredMutArg`, and `RecoveredCarrier`.
+
+- [ ] Audit fresh reborrow origin reset with targeted examples.
+  Fresh source-level reborrows should become `Exact`, while forwarding should preserve recovered
+  boundary origin. Cover returned-ref forwarding, returned-ref fresh reborrow, mut-arg writeback
+  forwarding, and carrier-import forwarding/reborrow.
+
+- [ ] Measure recovered-ref memory round-trips.
+  Pointer shadow already stores `export_parent` and `export_parent_recovered`; add targeted
+  store/reload tests to verify whether that is enough before widening shadow metadata.
+
+- [ ] Narrow or remove residual `canonical_call_arg_tag(...)` only if it becomes redundant.
+  It remains useful runtime hardening for stale or missing metadata; delete it only after traces
+  prove caller-side boundary parents are precise enough without it.

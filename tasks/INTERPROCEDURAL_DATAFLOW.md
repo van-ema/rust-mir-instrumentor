@@ -258,6 +258,32 @@ Each stage must clear the same gates before proceeding:
 
 This ensures every pruning step is justified by evidence rather than by intuition.
 
+## TODO
+
+- [ ] Tighten the existing intra-procedural unsafe-sensitive analysis.
+  Treat unknown calls and boundary escapes as sinks, and keep the first pass limited to hook
+  placement rather than semantic-hook retargeting.
+
+- [ ] Add crate-local per-function summaries.
+  Track pointer args reaching sinks, escaping args, return provenance, unknown calls, and direct
+  unsafe-sensitive behavior.
+
+- [ ] Add intra-crate summary propagation.
+  Propagate unsafe-sensitive relevance across known direct calls, derived returns, and incomplete
+  callees conservatively.
+
+- [ ] Use summaries only for pruning at first.
+  Do not use summary facts to retarget `PtrRead`, `PtrWrite`, `PtrUse`, or other semantic hooks.
+
+- [ ] Add cross-crate summary emission and merge.
+  Emit per-crate summaries in an analyze-only build and merge them into a whole-program index.
+
+- [ ] Add guided instrumentation from the merged index.
+  If the index is missing, stale, or inconsistent, fall back to existing local instrumentation.
+
+- [ ] Validate each stage with full examples, representative AFL smoke builds, and differential
+  comparison against full-instrumentation mode.
+
 ## Progress
 ## Crate-Local Fixed-Point Algorithm
 

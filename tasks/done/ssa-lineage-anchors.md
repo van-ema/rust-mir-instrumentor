@@ -1,5 +1,25 @@
 # Compiler-Side Lineage Anchors for Optimized MIR
 
+## TODO
+
+- [x] Normalize pointer-valued MIR expressions into reusable structural keys.
+
+- [x] Reuse per-block SSA anchors for repeated pointer expressions.
+
+- [x] Propagate anchors through predecessor meets when incoming paths agree.
+
+- [x] Rebind anchors through plain pointer copies and branch-result forwarding.
+
+- [x] Reuse ref-backed anchors through the ref-ancestor channel.
+
+- [x] Conservatively invalidate anchors on reassignment and potentially clobbering calls.
+
+- [x] Validate the optimized lineage regression family:
+  `lineage_opt_away`, `lineage_cfg_join`, `lineage_cfg_branch_join`, `lineage_loop_carried`,
+  `lineage_helper_nested`, and `lineage_mixed_mem_ssa`.
+
+- [x] Archive this completed task under `tasks/done`.
+
 ## Context
 
 `rusteze` now preserves provenance through memory much better than before:

@@ -148,3 +148,29 @@ High-value optimizations:
 This order should cut the two biggest remaining costs:
 - `ref_create`
 - alias checks on reads/writes
+
+## TODO
+
+- [x] Replace the old oracle-heavy `bytes` harness with the current fast no-oracle harness.
+
+- [x] Re-measure the no-oracle harness and confirm the harness-level overhead multiplier is gone.
+
+- [ ] Lazy-materialize ordinary unprotected `RefShared` TB nodes.
+  Keep eager materialization for `RefMut`, protected refs, and raw tags that the current model
+  still requires.
+
+- [ ] Add a singleton fast path in `tb_lite_check`.
+  If an allocation/epoch has only the access tag live, return before the full overlap walk.
+
+- [ ] Precompute the access ancestry once per TB-lite check.
+  Use that cached ancestry for child/foreign classification instead of repeated parent walks.
+
+- [ ] Narrow exact-parent and lineage-cache updates.
+  Index only tags that repair and lineage lookup actually need.
+
+- [ ] Make `tag_store::insert` populate shards directly.
+  Avoid first-lookup shard backfill on hot paths.
+
+- [ ] Re-profile `bytes` after each optimization.
+  Keep the full example gates green and compare `ref_create`, read alias-check, and write
+  alias-check timings against the measurements above.

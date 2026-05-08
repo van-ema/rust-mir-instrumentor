@@ -87,7 +87,7 @@ Focus on:
 - stale references across reset-like transitions
 
 Status:
-- pending
+- harness exists
 
 ### `indexmap`
 
@@ -97,7 +97,7 @@ Focus on:
 - interactions between index maintenance and underlying hash table storage
 
 Status:
-- pending
+- harness exists
 
 ## Workflow
 
@@ -111,3 +111,29 @@ For each target:
    - harness bug/noise
 5. fix false positives at the root cause
 6. add a regression if the false positive is important or recurring
+
+## TODO
+
+- [x] Add the main `smallvec` stateful harness.
+
+- [x] Add the main `bytes` stateful no-oracle harness.
+
+- [x] Add the main `rkyv` stateful harness.
+
+- [x] Add the main `hashbrown` stateful harness.
+
+- [x] Add the main `bumpalo` stateful harness.
+
+- [x] Add the main `indexmap` stateful harness.
+
+- [ ] Refresh seed corpora for all six primary targets.
+
+- [ ] Run fresh `rusteze` and ASan smoke campaigns for each target.
+
+- [ ] Classify current crash buckets as target bug, instrumentation/runtime false positive, or
+  harness noise.
+
+- [ ] Add regression examples for recurring high-confidence false positives.
+
+- [ ] Keep harnesses oracle-free unless a target-specific semantic oracle is required to reduce
+  harness noise.

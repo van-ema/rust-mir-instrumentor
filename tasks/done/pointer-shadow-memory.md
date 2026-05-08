@@ -1,5 +1,29 @@
 # Pointer-Shadow Memory for Provenance
 
+## TODO
+
+- [x] Add runtime pointer-shadow sidecar storage.
+
+- [x] Add shadow store/load hooks for typed thin pointer slots.
+
+- [x] Add shadow cleanup on allocation death and epoch removal.
+
+- [x] Propagate shadow metadata through bytewise copy/move patterns.
+
+- [x] Kill pointer shadow on overlapping non-pointer writes.
+
+- [x] Validate the core paper examples:
+  `lineage_static_smuggle`, `lineage_memcpy_roundtrip`, and `lineage_field_proj`.
+
+- [x] Archive the completed core design under `tasks/done`.
+
+- [ ] Future extension: wide pointers / DST metadata.
+
+- [ ] Future extension: broader helper/wrapper reload shapes that do not currently materialize as
+  direct shadowable loads.
+
+- [ ] Future extension: integer round-trips, if a sound narrow design is established.
+
 ## Context
 
 `rusteze` currently preserves most provenance through:

@@ -1,5 +1,19 @@
 # Bytes False Positives (2026-05-05)
 
+## TODO
+
+- [x] Preserve reversible exposed provenance for `Bytes` pointer tagging.
+
+- [x] Remove the old same-lineage `FROZEN_WRITE` false-positive cluster.
+
+- [x] Fix stack-carrier field false positives caused by receiver/pointee family confusion.
+
+- [x] Replay the saved `bytes` crash bucket on fresh binaries.
+  The saved bucket is stale on the current instrumented build: instrumented and plain harnesses
+  both exit `0` for the current files.
+
+- [x] Archive this task under `tasks/done`.
+
 ## Status
 
 Update after:
