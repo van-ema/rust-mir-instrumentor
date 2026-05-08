@@ -1240,7 +1240,8 @@ pub struct TagMeta {
     pub alias_exempt: bool,
     /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
     /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
-    /// bit4=TB-lite raw should reuse parent family until a write materializes it,
+    /// bit4=TB-lite raw is a derived same-family view; keep it out of the borrow tree
+    /// until an actual raw write needs access-local raw state,
     /// bit5=internal runtime normalization for const refs materialized at alloc end.
     pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
@@ -5658,7 +5659,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit1: basic lineage-repair hint
     // - bit2: strong root-origin repair hint
     // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
-    // - bit4: TB-lite raw should reuse parent family until first write materializes it
+    // - bit4: TB-lite raw is a derived same-family view; defer borrow-tree materialization
     // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
     // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
     let mut resolved_parent = derived_from;

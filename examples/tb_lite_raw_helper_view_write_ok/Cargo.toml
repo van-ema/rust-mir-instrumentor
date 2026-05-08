@@ -1,0 +1,6 @@
+[package]
+name = "tb_lite_raw_helper_view_write_ok"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

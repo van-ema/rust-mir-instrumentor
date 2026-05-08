@@ -583,11 +583,25 @@ fn tb_lite_resolve_parent_for_new_node(
     match kind {
         BorrowKind::Shared | BorrowKind::Unique => {
             tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
-                .or_else(|| tb_lite_find_ref_ancestor_tag(&tmap, effective_parent))
-                .unwrap_or(effective_parent)
+                .or_else(|| {
+                    tb_lite_find_ref_ancestor_tag(&tmap, effective_parent)
+                        .filter(|tag| tree.nodes.contains_key(tag))
+                })
+                .or_else(|| {
+                    tb_lite_find_materialized_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                })
+                .unwrap_or(0)
         }
         BorrowKind::RawConst | BorrowKind::RawMut => {
-            tb_lite_find_ref_ancestor_tag(&tmap, effective_parent).unwrap_or(effective_parent)
+            tb_lite_find_materialized_ref_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                .or_else(|| {
+                    tb_lite_find_ref_ancestor_tag(&tmap, effective_parent)
+                        .filter(|tag| tree.nodes.contains_key(tag))
+                })
+                .or_else(|| {
+                    tb_lite_find_materialized_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                })
+                .unwrap_or(0)
         }
     }
 }
@@ -1016,6 +1030,14 @@ fn tb_lite_check(
         return None;
     };
 
+    if matches!(access, AliasAccessKind::Write)
+        && matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut)
+        && (tmeta.lineage_hint & TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY) != 0
+        && !tree.nodes.contains_key(&orig_tag)
+    {
+        let _ = tb_lite_materialize_deferred_raw_node(tree, orig_tag, tmeta);
+    }
+
     if matches!(access, AliasAccessKind::Write) {
         tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(tree, tmeta);
     }
@@ -1156,6 +1178,10 @@ fn tb_lite_check(
                     && matches!(n.kind, BorrowKind::Unique)
                     && !(matches!(access, AliasAccessKind::Read)
                         && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
+                    && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
+                || (matches!(n.perm, TbPerm::Disabled)
+                    && matches!(n.kind, BorrowKind::Shared)
+                    && matches!(access, AliasAccessKind::Write)
                     && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
         })
         .filter(|n| {
@@ -1725,6 +1751,24 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
         if nodes.contains_key(&tag) && matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
             return Some(tag);
         }
+        if t.parent == 0 {
+            return None;
+        }
+        tag = t.parent;
+    }
+    None
+}
+
+fn tb_lite_find_materialized_ancestor_tag(
+    tmap: &HashMap<u64, TagMeta>,
+    nodes: &HashMap<u64, TbNode>,
+    mut tag: u64,
+) -> Option<u64> {
+    for _ in 0..tmap.len().saturating_add(1) {
+        if nodes.contains_key(&tag) {
+            return Some(tag);
+        }
+        let t = tmap.get(&tag)?;
         if t.parent == 0 {
             return None;
         }

@@ -71,6 +71,7 @@ members = [
     "examples/tb_lite_call_boundary_field_reborrow_ok",
     "examples/tb_lite_call_boundary_parent_borrow_reborrow_ok",
     "examples/tb_lite_pointer_local_ref_parent_ok",
+    "examples/tb_lite_raw_helper_view_write_ok",
     "examples/sb_lite_parent_read_after_field_reborrow",
     "examples/sb_lite_cross_lineage_fields_ok",
     "examples/sb_lite_unsafe_cell_raw_read_ok",
