@@ -2595,7 +2595,9 @@ impl MyOptimizationPass {
     ) -> bool {
         src_place.projection.is_empty()
             && matches!(
-                self.creation_parent_selection_mode_for_src_place(tcx, body, src_place, true),
+                self.creation_parent_selection_mode_for_src_place(
+                    tcx, body, src_place, false, true,
+                ),
                 ParentSelectionMode::SlotFamily
             )
     }
@@ -7563,6 +7565,7 @@ impl MyOptimizationPass {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         src_place: Place<'tcx>,
+        is_raw_creation: bool,
         use_projectionless_anchor: bool,
     ) -> ParentSelectionMode {
         if matches!(
@@ -7570,6 +7573,13 @@ impl MyOptimizationPass {
             ParentSelectionMode::ReceiverFamily
         ) {
             return ParentSelectionMode::ReceiverFamily;
+        }
+
+        if !is_raw_creation
+            && src_place.projection.is_empty()
+            && self.is_pointer_ty(body.local_decls[src_place.local].ty)
+        {
+            return ParentSelectionMode::SlotFamily;
         }
 
         if use_projectionless_anchor
@@ -7617,65 +7627,70 @@ impl MyOptimizationPass {
             && src_place.projection.is_empty()
             && !self.is_pointer_ty(src_local_ty)
             && self.ty_contains_direct_pointer_fields(tcx, body, src_local_ty);
-        let receiver_parent = if matches!(mode, ParentSelectionMode::ReceiverFamily) {
-            self.receiver_family_parent_operand_for_place(
-                tcx,
-                body,
-                source_info,
-                src_place,
-                tag_local_for_ptr_local,
-                ref_ancestor_local_for_ptr_local,
-                reborrow_anchor_local_for_stack_local,
-            )
-        } else {
-            None
-        };
-        let slot_parent = if matches!(mode, ParentSelectionMode::SlotFamily) {
-            self.slot_family_parent_operand_for_local(
-                src_place.local,
-                reborrow_anchor_local_for_stack_local,
-            )
-        } else {
-            None
-        };
-
-        receiver_parent
-            .or(slot_parent)
-            .or_else(|| {
-                self.projected_fast_path_pointee_parent_operand_for_src_place(
+        match mode {
+            ParentSelectionMode::ReceiverFamily => self
+                .receiver_family_parent_operand_for_place(
                     tcx,
                     body,
+                    source_info,
                     src_place,
                     tag_local_for_ptr_local,
                     ref_ancestor_local_for_ptr_local,
-                    is_raw_creation,
-                )
-            })
-            .or_else(|| {
-                self.projected_slot_family_parent_operand_for_src_place(
-                    tcx,
-                    body,
-                    bb,
-                    stmt_idx,
-                    src_place,
                     reborrow_anchor_local_for_stack_local,
-                    is_raw_creation,
                 )
-            })
-            .or_else(|| {
-                self.pointee_family_parent_operand_for_src_place(
+                .or_else(|| {
+                    self.projected_slot_family_parent_operand_for_src_place(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        src_place,
+                        reborrow_anchor_local_for_stack_local,
+                        is_raw_creation,
+                    )
+                })
+                .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0)),
+            ParentSelectionMode::SlotFamily => self
+                .slot_family_parent_operand_for_local(
+                    src_place.local,
+                    reborrow_anchor_local_for_stack_local,
+                )
+                .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0)),
+            ParentSelectionMode::PointeeFamily => self
+                .projected_fast_path_pointee_parent_operand_for_src_place(
                     tcx,
                     body,
-                    bb,
-                    stmt_idx,
                     src_place,
                     tag_local_for_ptr_local,
                     ref_ancestor_local_for_ptr_local,
                     is_raw_creation,
-                    projectionless_raw_direct_pointer_carrier,
                 )
-            })
-            .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0))
+                .or_else(|| {
+                    self.projected_slot_family_parent_operand_for_src_place(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        src_place,
+                        reborrow_anchor_local_for_stack_local,
+                        is_raw_creation,
+                    )
+                })
+                .or_else(|| {
+                    self.pointee_family_parent_operand_for_src_place(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        src_place,
+                        tag_local_for_ptr_local,
+                        ref_ancestor_local_for_ptr_local,
+                        is_raw_creation,
+                        projectionless_raw_direct_pointer_carrier,
+                    )
+                })
+                .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0)),
+        }
     }
 
     fn materialize_projected_reborrow_parent_local<'tcx>(
@@ -18122,7 +18137,13 @@ impl MyOptimizationPass {
                             projectionless_anchor_suppressed_locals,
                             is_raw_creation,
                             true,
-                            self.creation_parent_selection_mode_for_src_place(tcx, body, src, true),
+                            self.creation_parent_selection_mode_for_src_place(
+                                tcx,
+                                body,
+                                src,
+                                is_raw_creation,
+                                true,
+                            ),
                         )),
                     ))),
                 );
@@ -20129,6 +20150,7 @@ impl MyOptimizationPass {
                                         tcx,
                                         body,
                                         *src,
+                                        false,
                                         use_projectionless_anchor,
                                     ),
                                 )
@@ -20164,7 +20186,7 @@ impl MyOptimizationPass {
                                     true,
                                     true,
                                     self.creation_parent_selection_mode_for_src_place(
-                                        tcx, body, *src, true,
+                                        tcx, body, *src, true, true,
                                     ),
                                 )
                             }
@@ -20548,6 +20570,7 @@ impl MyOptimizationPass {
                                         tcx,
                                         body,
                                         *src,
+                                        false,
                                         use_projectionless_anchor,
                                     ),
                                 )

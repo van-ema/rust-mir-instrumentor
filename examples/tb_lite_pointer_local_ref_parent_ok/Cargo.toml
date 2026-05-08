@@ -1,0 +1,6 @@
+[package]
+name = "tb_lite_pointer_local_ref_parent_ok"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

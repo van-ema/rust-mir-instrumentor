@@ -1971,6 +1971,10 @@ name = "tb_lite_call_boundary_parent_borrow_reborrow_ok"
 version = "0.1.0"
 
 [[package]]
+name = "tb_lite_pointer_local_ref_parent_ok"
+version = "0.1.0"
+
+[[package]]
 name = "tb_miri_micro"
 version = "0.1.0"
 
