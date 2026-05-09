@@ -2293,6 +2293,20 @@ impl MyOptimizationPass {
         }
     }
 
+    fn ptr_ty_has_sized_pointee<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                pointee.is_sized(tcx, body.typing_env(tcx))
+            }
+            _ => false,
+        }
+    }
+
     /// Return true when we can safely extract a concrete address from a pointer type.
     /// This is stricter than `is_thin_ptr_ty`: we also require the pointee to be sized
     /// in the current typing environment.
@@ -2304,7 +2318,8 @@ impl MyOptimizationPass {
     ) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                self.is_thin_ptr_ty(tcx, body, ty) && pointee.is_sized(tcx, body.typing_env(tcx))
+                (self.is_thin_ptr_ty(tcx, body, ty) || self.ptr_ty_has_sized_pointee(tcx, body, ty))
+                    && pointee.is_sized(tcx, body.typing_env(tcx))
             }
             _ => false,
         }
@@ -2542,7 +2557,9 @@ impl MyOptimizationPass {
         addr_local: Local,
     ) -> Option<(Option<Statement<'tcx>>, Statement<'tcx>)> {
         let place_ty = place.ty(&body.local_decls, tcx).ty;
-        if self.is_thin_ptr_ty(tcx, body, place_ty) {
+        if self.is_thin_ptr_ty(tcx, body, place_ty)
+            || self.ptr_ty_has_sized_pointee(tcx, body, place_ty)
+        {
             let addr_stmt = Statement::new(
                 source_info,
                 StatementKind::Assign(Box::new((
@@ -10572,6 +10589,11 @@ impl MyOptimizationPass {
         let arg_ty = arg_place.ty(&body.local_decls, tcx).ty;
         if !self.is_pointer_ty(arg_ty) {
             return None;
+        }
+        if let TyKind::Ref(_, pointee_ty, _) = arg_ty.kind() {
+            if !self.is_pointer_ty(*pointee_ty) {
+                return None;
+            }
         }
 
         Some(CallEffect::PtrDerive)
