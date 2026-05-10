@@ -698,6 +698,38 @@ fn rz_validate_strict_raw_creation_addr(
     // in pointer-typed fields and reconstructs the real base pointer in `rebuild_vec`).
     // In that shape, eager OOB-on-derive is too strong: once the parent is already outside its
     // origin range, defer bounds enforcement to actual access / ref creation.
+    let Some(mut parent_meta) = tag_store::get(parent_tag) else {
+        if exposed_provenance_root && enforce_no_provenance {
+            return Some((
+                "WILD_POINTER",
+                format!(
+                    "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}"
+                ),
+            ));
+        }
+        return None;
+    };
+
+    let same_empty_family =
+        bounds_len == 0 && parent_meta.bounds_len == 0 && parent_meta.pointee_addr == pointee_addr;
+    let same_empty_metadata_family = same_empty_family
+        && parent_meta.parent != 0
+        && matches!(
+            parent_meta.kind,
+            PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
+        )
+        && rz_can_recover_parent_tag(parent_tag);
+    if same_empty_family
+        && (!rz_has_exposed_provenance_root(parent_tag, &parent_meta) || same_empty_metadata_family)
+    {
+        // Extending the same zero-length family at the same address is how empty views/sentinels
+        // move through helper plumbing in crates like `bytes`. That is not a concrete access and
+        // should not be rejected as no-provenance derive. Real zero-length forgeries still fail:
+        // there must be an existing live family member to inherit, and changing the address leaves
+        // the normal strict checks in place.
+        return None;
+    }
+
     if exposed_provenance_root && enforce_no_provenance {
         return Some((
             "WILD_POINTER",
@@ -705,23 +737,6 @@ fn rz_validate_strict_raw_creation_addr(
                 "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}"
             ),
         ));
-    }
-
-    let Some(mut parent_meta) = tag_store::get(parent_tag) else {
-        return None;
-    };
-
-    if bounds_len == 0
-        && parent_meta.bounds_len == 0
-        && parent_meta.pointee_addr == pointee_addr
-        && !rz_has_exposed_provenance_root(parent_tag, &parent_meta)
-    {
-        // Extending the same zero-length family at the same address is how empty views/sentinels
-        // move through helper plumbing in crates like `bytes`. That is not a concrete access and
-        // should not be rejected as no-provenance derive. Real zero-length forgeries still fail:
-        // roots/exposed-provenance pointers do not hit this path, and changing the address leaves
-        // the normal strict checks in place.
-        return None;
     }
 
     // Parent tags cache allocation-origin bounds at creation time. For same-base realloc growth,
@@ -4474,6 +4489,88 @@ fn recover_call_arg_parent_tag(addr: usize) -> u64 {
     recovered
 }
 
+fn tag_lineage_contains_locked(
+    tmap: &HashMap<u64, TagMeta>,
+    descendant_tag: u64,
+    ancestor_tag: u64,
+) -> bool {
+    if descendant_tag == 0 || ancestor_tag == 0 {
+        return false;
+    }
+
+    let mut cursor = descendant_tag;
+    for _ in 0..tmap.len().saturating_add(1) {
+        if cursor == ancestor_tag {
+            return true;
+        }
+        let Some(meta) = tmap.get(&cursor) else {
+            break;
+        };
+        if meta.parent == 0 {
+            break;
+        }
+        cursor = meta.parent;
+    }
+    false
+}
+
+fn recover_projected_ref_boundary_tag(addr: usize, boundary_parent_tag: u64) -> u64 {
+    if addr == 0 || boundary_parent_tag == 0 {
+        return 0;
+    }
+
+    let Some(boundary_parent_meta) = tag_store::get(boundary_parent_tag) else {
+        return 0;
+    };
+    if !matches!(
+        boundary_parent_meta.kind,
+        PtrKind::RefShared | PtrKind::RefMut
+    ) || !rz_ref_boundary_tag_is_valid(boundary_parent_tag)
+    {
+        return 0;
+    }
+    if boundary_parent_meta.pointee_addr == addr {
+        return boundary_parent_tag;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let mut candidates: Vec<u64> = Vec::new();
+    {
+        let tmap = tags().lock().unwrap();
+        for (tag, meta) in tmap.iter() {
+            if meta.pointee_addr != addr
+                || !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut)
+                || !tag_lineage_contains_locked(&tmap, *tag, boundary_parent_tag)
+            {
+                continue;
+            }
+            if alloc_epoch != 0 {
+                if meta.alloc_epoch != alloc_epoch && !(stack_or_tls_addr && meta.alloc_epoch == 0)
+                {
+                    continue;
+                }
+            } else if !(allow_epochless_exact && meta.alloc_epoch == 0) {
+                continue;
+            }
+            candidates.push(*tag);
+        }
+    }
+
+    candidates.sort_unstable_by(|a, b| b.cmp(a));
+    for tag in candidates {
+        if rz_can_recover_parent_tag(tag) && rz_ref_boundary_tag_is_valid(tag) {
+            return tag;
+        }
+    }
+
+    0
+}
+
 fn recover_live_boundary_tag(addr: usize) -> u64 {
     if addr == 0 {
         return 0;
@@ -4794,7 +4891,15 @@ pub extern "C" fn __rz_push_call_arg_boundary_tag(
         exact_tag
     };
     let tag = if recovered_origin {
-        let canonical_tag = canonical_call_arg_tag(addr, boundary_parent_tag);
+        let projected_ref_tag = recover_projected_ref_boundary_tag(addr, boundary_parent_tag);
+        let canonical_tag = canonical_call_arg_tag(
+            addr,
+            if projected_ref_tag != 0 {
+                projected_ref_tag
+            } else {
+                boundary_parent_tag
+            },
+        );
         if rz_ref_boundary_tag_is_valid(canonical_tag) {
             rz_validate_ref_boundary_use(canonical_tag, "CALL_ARG");
         }

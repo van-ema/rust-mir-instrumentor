@@ -1015,7 +1015,12 @@ fn tb_lite_on_tag_killed(tag: u64) {
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
+    let parent = node.parent;
+    let killed_readonly = matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst);
     tb_disable_node(node);
+    if killed_readonly {
+        tb_reactivate_frozen_unique_ancestors_without_readers(tree, parent);
+    }
 }
 
 fn tb_lite_check(
@@ -1664,6 +1669,63 @@ fn tb_disable_node_for_protector_end(n: &mut TbNode) {
     n.perm = TbPerm::Disabled;
     n.alive = false;
     n.poisoned_by_protector_end = true;
+}
+
+fn tb_has_live_readonly_descendant(
+    tree: &TbAllocState,
+    ancestor_tag: u64,
+    addr: usize,
+    size: usize,
+) -> bool {
+    tree.nodes.values().any(|node| {
+        node.tag != ancestor_tag
+            && tb_is_live_node(node)
+            && matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst)
+            && tb_is_ancestor(&tree.nodes, ancestor_tag, node.tag)
+            && tb_node_overlaps(node, addr, size)
+    })
+}
+
+fn tb_reactivate_frozen_unique_ancestors_without_readers(
+    tree: &mut TbAllocState,
+    start_parent: u64,
+) {
+    let mut cursor = start_parent;
+    for _ in 0..tree.nodes.len().saturating_add(1) {
+        let Some((next, start, len, should_reactivate, restored_perm)) =
+            tree.nodes.get(&cursor).map(|node| {
+                let restored_perm = match node.lazy_perm {
+                    TbPerm::Reserved { .. } | TbPerm::Active => Some(node.lazy_perm),
+                    TbPerm::Frozen | TbPerm::Disabled => None,
+                };
+                (
+                    node.parent,
+                    node.start,
+                    node.len,
+                    node.alive
+                        && matches!(node.kind, BorrowKind::Unique)
+                        && matches!(node.perm, TbPerm::Frozen)
+                        && restored_perm.is_some(),
+                    restored_perm,
+                )
+            })
+        else {
+            break;
+        };
+
+        if should_reactivate && !tb_has_live_readonly_descendant(tree, cursor, start, len) {
+            if let Some(node) = tree.nodes.get_mut(&cursor) {
+                if let Some(restored_perm) = restored_perm {
+                    node.perm = restored_perm;
+                }
+            }
+        }
+
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
 }
 
 /// Revive a node that was disabled specifically by protector release.
