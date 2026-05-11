@@ -3866,7 +3866,7 @@ impl MyOptimizationPass {
         eligible
     }
 
-    fn noescape_shared_reborrow_call_temp_local<'tcx>(
+    fn noescape_reborrow_call_temp_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -3895,12 +3895,12 @@ impl MyOptimizationPass {
         let mut def_src_place: Option<Place<'tcx>> = None;
         for bbd in body.basic_blocks.iter() {
             for stmt in &bbd.statements {
-                if let StatementKind::Assign(box (
-                    lhs,
-                    Rvalue::Ref(_, BorrowKind::Shared, src_place),
-                )) = &stmt.kind
+                if let StatementKind::Assign(box (lhs, Rvalue::Ref(_, borrow_kind, src_place))) =
+                    &stmt.kind
                 {
-                    if lhs.as_local() == Some(local) {
+                    let same_family_helper_reborrow =
+                        matches!(borrow_kind, BorrowKind::Shared | BorrowKind::Mut { .. });
+                    if lhs.as_local() == Some(local) && same_family_helper_reborrow {
                         def_src_place = Some(*src_place);
                     }
                 }
@@ -3922,11 +3922,12 @@ impl MyOptimizationPass {
         if self.is_instrumented_callee(tcx, callee_did)
             && (same_family_ref_reborrow_src || whole_place_slot_family_src)
         {
-            // This caller-side `&*base`/same-family shared temp is administrative: the
-            // call-boundary import creates the callee-side child that actually models any real
-            // escape or later return. Marking the caller temp as escaped via `PtrUse` keeps a
-            // frozen sibling alive past the call and diverges from TB/Miri's transient reborrow
-            // behavior for helper receivers like `len`, `capacity`, and `as_ptr`.
+            // This caller-side `&*base`/same-family temp is administrative: the call-boundary
+            // import creates the callee-side child that actually models any real escape or later
+            // return. Marking the caller temp as escaped via `PtrUse` keeps an artificial
+            // same-lineage sibling alive past the call and diverges from TB/Miri's transient
+            // receiver reborrow behavior for helper chains like `iter_mut`, `next`, `len`,
+            // `capacity`, and `as_ptr`.
             return Some(local);
         }
         let summary_allows =
@@ -12283,9 +12284,9 @@ impl MyOptimizationPass {
             TerminatorKind::Call { target, .. } => *target,
             _ => None,
         };
-        let mut noescape_shared_reborrow_call_temps: HashSet<Local> = HashSet::new();
+        let mut noescape_reborrow_call_temps: HashSet<Local> = HashSet::new();
         for (arg_index, arg) in args.iter().enumerate() {
-            if let Some(local) = self.noescape_shared_reborrow_call_temp_local(
+            if let Some(local) = self.noescape_reborrow_call_temp_local(
                 tcx,
                 body,
                 block_data,
@@ -12294,7 +12295,7 @@ impl MyOptimizationPass {
                 arg_index,
                 arg,
             ) {
-                noescape_shared_reborrow_call_temps.insert(local);
+                noescape_reborrow_call_temps.insert(local);
                 local_slot_shadow_store_locals.insert(local);
             }
         }
@@ -13146,9 +13147,8 @@ impl MyOptimizationPass {
             }
             let projected_carrier_raw_ptr_use = self.is_raw_pointer_ty(ty)
                 && self.raw_creation_allows_no_provenance_transport(tcx, body, p);
-            let noescape_shared_reborrow_temp =
-                noescape_shared_reborrow_call_temps.contains(&p.local);
-            if !projected_carrier_raw_ptr_use && !noescape_shared_reborrow_temp {
+            let noescape_reborrow_temp = noescape_reborrow_call_temps.contains(&p.local);
+            if !projected_carrier_raw_ptr_use && !noescape_reborrow_temp {
                 ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
@@ -13660,7 +13660,7 @@ impl MyOptimizationPass {
                 if dst_local == Some(arg_place.local) {
                     continue;
                 }
-                if noescape_shared_reborrow_call_temps.contains(&arg_place.local) {
+                if noescape_reborrow_call_temps.contains(&arg_place.local) {
                     kill_locals.insert(arg_place.local);
                 }
             }
