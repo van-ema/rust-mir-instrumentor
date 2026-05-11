@@ -230,6 +230,8 @@ enum CallEffect {
     ExposedProvenanceRoot,
     /// Wrapper constructors that return a non-pointer carrier whose pointer leaves come from arg0.
     CarrierCopyArg0,
+    /// Iterator-style helpers that return aggregate reference items derived from arg0's pointee carrier.
+    RefRetFromArg0PointeeLeafs,
     /// Box boundary modeling.
     BoxIntoRaw,
     BoxFromRaw,
@@ -510,6 +512,51 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         MatchKind::EndsWith,
         "::size_hint",
         CallEffect::Ignore,
+    ),
+    // Opaque iterator adapters that return another carrier derived from self.
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::traits::iterator::Iterator",
+        MatchKind::EndsWith,
+        "::take",
+        CallEffect::CarrierCopyArg0,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::Iterator",
+        MatchKind::EndsWith,
+        "::take",
+        CallEffect::CarrierCopyArg0,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::traits::collect::IntoIterator",
+        MatchKind::EndsWith,
+        "::into_iter",
+        CallEffect::CarrierCopyArg0,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::IntoIterator",
+        MatchKind::EndsWith,
+        "::into_iter",
+        CallEffect::CarrierCopyArg0,
+    ),
+    // `next` is only modeled structurally when the returned aggregate carries reference leaves
+    // and those leaves can be recovered from the pointee carrier behind `&mut self`.
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::traits::iterator::Iterator",
+        MatchKind::EndsWith,
+        "::next",
+        CallEffect::RefRetFromArg0PointeeLeafs,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::iter::Iterator",
+        MatchKind::EndsWith,
+        "::next",
+        CallEffect::RefRetFromArg0PointeeLeafs,
     ),
     // Slice helpers that return view/iterator carriers derived from arg0.
     EffectRule::two(
@@ -2875,6 +2922,24 @@ impl MyOptimizationPass {
             &mut out,
         );
         out
+    }
+
+    fn pointer_pointee_place_and_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_place: Place<'tcx>,
+    ) -> Option<(Place<'tcx>, Ty<'tcx>)> {
+        let ptr_ty = ptr_place.ty(&body.local_decls, tcx).ty;
+        let pointee_ty = match ptr_ty.kind() {
+            TyKind::Ref(_, pointee_ty, _) => *pointee_ty,
+            TyKind::RawPtr(pointee_ty, _) => *pointee_ty,
+            _ => return None,
+        };
+        Some((
+            ptr_place.project_deeper(&[PlaceElem::Deref], tcx),
+            pointee_ty,
+        ))
     }
 
     fn shadowable_leaf_ptr_places_from_place<'tcx>(
@@ -12655,13 +12720,34 @@ impl MyOptimizationPass {
                                     Place::from(dst_local),
                                     dst_ty,
                                 );
-                                let src_leafs = self.shadowable_leaf_ptr_specs_from_place(
-                                    tcx, body, src_place, src_ty,
-                                );
+                                let direct_src_leafs =
+                                    self.shadowable_leaf_ptr_specs_from_place(
+                                        tcx, body, src_place, src_ty,
+                                    );
+                                let pointee_src_leafs = self
+                                    .pointer_pointee_place_and_ty(tcx, body, src_place)
+                                    .map(|(pointee_place, pointee_ty)| {
+                                        self.shadowable_leaf_ptr_specs_from_place(
+                                            tcx,
+                                            body,
+                                            pointee_place,
+                                            pointee_ty,
+                                        )
+                                    })
+                                    .filter(|leafs| !leafs.is_empty());
                                 if let Some(matched_leafs) = self
                                     .pair_shadowable_leaf_ptr_specs_from_arg0(
-                                        &dst_leafs, &src_leafs,
+                                        &dst_leafs,
+                                        &direct_src_leafs,
                                     )
+                                    .or_else(|| {
+                                        pointee_src_leafs.as_ref().and_then(|leafs| {
+                                            self.pair_shadowable_leaf_ptr_specs_from_arg0(
+                                                &dst_leafs,
+                                                leafs,
+                                            )
+                                        })
+                                    })
                                 {
                                     for (dst_spec, src_spec) in matched_leafs {
                                         let kind = if src_spec.place.projection.is_empty()
@@ -12684,6 +12770,62 @@ impl MyOptimizationPass {
                                             place: dst_spec.place,
                                             kind,
                                         });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                CallEffect::RefRetFromArg0PointeeLeafs => {
+                    if let (Some(dst_local), Some(tgt_bb)) =
+                        (destination.as_local(), call_target_bb)
+                    {
+                        let dst_ty = body.local_decls[dst_local].ty;
+                        if !self.is_pointer_ty(dst_ty) {
+                            if let Some(src_place) = args
+                                .get(0)
+                                .and_then(|arg| self.place_from_operand(&arg.node))
+                            {
+                                let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                    tcx,
+                                    body,
+                                    Place::from(dst_local),
+                                    dst_ty,
+                                );
+                                let dst_has_only_ref_leafs = !dst_leafs.is_empty()
+                                    && dst_leafs.iter().all(|leaf_spec| {
+                                        matches!(leaf_spec.ty.kind(), TyKind::Ref(..))
+                                    });
+                                if dst_has_only_ref_leafs {
+                                    if let Some((pointee_place, pointee_ty)) =
+                                        self.pointer_pointee_place_and_ty(tcx, body, src_place)
+                                    {
+                                        let src_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                            tcx,
+                                            body,
+                                            pointee_place,
+                                            pointee_ty,
+                                        );
+                                        if let Some(matched_leafs) = self
+                                            .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                                &dst_leafs,
+                                                &src_leafs,
+                                            )
+                                        {
+                                            for (dst_spec, src_spec) in matched_leafs {
+                                                insert_points.push(InsertPoint {
+                                                    bb: tgt_bb,
+                                                    stmt_idx: 0,
+                                                    insert_before: true,
+                                                    source_info: term.source_info,
+                                                    place: dst_spec.place,
+                                                    kind: InstrKind::ShadowCopySlot {
+                                                        src_place: src_spec.place,
+                                                    },
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -23248,6 +23390,7 @@ fn call_effect_label(effect: CallEffect) -> &'static str {
         CallEffect::PtrDerive => "PtrDerive",
         CallEffect::ExposedProvenanceRoot => "ExposedProvenanceRoot",
         CallEffect::CarrierCopyArg0 => "CarrierCopyArg0",
+        CallEffect::RefRetFromArg0PointeeLeafs => "RefRetFromArg0PointeeLeafs",
         CallEffect::BoxIntoRaw => "BoxIntoRaw",
         CallEffect::BoxFromRaw => "BoxFromRaw",
         CallEffect::AllocShim(AllocShimKind::Alloc) => "AllocShim(Alloc)",
@@ -23290,6 +23433,18 @@ mod tests {
         assert_eq!(
             effect_for("core::slice::<impl [T]>::iter_mut"),
             CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::iter::Iterator::take"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::iter::IntoIterator::into_iter"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::iter::Iterator::next"),
+            CallEffect::RefRetFromArg0PointeeLeafs
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::is_empty"),
