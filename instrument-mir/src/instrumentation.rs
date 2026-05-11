@@ -2840,6 +2840,45 @@ impl MyOptimizationPass {
         None
     }
 
+    fn single_direct_pointer_leaf_place_for_projectionless_carrier<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+    ) -> Option<Place<'tcx>> {
+        if !src_place.projection.is_empty() {
+            return None;
+        }
+
+        let local = src_place.local;
+        let local_ty = body.local_decls[local].ty;
+        if self.is_pointer_ty(local_ty)
+            || !self.ty_contains_direct_pointer_fields(tcx, body, local_ty)
+        {
+            return None;
+        }
+
+        let leaf_specs = self.shadowable_leaf_ptr_specs_from_place(tcx, body, src_place, local_ty);
+        if leaf_specs.len() != 1 {
+            return None;
+        }
+
+        let field_place = self.first_direct_pointer_field_place(tcx, body, local)?;
+        (leaf_specs[0].place == field_place).then_some(field_place)
+    }
+
+    fn single_shadowable_leaf_place_for_pointer_pointee<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_place: Place<'tcx>,
+    ) -> Option<Place<'tcx>> {
+        let (pointee_place, pointee_ty) = self.pointer_pointee_place_and_ty(tcx, body, ptr_place)?;
+        let leaf_specs =
+            self.shadowable_leaf_ptr_specs_from_place(tcx, body, pointee_place, pointee_ty);
+        (leaf_specs.len() == 1).then_some(leaf_specs[0].place)
+    }
+
     fn leaf_path_key_child(parent_key: u64, field_idx: usize) -> u64 {
         parent_key
             .wrapping_mul(131)
@@ -12669,12 +12708,90 @@ impl MyOptimizationPass {
                                     (destination.as_local(), call_target_bb)
                                 {
                                     let dst_ty = body.local_decls[dst_local].ty;
+                                    let pointee_place_and_ty =
+                                        self.pointer_pointee_place_and_ty(tcx, body, p0);
+                                    let pointee_leaf_place = if self
+                                        .is_shadowable_ptr_ty(tcx, body, dst_ty)
+                                    {
+                                        self.single_shadowable_leaf_place_for_pointer_pointee(
+                                            tcx, body, p0,
+                                        )
+                                    } else {
+                                        None
+                                    };
                                     let loaded_ptr_ty = match ty0.kind() {
                                         TyKind::RawPtr(pointee_ty, _mutbl)
                                         | TyKind::Ref(_, pointee_ty, _mutbl) => Some(*pointee_ty),
                                         _ => None,
                                     };
-                                    if self.is_shadowable_ptr_ty(tcx, body, dst_ty)
+                                    if let Some(load_src_place) = pointee_leaf_place {
+                                        ptr_locals_needing_tag.insert(dst_local);
+                                        tagged_ptr_locals.insert(dst_local);
+                                        insert_points.push(InsertPoint {
+                                            bb: tgt_bb,
+                                            stmt_idx: 0,
+                                            insert_before: true,
+                                            source_info: term.source_info,
+                                            place: load_src_place,
+                                            kind: InstrKind::ShadowLoad {
+                                                dst_local,
+                                                require_tag: true,
+                                                validate_ref: false,
+                                            },
+                                        });
+                                        load_shadow_emitted = true;
+                                    } else if !self.is_pointer_ty(dst_ty) {
+                                        if let Some((pointee_place, pointee_ty)) =
+                                            pointee_place_and_ty
+                                        {
+                                            let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                                tcx,
+                                                body,
+                                                Place::from(dst_local),
+                                                dst_ty,
+                                            );
+                                            let src_leafs =
+                                                self.shadowable_leaf_ptr_specs_from_place(
+                                                    tcx,
+                                                    body,
+                                                    pointee_place,
+                                                    pointee_ty,
+                                                );
+                                            if let Some(matched_leafs) = self
+                                                .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                                    &dst_leafs, &src_leafs,
+                                                )
+                                            {
+                                                for (dst_spec, src_spec) in matched_leafs {
+                                                    let kind = if src_spec.place.projection.is_empty()
+                                                        && self.is_shadowable_ptr_ty(
+                                                            tcx,
+                                                            body,
+                                                            dst_spec.ty,
+                                                        )
+                                                    {
+                                                        ptr_locals_needing_tag
+                                                            .insert(src_spec.place.local);
+                                                        InstrKind::ShadowStore {
+                                                            src_local: src_spec.place.local,
+                                                        }
+                                                    } else {
+                                                        InstrKind::ShadowCopySlot {
+                                                            src_place: src_spec.place,
+                                                        }
+                                                    };
+                                                    insert_points.push(InsertPoint {
+                                                        bb: tgt_bb,
+                                                        stmt_idx: 0,
+                                                        insert_before: true,
+                                                        source_info: term.source_info,
+                                                        place: dst_spec.place,
+                                                        kind,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    } else if self.is_shadowable_ptr_ty(tcx, body, dst_ty)
                                         && loaded_ptr_ty.is_some_and(|ty| {
                                             self.is_shadowable_ptr_ty(tcx, body, ty)
                                         })
@@ -12720,10 +12837,9 @@ impl MyOptimizationPass {
                                     Place::from(dst_local),
                                     dst_ty,
                                 );
-                                let direct_src_leafs =
-                                    self.shadowable_leaf_ptr_specs_from_place(
-                                        tcx, body, src_place, src_ty,
-                                    );
+                                let direct_src_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                    tcx, body, src_place, src_ty,
+                                );
                                 let pointee_src_leafs = self
                                     .pointer_pointee_place_and_ty(tcx, body, src_place)
                                     .map(|(pointee_place, pointee_ty)| {
@@ -12743,8 +12859,7 @@ impl MyOptimizationPass {
                                     .or_else(|| {
                                         pointee_src_leafs.as_ref().and_then(|leafs| {
                                             self.pair_shadowable_leaf_ptr_specs_from_arg0(
-                                                &dst_leafs,
-                                                leafs,
+                                                &dst_leafs, leafs,
                                             )
                                         })
                                     })
@@ -12809,8 +12924,7 @@ impl MyOptimizationPass {
                                         );
                                         if let Some(matched_leafs) = self
                                             .pair_shadowable_leaf_ptr_specs_from_arg0(
-                                                &dst_leafs,
-                                                &src_leafs,
+                                                &dst_leafs, &src_leafs,
                                             )
                                         {
                                             for (dst_spec, src_spec) in matched_leafs {
@@ -12853,24 +12967,119 @@ impl MyOptimizationPass {
                             let prefer_return_boundary_for_ref = callee_instrumented
                                 && ret_take_enabled
                                 && matches!(dst_ty.kind(), TyKind::Ref(..));
+                            let src_arg_index = callee_path_opt
+                                .as_deref()
+                                .map(|p| self.ptr_derive_source_arg_index(p))
+                                .unwrap_or(0);
+                            let src_arg_place = args
+                                .get(src_arg_index)
+                                .and_then(|arg| self.place_from_operand(&arg.node));
+                            if !self.is_pointer_ty(dst_ty) {
+                                if let (Some(src_place), Some(tgt_bb)) =
+                                    (src_arg_place, call_target_bb)
+                                {
+                                    let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                                    let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                        tcx,
+                                        body,
+                                        Place::from(dst_local),
+                                        dst_ty,
+                                    );
+                                    let direct_src_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                        tcx, body, src_place, src_ty,
+                                    );
+                                    let pointee_src_leafs = self
+                                        .pointer_pointee_place_and_ty(tcx, body, src_place)
+                                        .map(|(pointee_place, pointee_ty)| {
+                                            self.shadowable_leaf_ptr_specs_from_place(
+                                                tcx,
+                                                body,
+                                                pointee_place,
+                                                pointee_ty,
+                                            )
+                                        })
+                                        .filter(|leafs| !leafs.is_empty());
+                                    if let Some(matched_leafs) = self
+                                        .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                            &dst_leafs,
+                                            &direct_src_leafs,
+                                        )
+                                        .or_else(|| {
+                                            pointee_src_leafs.as_ref().and_then(|leafs| {
+                                                self.pair_shadowable_leaf_ptr_specs_from_arg0(
+                                                    &dst_leafs, leafs,
+                                                )
+                                            })
+                                        })
+                                    {
+                                        for (dst_spec, src_spec) in matched_leafs {
+                                            let kind = if src_spec.place.projection.is_empty()
+                                                && self.is_shadowable_ptr_ty(
+                                                    tcx,
+                                                    body,
+                                                    dst_spec.ty,
+                                                )
+                                            {
+                                                ptr_locals_needing_tag.insert(src_spec.place.local);
+                                                InstrKind::ShadowStore {
+                                                    src_local: src_spec.place.local,
+                                                }
+                                            } else {
+                                                InstrKind::ShadowCopySlot {
+                                                    src_place: src_spec.place,
+                                                }
+                                            };
+                                            insert_points.push(InsertPoint {
+                                                bb: tgt_bb,
+                                                stmt_idx: 0,
+                                                insert_before: true,
+                                                source_info: term.source_info,
+                                                place: dst_spec.place,
+                                                kind,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             // Allow wide-pointer destinations too (e.g., from_raw_parts_mut -> &mut [T]).
                             if self.is_pointer_ty(dst_ty) && !prefer_return_boundary_for_ref {
                                 let mut derive_emitted_here = false;
                                 let mut derived_from_recovered_boundary = false;
-                                let src_arg_index = callee_path_opt
-                                    .as_deref()
-                                    .map(|p| self.ptr_derive_source_arg_index(p))
-                                    .unwrap_or(0);
-                                let src_arg_place = args
-                                    .get(src_arg_index)
-                                    .and_then(|arg| self.place_from_operand(&arg.node));
+                                let direct_pointer_leaf_place = src_arg_place.and_then(|src_place| {
+                                    if matches!(dst_ty.kind(), TyKind::RawPtr(..)) {
+                                        self.single_direct_pointer_leaf_place_for_projectionless_carrier(
+                                            tcx, body, src_place,
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                });
                                 let prefer_parent_snapshot =
                                     src_arg_place.is_some_and(|src_place| {
                                         let src_place_ty = src_place.ty(&body.local_decls, tcx).ty;
                                         !src_place.projection.is_empty()
                                             || !self.is_pointer_ty(src_place_ty)
                                     });
-                                if prefer_parent_snapshot {
+                                if let (Some(src_leaf_place), Some(tgt_bb)) =
+                                    (direct_pointer_leaf_place, call_target_bb)
+                                {
+                                    ptr_locals_needing_tag.insert(dst_local);
+                                    tagged_ptr_locals.insert(dst_local);
+                                    insert_points.push(InsertPoint {
+                                        bb: tgt_bb,
+                                        stmt_idx: 0,
+                                        insert_before: true,
+                                        source_info: term.source_info,
+                                        place: src_leaf_place,
+                                        kind: InstrKind::ShadowLoad {
+                                            dst_local,
+                                            require_tag: true,
+                                            validate_ref: false,
+                                        },
+                                    });
+                                    derive_emitted_here = true;
+                                    load_shadow_emitted = true;
+                                } else if prefer_parent_snapshot {
                                     if let Some(src_place) = src_arg_place {
                                         if boundary_recovered_ptr_locals.contains(&src_place.local)
                                         {
@@ -13728,6 +13937,33 @@ impl MyOptimizationPass {
                                 },
                             });
                         }
+                    }
+                }
+            } else if !self.is_pointer_ty(dst_ty)
+                && callee_instrumented
+                && self.supports_call_boundary_leaf_shadow_ty(tcx, body, dst_ty)
+            {
+                if let Some(callee_id) = callee_id_opt {
+                    // Raw-owner aggregates such as `BytesMut` export pointer leaf shadow from the
+                    // callee, but they do not qualify for the ref-carrier anchor path. Import the
+                    // returned leaf provenance directly into the caller's destination slots.
+                    for dst_leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                        tcx,
+                        body,
+                        Place::from(dst_local),
+                        dst_ty,
+                    ) {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: dst_leaf_spec.place,
+                            kind: InstrKind::RetLeafTake {
+                                callee_id,
+                                leaf_key: dst_leaf_spec.transport_key(),
+                            },
+                        });
                     }
                 }
             } else if !self.is_pointer_ty(dst_ty)
