@@ -511,20 +511,20 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::size_hint",
         CallEffect::Ignore,
     ),
-    // Slice helpers.
+    // Slice helpers that return view/iterator carriers derived from arg0.
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::iter",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::iter_mut",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     // ---- PtrDerive wrappers (pointer arithmetic + slice/vec pointer extraction) ----
 
@@ -809,20 +809,22 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
     ),
     // Method-style wrappers (e.g. std::ptr::mut_ptr::<impl *mut T>::copy)
     EffectRule::one(MatchKind::EndsWith, "::copy", CallEffect::MemCopy),
-    // ---- Common pure helpers (Ignore) ----
+    // ---- Common pure helpers / structural carriers ----
+    // RangeBounds::{start,end}_bound return Bound<&usize>-style carriers that must stay in the
+    // range object's local family instead of floating as untracked helper results.
     EffectRule::two(
         MatchKind::Contains,
         "::ops::RangeBounds",
         MatchKind::EndsWith,
         "::start_bound",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::ops::RangeBounds",
         MatchKind::EndsWith,
         "::end_bound",
-        CallEffect::Ignore,
+        CallEffect::CarrierCopyArg0,
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -15174,9 +15176,9 @@ impl MyOptimizationPass {
                 let ref_block = body
                     .basic_blocks_mut()
                     .push(BasicBlockData::new(None, is_cleanup));
+                let dst_ty = body.local_decls[dst_local].ty;
                 let needs_loaded_ref_validation =
-                    matches!(body.local_decls[dst_local].ty.kind(), TyKind::Ref(..))
-                        && (require_tag || validate_ref);
+                    matches!(dst_ty.kind(), TyKind::Ref(..)) && (require_tag || validate_ref);
                 let projected_field_ty = place.ty(&body.local_decls, tcx).ty;
                 let projected_carrier_anchor = if !place.projection.is_empty()
                     && matches!(projected_field_ty.kind(), TyKind::Ref(..))
@@ -23282,6 +23284,14 @@ mod tests {
             CallEffect::CarrierCopyArg0
         );
         assert_eq!(
+            effect_for("core::slice::<impl [T]>::iter"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::slice::<impl [T]>::iter_mut"),
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
             effect_for("core::slice::<impl [T]>::is_empty"),
             CallEffect::Ignore
         );
@@ -23329,7 +23339,11 @@ mod tests {
         );
         assert_eq!(
             effect_for("core::ops::RangeBounds::start_bound"),
-            CallEffect::Ignore
+            CallEffect::CarrierCopyArg0
+        );
+        assert_eq!(
+            effect_for("core::ops::RangeBounds::end_bound"),
+            CallEffect::CarrierCopyArg0
         );
         assert_eq!(
             effect_for("alloc::vec::Vec::<T, A>::len"),
