@@ -1734,6 +1734,14 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         leaf_key: u64,
     },
+    /// Callee-side: export the by-value carrier anchor for a non-pointer direct-ref return.
+    ///
+    /// This is the return-side counterpart of `RetAnchorTake`: the callee pushes the outer slot
+    /// family that should become the caller-visible reborrow anchor for the returned carrier.
+    RetAnchorPush {
+        callee_id: u64,
+        local: Local,
+    },
     /// Callee-side: push the tag for a returned pointer right before `Return`.
     RetPush {
         callee_id: u64,
@@ -13759,9 +13767,10 @@ impl MyOptimizationPass {
 
         // Caller-side return recovery.
         //
-        // Plain pointer returns use `RetRoot` / `RetTake`. Non-pointer carriers with embedded
-        // pointer fields use `RetAnchorTake` / `RetAnchorRoot` so the destination local keeps a
-        // whole-slot borrow family even though the MIR return place itself is not pointer-typed.
+        // Plain pointer returns use `RetPush` / `RetTake` (or `RetRoot` for opaque callees).
+        // Non-pointer carriers with embedded source-level refs use `RetAnchorPush` /
+        // `RetAnchorTake` (or `RetAnchorRoot` for opaque callees) so the destination local keeps
+        // a whole-slot borrow family even though the MIR return place itself is not pointer-typed.
         //
         // Keep the carrier cases outside the pointer-return classifier: wrapper returns such as
         // `Result<(), BytesMut>` must still import or seed an anchor even though
@@ -14436,7 +14445,21 @@ impl MyOptimizationPass {
                                 ptr_local: RETURN_PLACE,
                             },
                         });
-                    } else if self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty()) {
+                    }
+                    if self.supports_call_boundary_anchor_local(tcx, body, RETURN_PLACE) {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(RETURN_PLACE),
+                            kind: InstrKind::RetAnchorPush {
+                                callee_id,
+                                local: RETURN_PLACE,
+                            },
+                        });
+                    }
+                    if self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty()) {
                         let leaf_ptrs = self.shadowable_leaf_ptr_places_from_place(
                             tcx,
                             body,
@@ -15269,6 +15292,7 @@ impl MyOptimizationPass {
             InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
             InstrKind::RetLeafPush { .. } => hooks.def_id_push_ret_leaf_shadow,
+            InstrKind::RetAnchorPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetAnchorTake { .. } => hooks.def_id_take_ret_tag,
             InstrKind::RetLeafTake { .. } => hooks.def_id_take_ret_leaf_shadow,
@@ -15412,6 +15436,7 @@ impl MyOptimizationPass {
                 | InstrKind::PtrReadAllowUntagged { .. }
                 | InstrKind::PtrWriteAllowUntagged { .. }
                 // Return-boundary exports must run before FnExit tears down the callee frame.
+                | InstrKind::RetAnchorPush { .. }
                 | InstrKind::RetPush { .. }
                 | InstrKind::RetLeafPush { .. }
                 | InstrKind::RetAnchorRoot { .. }
@@ -18036,6 +18061,69 @@ impl MyOptimizationPass {
                 bd.statements.push(slot_addr_stmt1);
                 bd.statements.push(slot_addr_stmt2);
                 bd.terminator = Some(call_term);
+                continue;
+            }
+
+            // Callee-side: push the return anchor for a by-value direct-ref carrier immediately
+            // before the `Return` terminator.
+            if let InstrKind::RetAnchorPush { callee_id, local } = creation_kind {
+                let slot_state = self
+                    .carrier_slot_locals_for_local(
+                        local,
+                        reborrow_anchor_local_for_stack_local,
+                        anchor_is_slot_family_local_for_stack_local,
+                    )
+                    .expect("missing carrier-slot locals for RetAnchorPush");
+
+                let push_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_push_ret_tag,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let args_push: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_usize(tcx, source_info.span, 0),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(slot_state.anchor_local)),
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+
+                let call_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: push_func,
+                        args: args_push,
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+
+                body.basic_blocks_mut()[bb].terminator = Some(call_term);
                 continue;
             }
 
