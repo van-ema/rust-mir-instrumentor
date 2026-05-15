@@ -8309,6 +8309,118 @@ impl MyOptimizationPass {
         Some(selected_local)
     }
 
+    fn materialize_boundary_recovered_source_tag_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        src_local: Local,
+        src_tag_local: Local,
+        export_parent_local_for_ptr_local: &HashMap<Local, Local>,
+        export_parent_is_recovered_local_for_ptr_local: &HashMap<Local, Local>,
+        extra_stmts: &mut Vec<Statement<'tcx>>,
+    ) -> Local {
+        if !matches!(
+            body.local_decls[src_local].ty.kind(),
+            TyKind::Ref(_, _, Mutability::Not)
+        ) {
+            return src_tag_local;
+        }
+
+        let (Some(export_parent_local), Some(recovered_local)) = (
+            export_parent_local_for_ptr_local.get(&src_local).copied(),
+            export_parent_is_recovered_local_for_ptr_local
+                .get(&src_local)
+                .copied(),
+        ) else {
+            return src_tag_local;
+        };
+
+        let recovered_u64_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let not_recovered_u64_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let exact_part_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let export_part_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+        let selected_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.u64, source_info.span));
+
+        extra_stmts.extend([
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(recovered_u64_local),
+                    Rvalue::Cast(
+                        CastKind::IntToInt,
+                        Operand::Copy(Place::from(recovered_local)),
+                        tcx.types.u64,
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(not_recovered_u64_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Sub,
+                        Box::new((
+                            self.const_u64(tcx, source_info.span, 1),
+                            Operand::Copy(Place::from(recovered_u64_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(exact_part_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        Box::new((
+                            Operand::Copy(Place::from(not_recovered_u64_local)),
+                            Operand::Copy(Place::from(src_tag_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(export_part_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        Box::new((
+                            Operand::Copy(Place::from(recovered_u64_local)),
+                            Operand::Copy(Place::from(export_parent_local)),
+                        )),
+                    ),
+                ))),
+            ),
+            Statement::new(
+                source_info,
+                StatementKind::Assign(Box::new((
+                    Place::from(selected_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Add,
+                        Box::new((
+                            Operand::Copy(Place::from(exact_part_local)),
+                            Operand::Copy(Place::from(export_part_local)),
+                        )),
+                    ),
+                ))),
+            ),
+        ]);
+
+        selected_local
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
     /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
@@ -18187,6 +18299,36 @@ impl MyOptimizationPass {
                         anchor_is_slot_family_local_for_stack_local,
                     )
                     .expect("missing carrier-slot locals for RetAnchorPush");
+                let borrow_kind = self
+                    .first_direct_ref_field_place(tcx, body, local)
+                    .map(|(_, _, is_mut)| {
+                        if is_mut {
+                            BorrowKind::Mut {
+                                kind: MutBorrowKind::Default,
+                            }
+                        } else {
+                            BorrowKind::Shared
+                        }
+                    })
+                    .unwrap_or(BorrowKind::Shared);
+                let mut anchor_select_stmts = Vec::new();
+                let selected_anchor_local = self
+                    .materialize_projectionless_slot_anchor_parent_local(
+                        tcx,
+                        body,
+                        bb,
+                        stmt_idx,
+                        source_info,
+                        Place::from(local),
+                        borrow_kind,
+                        tag_local_for_ptr_local,
+                        ref_ancestor_local_for_ptr_local,
+                        reborrow_anchor_local_for_stack_local,
+                        anchor_is_slot_family_local_for_stack_local,
+                        projectionless_anchor_suppressed_locals,
+                        &mut anchor_select_stmts,
+                    )
+                    .unwrap_or(slot_state.anchor_local);
 
                 let push_func = Operand::function_handle(
                     tcx,
@@ -18204,7 +18346,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: Operand::Copy(Place::from(slot_state.anchor_local)),
+                        node: Operand::Copy(Place::from(selected_anchor_local)),
                         span: source_info.span,
                     },
                 ]
@@ -18216,6 +18358,7 @@ impl MyOptimizationPass {
 
                 let (orig_term, is_cleanup) = {
                     let bd = &mut body.basic_blocks_mut()[bb];
+                    bd.statements.extend(anchor_select_stmts);
                     (bd.terminator.take(), bd.is_cleanup)
                 };
 
@@ -18872,6 +19015,7 @@ impl MyOptimizationPass {
                 mark_slot_family,
             } = creation_kind
             {
+                let mut src_tag_select_stmts = Vec::new();
                 let Some(anchor_local) = reborrow_anchor_local_for_stack_local
                     .get(&dst_local)
                     .copied()
@@ -18881,7 +19025,18 @@ impl MyOptimizationPass {
                 let Some(src_tag_operand) = (if let Some(src_tag_local) =
                     tag_local_for_ptr_local.get(&src_local).copied()
                 {
-                    Some(Operand::Copy(Place::from(src_tag_local)))
+                    let selected_src_tag_local = self
+                        .materialize_boundary_recovered_source_tag_local(
+                            tcx,
+                            body,
+                            source_info,
+                            src_local,
+                            src_tag_local,
+                            export_parent_local_for_ptr_local,
+                            export_parent_is_recovered_local_for_ptr_local,
+                            &mut src_tag_select_stmts,
+                        );
+                    Some(Operand::Copy(Place::from(selected_src_tag_local)))
                 } else if let Some(src_anchor_local) = reborrow_anchor_local_for_stack_local
                     .get(&src_local)
                     .copied()
@@ -18916,67 +19071,69 @@ impl MyOptimizationPass {
                 } else {
                     stmt_idx + 1
                 };
+                let inserted_stmt_count = src_tag_select_stmts.len() + 5;
+                let seed_stmts = [
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_is_zero_local),
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Box::new((
+                                    Operand::Copy(Place::from(anchor_local)),
+                                    self.const_u64(tcx, source_info.span, 0),
+                                )),
+                            ),
+                        ))),
+                    ),
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_should_init_local),
+                            Rvalue::Cast(
+                                CastKind::IntToInt,
+                                Operand::Copy(Place::from(anchor_is_zero_local)),
+                                tcx.types.u64,
+                            ),
+                        ))),
+                    ),
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_new_part_local),
+                            Rvalue::BinaryOp(
+                                BinOp::Mul,
+                                Box::new((
+                                    Operand::Copy(Place::from(anchor_should_init_local)),
+                                    src_tag_operand,
+                                )),
+                            ),
+                        ))),
+                    ),
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_selected_local),
+                            Rvalue::BinaryOp(
+                                BinOp::Add,
+                                Box::new((
+                                    Operand::Copy(Place::from(anchor_local)),
+                                    Operand::Copy(Place::from(anchor_new_part_local)),
+                                )),
+                            ),
+                        ))),
+                    ),
+                    Statement::new(
+                        source_info,
+                        StatementKind::Assign(Box::new((
+                            Place::from(anchor_local),
+                            Rvalue::Use(Operand::Copy(Place::from(anchor_selected_local))),
+                        ))),
+                    ),
+                ];
                 bd.statements.splice(
                     insert_at..insert_at,
-                    [
-                        Statement::new(
-                            source_info,
-                            StatementKind::Assign(Box::new((
-                                Place::from(anchor_is_zero_local),
-                                Rvalue::BinaryOp(
-                                    BinOp::Eq,
-                                    Box::new((
-                                        Operand::Copy(Place::from(anchor_local)),
-                                        self.const_u64(tcx, source_info.span, 0),
-                                    )),
-                                ),
-                            ))),
-                        ),
-                        Statement::new(
-                            source_info,
-                            StatementKind::Assign(Box::new((
-                                Place::from(anchor_should_init_local),
-                                Rvalue::Cast(
-                                    CastKind::IntToInt,
-                                    Operand::Copy(Place::from(anchor_is_zero_local)),
-                                    tcx.types.u64,
-                                ),
-                            ))),
-                        ),
-                        Statement::new(
-                            source_info,
-                            StatementKind::Assign(Box::new((
-                                Place::from(anchor_new_part_local),
-                                Rvalue::BinaryOp(
-                                    BinOp::Mul,
-                                    Box::new((
-                                        Operand::Copy(Place::from(anchor_should_init_local)),
-                                        src_tag_operand,
-                                    )),
-                                ),
-                            ))),
-                        ),
-                        Statement::new(
-                            source_info,
-                            StatementKind::Assign(Box::new((
-                                Place::from(anchor_selected_local),
-                                Rvalue::BinaryOp(
-                                    BinOp::Add,
-                                    Box::new((
-                                        Operand::Copy(Place::from(anchor_local)),
-                                        Operand::Copy(Place::from(anchor_new_part_local)),
-                                    )),
-                                ),
-                            ))),
-                        ),
-                        Statement::new(
-                            source_info,
-                            StatementKind::Assign(Box::new((
-                                Place::from(anchor_local),
-                                Rvalue::Use(Operand::Copy(Place::from(anchor_selected_local))),
-                            ))),
-                        ),
-                    ],
+                    src_tag_select_stmts.into_iter().chain(seed_stmts),
                 );
                 if let Some(dst_anchor_state_local) = dst_anchor_state_local {
                     let state_stmt = if mark_slot_family {
@@ -19004,7 +19161,8 @@ impl MyOptimizationPass {
                             ))),
                         )
                     };
-                    bd.statements.insert(insert_at + 5, state_stmt);
+                    bd.statements
+                        .insert(insert_at + inserted_stmt_count, state_stmt);
                 }
                 continue;
             }
