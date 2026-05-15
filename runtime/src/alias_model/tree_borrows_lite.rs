@@ -26,6 +26,7 @@ enum TbPerm {
     Reserved { conflicted: bool },
     Active,
     Frozen,
+    ShadowedLocal,
     Disabled,
 }
 
@@ -265,7 +266,7 @@ fn tb_lite_on_call_arg_inplace_alias(callee_id: u64, parent_tag: u64, addr: usiz
 ///
 /// Protected children created for this callee are released, any same-slot ancestor protectors
 /// shadowed by nested `&mut self` calls are restored, and non-returned protected tags are
-/// disabled at protector end.
+/// retired at protector end.
 fn tb_lite_on_call_exit(callee_id: u64) {
     if !rz_tb_lite_enabled() {
         return;
@@ -401,10 +402,12 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             .any(|ret_tag| ret_tag != tag && tb_is_ancestor(&tree.nodes, tag, ret_tag));
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
-            if !returned_tags.contains(&tag)
-                && !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant)
-            {
-                tb_disable_node_for_protector_end(node);
+            if !returned_tags.contains(&tag) {
+                if returned_descendant && matches!(node.kind, BorrowKind::Unique) {
+                    tb_shadow_local_node(node);
+                } else if !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant) {
+                    tb_disable_node_for_protector_end(node);
+                }
             }
         }
         tb_unshadow_same_slot_protected_unique_ancestors(
@@ -1242,6 +1245,8 @@ fn tb_lite_check(
             (AliasAccessKind::Read, false, TbPerm::Reserved { .. }, _) => old_perm,
             (AliasAccessKind::Read, false, TbPerm::Active, true) => TbPerm::Disabled,
             (AliasAccessKind::Read, false, TbPerm::Active, false) => TbPerm::Frozen,
+            (AliasAccessKind::Read, false, TbPerm::ShadowedLocal, true) => TbPerm::Disabled,
+            (AliasAccessKind::Read, false, TbPerm::ShadowedLocal, false) => TbPerm::Frozen,
             (AliasAccessKind::Read, false, TbPerm::Frozen, _) => TbPerm::Frozen,
             (AliasAccessKind::Read, false, TbPerm::Disabled, _) => TbPerm::Disabled,
 
@@ -1259,6 +1264,7 @@ fn tb_lite_check(
             }
             (AliasAccessKind::Write, true, TbPerm::Reserved { .. }, _) => TbPerm::Active,
             (AliasAccessKind::Write, true, TbPerm::Active, _) => TbPerm::Active,
+            (AliasAccessKind::Write, true, TbPerm::ShadowedLocal, _) => TbPerm::ShadowedLocal,
             (AliasAccessKind::Write, true, TbPerm::Frozen, _)
                 if n.tag == access_tag && matches!(tmeta.kind, PtrKind::RefMut) =>
             {
@@ -1669,6 +1675,14 @@ fn tb_is_live_node(n: &TbNode) -> bool {
 }
 
 #[inline]
+fn tb_shadow_local_node(n: &mut TbNode) {
+    n.perm = TbPerm::ShadowedLocal;
+    n.lazy_perm = TbPerm::ShadowedLocal;
+    n.alive = true;
+    n.poisoned_by_protector_end = false;
+}
+
+#[inline]
 fn tb_disable_node(n: &mut TbNode) {
     n.perm = TbPerm::Disabled;
     n.alive = false;
@@ -1707,7 +1721,7 @@ fn tb_reactivate_frozen_unique_ancestors_without_readers(
             tree.nodes.get(&cursor).map(|node| {
                 let restored_perm = match node.lazy_perm {
                     TbPerm::Reserved { .. } | TbPerm::Active => Some(node.lazy_perm),
-                    TbPerm::Frozen | TbPerm::Disabled => None,
+                    TbPerm::Frozen | TbPerm::ShadowedLocal | TbPerm::Disabled => None,
                 };
                 (
                     node.parent,
