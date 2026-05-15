@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, bounds_len_bytes_or_zero, bounds_len_is_precise_empty,
-    find_alloc_containing, mut_arg_ret_leaf_shadows, mut_arg_ret_tags, ret_leaf_shadows, ret_tags,
-    rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
+    allocs, append_location_if_enabled, boundary_survivor_tags_for_callee,
+    boundary_survivor_tags_for_thread, bounds_len_bytes_or_zero, bounds_len_is_precise_empty,
+    find_alloc_containing, rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -288,59 +288,7 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         return;
     }
 
-    let returned_tags: HashSet<u64> = ret_tags()
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|((ret_thread_id, ret_callee_id, _addr), _tag)| {
-            *ret_thread_id == thread_id && *ret_callee_id == callee_id
-        })
-        .map(|((_ret_thread_id, _ret_callee_id, _addr), tag)| *tag)
-        .chain(
-            ret_leaf_shadows()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|((ret_thread_id, ret_callee_id, _leaf_index), _shadow)| {
-                    *ret_thread_id == thread_id && *ret_callee_id == callee_id
-                })
-                .map(
-                    |(
-                        (_ret_thread_id, _ret_callee_id, _leaf_index),
-                        (tag, _ref_ancestor, _export_parent, _export_parent_recovered),
-                    )| *tag,
-                ),
-        )
-        .chain(
-            mut_arg_ret_tags()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(
-                    |((ret_thread_id, ret_callee_id, _arg_index, _addr), _tag)| {
-                        *ret_thread_id == thread_id && *ret_callee_id == callee_id
-                    },
-                )
-                .map(|((_ret_thread_id, _ret_callee_id, _arg_index, _addr), tag)| *tag),
-        )
-        .chain(
-            mut_arg_ret_leaf_shadows()
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(
-                    |((ret_thread_id, ret_callee_id, _arg_index, _addr, _leaf_index), _shadow)| {
-                        *ret_thread_id == thread_id && *ret_callee_id == callee_id
-                    },
-                )
-                .map(
-                    |(
-                        (_ret_thread_id, _ret_callee_id, _arg_index, _addr, _leaf_index),
-                        (tag, _ref_ancestor, _export_parent, _export_parent_recovered),
-                    )| { *tag },
-                ),
-        )
-        .collect();
+    let returned_tags = boundary_survivor_tags_for_callee(callee_id);
     let tmap = tags().lock().unwrap();
     let mut all = tb_state().lock().unwrap();
     for tag in frame.protected_tags {
@@ -1015,12 +963,21 @@ fn tb_lite_on_tag_killed(tag: u64) {
     let Some(tree) = all.get_mut(&base) else {
         return;
     };
+    let boundary_survivor_tags = boundary_survivor_tags_for_thread();
+    let boundary_surviving_descendant = boundary_survivor_tags
+        .iter()
+        .copied()
+        .any(|survivor| survivor != tag && tb_is_ancestor(&tree.nodes, tag, survivor));
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
     let parent = node.parent;
     let killed_readonly = matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst);
-    tb_disable_node(node);
+    if boundary_surviving_descendant && matches!(node.kind, BorrowKind::Unique) {
+        tb_shadow_local_node(node);
+    } else {
+        tb_disable_node(node);
+    }
     if killed_readonly {
         tb_reactivate_frozen_unique_ancestors_without_readers(tree, parent);
     }

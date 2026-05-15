@@ -912,7 +912,7 @@ static RZ_ALLOC: RzGlobalAlloc = RzGlobalAlloc;
 
 // === end global allocator wrapper ===========================================
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Mutex;
 use std::thread::ThreadId;
@@ -1390,6 +1390,8 @@ static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64
 static MUT_ARG_RET_LEAF_SHADOWS: OnceLock<
     Mutex<HashMap<(ThreadId, u64, u64, usize, u64), PtrShadowTransport>>,
 > = OnceLock::new();
+static BOUNDARY_SURVIVOR_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64), HashSet<u64>>>> =
+    OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
@@ -1561,6 +1563,53 @@ pub(crate) fn mut_arg_ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, 
 pub(crate) fn mut_arg_ret_leaf_shadows(
 ) -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize, u64), PtrShadowTransport>> {
     MUT_ARG_RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn boundary_survivor_tags_for_callee(callee_id: u64) -> HashSet<u64> {
+    let thread_id = std::thread::current().id();
+    boundary_survivor_tags()
+        .lock()
+        .unwrap()
+        .get(&(thread_id, callee_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(crate) fn boundary_survivor_tags_for_thread() -> HashSet<u64> {
+    let thread_id = std::thread::current().id();
+    let survivors = boundary_survivor_tags().lock().unwrap();
+    let mut merged = HashSet::new();
+    for ((tid, _callee_id), tags) in survivors.iter() {
+        if *tid == thread_id {
+            merged.extend(tags.iter().copied());
+        }
+    }
+    merged
+}
+
+fn boundary_survivor_tags() -> &'static Mutex<HashMap<(ThreadId, u64), HashSet<u64>>> {
+    BOUNDARY_SURVIVOR_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_boundary_survivor_tag(callee_id: u64, tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let thread_id = std::thread::current().id();
+    boundary_survivor_tags()
+        .lock()
+        .unwrap()
+        .entry((thread_id, callee_id))
+        .or_default()
+        .insert(tag);
+}
+
+fn clear_boundary_survivor_tags(callee_id: u64) {
+    let thread_id = std::thread::current().id();
+    boundary_survivor_tags()
+        .lock()
+        .unwrap()
+        .remove(&(thread_id, callee_id));
 }
 
 #[inline]
@@ -5149,6 +5198,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
     }
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
+        remember_boundary_survivor_tag(callee_id, tag);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_tags()
@@ -5174,6 +5224,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
             callee_id, arg_index, addr, raw_tag, tag
         );
     }
+    clear_boundary_survivor_tags(callee_id);
     tag
 }
 
@@ -5206,6 +5257,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag_or_zero(
             callee_id, arg_index, addr, raw_tag, tag
         );
     }
+    clear_boundary_survivor_tags(callee_id);
     tag
 }
 
@@ -5229,6 +5281,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     }
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
+        remember_boundary_survivor_tag(callee_id, tag);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_leaf_shadows().lock().unwrap().insert(
@@ -5261,6 +5314,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
         export_parent,
         export_parent_recovered,
     );
+    clear_boundary_survivor_tags(callee_id);
 }
 
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
@@ -5277,6 +5331,7 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     }
     if tag != 0 {
         active_alias_model().on_ret_export(tag, addr);
+        remember_boundary_survivor_tag(callee_id, tag);
     }
     if !validate_before_export {
         // Tree Borrows returned `&mut` values can be repaired by the return-side export hook
@@ -5303,6 +5358,7 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
     }
     if tag != 0 {
         active_alias_model().on_ret_export(tag, 0);
+        remember_boundary_survivor_tag(callee_id, tag);
     }
     let thread_id = std::thread::current().id();
     ret_leaf_shadows().lock().unwrap().insert(
@@ -5320,6 +5376,7 @@ pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
     }
     if tag != 0 {
         active_alias_model().on_ret_export(tag, 0);
+        remember_boundary_survivor_tag(callee_id, tag);
         let thread_id = std::thread::current().id();
         ret_tags()
             .lock()
@@ -5355,11 +5412,13 @@ pub extern "C" fn __rz_require_loaded_ptr_tag(tag: u64) {
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    ret_tags()
+    let tag = ret_tags()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id, addr))
-        .unwrap_or(0)
+        .unwrap_or(0);
+    clear_boundary_survivor_tags(callee_id);
+    tag
 }
 
 /// Take one returned carrier-leaf shadow and recreate the caller destination slot shadow.
@@ -5379,6 +5438,7 @@ pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
         export_parent,
         export_parent_recovered,
     );
+    clear_boundary_survivor_tags(callee_id);
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -5403,6 +5463,7 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
             .remove(&(thread_id, callee_id, addr))
             .unwrap_or(0)
     };
+    clear_boundary_survivor_tags(callee_id);
     if tag != 0 {
         return tag;
     }
