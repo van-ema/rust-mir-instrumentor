@@ -3,8 +3,10 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, ret_tags, rz_sb_suppressed, tags,
-    PtrKind, TagMeta,
+    allocs, append_location_if_enabled, bounds_len_bytes_or_zero,
+    bounds_len_has_explicit_byte_bounds, bounds_len_is_exact_zst, bounds_len_is_known_nonempty,
+    bounds_len_is_precise_empty, find_alloc_containing, ret_tags, rz_sb_suppressed, tags, PtrKind,
+    TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -45,8 +47,14 @@ fn sb_protector_frames() -> &'static Mutex<Vec<SbProtectorFrame>> {
 }
 
 #[inline]
-fn range_from_ptr(addr: usize, len: usize) -> (usize, usize) {
+fn range_from_access(addr: usize, len: usize) -> (usize, usize) {
     let size = len.max(1);
+    (addr, addr.saturating_add(size))
+}
+
+#[inline]
+fn range_from_bounds(addr: usize, len: usize) -> (usize, usize) {
+    let size = bounds_len_bytes_or_zero(len);
     (addr, addr.saturating_add(size))
 }
 
@@ -142,15 +150,17 @@ fn sb_lite_push(tag: u64, tmeta: &TagMeta) {
 
     let mut bmap = borrows().lock().unwrap();
     let stack = bmap.entry(base).or_default();
-    let (start, end) = if tmeta.bounds_len != 0 {
-        range_from_ptr(tmeta.pointee_addr, tmeta.bounds_len)
+    let (start, end) = if bounds_len_is_exact_zst(tmeta.bounds_len) {
+        range_from_access(tmeta.pointee_addr, 1)
+    } else if bounds_len_has_explicit_byte_bounds(tmeta.bounds_len) {
+        range_from_bounds(tmeta.pointee_addr, tmeta.bounds_len)
     } else if let Some(end) = alloc_end {
         // For thin refs we often do not have precise type-size metadata here.
         // Use the containing allocation tail as a conservative fallback instead
         // of a 1-byte pseudo-range to avoid false SB conflicts on field/index accesses.
         (tmeta.pointee_addr, end)
     } else {
-        range_from_ptr(tmeta.pointee_addr, 1)
+        range_from_access(tmeta.pointee_addr, 1)
     };
 
     // Retagging: if we know the parent, truncate to it (invalidate younger tags).
@@ -315,7 +325,11 @@ fn sb_lite_validate_ref_creation(
         None => return None,
     };
 
-    let new_len = if bounds_len != 0 { bounds_len } else { 1 };
+    let new_len = if bounds_len_is_precise_empty(bounds_len) {
+        0
+    } else {
+        bounds_len_bytes_or_zero(bounds_len).max(1)
+    };
     let overlaps = |entry: &BorrowEntry| {
         ranges_overlap(
             entry.start,
@@ -356,7 +370,7 @@ fn sb_lite_validate_ref_creation(
 
     // Keep default behavior for thin refs. We only add extra overlap checks for mutable wide
     // reborrows (slice/str-like) where lineage has no same-base ref ancestor.
-    if !matches!(new_kind, PtrKind::RefMut) || bounds_len == 0 {
+    if !matches!(new_kind, PtrKind::RefMut) || !bounds_len_is_known_nonempty(bounds_len) {
         return None;
     }
 
@@ -381,7 +395,7 @@ fn sb_lite_validate_ref_creation(
                     pointee_addr,
                     bounds_len,
                     top_tm.pointee_addr,
-                    top_tm.bounds_len,
+                    bounds_len_bytes_or_zero(top_tm.bounds_len),
                 ) {
                     return Some(format!(
                         "REBORROW mutable overlaps active unique sibling: new=[0x{:x},0x{:x}) top={}/[0x{:x},0x{:x}) parent_ref={}",
@@ -389,7 +403,9 @@ fn sb_lite_validate_ref_creation(
                         pointee_addr.saturating_add(bounds_len),
                         top.tag,
                         top_tm.pointee_addr,
-                        top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
+                        top_tm
+                            .pointee_addr
+                            .saturating_add(bounds_len_bytes_or_zero(top_tm.bounds_len)),
                         pref_tag
                     ));
                 }
@@ -407,7 +423,7 @@ fn sb_lite_validate_ref_creation(
                 pointee_addr,
                 bounds_len,
                 top_tm.pointee_addr,
-                top_tm.bounds_len,
+                bounds_len_bytes_or_zero(top_tm.bounds_len),
             ) {
                 let parent_root = sb_lite_root_tag(&tmap, parent_tag);
                 let top_root = sb_lite_root_tag(&tmap, top.tag);
@@ -416,8 +432,10 @@ fn sb_lite_validate_ref_creation(
                 } else {
                     false
                 };
-                let same_range =
-                    pointee_addr == top_tm.pointee_addr && bounds_len == top_tm.bounds_len;
+                let same_range = bounds_len_has_explicit_byte_bounds(bounds_len)
+                    && bounds_len_has_explicit_byte_bounds(top_tm.bounds_len)
+                    && pointee_addr == top_tm.pointee_addr
+                    && bounds_len == top_tm.bounds_len;
                 // Missing-parent fallback is intentionally conservative to limit false positives
                 // when lineage is incomplete (e.g., wrapper types like NonNull). If roots differ,
                 // report only on exact-range duplicates; partial overlaps are too noisy.
@@ -430,7 +448,9 @@ fn sb_lite_validate_ref_creation(
                     pointee_addr.saturating_add(bounds_len),
                     top.tag,
                     top_tm.pointee_addr,
-                    top_tm.pointee_addr.saturating_add(top_tm.bounds_len),
+                    top_tm
+                        .pointee_addr
+                        .saturating_add(bounds_len_bytes_or_zero(top_tm.bounds_len)),
                     parent_tag,
                     parent_root,
                     top_root,
@@ -537,7 +557,7 @@ fn sb_lite_check(
         }
     };
 
-    let (access_start, access_end) = range_from_ptr(addr, size);
+    let (access_start, access_end) = range_from_access(addr, size);
     let top = match stack
         .iter()
         .rev()

@@ -1427,6 +1427,16 @@ mod logging;
 pub(in crate::instrumentation) enum SizeOperand<'tcx> {
     Const(Operand<'tcx>),
     SizeOf(Ty<'tcx>),
+    /// Bounds-length encoding for a sized reference pointee.
+    ///
+    /// Runtime-side bounds metadata distinguishes:
+    /// - `usize::MAX` => unknown
+    /// - `0` => precise empty wide view (`&[]`, empty `str`, ...)
+    /// - `usize::MAX - 1` => exact zero-sized thin pointee (`&Cell<()>`, `&()`, ...)
+    ///
+    /// This variant preserves that distinction without a side-channel bit: it lowers to
+    /// `size_of::<T>()`, and maps the runtime value `0` to the exact-ZST sentinel.
+    RefSizedBoundsLen(Ty<'tcx>),
     AlignOf(Ty<'tcx>),
     ElemCount {
         elem_ty: Ty<'tcx>,
@@ -2881,7 +2891,8 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ptr_place: Place<'tcx>,
     ) -> Option<Place<'tcx>> {
-        let (pointee_place, pointee_ty) = self.pointer_pointee_place_and_ty(tcx, body, ptr_place)?;
+        let (pointee_place, pointee_ty) =
+            self.pointer_pointee_place_and_ty(tcx, body, ptr_place)?;
         let leaf_specs =
             self.shadowable_leaf_ptr_specs_from_place(tcx, body, pointee_place, pointee_ty);
         (leaf_specs.len() == 1).then_some(leaf_specs[0].place)
@@ -4559,7 +4570,20 @@ impl MyOptimizationPass {
                     self.align_operand_for_ty(tcx, body, *pointee, span)
                 }
             }
-            _ => self.align_operand_for_src_place(tcx, body, src, span),
+            _ => {
+                if self.place_may_cross_packed_field(tcx, body, src) {
+                    SizeOperand::Const(self.const_usize(tcx, span, 1))
+                } else if self.place_contains_deref(src) {
+                    match dst_ty.kind() {
+                        TyKind::Ref(_, dst_pointee, _) => {
+                            self.align_operand_for_ty(tcx, body, *dst_pointee, span)
+                        }
+                        _ => self.align_operand_for_src_place(tcx, body, src, span),
+                    }
+                } else {
+                    self.align_operand_for_src_place(tcx, body, src, span)
+                }
+            }
         }
     }
 
@@ -4610,7 +4634,7 @@ impl MyOptimizationPass {
     }
 
     /// Best-effort bounds length for wide pointers (slice/str), in bytes.
-    /// Returns 0 for thin pointers or unknown metadata.
+    /// Returns `usize::MAX` for thin pointers or unknown metadata.
     fn bounds_len_operand_for_ptr_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -4621,7 +4645,7 @@ impl MyOptimizationPass {
         let ptr_ty = body.local_decls[ptr_local].ty;
         let pointee = match ptr_ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
-            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
+            _ => return self.unknown_bounds_len_operand(tcx, span),
         };
 
         match pointee.kind() {
@@ -4637,9 +4661,9 @@ impl MyOptimizationPass {
                     field_idx,
                     elem_ty,
                 },
-                None => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+                None => self.unknown_bounds_len_operand(tcx, span),
             },
-            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+            _ => self.unknown_bounds_len_operand(tcx, span),
         }
     }
 
@@ -4676,14 +4700,19 @@ impl MyOptimizationPass {
                         field_idx,
                         elem_ty,
                     },
-                    None => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+                    None => self.unknown_bounds_len_operand(tcx, span),
                 }
             }
             _ if pointee.is_sized(tcx, body.typing_env(tcx)) => {
-                self.size_operand_for_ty(tcx, body, pointee, span)
+                SizeOperand::RefSizedBoundsLen(pointee)
             }
-            _ => SizeOperand::Const(self.const_usize(tcx, span, 0)),
+            _ => self.unknown_bounds_len_operand(tcx, span),
         }
+    }
+
+    #[inline]
+    fn unknown_bounds_len_operand<'tcx>(&self, tcx: TyCtxt<'tcx>, span: Span) -> SizeOperand<'tcx> {
+        SizeOperand::Const(self.const_usize(tcx, span, usize::MAX))
     }
 
     fn ptr_ty_has_precise_wide_bounds<'tcx>(
@@ -11071,6 +11100,92 @@ impl MyOptimizationPass {
                 );
                 (Operand::Copy(Place::from(size_local)), vec![stmt])
             }
+            SizeOperand::RefSizedBoundsLen(ty) => {
+                let size_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let is_zero_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                let is_zero_usize_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let zst_marker_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let encoded_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+
+                let size_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(size_local),
+                        Rvalue::NullaryOp(NullOp::SizeOf, *ty),
+                    ))),
+                );
+                let is_zero_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(is_zero_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Eq,
+                            Box::new((
+                                Operand::Copy(Place::from(size_local)),
+                                self.const_usize(tcx, source_info.span, 0),
+                            )),
+                        ),
+                    ))),
+                );
+                let is_zero_usize_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(is_zero_usize_local),
+                        Rvalue::Cast(
+                            CastKind::IntToInt,
+                            Operand::Copy(Place::from(is_zero_local)),
+                            tcx.types.usize,
+                        ),
+                    ))),
+                );
+                let zst_marker_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(zst_marker_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Mul,
+                            Box::new((
+                                Operand::Copy(Place::from(is_zero_usize_local)),
+                                self.const_usize(tcx, source_info.span, usize::MAX - 1),
+                            )),
+                        ),
+                    ))),
+                );
+                let encoded_stmt = Statement::new(
+                    source_info,
+                    StatementKind::Assign(Box::new((
+                        Place::from(encoded_local),
+                        Rvalue::BinaryOp(
+                            BinOp::Add,
+                            Box::new((
+                                Operand::Copy(Place::from(size_local)),
+                                Operand::Copy(Place::from(zst_marker_local)),
+                            )),
+                        ),
+                    ))),
+                );
+
+                (
+                    Operand::Copy(Place::from(encoded_local)),
+                    vec![
+                        size_stmt,
+                        is_zero_stmt,
+                        is_zero_usize_stmt,
+                        zst_marker_stmt,
+                        encoded_stmt,
+                    ],
+                )
+            }
             SizeOperand::AlignOf(ty) => {
                 let align_local = body
                     .local_decls
@@ -12718,15 +12833,14 @@ impl MyOptimizationPass {
                                     let dst_ty = body.local_decls[dst_local].ty;
                                     let pointee_place_and_ty =
                                         self.pointer_pointee_place_and_ty(tcx, body, p0);
-                                    let pointee_leaf_place = if self
-                                        .is_shadowable_ptr_ty(tcx, body, dst_ty)
-                                    {
-                                        self.single_shadowable_leaf_place_for_pointer_pointee(
-                                            tcx, body, p0,
-                                        )
-                                    } else {
-                                        None
-                                    };
+                                    let pointee_leaf_place =
+                                        if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
+                                            self.single_shadowable_leaf_place_for_pointer_pointee(
+                                                tcx, body, p0,
+                                            )
+                                        } else {
+                                            None
+                                        };
                                     let loaded_ptr_ty = match ty0.kind() {
                                         TyKind::RawPtr(pointee_ty, _mutbl)
                                         | TyKind::Ref(_, pointee_ty, _mutbl) => Some(*pointee_ty),
@@ -12752,14 +12866,15 @@ impl MyOptimizationPass {
                                         if let Some((pointee_place, pointee_ty)) =
                                             pointee_place_and_ty
                                         {
-                                            let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
-                                                tcx,
-                                                body,
-                                                Place::from(dst_local),
-                                                dst_ty,
-                                            );
-                                            let src_leafs =
-                                                self.shadowable_leaf_ptr_specs_from_place(
+                                            let dst_leafs = self
+                                                .shadowable_leaf_ptr_specs_from_place(
+                                                    tcx,
+                                                    body,
+                                                    Place::from(dst_local),
+                                                    dst_ty,
+                                                );
+                                            let src_leafs = self
+                                                .shadowable_leaf_ptr_specs_from_place(
                                                     tcx,
                                                     body,
                                                     pointee_place,
@@ -12771,23 +12886,24 @@ impl MyOptimizationPass {
                                                 )
                                             {
                                                 for (dst_spec, src_spec) in matched_leafs {
-                                                    let kind = if src_spec.place.projection.is_empty()
-                                                        && self.is_shadowable_ptr_ty(
-                                                            tcx,
-                                                            body,
-                                                            dst_spec.ty,
-                                                        )
-                                                    {
-                                                        ptr_locals_needing_tag
-                                                            .insert(src_spec.place.local);
-                                                        InstrKind::ShadowStore {
-                                                            src_local: src_spec.place.local,
-                                                        }
-                                                    } else {
-                                                        InstrKind::ShadowCopySlot {
-                                                            src_place: src_spec.place,
-                                                        }
-                                                    };
+                                                    let kind =
+                                                        if src_spec.place.projection.is_empty()
+                                                            && self.is_shadowable_ptr_ty(
+                                                                tcx,
+                                                                body,
+                                                                dst_spec.ty,
+                                                            )
+                                                        {
+                                                            ptr_locals_needing_tag
+                                                                .insert(src_spec.place.local);
+                                                            InstrKind::ShadowStore {
+                                                                src_local: src_spec.place.local,
+                                                            }
+                                                        } else {
+                                                            InstrKind::ShadowCopySlot {
+                                                                src_place: src_spec.place,
+                                                            }
+                                                        };
                                                     insert_points.push(InsertPoint {
                                                         bb: tgt_bb,
                                                         stmt_idx: 0,
@@ -12993,9 +13109,10 @@ impl MyOptimizationPass {
                                         Place::from(dst_local),
                                         dst_ty,
                                     );
-                                    let direct_src_leafs = self.shadowable_leaf_ptr_specs_from_place(
-                                        tcx, body, src_place, src_ty,
-                                    );
+                                    let direct_src_leafs = self
+                                        .shadowable_leaf_ptr_specs_from_place(
+                                            tcx, body, src_place, src_ty,
+                                        );
                                     let pointee_src_leafs = self
                                         .pointer_pointee_place_and_ty(tcx, body, src_place)
                                         .map(|(pointee_place, pointee_ty)| {
@@ -13022,11 +13139,7 @@ impl MyOptimizationPass {
                                     {
                                         for (dst_spec, src_spec) in matched_leafs {
                                             let kind = if src_spec.place.projection.is_empty()
-                                                && self.is_shadowable_ptr_ty(
-                                                    tcx,
-                                                    body,
-                                                    dst_spec.ty,
-                                                )
+                                                && self.is_shadowable_ptr_ty(tcx, body, dst_spec.ty)
                                             {
                                                 ptr_locals_needing_tag.insert(src_spec.place.local);
                                                 InstrKind::ShadowStore {
@@ -21106,9 +21219,7 @@ impl MyOptimizationPass {
                     // - bit1: projected-source creation hint (used by runtime lineage repair)
                     // - bit2: stronger root-origin repair hint (bounded overlap recovery)
                     // - bit4: TB-lite raw is a derived same-family view
-                    // - bit6: hook-specific marker:
-                    //   * ref creation had precise wide-pointer bounds metadata
-                    //   * raw creation should validate projected/derived provenance immediately
+                    // - bit6: raw creation should validate projected/derived provenance immediately
                     // - bit7: deref-based raw creation must reject exposed/no-provenance parents
                     let alias_flags: u8 = match &creation_kind {
                         InstrKind::Ref { src, .. } => {
@@ -21139,10 +21250,6 @@ impl MyOptimizationPass {
                                 // in TB-lite. Mark only this path so ordinary repeated `&mut`
                                 // call arguments do not invalidate each other.
                                 flags |= 0b1000;
-                            }
-                            let dst_ty = place.ty(&body.local_decls, tcx).ty;
-                            if self.ptr_ty_has_precise_wide_bounds(tcx, body, dst_ty) {
-                                flags |= 0b0100_0000;
                             }
                             flags
                         }
@@ -21189,12 +21296,6 @@ impl MyOptimizationPass {
                             // synthesize a fresh root for a pointer that should remain attached to
                             // an existing live lineage at the same address.
                             flags |= 0b10;
-                            let dst_ty = body.local_decls[*dst_local].ty;
-                            if matches!(dst_ty.kind(), TyKind::Ref(..))
-                                && self.ptr_ty_has_precise_wide_bounds(tcx, body, dst_ty)
-                            {
-                                flags |= 0b0100_0000;
-                            }
                             flags
                         }
                         _ => {
@@ -21239,9 +21340,7 @@ impl MyOptimizationPass {
                                 source_info.span,
                             ),
                         })
-                        .unwrap_or_else(|| {
-                            SizeOperand::Const(self.const_usize(tcx, source_info.span, 0))
-                        });
+                        .unwrap_or_else(|| self.unknown_bounds_len_operand(tcx, source_info.span));
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);

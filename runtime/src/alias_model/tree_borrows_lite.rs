@@ -3,9 +3,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::{
-    allocs, append_location_if_enabled, find_alloc_containing, mut_arg_ret_leaf_shadows,
-    mut_arg_ret_tags, ret_leaf_shadows, ret_tags, rz_sb_suppressed, rz_violation, tag_store, tags,
-    PtrKind, TagMeta,
+    allocs, append_location_if_enabled, bounds_len_bytes_or_zero, bounds_len_is_precise_empty,
+    find_alloc_containing, mut_arg_ret_leaf_shadows, mut_arg_ret_tags, ret_leaf_shadows, ret_tags,
+    rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -411,7 +411,7 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             tree,
             tag,
             tmeta.pointee_addr,
-            tb_effective_len(tmeta.bounds_len),
+            tb_node_len_for_meta(tmeta),
         );
     }
     for tag in frame.inplace_protected_tags {
@@ -489,7 +489,7 @@ fn tb_lite_validate_ref_creation(
         return None;
     }
 
-    let new_len = tb_effective_len(bounds_len);
+    let new_len = tb_effective_access_len(bounds_len_bytes_or_zero(bounds_len));
     let new_end = pointee_addr.saturating_add(new_len);
     let base = tb_base_for_addr(pointee_addr);
     let (parent_ref, parent_epoch, parent_tag_epoch) = if parent_tag != 0 {
@@ -580,7 +580,7 @@ fn tb_lite_resolve_parent_for_new_node(
     } else {
         tmeta.parent
     };
-    let exact_new_len = tb_effective_len(tmeta.bounds_len);
+    let exact_new_len = tb_node_len_for_meta(tmeta);
     let effective_parent = if matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
         && effective_parent != 0
         && tree.nodes.get(&effective_parent).is_some_and(|node| {
@@ -642,7 +642,7 @@ fn tb_lite_insert_tag_node(
         perm,
         lazy_perm: perm,
         start: tmeta.pointee_addr,
-        len: tb_effective_len(tmeta.bounds_len),
+        len: tb_node_len_for_meta(tmeta),
         extra_ranges: Vec::new(),
         alive: true,
         protected,
@@ -1436,7 +1436,7 @@ fn tb_lite_check(
         }
     }
 
-    let access_len = tb_effective_len(size);
+    let access_len = tb_effective_access_len(size);
     for (tag, next, covered) in updates {
         if let Some(n) = tree.nodes.get_mut(&tag) {
             if covered {
@@ -1480,7 +1480,7 @@ fn tb_lite_recover_same_place_live_sibling(
         return None;
     }
 
-    let access_len = tb_effective_len(size);
+    let access_len = tb_effective_access_len(size);
     tree.nodes
         .values()
         .filter(|n| n.tag != dead_tag)
@@ -1502,7 +1502,7 @@ fn tb_lite_recover_root_raw_mut_sibling_for_const_write(
     size: usize,
     alloc_epoch: u64,
 ) -> Option<u64> {
-    let access_len = tb_effective_len(size);
+    let access_len = tb_effective_access_len(size);
     if raw_const_node.kind != BorrowKind::RawConst
         || raw_const_node.parent != 0
         || raw_const_node.start != addr
@@ -1582,11 +1582,22 @@ fn tb_dump(
 }
 
 #[inline]
-fn tb_effective_len(bounds_len: usize) -> usize {
-    if bounds_len == 0 {
+fn tb_node_len_for_meta(tmeta: &TagMeta) -> usize {
+    // Keep precise empty slice/str views in the lineage without inflating them into synthetic
+    // 1-byte authority. Unknown bounds still use the minimal 1-byte TB-lite footprint.
+    if bounds_len_is_precise_empty(tmeta.bounds_len) {
+        0
+    } else {
+        tb_effective_access_len(bounds_len_bytes_or_zero(tmeta.bounds_len))
+    }
+}
+
+#[inline]
+fn tb_effective_access_len(size: usize) -> usize {
+    if size == 0 {
         1
     } else {
-        bounds_len
+        size
     }
 }
 

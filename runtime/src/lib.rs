@@ -548,7 +548,7 @@ fn rz_validate_ref_creation_addr(
         PtrKind::RefShared => "READ",
         _ => "READ",
     };
-    let access_len = bounds_len.max(1);
+    let access_len = bounds_len_bytes_or_zero(bounds_len).max(1);
 
     let suspicious_untracked_parent = tag_store::get(parent_tag)
         .as_ref()
@@ -570,10 +570,10 @@ fn rz_validate_ref_creation_addr(
         }
     }
 
-    if bounds_len == 0 && pointee_addr != 0 {
-        // Empty slices / ZST-backed refs may legally carry a dangling non-null pointer so long
-        // as alignment was checked separately. Do not require allocation tracking for these
-        // zero-length creations; later concrete accesses still validate normally.
+    if bounds_len_is_zero_sized_known(bounds_len) && pointee_addr != 0 {
+        // Empty slice/str views and exact ZST refs may legally carry a dangling non-null pointer
+        // so long as alignment was checked separately. Do not require allocation tracking for
+        // these zero-sized creations; later concrete accesses still validate normally.
         return None;
     }
 
@@ -710,23 +710,26 @@ fn rz_validate_strict_raw_creation_addr(
         return None;
     };
 
-    let same_empty_family =
-        bounds_len == 0 && parent_meta.bounds_len == 0 && parent_meta.pointee_addr == pointee_addr;
-    let same_empty_metadata_family = same_empty_family
+    let same_zero_sized_family = bounds_len_is_zero_sized_known(bounds_len)
+        && bounds_len_is_zero_sized_known(parent_meta.bounds_len)
+        && parent_meta.pointee_addr == pointee_addr;
+    let same_zero_sized_metadata_family = same_zero_sized_family
         && parent_meta.parent != 0
         && matches!(
             parent_meta.kind,
             PtrKind::RefShared | PtrKind::RefMut | PtrKind::RawConst | PtrKind::RawMut
         )
         && rz_can_recover_parent_tag(parent_tag);
-    if same_empty_family
-        && (!rz_has_exposed_provenance_root(parent_tag, &parent_meta) || same_empty_metadata_family)
+    if same_zero_sized_family
+        && (!rz_has_exposed_provenance_root(parent_tag, &parent_meta)
+            || same_zero_sized_metadata_family)
     {
-        // Extending the same zero-length family at the same address is how empty views/sentinels
-        // move through helper plumbing in crates like `bytes`. That is not a concrete access and
-        // should not be rejected as no-provenance derive. Real zero-length forgeries still fail:
-        // there must be an existing live family member to inherit, and changing the address leaves
-        // the normal strict checks in place.
+        // Extending the same zero-sized family at the same address is metadata transport, not a
+        // concrete byte access. This covers both empty wide views (`&[]`, empty `str`) and exact
+        // ZST families (`&Cell<()>`, `&()`) so helper plumbing can carry the lineage without
+        // inventing fresh exposed-provenance roots. Real zero-sized forgeries still fail: there
+        // must be an existing live family member to inherit, and changing the address leaves the
+        // normal strict checks in place.
         return None;
     }
 
@@ -1261,6 +1264,53 @@ pub enum PtrKind {
     RawMut,
 }
 
+pub(crate) const BOUNDS_LEN_UNKNOWN: usize = usize::MAX;
+pub(crate) const BOUNDS_LEN_EXACT_ZST: usize = usize::MAX - 1;
+
+#[inline]
+pub(crate) fn bounds_len_is_unknown(bounds_len: usize) -> bool {
+    bounds_len == BOUNDS_LEN_UNKNOWN
+}
+
+#[inline]
+pub(crate) fn bounds_len_is_exact_zst(bounds_len: usize) -> bool {
+    bounds_len == BOUNDS_LEN_EXACT_ZST
+}
+
+#[inline]
+pub(crate) fn bounds_len_is_known(bounds_len: usize) -> bool {
+    !bounds_len_is_unknown(bounds_len)
+}
+
+#[inline]
+pub(crate) fn bounds_len_has_explicit_byte_bounds(bounds_len: usize) -> bool {
+    bounds_len_is_known(bounds_len) && !bounds_len_is_exact_zst(bounds_len)
+}
+
+#[inline]
+pub(crate) fn bounds_len_is_known_nonempty(bounds_len: usize) -> bool {
+    bounds_len_has_explicit_byte_bounds(bounds_len) && bounds_len != 0
+}
+
+#[inline]
+pub(crate) fn bounds_len_is_precise_empty(bounds_len: usize) -> bool {
+    bounds_len_has_explicit_byte_bounds(bounds_len) && bounds_len == 0
+}
+
+#[inline]
+pub(crate) fn bounds_len_is_zero_sized_known(bounds_len: usize) -> bool {
+    bounds_len_is_precise_empty(bounds_len) || bounds_len_is_exact_zst(bounds_len)
+}
+
+#[inline]
+pub(crate) fn bounds_len_bytes_or_zero(bounds_len: usize) -> usize {
+    if bounds_len_has_explicit_byte_bounds(bounds_len) {
+        bounds_len
+    } else {
+        0
+    }
+}
+
 /// Metadata associated with a borrow tag.
 #[derive(Copy, Clone, Debug)]
 pub struct TagMeta {
@@ -1284,13 +1334,15 @@ pub struct TagMeta {
     /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
     /// bit4=TB-lite raw is a derived same-family view; keep it out of the borrow tree
     /// until an actual raw write needs access-local raw state,
-    /// bit5=internal runtime normalization for const refs materialized at alloc end,
-    /// bit6=reference had precise wide-pointer bounds metadata at creation time.
+    /// bit5=internal runtime normalization for const refs materialized at alloc end.
     pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
     pub exposed_provenance_root: bool,
-    /// Optional bounds length in bytes for wide pointers (slice/str metadata).
-    /// 0 means unknown / not provided.
+    /// Optional bounds length encoding for pointers/references.
+    /// - `BOUNDS_LEN_UNKNOWN` => unknown / not provided
+    /// - `0` => precise empty wide view (`&[]`, empty `str`, ...)
+    /// - `BOUNDS_LEN_EXACT_ZST` => exact zero-sized thin pointee (`&()`, `&Cell<()>`, ...)
+    /// - any other value => explicit byte length
     pub bounds_len: usize,
     /// Optional writable extent for pointers derived from shared interior-mutability roots.
     /// When nonzero, raw writes may extend beyond the exact pointee bounds but must stay inside
@@ -1368,7 +1420,7 @@ fn tag_alias_exempt_via_bounded_ancestor(tag: u64, addr: usize, size: usize) -> 
         let Some(parent) = tmap.get(&meta.parent) else {
             break;
         };
-        if parent.alias_exempt && parent.bounds_len != 0 {
+        if parent.alias_exempt && bounds_len_is_known_nonempty(parent.bounds_len) {
             let parent_start = parent.pointee_addr;
             let parent_end = parent_start.saturating_add(parent.bounds_len);
             if addr >= parent_start && access_end <= parent_end {
@@ -1763,7 +1815,7 @@ fn recover_parent_for_alloc_root(
 /// Prefer explicit bounds when available; otherwise fall back to the recorded allocation-origin
 /// range for wider carriers such as `BytesMut`.
 fn repaired_parent_candidate_range(meta: &TagMeta) -> Option<(usize, usize)> {
-    if meta.bounds_len != 0 {
+    if bounds_len_is_known_nonempty(meta.bounds_len) {
         let end = meta.pointee_addr.checked_add(meta.bounds_len)?;
         return Some((meta.pointee_addr, end));
     }
@@ -1950,7 +2002,7 @@ fn rz_allow_bounded_stack_ref_no_alloc_noise(tmeta: &TagMeta, addr: usize, size:
     if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return false;
     }
-    if tmeta.bounds_len == 0 || size == 0 {
+    if !bounds_len_is_known_nonempty(tmeta.bounds_len) || size == 0 {
         return false;
     }
     if !(rz_stack_addr_hint(addr)
@@ -2047,7 +2099,7 @@ fn rz_allow_stack_ref_root_boundary_oob_noise(
     if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return false;
     }
-    if tmeta.parent != 0 || tmeta.bounds_len != 0 {
+    if tmeta.parent != 0 || bounds_len_is_known(tmeta.bounds_len) {
         return false;
     }
     if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
@@ -2109,7 +2161,7 @@ fn rz_allow_stack_raw_nonroot_boundary_oob_noise(
     if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         return false;
     }
-    if tmeta.parent == 0 || tmeta.bounds_len != 0 {
+    if tmeta.parent == 0 || bounds_len_is_known(tmeta.bounds_len) {
         return false;
     }
     if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
@@ -2464,7 +2516,6 @@ fn normalize_const_end_ref_pointee(
 
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
 const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
-const LINEAGE_HINT_PRECISE_WIDE_BOUNDS: u8 = 0b0100_0000;
 
 #[inline]
 fn normalize_const_end_ref_access_addr(
@@ -2491,7 +2542,7 @@ fn normalize_const_end_ref_access_addr(
     if (tmeta.lineage_hint & LINEAGE_HINT_CONST_END_REF_NORMALIZED) == 0 {
         return (addr, size);
     }
-    if tmeta.bounds_len == 0 {
+    if bounds_len_is_unknown(tmeta.bounds_len) {
         if tmeta.parent == 0
             && tmeta.origin_known
             && tmeta.origin_end > tmeta.origin_base
@@ -3722,7 +3773,7 @@ pub fn __rz_ptr_write(
     }
 
     // Bounds check against wide-pointer metadata (slice/str) if available.
-    if tmeta.bounds_len != 0 && size != 0 {
+    if bounds_len_has_explicit_byte_bounds(tmeta.bounds_len) && size != 0 {
         let access_end = match addr.checked_add(size) {
             Some(e) => e,
             None => {
@@ -4207,7 +4258,7 @@ pub fn __rz_ptr_read(
     }
 
     // Bounds check against wide-pointer metadata (slice/str) if available.
-    if tmeta.bounds_len != 0 && size != 0 {
+    if bounds_len_has_explicit_byte_bounds(tmeta.bounds_len) && size != 0 {
         let access_end = match addr.checked_add(size) {
             Some(e) => e,
             None => {
@@ -4342,7 +4393,7 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
         return;
     }
 
-    let access_size = tmeta.bounds_len.min(1).max(1);
+    let access_size = bounds_len_bytes_or_zero(tmeta.bounds_len).min(1).max(1);
     let Some(msg) = active_alias_model().check_access(
         tag,
         tag,
@@ -4382,7 +4433,7 @@ fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
         return true;
     }
 
-    let access_size = tmeta.bounds_len.min(1).max(1);
+    let access_size = bounds_len_bytes_or_zero(tmeta.bounds_len).min(1).max(1);
     active_alias_model()
         .check_access(
             tag,
@@ -4396,7 +4447,7 @@ fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
 }
 
 fn rz_ref_boundary_is_empty_precise_view(tmeta: &TagMeta) -> bool {
-    tmeta.bounds_len == 0 && (tmeta.lineage_hint & LINEAGE_HINT_PRECISE_WIDE_BOUNDS) != 0
+    bounds_len_is_precise_empty(tmeta.bounds_len)
 }
 
 #[inline]
@@ -5425,14 +5476,18 @@ pub extern "C" fn __record_ref_creation_with_extent(
     // - bit2: strong root-origin repair hint
     let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
     let requested_align = align_req;
-    let align_req = rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr).max(
+    let promised_align = if bounds_len_is_zero_sized_known(bounds_len) {
+        0
+    } else {
         rz_promised_alignment_for_addr(
             pointee_addr,
             lookup_alloc_snapshot(pointee_addr)
                 .map(|(_, meta)| meta.epoch)
                 .unwrap_or(0),
-        ),
-    );
+        )
+    };
+    let align_req =
+        rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr).max(promised_align);
     let required_align = if requested_align != 0 {
         requested_align
     } else {
@@ -5445,7 +5500,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
             "REF_CREATE",
             tag,
             pointee_addr,
-            bounds_len.max(1),
+            bounds_len_bytes_or_zero(bounds_len).max(1),
             align_req,
             required_align,
             None,
@@ -5498,7 +5553,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
                         p.bounds_len,
                     )
                 })
-                .unwrap_or((0, false, None, 0));
+                .unwrap_or((0, false, None, BOUNDS_LEN_UNKNOWN));
 
         if let Some(parent_pointee) = parent_pointee {
             let parent_alloc = lookup_alloc_snapshot(parent_pointee);
@@ -5512,7 +5567,12 @@ pub extern "C" fn __record_ref_creation_with_extent(
                             && pointee_meta.epoch != 0
                             && parent_epoch != pointee_meta.epoch)
                     {
-                        (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
+                        (
+                            pointee_meta.epoch,
+                            pointee_meta.live,
+                            BOUNDS_LEN_UNKNOWN,
+                            parent_tag,
+                        )
                     } else if parent_epoch == 0 && pointee_meta.epoch != 0 {
                         // Parent lineage is correct, but its allocation snapshot was lost.
                         // Keep the parent tag while refreshing the epoch/live snapshot from the
@@ -5536,7 +5596,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
                     if parent_meta.size != 0
                         && !(pointee_addr >= parent_base && pointee_addr < parent_end)
                     {
-                        (0, false, 0, 0)
+                        (0, false, BOUNDS_LEN_UNKNOWN, 0)
                     } else {
                         (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
                     }
@@ -5544,13 +5604,18 @@ pub extern "C" fn __record_ref_creation_with_extent(
                 (None, Some((_pointee_base, pointee_meta))) => {
                     alloc_is_stack = pointee_meta.is_stack;
                     alloc_size = pointee_meta.size;
-                    (pointee_meta.epoch, pointee_meta.live, 0, parent_tag)
+                    (
+                        pointee_meta.epoch,
+                        pointee_meta.live,
+                        BOUNDS_LEN_UNKNOWN,
+                        parent_tag,
+                    )
                 }
                 (None, None) => {
                     // Parent metadata already detached from a concrete allocation.
                     // Continuing to inherit it creates cascading false OOB/UAF reports.
                     if parent_epoch != 0 {
-                        (0, false, 0, 0)
+                        (0, false, BOUNDS_LEN_UNKNOWN, 0)
                     } else {
                         (parent_epoch, parent_live, inherited_bounds_len, parent_tag)
                     }
@@ -5568,12 +5633,12 @@ pub extern "C" fn __record_ref_creation_with_extent(
                 alloc_is_stack = m.is_stack;
                 alloc_size = m.size;
                 if m.is_stack && !m.live {
-                    (0, false, 0, 0)
+                    (0, false, BOUNDS_LEN_UNKNOWN, 0)
                 } else {
-                    (m.epoch, m.live, 0, 0)
+                    (m.epoch, m.live, BOUNDS_LEN_UNKNOWN, 0)
                 }
             })
-            .unwrap_or((0, false, 0, 0))
+            .unwrap_or((0, false, BOUNDS_LEN_UNKNOWN, 0))
     };
     if let (Some(p), Some(start)) = (profile, alloc_snapshot_start) {
         rz_profile_add_elapsed(&p.ref_create_alloc_snapshot_ns, start);
@@ -5595,7 +5660,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         if repaired_parent != 0 {
             resolved_parent_tag = repaired_parent;
             if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                if inherited_bounds_len == 0 {
+                if bounds_len_is_unknown(inherited_bounds_len) {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
                 if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
@@ -5636,7 +5701,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
                 let previous_parent = resolved_parent_tag;
                 resolved_parent_tag = repaired_parent;
                 if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                    if inherited_bounds_len == 0 {
+                    if bounds_len_is_unknown(inherited_bounds_len) {
                         inherited_bounds_len = parent_meta.bounds_len;
                     }
                     if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
@@ -5657,7 +5722,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         }
     }
 
-    let bounds_len = if bounds_len != 0 {
+    let bounds_len = if bounds_len_is_known(bounds_len) {
         bounds_len
     } else {
         inherited_bounds_len
@@ -5682,7 +5747,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: (alias_exempt & (0b0000_1110 | LINEAGE_HINT_PRECISE_WIDE_BOUNDS))
+        lineage_hint: (alias_exempt & 0b0000_1110)
             | if normalized_const_end_ref {
                 LINEAGE_HINT_CONST_END_REF_NORMALIZED
             } else {
@@ -5871,7 +5936,7 @@ pub extern "C" fn __record_raw_ptr_creation(
                             p.parent,
                         )
                     })
-                    .unwrap_or((0, false, None, 0, 0));
+                    .unwrap_or((0, false, None, BOUNDS_LEN_UNKNOWN, 0));
             parent_is_root = parent_parent == 0;
             parent_pointee_addr = parent_pointee;
 
@@ -5887,7 +5952,7 @@ pub extern "C" fn __record_raw_ptr_creation(
                         }
                         Some((_parent_base, _)) => {
                             parent_alloc_mismatch = true;
-                            (pointee_meta.epoch, pointee_meta.live, 0)
+                            (pointee_meta.epoch, pointee_meta.live, BOUNDS_LEN_UNKNOWN)
                         }
                         None => {
                             // Parent alloc metadata can be missing in optimized lowering
@@ -5896,7 +5961,7 @@ pub extern "C" fn __record_raw_ptr_creation(
                             if parent_pointee != pointee_addr {
                                 parent_alloc_mismatch = true;
                             }
-                            (pointee_meta.epoch, pointee_meta.live, 0)
+                            (pointee_meta.epoch, pointee_meta.live, BOUNDS_LEN_UNKNOWN)
                         }
                     }
                 } else {
@@ -5906,7 +5971,7 @@ pub extern "C" fn __record_raw_ptr_creation(
                 (parent_epoch, parent_live, inherited_bounds_len)
             }
         } else if exposed_provenance_root {
-            (0, false, 0)
+            (0, false, BOUNDS_LEN_UNKNOWN)
         } else {
             // Root creation: if the match is a dead stack slot, treat metadata as unknown
             // to avoid inheriting stale bounds/epoch from recycled stack storage.
@@ -5915,12 +5980,12 @@ pub extern "C" fn __record_raw_ptr_creation(
                     alloc_is_stack = m.is_stack;
                     alloc_size = m.size;
                     if m.is_stack && !m.live {
-                        (0, false, 0)
+                        (0, false, BOUNDS_LEN_UNKNOWN)
                     } else {
-                        (m.epoch, m.live, 0)
+                        (m.epoch, m.live, BOUNDS_LEN_UNKNOWN)
                     }
                 }
-                None => (0, false, 0),
+                None => (0, false, BOUNDS_LEN_UNKNOWN),
             }
         };
 
@@ -5938,7 +6003,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         if repaired_parent != 0 {
             resolved_parent = repaired_parent;
             if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if inherited_bounds_len == 0 {
+                if bounds_len_is_unknown(inherited_bounds_len) {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
                 if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
@@ -5975,7 +6040,7 @@ pub extern "C" fn __record_raw_ptr_creation(
             let previous_parent = resolved_parent;
             resolved_parent = repaired_parent;
             if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if inherited_bounds_len == 0 {
+                if bounds_len_is_unknown(inherited_bounds_len) {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
                 if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
@@ -6031,7 +6096,7 @@ pub extern "C" fn __record_raw_ptr_creation(
             let previous_parent = resolved_parent;
             resolved_parent = repaired_parent;
             if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if inherited_bounds_len == 0 {
+                if bounds_len_is_unknown(inherited_bounds_len) {
                     inherited_bounds_len = parent_meta.bounds_len;
                 }
                 if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
@@ -6070,24 +6135,24 @@ pub extern "C" fn __record_raw_ptr_creation(
             resolved_parent,
             exposed_provenance_root,
             enforce_no_provenance,
-            if bounds_len != 0 {
+            if bounds_len_is_known(bounds_len) {
                 bounds_len
             } else if carry_bounds_from_source {
                 inherited_bounds_len
             } else {
-                0
+                BOUNDS_LEN_UNKNOWN
             },
         ) {
             rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
         }
     }
 
-    let bounds_len = if bounds_len != 0 {
+    let bounds_len = if bounds_len_is_known(bounds_len) {
         bounds_len
     } else if carry_bounds_from_source {
         inherited_bounds_len
     } else {
-        0
+        BOUNDS_LEN_UNKNOWN
     };
     let (interior_mut_extent_base, interior_mut_extent_len) = if resolved_parent != 0 {
         if let Some(parent_meta) = tag_store::get(resolved_parent) {
@@ -6193,14 +6258,17 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
 
     if let Some(tmeta) = tag_store::mark_escaped(tag) {
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
-            let required_align = tmeta
-                .align_req
-                .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
+            let promised_align = if bounds_len_is_zero_sized_known(tmeta.bounds_len) {
+                0
+            } else {
+                rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch)
+            };
+            let required_align = tmeta.align_req.max(promised_align);
             rz_check_alignment(
                 "REF_USE",
                 tag,
                 addr,
-                tmeta.bounds_len.max(1),
+                bounds_len_bytes_or_zero(tmeta.bounds_len).max(1),
                 required_align,
                 required_align,
                 Some(&tmeta),
