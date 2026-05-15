@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, boundary_survivor_tags_for_callee,
-    boundary_survivor_tags_for_thread, bounds_len_bytes_or_zero, bounds_len_is_precise_empty,
-    find_alloc_containing, rz_sb_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
+    bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing, rz_sb_suppressed,
+    rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 use super::{AliasAccessKind, AliasModel};
@@ -963,17 +963,16 @@ fn tb_lite_on_tag_killed(tag: u64) {
     let Some(tree) = all.get_mut(&base) else {
         return;
     };
-    let boundary_survivor_tags = boundary_survivor_tags_for_thread();
-    let boundary_surviving_descendant = boundary_survivor_tags
-        .iter()
-        .copied()
-        .any(|survivor| survivor != tag && tb_is_ancestor(&tree.nodes, tag, survivor));
+    let has_live_descendant = tree
+        .nodes
+        .values()
+        .any(|n| n.tag != tag && tb_is_live_node(n) && tb_is_ancestor(&tree.nodes, tag, n.tag));
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
     let parent = node.parent;
     let killed_readonly = matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst);
-    if boundary_surviving_descendant && matches!(node.kind, BorrowKind::Unique) {
+    if has_live_descendant && matches!(node.kind, BorrowKind::Unique) {
         tb_shadow_local_node(node);
     } else {
         tb_disable_node(node);

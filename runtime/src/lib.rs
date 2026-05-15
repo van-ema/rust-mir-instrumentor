@@ -1575,18 +1575,6 @@ pub(crate) fn boundary_survivor_tags_for_callee(callee_id: u64) -> HashSet<u64> 
         .unwrap_or_default()
 }
 
-pub(crate) fn boundary_survivor_tags_for_thread() -> HashSet<u64> {
-    let thread_id = std::thread::current().id();
-    let survivors = boundary_survivor_tags().lock().unwrap();
-    let mut merged = HashSet::new();
-    for ((tid, _callee_id), tags) in survivors.iter() {
-        if *tid == thread_id {
-            merged.extend(tags.iter().copied());
-        }
-    }
-    merged
-}
-
 fn boundary_survivor_tags() -> &'static Mutex<HashMap<(ThreadId, u64), HashSet<u64>>> {
     BOUNDARY_SURVIVOR_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
