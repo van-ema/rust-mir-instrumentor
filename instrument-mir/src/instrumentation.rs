@@ -1889,6 +1889,7 @@ impl<'tcx> ShadowableLeafPtrSpec<'tcx> {
 struct ScanResult<'tcx> {
     insert_points: Vec<InsertPoint<'tcx>>,
     ptr_locals_needing_tag: HashSet<Local>,
+    boundary_recovered_ptr_locals: HashSet<Local>,
     local_slot_shadow_store_locals: HashSet<Local>,
     projected_reborrow_anchor_specs: ReborrowAnchorSpecMap,
     projectionless_anchor_suppressed_locals: HashSet<Local>,
@@ -8421,6 +8422,56 @@ impl MyOptimizationPass {
         selected_local
     }
 
+    fn backtrack_unique_aggregate_anchor_source_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        dst_local: Local,
+        reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
+    ) -> Option<Local> {
+        let statements = &body.basic_blocks[bb].statements;
+        let end = stmt_idx.min(statements.len());
+        for stmt in statements[..end].iter().rev() {
+            let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind else {
+                continue;
+            };
+            if dst_place.as_local() != Some(dst_local) {
+                continue;
+            }
+            let Rvalue::Aggregate(_, operands) = rvalue else {
+                return None;
+            };
+            let mut unique_src_local: Option<Local> = None;
+            let mut ambiguous = false;
+            for operand in operands.iter() {
+                let Some(src_place) = self.place_from_operand(operand) else {
+                    continue;
+                };
+                if !src_place.projection.is_empty() {
+                    continue;
+                }
+                let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                if !self.is_pointer_ty(src_ty)
+                    && !reborrow_anchor_local_for_stack_local.contains_key(&src_place.local)
+                {
+                    continue;
+                }
+                match unique_src_local {
+                    Some(existing) if existing != src_place.local => {
+                        ambiguous = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => unique_src_local = Some(src_place.local),
+                }
+            }
+            return if ambiguous { None } else { unique_src_local };
+        }
+        None
+    }
+
     /// Compute the set of stack locals worth tracking as allocations.
     ///
     /// We track locals whose address is taken (via `&` / `&raw`) so range-based allocation
@@ -14853,6 +14904,7 @@ impl MyOptimizationPass {
         ScanResult {
             insert_points,
             ptr_locals_needing_tag,
+            boundary_recovered_ptr_locals,
             local_slot_shadow_store_locals,
             projected_reborrow_anchor_specs,
             projectionless_anchor_suppressed_locals,
@@ -15015,6 +15067,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         reborrow_anchor_local_for_stack_local: &HashMap<Local, Local>,
         anchor_is_slot_family_local_for_stack_local: &HashMap<Local, Local>,
+        boundary_recovered_ptr_locals: &HashSet<Local>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
     ) {
         for (bb, block_data) in body.basic_blocks.iter_enumerated() {
@@ -15059,6 +15112,7 @@ impl MyOptimizationPass {
                     }
                     if let (Some(src_local), false) = (unique_src_local, ambiguous) {
                         if src_local != dst_local {
+                            let src_ty = body.local_decls[src_local].ty;
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx,
@@ -15068,7 +15122,13 @@ impl MyOptimizationPass {
                                 kind: InstrKind::ReborrowAnchorSeed {
                                     dst_local,
                                     src_local,
-                                    mark_slot_family: false,
+                                    mark_slot_family: self
+                                        .supports_call_boundary_anchor_local(tcx, body, dst_local)
+                                        && boundary_recovered_ptr_locals.contains(&src_local)
+                                        && matches!(
+                                            src_ty.kind(),
+                                            TyKind::Ref(_, _, Mutability::Not)
+                                        ),
                                 },
                             });
                             continue;
@@ -18313,21 +18373,48 @@ impl MyOptimizationPass {
                     .unwrap_or(BorrowKind::Shared);
                 let mut anchor_select_stmts = Vec::new();
                 let selected_anchor_local = self
-                    .materialize_projectionless_slot_anchor_parent_local(
+                    .backtrack_unique_aggregate_anchor_source_local(
                         tcx,
                         body,
                         bb,
                         stmt_idx,
-                        source_info,
-                        Place::from(local),
-                        borrow_kind,
-                        tag_local_for_ptr_local,
-                        ref_ancestor_local_for_ptr_local,
+                        local,
                         reborrow_anchor_local_for_stack_local,
-                        anchor_is_slot_family_local_for_stack_local,
-                        projectionless_anchor_suppressed_locals,
-                        &mut anchor_select_stmts,
                     )
+                    .and_then(|src_local| {
+                        let src_ty = body.local_decls[src_local].ty;
+                        let src_tag_local = tag_local_for_ptr_local.get(&src_local).copied()?;
+                        if !matches!(src_ty.kind(), TyKind::Ref(_, _, Mutability::Not)) {
+                            return None;
+                        }
+                        Some(self.materialize_boundary_recovered_source_tag_local(
+                            tcx,
+                            body,
+                            source_info,
+                            src_local,
+                            src_tag_local,
+                            export_parent_local_for_ptr_local,
+                            export_parent_is_recovered_local_for_ptr_local,
+                            &mut anchor_select_stmts,
+                        ))
+                    })
+                    .or_else(|| {
+                        self.materialize_projectionless_slot_anchor_parent_local(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            source_info,
+                            Place::from(local),
+                            borrow_kind,
+                            tag_local_for_ptr_local,
+                            ref_ancestor_local_for_ptr_local,
+                            reborrow_anchor_local_for_stack_local,
+                            anchor_is_slot_family_local_for_stack_local,
+                            projectionless_anchor_suppressed_locals,
+                            &mut anchor_select_stmts,
+                        )
+                    })
                     .unwrap_or(slot_state.anchor_local);
 
                 let push_func = Operand::function_handle(
@@ -23766,6 +23853,7 @@ impl MyOptimizationPass {
             body,
             &reborrow_anchor_local_for_stack_local,
             &anchor_is_slot_family_local_for_stack_local,
+            &scan.boundary_recovered_ptr_locals,
             &mut insert_points,
         );
 
