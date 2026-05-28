@@ -983,12 +983,19 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     while cur != 0 {
         let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
         if let Some(node) = tree.nodes.get_mut(&cur) {
-            if matches!(node.kind, BorrowKind::Unique)
-                && node.poisoned_by_protector_end
-                && matches!(node.lazy_perm, TbPerm::Reserved { .. })
-                && tb_range_covers(node.start, node.len, exported_start, exported_len)
-            {
-                tb_shadow_local_node(node);
+            if tb_range_covers(node.start, node.len, exported_start, exported_len) {
+                if matches!(node.kind, BorrowKind::Unique)
+                    && (matches!(node.perm, TbPerm::Disabled)
+                        || matches!(node.lazy_perm, TbPerm::Disabled)
+                        || (node.poisoned_by_protector_end
+                            && matches!(node.lazy_perm, TbPerm::Reserved { .. })))
+                {
+                    tb_shadow_local_node(node);
+                } else if node.poisoned_by_protector_end
+                    && matches!(node.lazy_perm, TbPerm::Reserved { .. })
+                {
+                    tb_revive_node_after_protector_end(node);
+                }
             }
         }
         cur = next;

@@ -1392,6 +1392,8 @@ static MUT_ARG_RET_LEAF_SHADOWS: OnceLock<
 > = OnceLock::new();
 static BOUNDARY_SURVIVOR_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64), HashSet<u64>>>> =
     OnceLock::new();
+static MUT_ARG_RET_BOUNDARY_LINEAGES: OnceLock<Mutex<HashMap<ThreadId, HashSet<u64>>>> =
+    OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
@@ -1579,6 +1581,10 @@ fn boundary_survivor_tags() -> &'static Mutex<HashMap<(ThreadId, u64), HashSet<u
     BOUNDARY_SURVIVOR_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn mut_arg_ret_boundary_lineages() -> &'static Mutex<HashMap<ThreadId, HashSet<u64>>> {
+    MUT_ARG_RET_BOUNDARY_LINEAGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn remember_boundary_survivor_tag(callee_id: u64, tag: u64) {
     if tag == 0 {
         return;
@@ -1592,12 +1598,83 @@ fn remember_boundary_survivor_tag(callee_id: u64, tag: u64) {
         .insert(tag);
 }
 
+fn remember_mut_arg_ret_boundary_lineage(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let thread_id = std::thread::current().id();
+    mut_arg_ret_boundary_lineages()
+        .lock()
+        .unwrap()
+        .entry(thread_id)
+        .or_default()
+        .insert(tag);
+}
+
 fn clear_boundary_survivor_tags(callee_id: u64) {
     let thread_id = std::thread::current().id();
     boundary_survivor_tags()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id));
+}
+
+fn tag_is_in_mut_arg_ret_boundary_lineage(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    let thread_id = std::thread::current().id();
+    let roots = mut_arg_ret_boundary_lineages()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .cloned()
+        .unwrap_or_default();
+    if roots.is_empty() {
+        return false;
+    }
+
+    let tmap = tags().lock().unwrap();
+    let mut cur = tag;
+    for _ in 0..64 {
+        if roots.contains(&cur) {
+            return true;
+        }
+        let Some(meta) = tmap.get(&cur) else {
+            return false;
+        };
+        if meta.parent == 0 || meta.parent == cur {
+            return false;
+        }
+        cur = meta.parent;
+    }
+    false
+}
+
+fn return_tag_is_mut_arg_ret_boundary_survivor(tag: u64) -> bool {
+    tag != 0
+        && active_alias_model().name() == "tb_lite"
+        && tag_is_in_mut_arg_ret_boundary_lineage(tag)
+}
+
+fn export_return_tag(callee_id: u64, tag: u64, addr: usize, boundary_survivor: bool) {
+    if tag == 0 {
+        return;
+    }
+    if boundary_survivor {
+        let export_addr = if addr != 0 {
+            addr
+        } else {
+            tag_store::get(tag)
+                .map(|meta| meta.pointee_addr)
+                .unwrap_or(0)
+        };
+        active_alias_model().on_mut_arg_ret_export(tag, export_addr);
+        remember_mut_arg_ret_boundary_lineage(tag);
+    } else {
+        active_alias_model().on_ret_export(tag, addr);
+    }
+    remember_boundary_survivor_tag(callee_id, tag);
 }
 
 #[inline]
@@ -5186,6 +5263,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
     }
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
+        remember_mut_arg_ret_boundary_lineage(tag);
         remember_boundary_survivor_tag(callee_id, tag);
     }
     let thread_id = std::thread::current().id();
@@ -5269,6 +5347,7 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     }
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
+        remember_mut_arg_ret_boundary_lineage(tag);
         remember_boundary_survivor_tag(callee_id, tag);
     }
     let thread_id = std::thread::current().id();
@@ -5310,6 +5389,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     let kind = tag_store::get(tag).map(|meta| meta.kind);
+    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
     let validate_before_export =
         active_alias_model().name() != "tb_lite" || matches!(kind, Some(PtrKind::RefShared));
     if validate_before_export {
@@ -5317,13 +5397,11 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
         // `on_ret_export` can resurrect an already-invalid family and mask the boundary violation.
         rz_validate_ref_boundary_use(tag, "RET");
     }
-    if tag != 0 {
-        active_alias_model().on_ret_export(tag, addr);
-        remember_boundary_survivor_tag(callee_id, tag);
-    }
+    export_return_tag(callee_id, tag, addr, boundary_survivor);
     if !validate_before_export {
-        // Tree Borrows returned `&mut` values can be repaired by the return-side export hook
-        // before they become caller-visible. Validate the post-export family in that case.
+        // Ordinary returned `&mut` values stay on the strict return path. A caller-owned survivor
+        // that is being forwarded as a return uses the mut-arg-ret repair above, then validates the
+        // repaired family before it becomes visible to the caller.
         rz_validate_ref_boundary_use(tag, "RET");
     }
     let thread_id = std::thread::current().id();
@@ -5341,13 +5419,11 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
     let export_parent = ptr_shadow::load_export_parent(slot_addr);
     let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
+    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
     if active_alias_model().name() == "sb_lite" {
         rz_validate_ref_boundary_use(tag, "RET");
     }
-    if tag != 0 {
-        active_alias_model().on_ret_export(tag, 0);
-        remember_boundary_survivor_tag(callee_id, tag);
-    }
+    export_return_tag(callee_id, tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();
     ret_leaf_shadows().lock().unwrap().insert(
         (thread_id, callee_id, leaf_key),
@@ -5359,12 +5435,12 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
 #[no_mangle]
 pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
     let _g = RzRuntimeGuard::enter();
+    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
     if active_alias_model().name() == "sb_lite" {
         rz_validate_ref_boundary_use(tag, "RET");
     }
     if tag != 0 {
-        active_alias_model().on_ret_export(tag, 0);
-        remember_boundary_survivor_tag(callee_id, tag);
+        export_return_tag(callee_id, tag, 0, boundary_survivor);
         let thread_id = std::thread::current().id();
         ret_tags()
             .lock()
@@ -6108,7 +6184,17 @@ pub extern "C" fn __record_raw_ptr_creation(
             );
         }
     }
-    if !exposed_provenance_root && projected_raw_hint && pointee_addr != 0 {
+    // A strong projected root on a live allocation is a provenance-preserving owner/payload
+    // reconstruction. Do not poison it just because an older tag at the same address was exposed.
+    let provenance_preserving_alloc_root = derived_from == 0
+        && strong_projected_raw_hint
+        && alloc_epoch != 0
+        && alloc_live_at_creation;
+    if !exposed_provenance_root
+        && projected_raw_hint
+        && !provenance_preserving_alloc_root
+        && pointee_addr != 0
+    {
         let resolved_parent_is_tracked = if resolved_parent == 0 {
             false
         } else {
