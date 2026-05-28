@@ -1715,7 +1715,15 @@ enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         local: Local,
-    }, // Callee-side validation for a return value that is not itself pointer-typed,
+    },
+    /// Callee-side: seed a non-pointer carrier anchor from an imported pointer leaf shadow.
+    ///
+    /// This is the raw-owner by-value path for carriers with one structural pointer leaf. The
+    /// caller transports only that leaf shadow; the callee rebuilds its local projectionless
+    /// anchor from the imported leaf instead of consuming a separate whole-slot boundary tag.
+    ArgAnchorSeedFromShadow {
+        local: Local,
+    },
     /// Callee-side: restore one exact pointer-leaf shadow into a by-value raw-owner aggregate
     /// argument slot.
     ArgLeafTake {
@@ -1885,6 +1893,8 @@ impl<'tcx> ShadowableLeafPtrSpec<'tcx> {
     }
 }
 
+const SHADOWABLE_LEAF_PTR_RECURSION_DEPTH: usize = 8;
+
 #[derive(Clone, Debug)]
 struct ScanResult<'tcx> {
     insert_points: Vec<InsertPoint<'tcx>>,
@@ -1960,9 +1970,13 @@ struct Hooks {
     def_id_shadow_store_ptr: DefId,
     def_id_shadow_store_ptr_local: DefId,
     def_id_shadow_load_tag: DefId,
+    def_id_shadow_load_tag_for_ptr: DefId,
     def_id_shadow_load_ref_ancestor: DefId,
+    def_id_shadow_load_ref_ancestor_for_ptr: DefId,
     def_id_shadow_load_export_parent: DefId,
+    def_id_shadow_load_export_parent_for_ptr: DefId,
     def_id_shadow_load_export_parent_recovered: DefId,
+    def_id_shadow_load_export_parent_recovered_for_ptr: DefId,
     def_id_shadow_kill_range: DefId,
     def_id_tag_kill: DefId,
     def_id_tag_retain: DefId,
@@ -2748,7 +2762,12 @@ impl MyOptimizationPass {
         if self.is_pointer_ty(local_ty) {
             return false;
         }
-        if !self.ty_contains_pointer_fields(tcx, body, local_ty, 8) {
+        if !self.ty_contains_pointer_fields(
+            tcx,
+            body,
+            local_ty,
+            SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
+        ) {
             return false;
         }
 
@@ -2781,6 +2800,36 @@ impl MyOptimizationPass {
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
     }
 
+    /// Return whether `local` needs slot-family anchor transport at by-value call boundaries.
+    ///
+    /// This is broader than ref-style anchor transport: raw-owner/container aggregates do not
+    /// carry a source-level `&T`, but callees may still create helper borrows from the moved
+    /// carrier. Those helper borrows should inherit the caller-visible carrier family.
+    fn supports_call_boundary_slot_anchor_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        if !self.supports_slot_family_local(tcx, body, local) {
+            return false;
+        }
+        let local_ty = body.local_decls[local].ty;
+        if self.is_pointer_ty(local_ty)
+            || !self.ty_contains_pointer_fields(
+                tcx,
+                body,
+                local_ty,
+                SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
+            )
+        {
+            return false;
+        }
+
+        let raw_ptr_ty = Ty::new_imm_ptr(tcx, local_ty);
+        self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
+    }
+
     /// Return whether `ty` should use structural leaf-shadow transport at by-value call
     /// boundaries.
     ///
@@ -2794,7 +2843,7 @@ impl MyOptimizationPass {
         ty: Ty<'tcx>,
     ) -> bool {
         !self.is_pointer_ty(ty)
-            && self.ty_contains_direct_pointer_fields(tcx, body, ty)
+            && self.ty_contains_pointer_fields(tcx, body, ty, SHADOWABLE_LEAF_PTR_RECURSION_DEPTH)
             && !self.ty_contains_direct_ref_fields(tcx, ty)
     }
 
@@ -2808,6 +2857,38 @@ impl MyOptimizationPass {
             return false;
         }
         self.supports_call_boundary_leaf_shadow_ty(tcx, body, body.local_decls[local].ty)
+    }
+
+    /// Return whether a by-value carrier can rebuild its local slot-family anchor from one
+    /// transported pointer leaf shadow instead of transporting a separate whole-slot boundary tag.
+    fn supports_call_boundary_leaf_seeded_anchor_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        if !self.supports_call_boundary_leaf_shadow_local(tcx, body, local) {
+            return false;
+        }
+        self.shadowable_leaf_ptr_specs_from_place(
+            tcx,
+            body,
+            Place::from(local),
+            body.local_decls[local].ty,
+        )
+        .len()
+            == 1
+    }
+
+    /// Return whether a by-value carrier still needs a dedicated whole-slot boundary tag.
+    fn supports_call_boundary_whole_slot_anchor_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        self.supports_call_boundary_slot_anchor_local(tcx, body, local)
+            && !self.supports_call_boundary_leaf_seeded_anchor_local(tcx, body, local)
     }
 
     fn is_whole_place_slot_family_source<'tcx>(
@@ -2975,7 +3056,7 @@ impl MyOptimizationPass {
             tcx,
             body,
             base_place,
-            3,
+            SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
             Some(0),
             0,
             &mut out,
@@ -8705,39 +8786,64 @@ impl MyOptimizationPass {
                         },
                     });
                 }
-            } else if self.supports_call_boundary_anchor_local(tcx, body, arg_local) {
-                projectionless_anchor_suppressed_locals.insert(arg_local);
-                insert_points.push(InsertPoint {
-                    bb: entry_bb,
-                    stmt_idx: entry_stmt_idx,
-                    insert_before: false,
-                    source_info: entry_source_info,
-                    place: Place::from(arg_local),
-                    kind: InstrKind::ArgAnchorTake {
-                        callee_id,
-                        arg_index: arg_index as u64,
-                        local: arg_local,
-                    },
-                });
-            } else if self.supports_call_boundary_leaf_shadow_local(tcx, body, arg_local) {
-                for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+            } else {
+                let arg_leaf_specs = self.shadowable_leaf_ptr_specs_from_place(
                     tcx,
                     body,
                     Place::from(arg_local),
                     arg_ty,
-                ) {
+                );
+                let leaf_seeded_anchor =
+                    self.supports_call_boundary_leaf_seeded_anchor_local(tcx, body, arg_local);
+                if self.supports_call_boundary_whole_slot_anchor_local(tcx, body, arg_local) {
+                    projectionless_anchor_suppressed_locals.insert(arg_local);
                     insert_points.push(InsertPoint {
                         bb: entry_bb,
                         stmt_idx: entry_stmt_idx,
                         insert_before: false,
                         source_info: entry_source_info,
-                        place: leaf_spec.place,
-                        kind: InstrKind::ArgLeafTake {
+                        place: Place::from(arg_local),
+                        kind: InstrKind::ArgAnchorTake {
                             callee_id,
                             arg_index: arg_index as u64,
-                            leaf_key: leaf_spec.transport_key(),
+                            local: arg_local,
                         },
                     });
+                }
+                if self.supports_call_boundary_leaf_shadow_local(tcx, body, arg_local) {
+                    for leaf_spec in arg_leaf_specs {
+                        insert_points.push(InsertPoint {
+                            bb: entry_bb,
+                            stmt_idx: entry_stmt_idx,
+                            insert_before: false,
+                            source_info: entry_source_info,
+                            place: leaf_spec.place,
+                            kind: InstrKind::ArgLeafTake {
+                                callee_id,
+                                arg_index: arg_index as u64,
+                                leaf_key: leaf_spec.transport_key(),
+                            },
+                        });
+                    }
+                }
+                if leaf_seeded_anchor {
+                    projectionless_anchor_suppressed_locals.insert(arg_local);
+                    let seed_specs = self.shadowable_leaf_ptr_specs_from_place(
+                        tcx,
+                        body,
+                        Place::from(arg_local),
+                        arg_ty,
+                    );
+                    if let [seed_spec] = seed_specs.as_slice() {
+                        insert_points.push(InsertPoint {
+                            bb: entry_bb,
+                            stmt_idx: entry_stmt_idx,
+                            insert_before: false,
+                            source_info: entry_source_info,
+                            place: seed_spec.place,
+                            kind: InstrKind::ArgAnchorSeedFromShadow { local: arg_local },
+                        });
+                    }
                 }
             }
         }
@@ -13806,50 +13912,50 @@ impl MyOptimizationPass {
                     if self.is_pointer_ty(ty) {
                         continue;
                     }
-                    if !self.supports_call_boundary_anchor_local(tcx, body, p.local) {
-                        if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
-                            for leaf_spec in
-                                self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty)
-                            {
+                    if self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
+                        && self.is_whole_place_slot_family_source(tcx, body, p)
+                    {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: p,
+                            kind: InstrKind::CallArgPush {
+                                callee_id,
+                                arg_index: arg_index as u64,
+                                ptr_local: p.local,
+                                parent_mode: ParentSelectionMode::SlotFamily,
+                                flags: 0,
+                            },
+                        });
+                        if let Some(tgt_bb) = call_target_bb {
+                            if self.is_shadowable_ptr_ty(tcx, body, ty) {
                                 insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx: block_data.statements.len(),
-                                    insert_before: false,
+                                    bb: tgt_bb,
+                                    stmt_idx: 0,
+                                    insert_before: true,
                                     source_info: term.source_info,
-                                    place: leaf_spec.place,
-                                    kind: InstrKind::CallArgLeafPush {
-                                        callee_id,
-                                        arg_index: arg_index as u64,
-                                        leaf_key: leaf_spec.transport_key(),
-                                    },
+                                    place: Place::from(p.local),
+                                    kind: InstrKind::ShadowStore { src_local: p.local },
                                 });
                             }
                         }
-                        continue;
                     }
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: p,
-                        kind: InstrKind::CallArgPush {
-                            callee_id,
-                            arg_index: arg_index as u64,
-                            ptr_local: p.local,
-                            parent_mode: ParentSelectionMode::SlotFamily,
-                            flags: 0,
-                        },
-                    });
-                    if let Some(tgt_bb) = call_target_bb {
-                        if self.is_shadowable_ptr_ty(tcx, body, ty) {
+                    if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
+                        for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty)
+                        {
                             insert_points.push(InsertPoint {
-                                bb: tgt_bb,
-                                stmt_idx: 0,
-                                insert_before: true,
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
                                 source_info: term.source_info,
-                                place: Place::from(p.local),
-                                kind: InstrKind::ShadowStore { src_local: p.local },
+                                place: leaf_spec.place,
+                                kind: InstrKind::CallArgLeafPush {
+                                    callee_id,
+                                    arg_index: arg_index as u64,
+                                    leaf_key: leaf_spec.transport_key(),
+                                },
                             });
                         }
                     }
@@ -15574,6 +15680,7 @@ impl MyOptimizationPass {
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
                 hooks.def_id_take_call_arg_tag
             }
+            InstrKind::ArgAnchorSeedFromShadow { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
             InstrKind::RetLeafPush { .. } => hooks.def_id_push_ret_leaf_shadow,
@@ -15711,7 +15818,8 @@ impl MyOptimizationPass {
                 | InstrKind::ReborrowAnchorSet { .. }
                 | InstrKind::ReborrowAnchorSeed { .. }
                 | InstrKind::ReborrowAnchorZero { .. }
-                | InstrKind::ParentTagSnapshot { .. } => 1,
+                | InstrKind::ParentTagSnapshot { .. }
+                | InstrKind::ArgAnchorSeedFromShadow { .. } => 1,
                 InstrKind::ShadowLoad { .. } => 1,
                 // Debug ref activation may need the restored tag/ref_ancestor emitted by
                 // ShadowLoad or TagProp at the same definition site.
@@ -15758,7 +15866,10 @@ impl MyOptimizationPass {
         for (idx, ip) in insert_points.into_iter().enumerate() {
             if matches!(
                 ip.kind,
-                InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. }
+                InstrKind::ArgRetag { .. }
+                    | InstrKind::ArgAnchorTake { .. }
+                    | InstrKind::ArgAnchorSeedFromShadow { .. }
+                    | InstrKind::ArgLeafTake { .. }
             ) {
                 arg_retag_points.push((idx, ip));
             } else {
@@ -15850,6 +15961,18 @@ impl MyOptimizationPass {
                 ) else {
                     continue;
                 };
+                let ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((ptr_addr_stmt1_opt, ptr_addr_stmt2)) = self.addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    Place::from(dst_local),
+                    ptr_addr_local,
+                ) else {
+                    continue;
+                };
 
                 let (orig_term, is_cleanup) = {
                     let bd = &mut body.basic_blocks_mut()[bb];
@@ -15902,54 +16025,78 @@ impl MyOptimizationPass {
 
                 let tag_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_shadow_load_tag,
+                    hooks.def_id_shadow_load_tag_for_ptr,
                     std::iter::empty(),
                     source_info.span,
                 );
-                let tag_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                    node: Operand::Copy(Place::from(addr_local)),
-                    span: source_info.span,
-                }]
+                let tag_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(ptr_addr_local)),
+                        span: source_info.span,
+                    },
+                ]
                 .into_boxed_slice();
 
                 let ref_func = Operand::function_handle(
                     tcx,
-                    hooks.def_id_shadow_load_ref_ancestor,
+                    hooks.def_id_shadow_load_ref_ancestor_for_ptr,
                     std::iter::empty(),
                     source_info.span,
                 );
-                let ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                    node: Operand::Copy(Place::from(addr_local)),
-                    span: source_info.span,
-                }]
+                let ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(ptr_addr_local)),
+                        span: source_info.span,
+                    },
+                ]
                 .into_boxed_slice();
 
                 let export_parent_func = dst_export_parent_local.map(|_| {
                     Operand::function_handle(
                         tcx,
-                        hooks.def_id_shadow_load_export_parent,
+                        hooks.def_id_shadow_load_export_parent_for_ptr,
                         std::iter::empty(),
                         source_info.span,
                     )
                 });
-                let export_parent_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                    node: Operand::Copy(Place::from(addr_local)),
-                    span: source_info.span,
-                }]
+                let export_parent_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(ptr_addr_local)),
+                        span: source_info.span,
+                    },
+                ]
                 .into_boxed_slice();
 
                 let recovered_func = dst_recovered_local.map(|_| {
                     Operand::function_handle(
                         tcx,
-                        hooks.def_id_shadow_load_export_parent_recovered,
+                        hooks.def_id_shadow_load_export_parent_recovered_for_ptr,
                         std::iter::empty(),
                         source_info.span,
                     )
                 });
-                let recovered_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                    node: Operand::Copy(Place::from(addr_local)),
-                    span: source_info.span,
-                }]
+                let recovered_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(ptr_addr_local)),
+                        span: source_info.span,
+                    },
+                ]
                 .into_boxed_slice();
 
                 let final_post_load_block = post_load_block;
@@ -16234,6 +16381,10 @@ impl MyOptimizationPass {
                     let rem = bd.statements.split_off(split_at);
                     bd.statements.push(slot_addr_stmt1);
                     bd.statements.push(slot_addr_stmt2);
+                    if let Some(ptr_addr_stmt1) = ptr_addr_stmt1_opt {
+                        bd.statements.push(ptr_addr_stmt1);
+                    }
+                    bd.statements.push(ptr_addr_stmt2);
                     bd.terminator = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Call {
@@ -22661,6 +22812,134 @@ impl MyOptimizationPass {
             let place = ip.place;
             let creation_kind = ip.kind;
 
+            if let InstrKind::ArgAnchorSeedFromShadow { local } = creation_kind {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&local)
+                    .expect("missing anchor local for ArgAnchorSeedFromShadow");
+                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
+                    .get(&local)
+                    .copied();
+                let seed_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((addr_stmt1, addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    seed_addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+                let seed_ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((seed_ptr_addr_stmt1_opt, seed_ptr_addr_stmt2)) =
+                    self.addr_stmts_for_place(tcx, body, source_info, place, seed_ptr_addr_local)
+                else {
+                    continue;
+                };
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                let load_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_shadow_load_tag_for_ptr,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![
+                            Spanned {
+                                node: Operand::Copy(Place::from(seed_addr_local)),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: Operand::Copy(Place::from(seed_ptr_addr_local)),
+                                span: source_info.span,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        destination: Place::from(anchor_local),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(addr_stmt1);
+                    bd.statements.push(addr_stmt2);
+                    if let Some(seed_ptr_addr_stmt1) = seed_ptr_addr_stmt1_opt {
+                        bd.statements.push(seed_ptr_addr_stmt1);
+                    }
+                    bd.statements.push(seed_ptr_addr_stmt2);
+                    bd.terminator = Some(load_term);
+                    rem
+                };
+                if let Some(anchor_state_local) = anchor_state_local {
+                    let anchor_nonzero_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                    let anchor_state_u8_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u8, source_info.span));
+                    body.basic_blocks_mut()[cont_block].statements.extend([
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_nonzero_local),
+                                Rvalue::BinaryOp(
+                                    BinOp::Ne,
+                                    Box::new((
+                                        Operand::Copy(Place::from(anchor_local)),
+                                        self.const_u64(tcx, source_info.span, 0),
+                                    )),
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_state_u8_local),
+                                Rvalue::Cast(
+                                    CastKind::IntToInt,
+                                    Operand::Copy(Place::from(anchor_nonzero_local)),
+                                    tcx.types.u8,
+                                ),
+                            ))),
+                        ),
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(anchor_state_local),
+                                Rvalue::Use(Operand::Copy(Place::from(anchor_state_u8_local))),
+                            ))),
+                        ),
+                    ]);
+                }
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
             if let InstrKind::ArgRetag {
                 callee_id,
                 arg_index,
@@ -23250,6 +23529,92 @@ impl MyOptimizationPass {
                         .extend(remaining_stmts);
                 }
             }
+
+            if let InstrKind::ArgLeafTake {
+                callee_id,
+                arg_index,
+                leaf_key,
+            } = creation_kind
+            {
+                let take_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let (addr_stmt1, addr_stmt2) = self
+                    .slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        place,
+                        take_addr_local,
+                        false,
+                    )
+                    .expect("ArgLeafTake on unsupported local leaf slot");
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+                let cont_block = {
+                    let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    body.basic_blocks_mut().push(cont_data)
+                };
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_take_call_arg_leaf_shadow,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, callee_id),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, arg_index),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, leaf_key),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: Operand::Copy(Place::from(take_addr_local)),
+                                span: source_info.span,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(addr_stmt1);
+                    bd.statements.push(addr_stmt2);
+                    bd.terminator = Some(take_term);
+                    rem
+                };
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+            }
         }
     }
 
@@ -23631,15 +23996,27 @@ impl MyOptimizationPass {
         let def_id_shadow_load_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_tag", 1)
             .expect("missing '__rz_shadow_load_tag' definition");
+        let def_id_shadow_load_tag_for_ptr = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_tag_for_ptr", 2)
+            .expect("missing '__rz_shadow_load_tag_for_ptr' definition");
         let def_id_shadow_load_ref_ancestor = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_ref_ancestor", 1)
             .expect("missing '__rz_shadow_load_ref_ancestor' definition");
+        let def_id_shadow_load_ref_ancestor_for_ptr = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_ref_ancestor_for_ptr", 2)
+            .expect("missing '__rz_shadow_load_ref_ancestor_for_ptr' definition");
         let def_id_shadow_load_export_parent = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent", 1)
             .expect("missing '__rz_shadow_load_export_parent' definition");
+        let def_id_shadow_load_export_parent_for_ptr = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent_for_ptr", 2)
+            .expect("missing '__rz_shadow_load_export_parent_for_ptr' definition");
         let def_id_shadow_load_export_parent_recovered = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent_recovered", 1)
             .expect("missing '__rz_shadow_load_export_parent_recovered' definition");
+        let def_id_shadow_load_export_parent_recovered_for_ptr = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_load_export_parent_recovered_for_ptr", 2)
+            .expect("missing '__rz_shadow_load_export_parent_recovered_for_ptr' definition");
         let def_id_shadow_kill_range = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_kill_range", 2)
             .expect("missing '__rz_shadow_kill_range' definition");
@@ -23691,9 +24068,13 @@ impl MyOptimizationPass {
             def_id_shadow_store_ptr,
             def_id_shadow_store_ptr_local,
             def_id_shadow_load_tag,
+            def_id_shadow_load_tag_for_ptr,
             def_id_shadow_load_ref_ancestor,
+            def_id_shadow_load_ref_ancestor_for_ptr,
             def_id_shadow_load_export_parent,
+            def_id_shadow_load_export_parent_for_ptr,
             def_id_shadow_load_export_parent_recovered,
+            def_id_shadow_load_export_parent_recovered_for_ptr,
             def_id_shadow_kill_range,
             def_id_tag_kill,
             def_id_tag_retain,

@@ -401,6 +401,42 @@ fn load_entry(addr: usize) -> Option<PtrShadowEntry> {
 }
 
 #[inline]
+fn entry_matches_ptr_value(entry: PtrShadowEntry, ptr_addr: usize) -> bool {
+    if entry.tag == 0 {
+        return false;
+    }
+    tag_store::get(entry.tag).is_some_and(|meta| meta.pointee_addr == ptr_addr)
+}
+
+/// Load pointer shadow only if it still describes the pointer value in the slot.
+///
+/// Shadow metadata moves with pointer bytes. If the slot now contains a different address than
+/// the exact tag records, the shadow is stale; returning it would attach provenance to the wrong
+/// pointer value.
+#[inline]
+fn load_entry_for_ptr_value(addr: usize, ptr_addr: usize) -> Option<PtrShadowEntry> {
+    let entry = load_entry(addr)?;
+    if entry_matches_ptr_value(entry, ptr_addr) {
+        return Some(entry);
+    }
+
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        let tag_pointee = tag_store::get(entry.tag)
+            .map(|meta| meta.pointee_addr)
+            .unwrap_or(0);
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] stale load slot=0x{:x} ptr=0x{:x} tag={} tag_pointee=0x{:x}",
+            addr, ptr_addr, entry.tag, tag_pointee
+        );
+    }
+
+    None
+}
+
+#[inline]
 fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
     if addr == 0 {
         return None;
@@ -448,8 +484,22 @@ pub(crate) fn load_tag(addr: usize) -> u64 {
 }
 
 #[inline]
+pub(crate) fn load_tag_for_ptr_value(addr: usize, ptr_addr: usize) -> u64 {
+    load_entry_for_ptr_value(addr, ptr_addr)
+        .map(|entry| entry.tag)
+        .unwrap_or(0)
+}
+
+#[inline]
 pub(crate) fn load_ref_ancestor(addr: usize) -> u64 {
     load_entry(addr)
+        .map(|entry| entry.ref_ancestor)
+        .unwrap_or(0)
+}
+
+#[inline]
+pub(crate) fn load_ref_ancestor_for_ptr_value(addr: usize, ptr_addr: usize) -> u64 {
+    load_entry_for_ptr_value(addr, ptr_addr)
         .map(|entry| entry.ref_ancestor)
         .unwrap_or(0)
 }
@@ -462,8 +512,22 @@ pub(crate) fn load_export_parent(addr: usize) -> u64 {
 }
 
 #[inline]
+pub(crate) fn load_export_parent_for_ptr_value(addr: usize, ptr_addr: usize) -> u64 {
+    load_entry_for_ptr_value(addr, ptr_addr)
+        .map(|entry| entry.export_parent)
+        .unwrap_or(0)
+}
+
+#[inline]
 pub(crate) fn load_export_parent_recovered(addr: usize) -> u8 {
     load_entry(addr)
+        .map(|entry| entry.export_parent_recovered)
+        .unwrap_or(0)
+}
+
+#[inline]
+pub(crate) fn load_export_parent_recovered_for_ptr_value(addr: usize, ptr_addr: usize) -> u8 {
+    load_entry_for_ptr_value(addr, ptr_addr)
         .map(|entry| entry.export_parent_recovered)
         .unwrap_or(0)
 }
