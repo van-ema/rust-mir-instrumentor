@@ -523,7 +523,7 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                     valid_mask: 0,
                     poisoned: false,
                 });
-                if !slot.poisoned
+            if !slot.poisoned
                 && (slot.tag != src_entry.tag
                     || slot.ref_ancestor != src_entry.ref_ancestor
                     || slot.export_parent != src_entry.export_parent

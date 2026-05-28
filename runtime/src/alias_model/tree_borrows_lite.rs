@@ -179,11 +179,11 @@ impl AliasModel for TreeBorrowsLiteModel {
     }
 
     fn on_mut_arg_ret_export(&self, tag: u64, addr: usize) {
-        tb_lite_on_ret_family_export(tag, addr);
+        tb_lite_on_mut_arg_ret_export(tag, addr);
     }
 
     fn on_ret_export(&self, tag: u64, addr: usize) {
-        tb_lite_on_ret_family_export(tag, addr);
+        tb_lite_on_return_export(tag, addr);
     }
 
     fn check_access(
@@ -882,19 +882,18 @@ fn tb_unshadow_same_slot_protected_unique_ancestors(
     }
 }
 
-/// Re-enable a family that is exported after call-exit teardown has already run.
+/// Re-enable an ordinary return family that is exported after call-exit teardown has already run.
 ///
-/// Both normal return export hooks and mut-arg-ret export hooks can publish the caller-visible
-/// surviving family after `FnExit` has released the callee's protector frame. By the time the
-/// export becomes visible, the exact returned tag or one of its reserved ancestors may already
-/// have been disabled as frame-local state. This helper repairs that producer-side damage before
-/// the caller observes the lineage:
+/// Normal returned refs must not get broad ancestor repair before the return-boundary validation:
+/// Tree Borrows intentionally rejects a returned `&mut` that was frozen/invalidated before return.
+/// This helper therefore keeps the green-base behavior:
 /// - always re-enable the exported exact tag itself
-/// - additionally revive protector-end-disabled reserved ancestors for returned refs
+/// - additionally revive protector-end-disabled reserved ancestors only when the exported ref is
+///   still a reserved borrow
 ///
 /// That keeps caller-visible returned lineages attached to a live family without reviving
-/// unrelated poisoned raw ancestors or reintroducing a read-side recovery hatch.
-fn tb_lite_on_ret_family_export(tag: u64, addr: usize) {
+/// unrelated poisoned raw ancestors or masking ordinary returned-reference UB.
+fn tb_lite_on_return_export(tag: u64, addr: usize) {
     if !rz_tb_lite_enabled() || tag == 0 {
         return;
     }
@@ -939,6 +938,57 @@ fn tb_lite_on_ret_family_export(tag: u64, addr: usize) {
         if let Some(node) = tree.nodes.get_mut(&cur) {
             if node.poisoned_by_protector_end && matches!(node.lazy_perm, TbPerm::Reserved { .. }) {
                 tb_revive_node_after_protector_end(node);
+            }
+        }
+        cur = next;
+    }
+}
+
+/// Repair a caller-owned mutable argument family exported back after a call.
+///
+/// Mut-arg-ret export is not an ordinary returned reference. It is the callee writing back the
+/// surviving lineage for a caller-owned `&mut T` carrier. If protector teardown disabled an older
+/// same-lineage Unique ancestor before the survivor was exported, that ancestor is only an
+/// obsolete local handle. Mark it `ShadowedLocal` instead of leaving a hard-dead ancestor that
+/// later breaks the caller's live child lineage.
+fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
+    if !rz_tb_lite_enabled() || tag == 0 || addr == 0 {
+        return;
+    }
+
+    let Some(tmeta) = tags().lock().unwrap().get(&tag).copied() else {
+        return;
+    };
+    let base = tb_base_for_addr(tmeta.pointee_addr);
+    let mut all = tb_state().lock().unwrap();
+    let Some(tree) = all.get_mut(&base) else {
+        return;
+    };
+    let Some(node) = tree.nodes.get_mut(&tag) else {
+        return;
+    };
+    if node.start != addr {
+        return;
+    }
+    if node.poisoned_by_protector_end
+        && matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut)
+    {
+        return;
+    }
+    let exported_start = node.start;
+    let exported_len = node.len;
+    tb_reenable_exported_exact_node(node);
+
+    let mut cur = tree.nodes.get(&tag).map(|node| node.parent).unwrap_or(0);
+    while cur != 0 {
+        let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
+        if let Some(node) = tree.nodes.get_mut(&cur) {
+            if matches!(node.kind, BorrowKind::Unique)
+                && node.poisoned_by_protector_end
+                && matches!(node.lazy_perm, TbPerm::Reserved { .. })
+                && tb_range_covers(node.start, node.len, exported_start, exported_len)
+            {
+                tb_shadow_local_node(node);
             }
         }
         cur = next;
