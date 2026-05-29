@@ -1,6 +1,44 @@
 use super::*;
 
 #[derive(Clone, Debug)]
+pub(in crate::instrumentation) enum SizeOperand<'tcx> {
+    Const(Operand<'tcx>),
+    SizeOf(Ty<'tcx>),
+    /// Bounds-length encoding for a sized reference pointee.
+    ///
+    /// Runtime-side bounds metadata distinguishes:
+    /// - `usize::MAX` => unknown
+    /// - `0` => precise empty wide view (`&[]`, empty `str`, ...)
+    /// - `usize::MAX - 1` => exact zero-sized thin pointee (`&Cell<()>`, `&()`, ...)
+    ///
+    /// This variant preserves that distinction without a side-channel bit: it lowers to
+    /// `size_of::<T>()`, and maps the runtime value `0` to the exact-ZST sentinel.
+    RefSizedBoundsLen(Ty<'tcx>),
+    AlignOf(Ty<'tcx>),
+    ElemCount {
+        elem_ty: Ty<'tcx>,
+        count_op: Operand<'tcx>,
+    },
+    /// Size derived from wide-pointer metadata (slice length).
+    PtrMetadataSlice {
+        ptr_local: Local,
+        elem_ty: Ty<'tcx>,
+    },
+    /// Size derived from wide-pointer metadata (str length).
+    PtrMetadataStr {
+        ptr_local: Local,
+    },
+    /// Size derived from wide-pointer metadata for a struct DST with trailing `[T]` field.
+    /// Total bytes = offset_of(adt_ty, field_idx) + metadata * size_of::<elem_ty>().
+    PtrMetadataAdtSlice {
+        ptr_local: Local,
+        adt_ty: Ty<'tcx>,
+        field_idx: FieldIdx,
+        elem_ty: Ty<'tcx>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub(in crate::instrumentation) enum InstrKind<'tcx> {
     Ref {
         bk: BorrowKind,
