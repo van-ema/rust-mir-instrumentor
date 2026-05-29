@@ -1,3 +1,5 @@
+//! Describes structural pointer transport through slots, carriers, and leaves.
+
 use super::*;
 
 impl MyOptimizationPass {

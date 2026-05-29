@@ -1,3 +1,5 @@
+//! Shared data types used by instrumentation scanning and lowering.
+
 use super::*;
 
 #[derive(Clone, Debug)]

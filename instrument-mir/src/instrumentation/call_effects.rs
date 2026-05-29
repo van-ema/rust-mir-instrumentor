@@ -1,3 +1,5 @@
+//! Classifies known calls into effects the pass can instrument.
+
 use super::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

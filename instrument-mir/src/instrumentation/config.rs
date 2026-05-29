@@ -1,3 +1,5 @@
+//! Reads environment switches that control instrumentation behavior.
+
 use super::*;
 
 impl MyOptimizationPass {

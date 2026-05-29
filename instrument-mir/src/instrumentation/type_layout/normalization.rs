@@ -1,3 +1,5 @@
+//! Normalizes types before layout and pointer-shape checks.
+
 use super::super::*;
 
 impl MyOptimizationPass {

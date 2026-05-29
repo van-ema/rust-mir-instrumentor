@@ -1,3 +1,5 @@
+//! Reads sizes and offsets for constant and promoted allocations.
+
 use super::super::*;
 
 impl MyOptimizationPass {

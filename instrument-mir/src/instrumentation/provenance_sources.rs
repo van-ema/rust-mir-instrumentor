@@ -1,3 +1,5 @@
+//! Recovers pointer sources and chooses parent tags for new pointer views.
+
 use super::*;
 
 impl MyOptimizationPass {

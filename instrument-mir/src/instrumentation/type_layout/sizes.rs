@@ -1,3 +1,5 @@
+//! Computes type sizes and lowers size operands for runtime calls.
+
 use super::super::*;
 
 impl MyOptimizationPass {

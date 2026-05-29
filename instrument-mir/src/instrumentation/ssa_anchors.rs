@@ -1,3 +1,5 @@
+//! Tracks reusable SSA anchors for repeated pointer expressions.
+
 use super::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

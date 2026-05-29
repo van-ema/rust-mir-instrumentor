@@ -1,3 +1,5 @@
+//! Decides which crates and callees are handled as instrumented code.
+
 use super::*;
 
 pub(in crate::instrumentation) trait FunctionDefId {

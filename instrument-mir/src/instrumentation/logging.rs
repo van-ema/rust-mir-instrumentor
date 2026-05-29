@@ -1,3 +1,5 @@
+//! Provides small logging helpers for the MIR instrumentation pass.
+
 use super::*;
 
 impl MyOptimizationPass {

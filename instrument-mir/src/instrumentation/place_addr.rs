@@ -1,3 +1,5 @@
+//! Builds MIR places and address operands used by runtime hooks.
+
 use super::*;
 
 impl MyOptimizationPass {

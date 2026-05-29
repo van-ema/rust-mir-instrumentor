@@ -1,3 +1,5 @@
+//! Checks whether types are pointers, references, wrappers, or carriers.
+
 use super::super::*;
 
 impl MyOptimizationPass {

@@ -1,3 +1,5 @@
+//! Computes bounds information for sized and wide pointer values.
+
 use super::super::*;
 
 impl MyOptimizationPass {

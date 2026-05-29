@@ -1,3 +1,5 @@
+//! Detects types that should be exempt from alias checks.
+
 use super::super::*;
 
 impl MyOptimizationPass {

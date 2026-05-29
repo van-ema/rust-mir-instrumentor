@@ -1,3 +1,5 @@
+//! Finds runtime hook functions and builds operands that call them.
+
 use super::*;
 
 impl MyOptimizationPass {
