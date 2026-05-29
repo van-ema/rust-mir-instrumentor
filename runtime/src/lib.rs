@@ -1378,10 +1378,11 @@ const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
     OnceLock::new();
 static CALL_ARG_LEAF_SHADOWS: OnceLock<
-    Mutex<HashMap<(ThreadId, u64, u64, u64), PtrShadowTransport>>,
+    Mutex<HashMap<(ThreadId, u64, u64, u64), CallArgLeafTransport>>,
 > = OnceLock::new();
 static RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, usize), u64>>> = OnceLock::new();
 type PtrShadowTransport = (u64, u64, u64, u8);
+type CallArgLeafTransport = (usize, PtrShadowTransport);
 
 static RET_LEAF_SHADOWS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64), PtrShadowTransport>>> =
     OnceLock::new();
@@ -1394,7 +1395,15 @@ static BOUNDARY_SURVIVOR_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64), HashSet<u
     OnceLock::new();
 static MUT_ARG_RET_BOUNDARY_LINEAGES: OnceLock<Mutex<HashMap<ThreadId, HashSet<u64>>>> =
     OnceLock::new();
+static CALL_ARG_LEAF_SCOPES: OnceLock<Mutex<HashMap<ThreadId, Vec<CallArgLeafScope>>>> =
+    OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct CallArgLeafScope {
+    callee_id: u64,
+    leaf_shadows: HashMap<(u64, usize), PtrShadowTransport>,
+}
 
 fn allocs() -> &'static Mutex<BTreeMap<usize, AllocMeta>> {
     ALLOCS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1544,9 +1553,124 @@ fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), CallAr
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn call_arg_leaf_shadows() -> &'static Mutex<HashMap<(ThreadId, u64, u64, u64), PtrShadowTransport>>
-{
+fn call_arg_leaf_shadows(
+) -> &'static Mutex<HashMap<(ThreadId, u64, u64, u64), CallArgLeafTransport>> {
     CALL_ARG_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn call_arg_leaf_scopes() -> &'static Mutex<HashMap<ThreadId, Vec<CallArgLeafScope>>> {
+    CALL_ARG_LEAF_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn capture_call_arg_leaf_shadows_for_arg(
+    thread_id: ThreadId,
+    callee_id: u64,
+    matched_callee_id: u64,
+    arg_index: u64,
+) {
+    let captured: Vec<((u64, usize), PtrShadowTransport)> = {
+        let mut leafs = call_arg_leaf_shadows().lock().unwrap();
+        let keys: Vec<_> = leafs
+            .keys()
+            .filter(|(tid, cid, idx, _key)| {
+                *tid == thread_id && *cid == matched_callee_id && *idx == arg_index
+            })
+            .copied()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let leaf_key = key.3;
+                leafs
+                    .remove(&key)
+                    .map(|(slot_addr, shadow)| ((leaf_key, slot_addr), shadow))
+            })
+            .collect()
+    };
+    if captured.is_empty() {
+        return;
+    }
+
+    let mut scopes = call_arg_leaf_scopes().lock().unwrap();
+    let stack = scopes.entry(thread_id).or_default();
+    if !stack
+        .last()
+        .is_some_and(|scope| scope.callee_id == callee_id)
+    {
+        stack.push(CallArgLeafScope {
+            callee_id,
+            leaf_shadows: HashMap::new(),
+        });
+    }
+    if let Some(scope) = stack.last_mut() {
+        scope.leaf_shadows.extend(captured);
+    }
+}
+
+fn current_slot_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
+    let ptr_addr = shadow_slot_value_addr(slot_addr);
+    let shadow = (
+        ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr),
+        ptr_shadow::load_ref_ancestor_for_ptr_value(slot_addr, ptr_addr),
+        ptr_shadow::load_export_parent_for_ptr_value(slot_addr, ptr_addr),
+        ptr_shadow::load_export_parent_recovered_for_ptr_value(slot_addr, ptr_addr),
+    );
+    (shadow.0 != 0 || shadow.1 != 0 || shadow.2 != 0).then_some(shadow)
+}
+
+fn scoped_call_arg_leaf_shadow(
+    thread_id: ThreadId,
+    leaf_key: u64,
+    slot_addr: usize,
+) -> Option<PtrShadowTransport> {
+    let scoped = {
+        let scopes = call_arg_leaf_scopes().lock().unwrap();
+        let stack = scopes.get(&thread_id)?;
+        stack
+            .iter()
+            .rev()
+            .find_map(|scope| scope.leaf_shadows.get(&(leaf_key, slot_addr)).copied())?
+    };
+    Some(current_slot_shadow(slot_addr).unwrap_or(scoped))
+}
+
+fn clear_unconsumed_call_arg_leaf_shadows(callee_id: u64) {
+    let thread_id = std::thread::current().id();
+    call_arg_leaf_shadows()
+        .lock()
+        .unwrap()
+        .retain(|(tid, cid, _idx, _key), _shadow| *tid != thread_id || *cid != callee_id);
+}
+
+fn enter_call_arg_leaf_scope(callee_id: u64) {
+    let thread_id = std::thread::current().id();
+    call_arg_leaf_scopes()
+        .lock()
+        .unwrap()
+        .entry(thread_id)
+        .or_default()
+        .push(CallArgLeafScope {
+            callee_id,
+            leaf_shadows: HashMap::new(),
+        });
+}
+
+fn exit_call_arg_leaf_scope(callee_id: u64) {
+    let thread_id = std::thread::current().id();
+    let mut scopes = call_arg_leaf_scopes().lock().unwrap();
+    let Some(stack) = scopes.get_mut(&thread_id) else {
+        return;
+    };
+    if stack
+        .last()
+        .is_some_and(|scope| scope.callee_id == callee_id)
+    {
+        stack.pop();
+    } else if let Some(pos) = stack.iter().rposition(|scope| scope.callee_id == callee_id) {
+        stack.remove(pos);
+    }
+    if stack.is_empty() {
+        scopes.remove(&thread_id);
+    }
 }
 
 pub(crate) fn ret_tags() -> &'static Mutex<HashMap<(ThreadId, u64, usize), u64>> {
@@ -5170,14 +5294,10 @@ pub extern "C" fn __rz_push_call_arg_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
+    let shadow = current_slot_shadow(slot_addr).unwrap_or((0, 0, 0, 0));
     call_arg_leaf_shadows().lock().unwrap().insert(
         (thread_id, callee_id, arg_index, leaf_key),
-        (
-            ptr_shadow::load_tag(slot_addr),
-            ptr_shadow::load_ref_ancestor(slot_addr),
-            ptr_shadow::load_export_parent(slot_addr),
-            ptr_shadow::load_export_parent_recovered(slot_addr),
-        ),
+        (slot_addr, shadow),
     );
 }
 
@@ -5249,6 +5369,9 @@ pub extern "C" fn __rz_take_call_arg_tag(
             inplace_alias_parent.unwrap_or(0)
         );
     }
+    if tag != 0 {
+        capture_call_arg_leaf_shadows_for_arg(thread_id, callee_id, matched_callee_id, arg_index);
+    }
     if tag != 0 && protect_arg {
         active_alias_model().on_call_arg_taken(matched_callee_id, tag);
         if let Some(alias_parent_tag) = inplace_alias_parent {
@@ -5291,7 +5414,10 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
     tag
 }
 
-/// Restore one exact pointer-leaf shadow into a by-value raw-owner aggregate argument slot.
+/// Restore one exact pointer-leaf shadow into an argument slot.
+///
+/// If no exact or activation-scoped structural leaf fact exists, the slot becomes untracked
+/// instead of inheriting stale shadow from an older stack occupant.
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_leaf_shadow(
     callee_id: u64,
@@ -5301,11 +5427,15 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor, export_parent, export_parent_recovered) = call_arg_leaf_shadows()
-        .lock()
-        .unwrap()
-        .remove(&(thread_id, callee_id, arg_index, leaf_key))
-        .unwrap_or((0, 0, 0, 0));
+    let shadow = {
+        let mut leafs = call_arg_leaf_shadows().lock().unwrap();
+        leafs
+            .remove(&(thread_id, callee_id, arg_index, leaf_key))
+            .map(|(_slot_addr, shadow)| shadow)
+    }
+    .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr));
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        shadow.unwrap_or((0, 0, 0, 0));
     ptr_shadow::store_ptr(
         slot_addr,
         tag,
@@ -5602,10 +5732,19 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     __record_raw_ptr_creation(addr, is_mut, 0, alias_exempt, bounds_len, align_req)
 }
 
+/// Open the per-activation call-argument payload scope for an instrumented function.
+#[no_mangle]
+pub extern "C" fn __rz_enter_fn(callee_id: u64) {
+    let _g = RzRuntimeGuard::enter();
+    enter_call_arg_leaf_scope(callee_id);
+}
+
 /// Notify runtime alias models that the current instrumented function is exiting.
 #[no_mangle]
 pub extern "C" fn __rz_exit_fn(callee_id: u64) {
     let _g = RzRuntimeGuard::enter();
+    clear_unconsumed_call_arg_leaf_shadows(callee_id);
+    exit_call_arg_leaf_scope(callee_id);
     active_alias_model().on_call_exit(callee_id);
 }
 

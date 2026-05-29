@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 mod config;
 mod metadata_dataflow;
+mod structural_provenance;
 
 // (rest unchanged)
 // NOTE: This pass intentionally avoids instrumenting std/core/alloc directly.
@@ -1833,6 +1834,10 @@ enum InstrKind<'tcx> {
         is_mut: bool,
         is_ref: bool,
     },
+    /// Callee-side: open runtime per-activation state for this function.
+    FnEnter {
+        callee_id: u64,
+    },
     /// Callee-side: notify runtime alias models that this function is exiting.
     FnExit {
         callee_id: u64,
@@ -1966,6 +1971,7 @@ struct Hooks {
     def_id_take_mut_arg_ret_tag_or_zero: DefId,
     def_id_push_mut_arg_ret_leaf_shadow: DefId,
     def_id_take_mut_arg_ret_leaf_shadow: DefId,
+    def_id_enter_fn: DefId,
     def_id_exit_fn: DefId,
     def_id_shadow_store_ptr: DefId,
     def_id_shadow_store_ptr_local: DefId,
@@ -13244,18 +13250,13 @@ impl MyOptimizationPass {
                                         )
                                     })
                                     .filter(|leafs| !leafs.is_empty());
-                                if let Some(matched_leafs) = self
-                                    .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                if let Some(matched_leafs) =
+                                    structural_provenance::pair_return_leafs_from_arg0(
+                                        self,
                                         &dst_leafs,
                                         &direct_src_leafs,
+                                        pointee_src_leafs.as_deref(),
                                     )
-                                    .or_else(|| {
-                                        pointee_src_leafs.as_ref().and_then(|leafs| {
-                                            self.pair_shadowable_leaf_ptr_specs_from_arg0(
-                                                &dst_leafs, leafs,
-                                            )
-                                        })
-                                    })
                                 {
                                     for (dst_spec, src_spec) in matched_leafs {
                                         let kind = if src_spec.place.projection.is_empty()
@@ -13393,18 +13394,13 @@ impl MyOptimizationPass {
                                             )
                                         })
                                         .filter(|leafs| !leafs.is_empty());
-                                    if let Some(matched_leafs) = self
-                                        .pair_shadowable_leaf_ptr_specs_from_arg0(
+                                    if let Some(matched_leafs) =
+                                        structural_provenance::pair_return_leafs_from_arg0(
+                                            self,
                                             &dst_leafs,
                                             &direct_src_leafs,
+                                            pointee_src_leafs.as_deref(),
                                         )
-                                        .or_else(|| {
-                                            pointee_src_leafs.as_ref().and_then(|leafs| {
-                                                self.pair_shadowable_leaf_ptr_specs_from_arg0(
-                                                    &dst_leafs, leafs,
-                                                )
-                                            })
-                                        })
                                     {
                                         for (dst_spec, src_spec) in matched_leafs {
                                             let kind = if src_spec.place.projection.is_empty()
@@ -14689,6 +14685,18 @@ impl MyOptimizationPass {
         let track_all_stack_allocs = self.track_all_stack_allocs_flag();
 
         let entry_insert_at = self.entry_insert_after_prologue(body);
+        let callee_id = self.callee_id_u64(tcx, body.source.def_id());
+        insert_points.push(InsertPoint {
+            bb: START_BLOCK,
+            stmt_idx: entry_insert_at,
+            insert_before: false,
+            source_info: SourceInfo {
+                span: rustc_span::DUMMY_SP,
+                scope: OUTERMOST_SOURCE_SCOPE,
+            },
+            place: Place::from(RETURN_PLACE),
+            kind: InstrKind::FnEnter { callee_id },
+        });
         self.push_arg_retags_at_entry(
             tcx,
             body,
@@ -15695,6 +15703,7 @@ impl MyOptimizationPass {
             InstrKind::MutArgRetTake { .. } => hooks.def_id_take_mut_arg_ret_tag,
             InstrKind::MutArgRetTakePtrOnly { .. } => hooks.def_id_take_mut_arg_ret_tag_or_zero,
             InstrKind::MutArgRetLeafTake { .. } => hooks.def_id_take_mut_arg_ret_leaf_shadow,
+            InstrKind::FnEnter { .. } => hooks.def_id_enter_fn,
             InstrKind::FnExit { .. } => hooks.def_id_exit_fn,
         };
         Operand::function_handle(tcx, def_id, std::iter::empty(), sp)
@@ -15801,6 +15810,7 @@ impl MyOptimizationPass {
                 InstrKind::Ref { .. }
                 | InstrKind::Raw { .. }
                 | InstrKind::RawRoot { .. }
+                | InstrKind::FnEnter { .. }
                 | InstrKind::ArgRetag { .. }
                 | InstrKind::ArgAnchorTake { .. }
                 | InstrKind::ArgLeafTake { .. }
@@ -15866,7 +15876,8 @@ impl MyOptimizationPass {
         for (idx, ip) in insert_points.into_iter().enumerate() {
             if matches!(
                 ip.kind,
-                InstrKind::ArgRetag { .. }
+                InstrKind::FnEnter { .. }
+                    | InstrKind::ArgRetag { .. }
                     | InstrKind::ArgAnchorTake { .. }
                     | InstrKind::ArgAnchorSeedFromShadow { .. }
                     | InstrKind::ArgLeafTake { .. }
@@ -22812,6 +22823,53 @@ impl MyOptimizationPass {
             let place = ip.place;
             let creation_kind = ip.kind;
 
+            if let InstrKind::FnEnter { callee_id } = creation_kind {
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                let enter_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_enter_fn,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![Spanned {
+                            node: self.const_u64(tcx, source_info.span, callee_id),
+                            span: source_info.span,
+                        }]
+                        .into_boxed_slice(),
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = stmt_idx.min(bd.statements.len());
+                    let rem = bd.statements.split_off(split_at);
+                    bd.terminator = Some(enter_term);
+                    rem
+                };
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+                continue;
+            }
+
             if let InstrKind::ArgAnchorSeedFromShadow { local } = creation_kind {
                 let anchor_local = *reborrow_anchor_local_for_stack_local
                     .get(&local)
@@ -23984,6 +24042,9 @@ impl MyOptimizationPass {
         let def_id_take_mut_arg_ret_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_take_mut_arg_ret_leaf_shadow", 5)
             .expect("missing '__rz_take_mut_arg_ret_leaf_shadow' definition");
+        let def_id_enter_fn = self
+            .find_runtime_fn_def_id(tcx, "__rz_enter_fn", 1)
+            .expect("missing '__rz_enter_fn' definition");
         let def_id_exit_fn = self
             .find_runtime_fn_def_id(tcx, "__rz_exit_fn", 1)
             .expect("missing '__rz_exit_fn' definition");
@@ -24064,6 +24125,7 @@ impl MyOptimizationPass {
             def_id_take_mut_arg_ret_tag_or_zero,
             def_id_push_mut_arg_ret_leaf_shadow,
             def_id_take_mut_arg_ret_leaf_shadow,
+            def_id_enter_fn,
             def_id_exit_fn,
             def_id_shadow_store_ptr,
             def_id_shadow_store_ptr_local,

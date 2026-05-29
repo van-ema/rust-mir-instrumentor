@@ -678,14 +678,15 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let parent = node.parent;
     let protected = node.protected;
     let returned_carrier_reroot = (tmeta.lineage_hint & 0b1000) != 0;
-    if returned_carrier_reroot {
-        let stack_like_root_ref =
-            parent == 0 && matches!(kind, BorrowKind::Shared | BorrowKind::Unique) && {
-                let amap = allocs().lock().unwrap();
-                find_alloc_containing(&amap, tmeta.pointee_addr)
-                    .map(|(_base, meta)| meta.is_stack)
-                    .unwrap_or(false)
-            };
+    // Same-slot returned-carrier rerooting is write-like. A shared root is only a read view; it
+    // must not retire an older unique family such as a two-phase receiver reservation.
+    if returned_carrier_reroot && matches!(kind, BorrowKind::Unique) {
+        let stack_like_root_ref = parent == 0 && {
+            let amap = allocs().lock().unwrap();
+            find_alloc_containing(&amap, tmeta.pointee_addr)
+                .map(|(_base, meta)| meta.is_stack)
+                .unwrap_or(false)
+        };
         if stack_like_root_ref {
             let superseded_roots: Vec<u64> = tree
                 .nodes
