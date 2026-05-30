@@ -28,8 +28,12 @@ impl MyOptimizationPass {
             || s.contains("/library/alloc/")
     }
 
-    /// Best-effort byte size for memory ops using `count * size_of::<T>()` when possible.
-    pub(in crate::instrumentation) fn memop_size_bytes<'tcx>(
+    /// Byte size for `ptr::copy` / `copy_nonoverlapping` / `write_bytes` effects.
+    ///
+    /// This is an access length, not tag-bounds metadata. If the pointee size is not known, use
+    /// `0` so the runtime treats the access length as unknown; never pass the bounds sentinel
+    /// (`usize::MAX`) as a real read/write size.
+    pub(in crate::instrumentation) fn memop_access_size_bytes<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -38,10 +42,6 @@ impl MyOptimizationPass {
         span: Span,
     ) -> SizeOperand<'tcx> {
         let ptr_ty = body.local_decls[ptr_local].ty;
-        if !self.is_thin_ptr_ty(tcx, body, ptr_ty) {
-            return self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, span);
-        }
-
         let elem_ty = match ptr_ty.kind() {
             TyKind::RawPtr(pointee_ty, _) => *pointee_ty,
             TyKind::Ref(_, pointee_ty, _) => *pointee_ty,
@@ -51,7 +51,6 @@ impl MyOptimizationPass {
         };
 
         if !elem_ty.is_sized(tcx, body.typing_env(tcx)) {
-            // TODO(wide-ptr): support unsized element types by using metadata length when available.
             return SizeOperand::Const(self.const_usize(tcx, span, 0));
         }
 
@@ -810,7 +809,13 @@ impl MyOptimizationPass {
                 let count_op = &args[2].node;
 
                 let size_op_for = |ptr_local: Local| -> SizeOperand<'tcx> {
-                    self.memop_size_bytes(tcx, body, ptr_local, count_op, term.source_info.span)
+                    self.memop_access_size_bytes(
+                        tcx,
+                        body,
+                        ptr_local,
+                        count_op,
+                        term.source_info.span,
+                    )
                 };
 
                 // These hooks are inserted via terminator splitting. Because later insert points
@@ -901,8 +906,13 @@ impl MyOptimizationPass {
                 if let Some(dst) = dst_local {
                     *classified_write_ptr_local = Some(dst);
                     ptr_locals_needing_tag.insert(dst);
-                    let size_op =
-                        self.memop_size_bytes(tcx, body, dst, count_op, term.source_info.span);
+                    let size_op = self.memop_access_size_bytes(
+                        tcx,
+                        body,
+                        dst,
+                        count_op,
+                        term.source_info.span,
+                    );
                     insert_points.push(InsertPoint {
                         bb,
                         stmt_idx: block_data.statements.len(),
@@ -939,7 +949,7 @@ impl MyOptimizationPass {
                             source_info: term.source_info,
                             place: dst_place,
                             kind: InstrKind::ShadowKill {
-                                size_op: self.memop_size_bytes(
+                                size_op: self.memop_access_size_bytes(
                                     tcx,
                                     body,
                                     dst,
