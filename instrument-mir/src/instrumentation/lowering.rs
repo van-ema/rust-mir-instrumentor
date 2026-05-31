@@ -1041,9 +1041,12 @@ impl MyOptimizationPass {
                 | InstrKind::ShadowStoreBoxPointee { .. }
                 | InstrKind::ShadowCopySlot { .. }
                 | InstrKind::ShadowCopyRange { .. } => 3,
+                InstrKind::IndirectCallScopeBegin => 2,
                 InstrKind::CallArgPush { .. }
+                | InstrKind::IndirectCallArgPush { .. }
                 | InstrKind::CallArgValidate { .. }
                 | InstrKind::CallArgLeafPush { .. }
+                | InstrKind::IndirectCallArgLeafPush { .. }
                 | InstrKind::PtrUse { .. }
                 | InstrKind::RetValidate { .. }
                 | InstrKind::RetAnchorTake { .. }
@@ -1051,6 +1054,7 @@ impl MyOptimizationPass {
                 | InstrKind::MutArgRetTake { .. }
                 | InstrKind::MutArgRetLeafTake { .. }
                 | InstrKind::MutArgRetTakePtrOnly { .. } => 3,
+                InstrKind::IndirectCallScopeEnd => 4,
                 _ => 4,
             }
         }
@@ -5071,6 +5075,42 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if matches!(
+                creation_kind,
+                InstrKind::IndirectCallScopeBegin | InstrKind::IndirectCallScopeEnd
+            ) {
+                let func_def = match creation_kind {
+                    InstrKind::IndirectCallScopeBegin => hooks.def_id_begin_indirect_call_arg_scope,
+                    InstrKind::IndirectCallScopeEnd => hooks.def_id_end_indirect_call_arg_scope,
+                    _ => unreachable!(),
+                };
+                let func =
+                    Operand::function_handle(tcx, func_def, std::iter::empty(), source_info.span);
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                body.basic_blocks_mut()[bb].terminator = Some(Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func,
+                        args: Vec::new().into_boxed_slice(),
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                });
+                continue;
+            }
+
             if let InstrKind::TagKill { ptr_local } = creation_kind {
                 let Some(tag_local) = tag_local_for_ptr_local.get(&ptr_local).copied() else {
                     continue;
@@ -5462,7 +5502,8 @@ impl MyOptimizationPass {
                     };
                     (Some(slot_stmt1), slot_stmt2)
                 }
-                InstrKind::CallArgPush { ptr_local, .. } => {
+                InstrKind::CallArgPush { ptr_local, .. }
+                | InstrKind::IndirectCallArgPush { ptr_local, .. } => {
                     let place_ty = place.ty(&body.local_decls, tcx).ty;
                     if self.is_pointer_ty(place_ty) {
                         match self.addr_stmts_for_place(tcx, body, source_info, place, addr_local) {
@@ -5483,7 +5524,9 @@ impl MyOptimizationPass {
                         (Some(slot_stmt1), slot_stmt2)
                     }
                 }
-                InstrKind::CallArgLeafPush { .. } | InstrKind::ArgLeafTake { .. } => {
+                InstrKind::CallArgLeafPush { .. }
+                | InstrKind::IndirectCallArgLeafPush { .. }
+                | InstrKind::ArgLeafTake { .. } => {
                     let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
                         tcx,
                         body,
@@ -5958,13 +6001,30 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::CallArgPush {
-                    callee_id,
-                    arg_index,
-                    ptr_local,
-                    parent_mode,
-                    flags,
-                } => {
+                ref kind @ (InstrKind::CallArgPush { .. }
+                | InstrKind::IndirectCallArgPush { .. }) => {
+                    let (callee_id_opt, arg_index, ptr_local, parent_mode, flags) = match kind {
+                        InstrKind::CallArgPush {
+                            callee_id,
+                            arg_index,
+                            ptr_local,
+                            parent_mode,
+                            flags,
+                        } => (
+                            Some(*callee_id),
+                            *arg_index,
+                            *ptr_local,
+                            *parent_mode,
+                            *flags,
+                        ),
+                        InstrKind::IndirectCallArgPush {
+                            arg_index,
+                            ptr_local,
+                            parent_mode,
+                            flags,
+                        } => (None, *arg_index, *ptr_local, *parent_mode, *flags),
+                        _ => unreachable!(),
+                    };
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -6178,16 +6238,16 @@ impl MyOptimizationPass {
                             )
                         };
 
-                    let arg_callee = self.const_u64(tcx, source_info.span, callee_id);
-                    let arg_index = self.const_u64(tcx, source_info.span, arg_index);
-
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned {
-                            node: arg_callee,
+                    let mut arg_vec: Vec<Spanned<Operand<'tcx>>> = Vec::new();
+                    if let Some(callee_id) = callee_id_opt {
+                        arg_vec.push(Spanned {
+                            node: self.const_u64(tcx, source_info.span, callee_id),
                             span: source_info.span,
-                        },
+                        });
+                    }
+                    arg_vec.extend([
                         Spanned {
-                            node: arg_index,
+                            node: self.const_u64(tcx, source_info.span, arg_index),
                             span: source_info.span,
                         },
                         Spanned {
@@ -6210,8 +6270,9 @@ impl MyOptimizationPass {
                             node: self.const_u8(tcx, source_info.span, flags),
                             span: source_info.span,
                         },
-                    ]
-                    .into_boxed_slice();
+                    ]);
+
+                    let args: Box<[Spanned<Operand<'tcx>>]> = arg_vec.into_boxed_slice();
 
                     (args, Place::from(tmp_unit))
                 }
@@ -6247,24 +6308,37 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
-                InstrKind::CallArgLeafPush {
-                    callee_id,
-                    arg_index,
-                    leaf_key,
-                }
-                | InstrKind::ArgLeafTake {
-                    callee_id,
-                    arg_index,
-                    leaf_key,
-                } => {
+                ref kind @ (InstrKind::CallArgLeafPush { .. }
+                | InstrKind::IndirectCallArgLeafPush { .. }
+                | InstrKind::ArgLeafTake { .. }) => {
+                    let (callee_id_opt, arg_index, leaf_key) = match kind {
+                        InstrKind::CallArgLeafPush {
+                            callee_id,
+                            arg_index,
+                            leaf_key,
+                        }
+                        | InstrKind::ArgLeafTake {
+                            callee_id,
+                            arg_index,
+                            leaf_key,
+                        } => (Some(*callee_id), *arg_index, *leaf_key),
+                        InstrKind::IndirectCallArgLeafPush {
+                            arg_index,
+                            leaf_key,
+                        } => (None, *arg_index, *leaf_key),
+                        _ => unreachable!(),
+                    };
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned {
+                    let mut arg_vec: Vec<Spanned<Operand<'tcx>>> = Vec::new();
+                    if let Some(callee_id) = callee_id_opt {
+                        arg_vec.push(Spanned {
                             node: self.const_u64(tcx, source_info.span, callee_id),
                             span: source_info.span,
-                        },
+                        });
+                    }
+                    arg_vec.extend([
                         Spanned {
                             node: self.const_u64(tcx, source_info.span, arg_index),
                             span: source_info.span,
@@ -6277,8 +6351,8 @@ impl MyOptimizationPass {
                             node: arg_addr,
                             span: source_info.span,
                         },
-                    ]
-                    .into_boxed_slice();
+                    ]);
+                    let args: Box<[Spanned<Operand<'tcx>>]> = arg_vec.into_boxed_slice();
 
                     (args, Place::from(tmp_unit))
                 }

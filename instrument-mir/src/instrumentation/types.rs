@@ -254,6 +254,22 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         /// Bit 0 marks the custom-MIR exact in-place source shape `Move(*ptr)`.
         flags: u8,
     },
+    /// Caller-side scope marker for an unresolved function-pointer/vtable call.
+    IndirectCallScopeBegin,
+    /// Caller-side scope cleanup after an unresolved function-pointer/vtable call returns.
+    IndirectCallScopeEnd,
+    /// Caller-side tag push for pointer arguments to an unresolved function-pointer/vtable call.
+    IndirectCallArgPush {
+        arg_index: u64,
+        ptr_local: Local,
+        parent_mode: ParentSelectionMode,
+        flags: u8,
+    },
+    /// Caller-side leaf-shadow push for an unresolved function-pointer/vtable call.
+    IndirectCallArgLeafPush {
+        arg_index: u64,
+        leaf_key: u64,
+    },
     /// Caller-side validation for a by-value argument that is not itself pointer-typed,
     /// but carries a reference inside an aggregate/container.
     ///
@@ -531,6 +547,10 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_read_allow_untagged: DefId,
     pub(in crate::instrumentation) def_id_use: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_begin_indirect_call_arg_scope: DefId,
+    pub(in crate::instrumentation) def_id_end_indirect_call_arg_scope: DefId,
+    pub(in crate::instrumentation) def_id_push_indirect_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_push_indirect_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_validate_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag_anchor: DefId,

@@ -1369,6 +1369,13 @@ struct CallArgTagEntry {
     flags: u8,
 }
 
+#[derive(Debug, Default)]
+struct DynamicCallArgScope {
+    arg_tags: HashMap<(u64, usize), CallArgTagEntry>,
+    leaf_shadows: HashMap<(u64, u64), CallArgLeafTransport>,
+    consumed: bool,
+}
+
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 // A callee still consumes the explicit boundary parent, but TB-lite must not
 // turn that parent into a protected child for unresolved/generic `&mut Self`.
@@ -1396,6 +1403,8 @@ static BOUNDARY_SURVIVOR_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64), HashSet<u
 static MUT_ARG_RET_BOUNDARY_LINEAGES: OnceLock<Mutex<HashMap<ThreadId, HashSet<u64>>>> =
     OnceLock::new();
 static CALL_ARG_LEAF_SCOPES: OnceLock<Mutex<HashMap<ThreadId, Vec<CallArgLeafScope>>>> =
+    OnceLock::new();
+static DYNAMIC_CALL_ARG_SCOPES: OnceLock<Mutex<HashMap<ThreadId, Vec<DynamicCallArgScope>>>> =
     OnceLock::new();
 static PROMISED_ALIGNMENTS: OnceLock<Mutex<HashMap<(usize, u64), usize>>> = OnceLock::new();
 
@@ -1560,6 +1569,10 @@ fn call_arg_leaf_shadows(
 
 fn call_arg_leaf_scopes() -> &'static Mutex<HashMap<ThreadId, Vec<CallArgLeafScope>>> {
     CALL_ARG_LEAF_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dynamic_call_arg_scopes() -> &'static Mutex<HashMap<ThreadId, Vec<DynamicCallArgScope>>> {
+    DYNAMIC_CALL_ARG_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn capture_call_arg_leaf_shadows_for_arg(
@@ -5223,23 +5236,13 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
     tag
 }
 
-/// Push explicit call-boundary pointer state so callees can retag on entry.
-///
-/// `exact_tag` is the caller local's current tag. `boundary_parent_tag` is the family the callee
-/// should inherit when the local came from an earlier boundary import/recovery. Exact-origin
-/// locals validate the exact tag first; recovered-origin locals validate/export the boundary
-/// parent instead of a transient local child.
-#[no_mangle]
-pub extern "C" fn __rz_push_call_arg_boundary_tag(
-    callee_id: u64,
-    arg_index: u64,
+fn call_arg_boundary_entry(
     addr: usize,
     exact_tag: u64,
     boundary_parent_tag: u64,
     boundary_origin: u8,
     flags: u8,
-) {
-    let _g = RzRuntimeGuard::enter();
+) -> CallArgTagEntry {
     let recovered_origin = boundary_origin != CALL_ARG_BOUNDARY_ORIGIN_EXACT;
     let boundary_parent_tag = if boundary_parent_tag != 0 {
         boundary_parent_tag
@@ -5264,17 +5267,135 @@ pub extern "C" fn __rz_push_call_arg_boundary_tag(
         rz_validate_ref_boundary_use(exact_tag, "CALL_ARG");
         canonical_call_arg_tag(addr, exact_tag)
     };
+    CallArgTagEntry { tag, flags }
+}
+
+/// Push explicit call-boundary pointer state so callees can retag on entry.
+///
+/// `exact_tag` is the caller local's current tag. `boundary_parent_tag` is the family the callee
+/// should inherit when the local came from an earlier boundary import/recovery. Exact-origin
+/// locals validate the exact tag first; recovered-origin locals validate/export the boundary
+/// parent instead of a transient local child.
+#[no_mangle]
+pub extern "C" fn __rz_push_call_arg_boundary_tag(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    exact_tag: u64,
+    boundary_parent_tag: u64,
+    boundary_origin: u8,
+    flags: u8,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let boundary_parent_tag = if boundary_parent_tag != 0 {
+        boundary_parent_tag
+    } else {
+        exact_tag
+    };
+    let entry =
+        call_arg_boundary_entry(addr, exact_tag, boundary_parent_tag, boundary_origin, flags);
     if rz_trace_call_tags_enabled() {
         eprintln!(
             "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
-            callee_id, arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, tag, flags
+            callee_id, arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, entry.tag, flags
         );
     }
     let thread_id = std::thread::current().id();
-    call_arg_tags().lock().unwrap().insert(
-        (thread_id, callee_id, arg_index, addr),
-        CallArgTagEntry { tag, flags },
-    );
+    call_arg_tags()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, arg_index, addr), entry);
+}
+
+/// Open a caller-side side channel for an unresolved function-pointer/vtable call.
+#[no_mangle]
+pub extern "C" fn __rz_begin_indirect_call_arg_scope() {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    dynamic_call_arg_scopes()
+        .lock()
+        .unwrap()
+        .entry(thread_id)
+        .or_default()
+        .push(DynamicCallArgScope::default());
+}
+
+/// Close the caller-side side channel for an unresolved function-pointer/vtable call.
+#[no_mangle]
+pub extern "C" fn __rz_end_indirect_call_arg_scope() {
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+    let Some(stack) = scopes.get_mut(&thread_id) else {
+        return;
+    };
+    stack.pop();
+    if stack.is_empty() {
+        scopes.remove(&thread_id);
+    }
+}
+
+/// Push call-boundary pointer state for an unresolved function-pointer/vtable call.
+#[no_mangle]
+pub extern "C" fn __rz_push_indirect_call_arg_boundary_tag(
+    arg_index: u64,
+    addr: usize,
+    exact_tag: u64,
+    boundary_parent_tag: u64,
+    boundary_origin: u8,
+    flags: u8,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let boundary_parent_tag = if boundary_parent_tag != 0 {
+        boundary_parent_tag
+    } else {
+        exact_tag
+    };
+    let entry =
+        call_arg_boundary_entry(addr, exact_tag, boundary_parent_tag, boundary_origin, flags);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] push indirect arg={} addr=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
+            arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, entry.tag, flags
+        );
+    }
+    let thread_id = std::thread::current().id();
+    let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+    let stack = scopes.entry(thread_id).or_default();
+    if stack.is_empty() {
+        stack.push(DynamicCallArgScope::default());
+    }
+    if let Some(scope) = stack.last_mut() {
+        scope.arg_tags.insert((arg_index, addr), entry);
+    }
+}
+
+/// Push one pointer-leaf shadow for an unresolved function-pointer/vtable call.
+#[no_mangle]
+pub extern "C" fn __rz_push_indirect_call_arg_leaf_shadow(
+    arg_index: u64,
+    leaf_key: u64,
+    slot_addr: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    let shadow = current_slot_shadow(slot_addr).unwrap_or((0, 0, 0, 0));
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] push indirect leaf arg={} leaf={} slot=0x{:x} tag={}",
+            arg_index, leaf_key, slot_addr, shadow.0
+        );
+    }
+    let thread_id = std::thread::current().id();
+    let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+    let stack = scopes.entry(thread_id).or_default();
+    if stack.is_empty() {
+        stack.push(DynamicCallArgScope::default());
+    }
+    if let Some(scope) = stack.last_mut() {
+        scope
+            .leaf_shadows
+            .insert((arg_index, leaf_key), (slot_addr, shadow));
+    }
 }
 
 /// Validate a non-pointer by-value call argument carrier's inner reference tag.
@@ -5311,7 +5432,7 @@ pub extern "C" fn __rz_take_call_arg_tag(
 ) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, protect_arg, inplace_alias_parent, matched_callee_id) = {
+    let direct_entry = {
         let mut tags = call_arg_tags().lock().unwrap();
         let mut matched_callee_id = callee_id;
         let allow_cross_callee_fallback = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
@@ -5339,9 +5460,8 @@ pub extern "C" fn __rz_take_call_arg_tag(
                 }
                 CallArgTagEntry::default()
             });
-        let tag = entry.tag;
         let protect_arg = (entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0;
-        let inplace_alias_parent = if tag != 0 && protect_arg {
+        let inplace_alias_parent = if entry.tag != 0 && protect_arg {
             tags.iter()
                 .find(|((tid, cid, other_arg, other_addr), other_entry)| {
                     *tid == thread_id
@@ -5355,8 +5475,43 @@ pub extern "C" fn __rz_take_call_arg_tag(
         } else {
             None
         };
-        (tag, protect_arg, inplace_alias_parent, matched_callee_id)
+        (entry, inplace_alias_parent, matched_callee_id)
     };
+    let (entry, inplace_alias_parent, matched_callee_id) = if direct_entry.0.tag != 0 {
+        direct_entry
+    } else {
+        let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+        let dynamic_entry = scopes
+            .get_mut(&thread_id)
+            .and_then(|stack| stack.last_mut())
+            .and_then(|scope| {
+                let entry = scope.arg_tags.remove(&(arg_index, addr))?;
+                scope.consumed = true;
+                let protect_arg = (entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0;
+                let inplace_alias_parent = if entry.tag != 0 && protect_arg {
+                    scope
+                        .arg_tags
+                        .iter()
+                        .find(|((other_arg, other_addr), other_entry)| {
+                            *other_arg != arg_index
+                                && *other_addr == addr
+                                && (other_entry.flags & CALL_ARG_FLAG_INPLACE_EXACT_SOURCE) != 0
+                                && (other_entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0
+                        })
+                        .map(|(_key, other_entry)| other_entry.tag)
+                } else {
+                    None
+                };
+                Some((entry, inplace_alias_parent))
+            });
+        if let Some((entry, inplace_alias_parent)) = dynamic_entry {
+            (entry, inplace_alias_parent, callee_id)
+        } else {
+            direct_entry
+        }
+    };
+    let tag = entry.tag;
+    let protect_arg = (entry.flags & CALL_ARG_FLAG_NO_PROTECTOR) == 0;
     if rz_trace_call_tags_enabled() {
         eprintln!(
             "[rusteze-runtime][call-tag] take callee={} matched_callee={} arg={} addr=0x{:x} -> {} protector={} inplace_alias_parent={}",
@@ -5433,6 +5588,18 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
             .remove(&(thread_id, callee_id, arg_index, leaf_key))
             .map(|(_slot_addr, shadow)| shadow)
     }
+    .or_else(|| {
+        let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+        scopes
+            .get_mut(&thread_id)
+            .and_then(|stack| {
+                stack
+                    .iter_mut()
+                    .rev()
+                    .find_map(|scope| scope.leaf_shadows.remove(&(arg_index, leaf_key)))
+            })
+            .map(|(_slot_addr, shadow)| shadow)
+    })
     .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr));
     let (tag, ref_ancestor, export_parent, export_parent_recovered) =
         shadow.unwrap_or((0, 0, 0, 0));

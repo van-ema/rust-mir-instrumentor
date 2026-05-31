@@ -1195,6 +1195,13 @@ impl MyOptimizationPass {
         let callee_instrumented = callee_opt
             .map(|(did, _)| self.is_instrumented_callee(tcx, did))
             .unwrap_or(false);
+        let direct_call_arg_callee_id = if callee_instrumented {
+            callee_id_opt
+        } else {
+            None
+        };
+        let unresolved_indirect_call =
+            callee_id_opt.is_none() && matches!(func.ty(body, tcx).kind(), TyKind::FnPtr(..));
         let ret_take_enabled = self.ret_take_enabled();
 
         // 6a: Remove is_plain_store/is_plain_load computation.
@@ -1232,6 +1239,36 @@ impl MyOptimizationPass {
             TerminatorKind::Call { target, .. } => *target,
             _ => None,
         };
+        let indirect_call_needs_transport = unresolved_indirect_call
+            && args.iter().any(|arg| {
+                let Some(p) = self.place_from_operand(&arg.node) else {
+                    return false;
+                };
+                let ty = p.ty(&body.local_decls, tcx).ty;
+                self.is_pointer_ty(ty)
+                    || self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
+                    || self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty)
+            });
+        if indirect_call_needs_transport {
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: *destination,
+                kind: InstrKind::IndirectCallScopeBegin,
+            });
+            if let Some(tgt_bb) = call_target_bb {
+                insert_points.push(InsertPoint {
+                    bb: tgt_bb,
+                    stmt_idx: 0,
+                    insert_before: true,
+                    source_info: term.source_info,
+                    place: *destination,
+                    kind: InstrKind::IndirectCallScopeEnd,
+                });
+            }
+        }
         let mut noescape_reborrow_call_temps: HashSet<Local> = HashSet::new();
         for (arg_index, arg) in args.iter().enumerate() {
             if let Some(local) = self.noescape_reborrow_call_temp_local(
@@ -2108,35 +2145,43 @@ impl MyOptimizationPass {
                 continue;
             };
             let ty = p.ty(&body.local_decls, tcx).ty;
-            if callee_instrumented
+            if (direct_call_arg_callee_id.is_some() || unresolved_indirect_call)
                 && !self.is_pointer_ty(ty)
                 && !p.projection.is_empty()
                 && self.is_pointer_ty(body.local_decls[p.local].ty)
             {
-                if let Some(callee_id) = callee_id_opt {
-                    let exact_inplace_source =
-                        p.projection.len() == 1 && matches!(p.projection[0], ProjectionElem::Deref);
-                    let suppress_protector = !self.tb_call_arg_protector_supported_for_ty(
-                        tcx,
-                        body,
-                        body.local_decls[p.local].ty,
-                    );
-                    let flags = self.call_arg_push_flags(exact_inplace_source, suppress_protector);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: p,
-                        kind: InstrKind::CallArgPush {
-                            callee_id,
-                            arg_index: arg_index as u64,
-                            ptr_local: p.local,
-                            parent_mode: ParentSelectionMode::PointeeFamily,
-                            flags,
-                        },
-                    });
-                }
+                let exact_inplace_source =
+                    p.projection.len() == 1 && matches!(p.projection[0], ProjectionElem::Deref);
+                let suppress_protector = !self.tb_call_arg_protector_supported_for_ty(
+                    tcx,
+                    body,
+                    body.local_decls[p.local].ty,
+                );
+                let flags = self.call_arg_push_flags(exact_inplace_source, suppress_protector);
+                let kind = if let Some(callee_id) = direct_call_arg_callee_id {
+                    InstrKind::CallArgPush {
+                        callee_id,
+                        arg_index: arg_index as u64,
+                        ptr_local: p.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags,
+                    }
+                } else {
+                    InstrKind::IndirectCallArgPush {
+                        arg_index: arg_index as u64,
+                        ptr_local: p.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags,
+                    }
+                };
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: p,
+                    kind,
+                });
             }
             if !self.is_pointer_ty(ty) && self.ty_contains_direct_ref_fields(tcx, ty) {
                 insert_points.push(InsertPoint {
@@ -2247,27 +2292,35 @@ impl MyOptimizationPass {
             }
 
             // Inter-procedural: push argument tag to callee if instrumented.
-            if callee_instrumented {
-                if let Some(callee_id) = callee_id_opt {
-                    ptr_locals_needing_tag.insert(p.local);
-                    let suppress_protector =
-                        !self.tb_call_arg_protector_supported_for_ty(tcx, body, ty);
-                    let flags = self.call_arg_push_flags(false, suppress_protector);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: p,
-                        kind: InstrKind::CallArgPush {
-                            callee_id,
-                            arg_index: arg_index as u64,
-                            ptr_local: p.local,
-                            parent_mode: ParentSelectionMode::PointeeFamily,
-                            flags,
-                        },
-                    });
-                }
+            if direct_call_arg_callee_id.is_some() || unresolved_indirect_call {
+                ptr_locals_needing_tag.insert(p.local);
+                let suppress_protector =
+                    !self.tb_call_arg_protector_supported_for_ty(tcx, body, ty);
+                let flags = self.call_arg_push_flags(false, suppress_protector);
+                let kind = if let Some(callee_id) = direct_call_arg_callee_id {
+                    InstrKind::CallArgPush {
+                        callee_id,
+                        arg_index: arg_index as u64,
+                        ptr_local: p.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags,
+                    }
+                } else {
+                    InstrKind::IndirectCallArgPush {
+                        arg_index: arg_index as u64,
+                        ptr_local: p.local,
+                        parent_mode: ParentSelectionMode::PointeeFamily,
+                        flags,
+                    }
+                };
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx: block_data.statements.len(),
+                    insert_before: false,
+                    source_info: term.source_info,
+                    place: p,
+                    kind,
+                });
             }
 
             // Unknown call policy: conservatively model potential read/write through any pointer arg.
@@ -2344,62 +2397,77 @@ impl MyOptimizationPass {
             }
         }
 
-        if callee_instrumented {
-            if let Some(callee_id) = callee_id_opt {
-                for (arg_index, a) in args.iter().enumerate() {
-                    let Some(p) = self.place_from_operand(&a.node) else {
-                        continue;
+        if direct_call_arg_callee_id.is_some() || unresolved_indirect_call {
+            for (arg_index, a) in args.iter().enumerate() {
+                let Some(p) = self.place_from_operand(&a.node) else {
+                    continue;
+                };
+                let ty = p.ty(&body.local_decls, tcx).ty;
+                if self.is_pointer_ty(ty) {
+                    continue;
+                }
+                if self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
+                    && self.is_whole_place_slot_family_source(tcx, body, p)
+                {
+                    let kind = if let Some(callee_id) = direct_call_arg_callee_id {
+                        InstrKind::CallArgPush {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            ptr_local: p.local,
+                            parent_mode: ParentSelectionMode::SlotFamily,
+                            flags: 0,
+                        }
+                    } else {
+                        InstrKind::IndirectCallArgPush {
+                            arg_index: arg_index as u64,
+                            ptr_local: p.local,
+                            parent_mode: ParentSelectionMode::SlotFamily,
+                            flags: 0,
+                        }
                     };
-                    let ty = p.ty(&body.local_decls, tcx).ty;
-                    if self.is_pointer_ty(ty) {
-                        continue;
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind,
+                    });
+                    if let Some(tgt_bb) = call_target_bb {
+                        if self.is_shadowable_ptr_ty(tcx, body, ty) {
+                            insert_points.push(InsertPoint {
+                                bb: tgt_bb,
+                                stmt_idx: 0,
+                                insert_before: true,
+                                source_info: term.source_info,
+                                place: Place::from(p.local),
+                                kind: InstrKind::ShadowStore { src_local: p.local },
+                            });
+                        }
                     }
-                    if self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
-                        && self.is_whole_place_slot_family_source(tcx, body, p)
-                    {
+                }
+                if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
+                    for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty) {
+                        let kind = if let Some(callee_id) = direct_call_arg_callee_id {
+                            InstrKind::CallArgLeafPush {
+                                callee_id,
+                                arg_index: arg_index as u64,
+                                leaf_key: leaf_spec.transport_key(),
+                            }
+                        } else {
+                            InstrKind::IndirectCallArgLeafPush {
+                                arg_index: arg_index as u64,
+                                leaf_key: leaf_spec.transport_key(),
+                            }
+                        };
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
                             insert_before: false,
                             source_info: term.source_info,
-                            place: p,
-                            kind: InstrKind::CallArgPush {
-                                callee_id,
-                                arg_index: arg_index as u64,
-                                ptr_local: p.local,
-                                parent_mode: ParentSelectionMode::SlotFamily,
-                                flags: 0,
-                            },
+                            place: leaf_spec.place,
+                            kind,
                         });
-                        if let Some(tgt_bb) = call_target_bb {
-                            if self.is_shadowable_ptr_ty(tcx, body, ty) {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: true,
-                                    source_info: term.source_info,
-                                    place: Place::from(p.local),
-                                    kind: InstrKind::ShadowStore { src_local: p.local },
-                                });
-                            }
-                        }
-                    }
-                    if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
-                        for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty)
-                        {
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: leaf_spec.place,
-                                kind: InstrKind::CallArgLeafPush {
-                                    callee_id,
-                                    arg_index: arg_index as u64,
-                                    leaf_key: leaf_spec.transport_key(),
-                                },
-                            });
-                        }
                     }
                 }
             }

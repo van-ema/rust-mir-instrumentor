@@ -639,7 +639,12 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         | InstrKind::PtrWrite { .. }
         | InstrKind::PtrReadAllowUntagged { .. }
         | InstrKind::PtrWriteAllowUntagged { .. } => 2,
-        InstrKind::CallArgPush { .. } | InstrKind::PtrUse { .. } => 3,
+        InstrKind::IndirectCallScopeBegin => 2,
+        InstrKind::CallArgPush { .. }
+        | InstrKind::IndirectCallArgPush { .. }
+        | InstrKind::IndirectCallArgLeafPush { .. }
+        | InstrKind::PtrUse { .. } => 3,
+        InstrKind::IndirectCallScopeEnd => 4,
         _ => 4,
     }
 }

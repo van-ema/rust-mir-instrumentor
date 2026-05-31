@@ -60,6 +60,12 @@ impl MyOptimizationPass {
                 }
             }
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
+            InstrKind::IndirectCallScopeBegin => hooks.def_id_begin_indirect_call_arg_scope,
+            InstrKind::IndirectCallScopeEnd => hooks.def_id_end_indirect_call_arg_scope,
+            InstrKind::IndirectCallArgPush { .. } => hooks.def_id_push_indirect_call_arg_tag,
+            InstrKind::IndirectCallArgLeafPush { .. } => {
+                hooks.def_id_push_indirect_call_arg_leaf_shadow
+            }
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
             InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
@@ -253,6 +259,18 @@ impl MyOptimizationPass {
         let def_id_push_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_boundary_tag", 7)
             .expect("missing '__rz_push_call_arg_boundary_tag' definition");
+        let def_id_begin_indirect_call_arg_scope = self
+            .find_runtime_fn_def_id(tcx, "__rz_begin_indirect_call_arg_scope", 0)
+            .expect("missing '__rz_begin_indirect_call_arg_scope' definition");
+        let def_id_end_indirect_call_arg_scope = self
+            .find_runtime_fn_def_id(tcx, "__rz_end_indirect_call_arg_scope", 0)
+            .expect("missing '__rz_end_indirect_call_arg_scope' definition");
+        let def_id_push_indirect_call_arg_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_boundary_tag", 6)
+            .expect("missing '__rz_push_indirect_call_arg_boundary_tag' definition");
+        let def_id_push_indirect_call_arg_leaf_shadow = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_leaf_shadow", 3)
+            .expect("missing '__rz_push_indirect_call_arg_leaf_shadow' definition");
         let def_id_validate_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
             .expect("missing '__rz_validate_call_arg_tag' definition");
@@ -372,6 +390,10 @@ impl MyOptimizationPass {
             def_id_read_allow_untagged,
             def_id_use,
             def_id_push_call_arg_tag,
+            def_id_begin_indirect_call_arg_scope,
+            def_id_end_indirect_call_arg_scope,
+            def_id_push_indirect_call_arg_tag,
+            def_id_push_indirect_call_arg_leaf_shadow,
             def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
             def_id_take_call_arg_tag_anchor,
