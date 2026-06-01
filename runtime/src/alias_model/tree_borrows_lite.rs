@@ -623,14 +623,18 @@ fn tb_lite_materialize_deferred_raw_node(
     Some(tb_lite_insert_tag_node(tree, tag, tmeta, kind))
 }
 
+/// Retire a temporary raw parent used only to create a real `&mut`.
+///
+/// Example: `r: &mut T` becomes `p: *mut T`, then `child: &mut T` is made from
+/// `p`, and the write happens through `child`. The raw pointer `p` is just a
+/// bridge; it should not stay in the tree as a frozen node that blocks the
+/// `child` write. If the raw parent was deferred, create its node first, then
+/// disable it unless that raw parent or its parent family is protected.
 fn tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(
     tree: &mut TbAllocState,
     tmeta: &TagMeta,
 ) {
-    if !matches!(tmeta.kind, PtrKind::RefMut)
-        || tmeta.parent == 0
-        || tree.nodes.contains_key(&tmeta.parent)
-    {
+    if !matches!(tmeta.kind, PtrKind::RefMut) || tmeta.parent == 0 {
         return;
     }
     let Some(parent_meta) = tag_store::get(tmeta.parent) else {
@@ -643,11 +647,15 @@ fn tb_lite_materialize_and_disable_deferred_raw_parent_of_ref_write(
     }
     if let Some(raw_node) = tb_lite_materialize_deferred_raw_node(tree, tmeta.parent, &parent_meta)
     {
+        let protected_raw_parent = tree
+            .nodes
+            .get(&tmeta.parent)
+            .is_some_and(tb_protector_active);
         let protected_parent_family = tree
             .nodes
             .get(&raw_node.parent)
             .is_some_and(tb_protector_active);
-        if !protected_parent_family {
+        if !protected_raw_parent && !protected_parent_family {
             if let Some(parent_node) = tree.nodes.get_mut(&tmeta.parent) {
                 tb_disable_node(parent_node);
             }
@@ -1200,6 +1208,20 @@ fn tb_lite_check(
         }
     }
 
+    if matches!(access, AliasAccessKind::Write) {
+        tb_lite_prepare_local_write(
+            tree,
+            access_tag,
+            &access_lineage,
+            addr,
+            size,
+            tmeta.alloc_epoch,
+        );
+        if let Some(prepared_node) = tree.nodes.get(&access_tag).cloned() {
+            node = prepared_node;
+        }
+    }
+
     // Apply a TB-lite transition to all nodes of the allocation.
     // For locations outside the node's currently accessed ranges, `lazy_perm`
     // approximates the "future initial permission" from the TB state machine.
@@ -1725,17 +1747,150 @@ fn tb_has_live_readonly_descendant(
     })
 }
 
+/// Retire temporary helper views before a real local mutable write.
+///
+/// Example: `r: &mut T` is read through a short-lived helper `tmp: &T`, then the
+/// program writes through `r` again. The helper read may leave `tmp` as a frozen
+/// node. That helper should be invalidated by the `r` write; it should not block
+/// the write itself. After retiring such helpers, restore any local unique
+/// ancestors that were frozen only because those helpers existed. If no helper
+/// was retired, do not restore anything, so real alternating read/write
+/// violations still fail.
+fn tb_lite_prepare_local_write(
+    tree: &mut TbAllocState,
+    access_tag: u64,
+    access_lineage: &[u64],
+    addr: usize,
+    size: usize,
+    alloc_epoch: u64,
+) {
+    let Some(access_node) = tree.nodes.get(&access_tag) else {
+        return;
+    };
+    if !matches!(access_node.kind, BorrowKind::Unique | BorrowKind::RawMut) {
+        return;
+    }
+    let collapse_raw_lineage_helpers = matches!(access_node.kind, BorrowKind::Unique);
+
+    let readonly_blockers: Vec<u64> = tree
+        .nodes
+        .values()
+        .filter(|node| node.tag != access_tag)
+        .filter(|node| !tb_lineage_contains(access_lineage, node.tag))
+        .filter(|node| tb_is_live_node(node))
+        .filter(|node| matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst))
+        .filter(|node| !tb_protector_active(node))
+        .filter(|node| alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch)
+        .filter(|node| tb_node_overlaps(node, addr, size))
+        .map(|node| node.tag)
+        .collect();
+
+    let raw_lineage_helpers: Vec<u64> = if collapse_raw_lineage_helpers {
+        let tmap = tags().lock().unwrap();
+        access_lineage
+            .iter()
+            .filter(|tag| **tag != access_tag)
+            .filter_map(|tag| tree.nodes.get(tag))
+            .filter(|node| tb_is_live_node(node))
+            .filter(|node| matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut))
+            .filter(|node| !tb_protector_active(node))
+            .filter(|node| {
+                alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch
+            })
+            .filter(|node| tb_lite_raw_transport_family_marked(&tmap, node.tag, node.kind))
+            .map(|node| node.tag)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let retired_helper = !readonly_blockers.is_empty() || !raw_lineage_helpers.is_empty();
+
+    for tag in readonly_blockers {
+        if let Some(node) = tree.nodes.get_mut(&tag) {
+            tb_disable_node(node);
+        }
+    }
+    for tag in raw_lineage_helpers {
+        if let Some(node) = tree.nodes.get_mut(&tag) {
+            tb_disable_node(node);
+        }
+    }
+
+    if retired_helper {
+        tb_reactivate_frozen_unique_ancestors_without_readers_for_access(
+            tree, access_tag, addr, size,
+        );
+    }
+}
+
+// Some raw helpers are emitted as RawRoot after their immediate source was a
+// tag-preserving raw transport. Treat that whole raw metadata chain as
+// administrative when a real RefMut descendant performs the write.
+fn tb_lite_raw_transport_family_marked(
+    tmap: &HashMap<u64, TagMeta>,
+    tag: u64,
+    kind: BorrowKind,
+) -> bool {
+    if !matches!(kind, BorrowKind::RawConst | BorrowKind::RawMut) {
+        return false;
+    }
+
+    let mut cursor = tag;
+    for _ in 0..tmap.len().saturating_add(1) {
+        let Some(meta) = tmap.get(&cursor) else {
+            return false;
+        };
+        let meta_kind = match meta.kind {
+            PtrKind::RawConst => BorrowKind::RawConst,
+            PtrKind::RawMut => BorrowKind::RawMut,
+            _ => return false,
+        };
+        if tb_lite_should_defer_raw_family(meta, meta_kind) {
+            return true;
+        }
+        if meta.parent == 0 {
+            return false;
+        }
+        cursor = meta.parent;
+    }
+
+    false
+}
+
 fn tb_reactivate_frozen_unique_ancestors_without_readers(
     tree: &mut TbAllocState,
     start_parent: u64,
+) {
+    tb_reactivate_frozen_unique_ancestors_without_readers_inner(tree, start_parent, None);
+}
+
+fn tb_reactivate_frozen_unique_ancestors_without_readers_for_access(
+    tree: &mut TbAllocState,
+    start_parent: u64,
+    addr: usize,
+    size: usize,
+) {
+    tb_reactivate_frozen_unique_ancestors_without_readers_inner(
+        tree,
+        start_parent,
+        Some((addr, size)),
+    );
+}
+
+fn tb_reactivate_frozen_unique_ancestors_without_readers_inner(
+    tree: &mut TbAllocState,
+    start_parent: u64,
+    access_range: Option<(usize, usize)>,
 ) {
     let mut cursor = start_parent;
     for _ in 0..tree.nodes.len().saturating_add(1) {
         let Some((next, start, len, should_reactivate, restored_perm)) =
             tree.nodes.get(&cursor).map(|node| {
                 let restored_perm = match node.lazy_perm {
-                    TbPerm::Reserved { .. } | TbPerm::Active => Some(node.lazy_perm),
-                    TbPerm::Frozen | TbPerm::ShadowedLocal | TbPerm::Disabled => None,
+                    TbPerm::Reserved { .. } | TbPerm::Active | TbPerm::ShadowedLocal => {
+                        Some(node.lazy_perm)
+                    }
+                    TbPerm::Frozen | TbPerm::Disabled => None,
                 };
                 (
                     node.parent,
@@ -1744,6 +1899,7 @@ fn tb_reactivate_frozen_unique_ancestors_without_readers(
                     node.alive
                         && matches!(node.kind, BorrowKind::Unique)
                         && matches!(node.perm, TbPerm::Frozen)
+                        && !node.poisoned_by_protector_end
                         && restored_perm.is_some(),
                     restored_perm,
                 )
@@ -1752,7 +1908,10 @@ fn tb_reactivate_frozen_unique_ancestors_without_readers(
             break;
         };
 
-        if should_reactivate && !tb_has_live_readonly_descendant(tree, cursor, start, len) {
+        let (check_start, check_len) = access_range.unwrap_or((start, len));
+        if should_reactivate
+            && !tb_has_live_readonly_descendant(tree, cursor, check_start, check_len)
+        {
             if let Some(node) = tree.nodes.get_mut(&cursor) {
                 if let Some(restored_perm) = restored_perm {
                     node.perm = restored_perm;
