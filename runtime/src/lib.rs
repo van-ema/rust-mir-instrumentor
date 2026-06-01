@@ -2765,7 +2765,12 @@ fn normalize_const_end_ref_pointee(
     }
 }
 
+// Some optimized MIR exposes a const/static reference at the allocation end.
+// Example: for const bytes `[a, b]`, the ref may look like `base + 2`.
+// We normalize it to `base`, and this hint lets later checks translate accesses
+// consistently instead of treating the normalized tag as pointing at the end.
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
+// Example: `q = p.add(1)` stays in `p`'s TB family; it is not a new raw authority.
 const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
 
 #[inline]

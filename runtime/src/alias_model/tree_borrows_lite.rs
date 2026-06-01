@@ -11,6 +11,7 @@ use crate::{
 use super::{AliasAccessKind, AliasModel};
 
 pub(crate) struct TreeBorrowsLiteModel;
+// Example: `q = p.add(1)` stays in `p`'s TB family; it is not a new raw authority.
 const TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -37,6 +38,7 @@ struct TbNode {
     alloc_epoch: u64,
     kind: BorrowKind,
     perm: TbPerm,
+    // Default permission for same-allocation bytes not yet covered by this node's ranges.
     lazy_perm: TbPerm,
     start: usize,
     len: usize,
@@ -512,6 +514,30 @@ fn tb_lite_should_defer_raw_family(tmeta: &TagMeta, kind: BorrowKind) -> bool {
         && (tmeta.lineage_hint & TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY) != 0
 }
 
+// A raw transport helper is only a value-level step such as `q = p.add(1)`.
+// When creating a real ref from it, skip the helper and use the underlying
+// authority family. For raw-to-raw children, keep covering helpers so real raw
+// accesses still observe their TB state.
+fn tb_lite_raw_transport_parent_skippable(
+    tmap: &HashMap<u64, TagMeta>,
+    nodes: &HashMap<u64, TbNode>,
+    tag: u64,
+    child_start: usize,
+    child_len: usize,
+    skip_even_when_covering: bool,
+) -> bool {
+    if child_len == 0 {
+        return false;
+    }
+    let Some(node) = nodes.get(&tag) else {
+        return false;
+    };
+    matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut)
+        && !tb_protector_active(node)
+        && (skip_even_when_covering || !tb_node_covers(node, child_start, child_len))
+        && tb_lite_raw_transport_family_marked(tmap, tag, node.kind)
+}
+
 fn tb_lite_resolve_parent_for_new_node(
     tree: &TbAllocState,
     tmeta: &TagMeta,
@@ -553,7 +579,14 @@ fn tb_lite_resolve_parent_for_new_node(
                         .filter(|tag| tree.nodes.contains_key(tag))
                 })
                 .or_else(|| {
-                    tb_lite_find_materialized_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                    tb_lite_find_materialized_authority_ancestor_tag(
+                        &tmap,
+                        &tree.nodes,
+                        effective_parent,
+                        tmeta.pointee_addr,
+                        exact_new_len,
+                        true,
+                    )
                 })
                 .unwrap_or(0)
         }
@@ -564,7 +597,14 @@ fn tb_lite_resolve_parent_for_new_node(
                         .filter(|tag| tree.nodes.contains_key(tag))
                 })
                 .or_else(|| {
-                    tb_lite_find_materialized_ancestor_tag(&tmap, &tree.nodes, effective_parent)
+                    tb_lite_find_materialized_authority_ancestor_tag(
+                        &tmap,
+                        &tree.nodes,
+                        effective_parent,
+                        tmeta.pointee_addr,
+                        exact_new_len,
+                        false,
+                    )
                 })
                 .unwrap_or(0)
         }
@@ -1257,6 +1297,9 @@ fn tb_lite_check(
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
         let covered = tb_node_overlaps(&n, addr, size);
+        // `perm` is for ranges this node already covers. `lazy_perm` is the
+        // node's default permission for same-allocation bytes that have not
+        // been materialized into this node's range yet.
         let old_perm = if covered { n.perm } else { n.lazy_perm };
 
         let next = match (access, child, old_perm, tb_protector_active(&n)) {
@@ -1606,12 +1649,13 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} epoch={} kind={:?} perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} epoch={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x})\n",
             n.tag,
             n.parent,
             n.alloc_epoch,
             n.kind,
             n.perm,
+            n.lazy_perm,
             n.alive,
             n.protected,
             n.protector_shadow_depth,
@@ -1703,6 +1747,15 @@ fn tb_node_overlaps(node: &TbNode, addr: usize, size: usize) -> bool {
             .extra_ranges
             .iter()
             .any(|(start, len)| tb_ranges_overlap(addr, size, *start, *len))
+}
+
+#[inline]
+fn tb_node_covers(node: &TbNode, addr: usize, size: usize) -> bool {
+    tb_range_covers(node.start, node.len, addr, size)
+        || node
+            .extra_ranges
+            .iter()
+            .any(|(start, len)| tb_range_covers(*start, *len, addr, size))
 }
 
 #[inline]
@@ -2031,13 +2084,25 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
     None
 }
 
-fn tb_lite_find_materialized_ancestor_tag(
+fn tb_lite_find_materialized_authority_ancestor_tag(
     tmap: &HashMap<u64, TagMeta>,
     nodes: &HashMap<u64, TbNode>,
     mut tag: u64,
+    child_start: usize,
+    child_len: usize,
+    skip_covering_transport: bool,
 ) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
-        if nodes.contains_key(&tag) {
+        if nodes.contains_key(&tag)
+            && !tb_lite_raw_transport_parent_skippable(
+                tmap,
+                nodes,
+                tag,
+                child_start,
+                child_len,
+                skip_covering_transport,
+            )
+        {
             return Some(tag);
         }
         let t = tmap.get(&tag)?;
