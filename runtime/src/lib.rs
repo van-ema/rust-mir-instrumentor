@@ -688,7 +688,8 @@ fn rz_validate_strict_raw_creation_addr(
     kind: PtrKind,
     parent_tag: u64,
     exposed_provenance_root: bool,
-    enforce_no_provenance: bool,
+    strict_provenance: bool,
+    deref_projection_check: bool,
     bounds_len: usize,
 ) -> Option<(&'static str, String)> {
     // Raw-pointer creation should reject missing provenance, and should still catch the common
@@ -699,7 +700,7 @@ fn rz_validate_strict_raw_creation_addr(
     // In that shape, eager OOB-on-derive is too strong: once the parent is already outside its
     // origin range, defer bounds enforcement to actual access / ref creation.
     let Some(mut parent_meta) = tag_store::get(parent_tag) else {
-        if exposed_provenance_root && enforce_no_provenance {
+        if exposed_provenance_root && (strict_provenance || deref_projection_check) {
             return Some((
                 "WILD_POINTER",
                 format!(
@@ -733,7 +734,7 @@ fn rz_validate_strict_raw_creation_addr(
         return None;
     }
 
-    if exposed_provenance_root && enforce_no_provenance {
+    if exposed_provenance_root && strict_provenance {
         return Some((
             "WILD_POINTER",
             format!(
@@ -756,14 +757,42 @@ fn rz_validate_strict_raw_creation_addr(
         }
     }
 
-    if enforce_no_provenance && rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
-        return Some((
-            "WILD_POINTER",
-            format!(
-                "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
-                parent_meta.pointee_addr
-            ),
-        ));
+    if rz_has_exposed_provenance_root(parent_tag, &parent_meta) {
+        if strict_provenance {
+            return Some((
+                "WILD_POINTER",
+                format!(
+                    "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                    parent_meta.pointee_addr
+                ),
+            ));
+        }
+        if deref_projection_check && parent_meta.parent != 0 {
+            let access_len = bounds_len_bytes_or_zero(bounds_len).max(1);
+            if let Err(reason) = validate_exposed_live_alloc_access(
+                parent_meta.pointee_addr,
+                parent_meta.alloc_epoch,
+                pointee_addr,
+                access_len,
+            ) {
+                return Some((
+                    reason.violation_kind(),
+                    format!(
+                        "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason={} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                        reason.label(),
+                        parent_meta.pointee_addr
+                    ),
+                ));
+            }
+        } else if deref_projection_check {
+            return Some((
+                "WILD_POINTER",
+                format!(
+                    "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=NO_PROVENANCE_DERIVE kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                    parent_meta.pointee_addr
+                ),
+            ));
+        }
     }
 
     let parent_already_oob = parent_meta.origin_known
@@ -809,6 +838,87 @@ fn rz_has_exposed_provenance_root(tag: u64, tmeta: &TagMeta) -> bool {
         depth += 1;
     }
     false
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ExposedAllocAccessError {
+    AnchorNoAlloc,
+    AnchorDead,
+    AnchorEpochMismatch,
+    AccessNoAlloc,
+    AccessDead,
+    AccessDifferentAlloc,
+    AccessOutOfBounds,
+}
+
+impl ExposedAllocAccessError {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AnchorNoAlloc => "EXPOSED_ANCHOR_NO_ALLOC",
+            Self::AnchorDead => "EXPOSED_ANCHOR_DEAD_ALLOC",
+            Self::AnchorEpochMismatch => "EXPOSED_ANCHOR_EPOCH_MISMATCH",
+            Self::AccessNoAlloc => "EXPOSED_ACCESS_NO_ALLOC",
+            Self::AccessDead => "EXPOSED_ACCESS_DEAD_ALLOC",
+            Self::AccessDifferentAlloc => "EXPOSED_ACCESS_DIFFERENT_ALLOC",
+            Self::AccessOutOfBounds => "EXPOSED_ACCESS_OOB",
+        }
+    }
+
+    fn violation_kind(self) -> &'static str {
+        match self {
+            Self::AnchorDead | Self::AccessDead | Self::AnchorEpochMismatch => "USE_AFTER_DEAD",
+            Self::AccessDifferentAlloc | Self::AccessOutOfBounds => "OUT_OF_BOUNDS",
+            Self::AnchorNoAlloc | Self::AccessNoAlloc => "WILD_POINTER",
+        }
+    }
+}
+
+#[inline]
+fn validate_exposed_live_alloc_access(
+    anchor_addr: usize,
+    anchor_epoch: u64,
+    access_addr: usize,
+    access_len: usize,
+) -> Result<(usize, AllocMeta), ExposedAllocAccessError> {
+    let access_len = access_len.max(1);
+    let _access_end = access_addr
+        .checked_add(access_len)
+        .ok_or(ExposedAllocAccessError::AccessOutOfBounds)?;
+
+    let amap = allocs().lock().unwrap();
+    let Some((anchor_base, anchor_meta)) = find_alloc_containing(&amap, anchor_addr) else {
+        return Err(ExposedAllocAccessError::AnchorNoAlloc);
+    };
+    if !anchor_meta.live {
+        return Err(ExposedAllocAccessError::AnchorDead);
+    }
+    if anchor_epoch != 0 && anchor_meta.epoch != 0 && anchor_epoch != anchor_meta.epoch {
+        return Err(ExposedAllocAccessError::AnchorEpochMismatch);
+    }
+
+    let Some((access_base, access_meta)) =
+        find_alloc_covering_range(&amap, access_addr, access_len)
+    else {
+        if let Some((containing_base, containing_meta)) = find_alloc_containing(&amap, access_addr)
+        {
+            if !containing_meta.live {
+                return Err(ExposedAllocAccessError::AccessDead);
+            }
+            if containing_base != anchor_base {
+                return Err(ExposedAllocAccessError::AccessDifferentAlloc);
+            }
+            return Err(ExposedAllocAccessError::AccessOutOfBounds);
+        }
+        return Err(ExposedAllocAccessError::AccessNoAlloc);
+    };
+    if !access_meta.live {
+        return Err(ExposedAllocAccessError::AccessDead);
+    }
+    if access_base != anchor_base {
+        return Err(ExposedAllocAccessError::AccessDifferentAlloc);
+    }
+
+    Ok((access_base, *access_meta))
 }
 
 #[inline]
@@ -3744,15 +3854,44 @@ pub fn __rz_ptr_write(
         return;
     };
     if rz_has_exposed_provenance_root(tag, &tmeta) {
-        let msg = append_location_if_enabled(
-            format!(
-                "WRITE via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
-                tmeta.kind, tmeta.parent, tmeta.pointee_addr
-            ),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("WILD_POINTER", msg);
-        return;
+        if rz_strict_provenance_enabled() {
+            let msg = append_location_if_enabled(
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                    tmeta.kind, tmeta.parent, tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation("WILD_POINTER", msg);
+            return;
+        }
+        if tmeta.parent == 0 {
+            let msg = append_location_if_enabled(
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                    tmeta.kind, tmeta.parent, tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation("WILD_POINTER", msg);
+            return;
+        }
+        if let Err(reason) =
+            validate_exposed_live_alloc_access(tmeta.pointee_addr, tmeta.alloc_epoch, addr, size)
+        {
+            let msg = append_location_if_enabled(
+                format!(
+                    "WRITE via tag={tag} addr=0x{addr:x} size={size}\nreason={} kind={:?} parent={} pointee=0x{:x}",
+                    reason.label(),
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(reason.violation_kind(), msg);
+            return;
+        }
     }
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
@@ -4287,15 +4426,44 @@ pub fn __rz_ptr_read(
         return;
     };
     if rz_has_exposed_provenance_root(tag, &tmeta) {
-        let msg = append_location_if_enabled(
-            format!(
-                "READ via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
-                tmeta.kind, tmeta.parent, tmeta.pointee_addr
-            ),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("WILD_POINTER", msg);
-        return;
+        if rz_strict_provenance_enabled() {
+            let msg = append_location_if_enabled(
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                    tmeta.kind, tmeta.parent, tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation("WILD_POINTER", msg);
+            return;
+        }
+        if tmeta.parent == 0 {
+            let msg = append_location_if_enabled(
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\nreason=NO_PROVENANCE_ACCESS kind={:?} parent={} pointee=0x{:x}",
+                    tmeta.kind, tmeta.parent, tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation("WILD_POINTER", msg);
+            return;
+        }
+        if let Err(reason) =
+            validate_exposed_live_alloc_access(tmeta.pointee_addr, tmeta.alloc_epoch, addr, size)
+        {
+            let msg = append_location_if_enabled(
+                format!(
+                    "READ via tag={tag} addr=0x{addr:x} size={size}\nreason={} kind={:?} parent={} pointee=0x{:x}",
+                    reason.label(),
+                    tmeta.kind,
+                    tmeta.parent,
+                    tmeta.pointee_addr
+                ),
+                "RZ_LOG_LOC",
+            );
+            rz_violation(reason.violation_kind(), msg);
+            return;
+        }
     }
     tmeta.alias_exempt |=
         access_alias_exempt != 0 || tag_alias_exempt_via_bounded_ancestor(tag, addr, size);
@@ -6399,6 +6567,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit4: TB-lite raw is a derived same-family view; defer borrow-tree materialization
     // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
     // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
+    // - bit7: deref-projected raw creation; strict mode rejects exposed provenance, while default
+    //   mode requires the projected address to stay inside the same live allocation
     let mut resolved_parent = derived_from;
     if strong_projected_raw_hint && matches!(kind, PtrKind::RawMut) {
         let repaired_parent =
@@ -6630,24 +6800,18 @@ pub extern "C" fn __record_raw_ptr_creation(
     }
 
     // `strict_creation_check` is instrumentation's "validate this raw creation eagerly" bit.
-    // In permissive mode we still want the derived-OOB checks, but we do *not* want to reject
-    // no-provenance carrier/sentinel field projections outright. Libraries such as `bytes`
-    // intentionally carry integer metadata in pointer-typed fields and use empty dangling
-    // sentinels.
-    //
-    // Projected pointer-field transport inside non-pointer carriers (for example `BytesMut.data`)
-    // is handled by instrumentation and should not set bit7. For the remaining deref-based raw
-    // creations, keep eager no-provenance rejection even outside strict-provenance mode: these
-    // are genuine forged-deref shapes such as `&raw const (*dangling).field`.
-    let enforce_no_provenance =
-        rz_strict_provenance_enabled() || _deref_creation_no_provenance_check;
-    if strict_creation_check || (exposed_provenance_root && rz_strict_provenance_enabled()) {
+    // In strict-provenance mode, exposed-provenance parents are rejected. In default mode, bit7
+    // means this is a deref projection (`(*p).field`), so validate allocation reality instead:
+    // the parent anchor and projected child must be in the same live allocation.
+    let strict_provenance = rz_strict_provenance_enabled();
+    if strict_creation_check || (exposed_provenance_root && strict_provenance) {
         if let Some((vk, msg)) = rz_validate_strict_raw_creation_addr(
             pointee_addr,
             kind,
             resolved_parent,
             exposed_provenance_root,
-            enforce_no_provenance,
+            strict_provenance,
+            _deref_creation_no_provenance_check,
             if bounds_len_is_known(bounds_len) {
                 bounds_len
             } else if carry_bounds_from_source {
