@@ -284,14 +284,17 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     CallArgValidate {
         local: Local,
     },
-    /// Caller-side: export one exact pointer-leaf shadow from a by-value raw-owner aggregate.
+    /// Caller-side: export one exact pointer field from a by-value aggregate.
     ///
-    /// This is structural transport, not borrow transport: the callee restores the same leaf
-    /// shadow into its copied argument slot instead of synthesizing a whole-slot reference family.
+    /// Example: for `Source { input: &str }`, send `input`, not a borrow of `Source`.
     CallArgLeafPush {
         callee_id: u64,
         arg_index: u64,
         leaf_key: u64,
+    },
+    /// Caller-side cleanup for closure captures sent through an uninstrumented helper.
+    CallArgLeafClear {
+        callee_id: u64,
     },
     /// Callee-side retagging of pointer arguments from the runtime side-channel.
     ArgRetag {
@@ -311,16 +314,13 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         arg_index: u64,
         local: Local,
     },
-    /// Callee-side: seed a non-pointer carrier anchor from an imported pointer leaf shadow.
+    /// Callee-side: seed a carrier anchor from one imported raw-owner leaf.
     ///
-    /// This is the raw-owner by-value path for carriers with one structural pointer leaf. The
-    /// caller transports only that leaf shadow; the callee rebuilds its local projectionless
-    /// anchor from the imported leaf instead of consuming a separate whole-slot boundary tag.
+    /// Example: a one-pointer owner can use that pointer as the slot-family seed.
     ArgAnchorSeedFromShadow {
         local: Local,
     },
-    /// Callee-side: restore one exact pointer-leaf shadow into a by-value raw-owner aggregate
-    /// argument slot.
+    /// Callee-side: restore one exact pointer-leaf shadow into a by-value aggregate argument slot.
     ArgLeafTake {
         callee_id: u64,
         arg_index: u64,
@@ -347,10 +347,9 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         callee_id: u64,
         leaf_key: u64,
     },
-    /// Callee-side: export the by-value carrier anchor for a non-pointer direct-ref return.
+    /// Callee-side: export a whole-slot return anchor when leaf transport is not enough.
     ///
-    /// This is the return-side counterpart of `RetAnchorTake`: the callee pushes the outer slot
-    /// family that should become the caller-visible reborrow anchor for the returned carrier.
+    /// Owner carriers like `Bytes` need this; simple view returns like `Option<&T>` do not.
     RetAnchorPush {
         callee_id: u64,
         local: Local,
@@ -556,6 +555,7 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_take_call_arg_tag_anchor: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_leaf_shadow: DefId,
+    pub(in crate::instrumentation) def_id_clear_call_arg_leaf_shadows: DefId,
     pub(in crate::instrumentation) def_id_push_ret_tag: DefId,
     pub(in crate::instrumentation) def_id_validate_ret_tag: DefId,
     pub(in crate::instrumentation) def_id_take_ret_tag: DefId,

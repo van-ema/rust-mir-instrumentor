@@ -68,6 +68,7 @@ impl MyOptimizationPass {
             }
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
             InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
+            InstrKind::CallArgLeafClear { .. } => hooks.def_id_clear_call_arg_leaf_shadows,
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
                 hooks.def_id_take_call_arg_tag
             }
@@ -286,6 +287,9 @@ impl MyOptimizationPass {
         let def_id_take_call_arg_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_leaf_shadow", 4)
             .expect("missing '__rz_take_call_arg_leaf_shadow' definition");
+        let def_id_clear_call_arg_leaf_shadows = self
+            .find_runtime_fn_def_id(tcx, "__rz_clear_call_arg_leaf_shadows", 1)
+            .expect("missing '__rz_clear_call_arg_leaf_shadows' definition");
         let def_id_push_ret_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_ret_tag", 3)
             .expect("missing '__rz_push_ret_tag' definition");
@@ -399,6 +403,7 @@ impl MyOptimizationPass {
             def_id_take_call_arg_tag_anchor,
             def_id_push_call_arg_leaf_shadow,
             def_id_take_call_arg_leaf_shadow,
+            def_id_clear_call_arg_leaf_shadows,
             def_id_push_ret_tag,
             def_id_validate_ret_tag,
             def_id_take_ret_tag,

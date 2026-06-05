@@ -91,13 +91,10 @@ impl MyOptimizationPass {
         self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
     }
 
-    /// Return whether `ty` should use structural leaf-shadow transport at by-value call
-    /// boundaries.
+    /// Return whether `ty` has inner pointer fields to copy across a call.
     ///
-    /// This is the raw-owner/container path: the value carries pointer bytes that should survive
-    /// the ABI move into the callee, but it does not itself represent a source-level borrow
-    /// carrier.
-    pub(in crate::instrumentation) fn supports_call_boundary_leaf_shadow_ty<'tcx>(
+    /// Example: `Source { input: &str }` copies the shadow for `input`, not for `Source`.
+    pub(in crate::instrumentation) fn supports_call_boundary_exact_leaf_shadow_ty<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -105,10 +102,9 @@ impl MyOptimizationPass {
     ) -> bool {
         !self.is_pointer_ty(ty)
             && self.ty_contains_pointer_fields(tcx, body, ty, SHADOWABLE_LEAF_PTR_RECURSION_DEPTH)
-            && !self.ty_contains_direct_ref_fields(tcx, ty)
     }
 
-    pub(in crate::instrumentation) fn supports_call_boundary_leaf_shadow_local<'tcx>(
+    pub(in crate::instrumentation) fn supports_call_boundary_exact_leaf_shadow_local<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
@@ -117,7 +113,57 @@ impl MyOptimizationPass {
         if !self.supports_slot_family_local(tcx, body, local) {
             return false;
         }
-        self.supports_call_boundary_leaf_shadow_ty(tcx, body, body.local_decls[local].ty)
+        self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, body.local_decls[local].ty)
+    }
+
+    /// Return exact pointer leaves stored inside the value referenced by `ptr_place`.
+    ///
+    /// Example: for `arg: &mut RecursionGuard`, return `(*arg).receiver` if it is a pointer field.
+    pub(in crate::instrumentation) fn ref_pointee_leaf_specs_from_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_place: Place<'tcx>,
+    ) -> Vec<ShadowableLeafPtrSpec<'tcx>> {
+        let ptr_ty = ptr_place.ty(&body.local_decls, tcx).ty;
+        let TyKind::Ref(_, pointee_ty, _) = ptr_ty.kind() else {
+            return Vec::new();
+        };
+        if !pointee_ty.is_sized(tcx, body.typing_env(tcx))
+            || !self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, *pointee_ty)
+        {
+            return Vec::new();
+        }
+
+        let pointee_place = ptr_place.project_deeper(&[PlaceElem::Deref], tcx);
+        self.call_boundary_leaf_ptr_specs_from_place(tcx, body, pointee_place, *pointee_ty)
+    }
+
+    /// Return the body id for a closure-like value, if this type is one.
+    pub(in crate::instrumentation) fn closure_like_callee_id_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> Option<u64> {
+        match ty.kind() {
+            TyKind::Closure(def_id, _) | TyKind::CoroutineClosure(def_id, _) => {
+                Some(self.callee_id_u64(tcx, *def_id))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return whether one raw-owner leaf can seed the whole carrier slot.
+    ///
+    /// `Source { input: &str }` is excluded because `input` points at bytes, not at `Source`.
+    pub(in crate::instrumentation) fn supports_call_boundary_raw_owner_leaf_shadow_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        self.supports_call_boundary_exact_leaf_shadow_local(tcx, body, local)
+            && !self.ty_contains_direct_ref_fields(tcx, body.local_decls[local].ty)
     }
 
     /// Return whether a by-value carrier can rebuild its local slot-family anchor from one
@@ -128,7 +174,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         local: Local,
     ) -> bool {
-        if !self.supports_call_boundary_leaf_shadow_local(tcx, body, local) {
+        if !self.supports_call_boundary_raw_owner_leaf_shadow_local(tcx, body, local) {
             return false;
         }
         self.shadowable_leaf_ptr_specs_from_place(
@@ -148,8 +194,38 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         local: Local,
     ) -> bool {
-        self.supports_call_boundary_slot_anchor_local(tcx, body, local)
-            && !self.supports_call_boundary_leaf_seeded_anchor_local(tcx, body, local)
+        if !self.supports_call_boundary_slot_anchor_local(tcx, body, local)
+            || self.supports_call_boundary_leaf_seeded_anchor_local(tcx, body, local)
+        {
+            return false;
+        }
+        if self.supports_call_boundary_anchor_local(tcx, body, local) {
+            return true;
+        }
+        !self.ty_contains_ref_fields_recursive(
+            tcx,
+            body.local_decls[local].ty,
+            SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
+        )
+    }
+
+    /// Return whether an aggregate return still needs a whole-slot anchor.
+    ///
+    /// `Option<&T>` is leaf-only. `Bytes` still needs an anchor for later borrows of the `Bytes`.
+    pub(in crate::instrumentation) fn supports_call_boundary_return_anchor_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        if !self.supports_call_boundary_anchor_local(tcx, body, local) {
+            return false;
+        }
+        self.ty_contains_raw_pointer_fields_recursive(
+            tcx,
+            body.local_decls[local].ty,
+            SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
+        )
     }
 
     pub(in crate::instrumentation) fn is_whole_place_slot_family_source<'tcx>(

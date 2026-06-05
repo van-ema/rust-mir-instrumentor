@@ -63,8 +63,10 @@ impl MyOptimizationPass {
     pub(in crate::instrumentation) fn aggregate_field_specs_for_kind<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
         dst_ty: Ty<'tcx>,
         aggregate_kind: &AggregateKind<'tcx>,
+        ops: &[Operand<'tcx>],
     ) -> Option<(Option<VariantIdx>, Vec<(usize, Ty<'tcx>)>)> {
         match (dst_ty.kind(), aggregate_kind) {
             (TyKind::Tuple(field_tys), AggregateKind::Tuple) => Some((
@@ -95,6 +97,20 @@ impl MyOptimizationPass {
                     ))
                 }
             }
+            (
+                _,
+                AggregateKind::Closure(..)
+                | AggregateKind::Coroutine(..)
+                | AggregateKind::CoroutineClosure(..),
+            ) => Some((
+                None,
+                // Captured operands become fields in order, so their shadow moves
+                // with the pointer value just like tuple and struct fields.
+                ops.iter()
+                    .enumerate()
+                    .map(|(idx, op)| (idx, op.ty(&body.local_decls, tcx)))
+                    .collect(),
+            )),
             _ => None,
         }
     }
@@ -114,7 +130,7 @@ impl MyOptimizationPass {
         ptr_locals_needing_tag: &mut HashSet<Local>,
     ) {
         let Some((variant, field_specs)) =
-            self.aggregate_field_specs_for_kind(tcx, dst_ty, aggregate_kind)
+            self.aggregate_field_specs_for_kind(tcx, body, dst_ty, aggregate_kind, ops)
         else {
             return;
         };

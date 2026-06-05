@@ -1247,7 +1247,7 @@ impl MyOptimizationPass {
                 let ty = p.ty(&body.local_decls, tcx).ty;
                 self.is_pointer_ty(ty)
                     || self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
-                    || self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty)
+                    || self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, ty)
             });
         if indirect_call_needs_transport {
             insert_points.push(InsertPoint {
@@ -2404,6 +2404,29 @@ impl MyOptimizationPass {
                 };
                 let ty = p.ty(&body.local_decls, tcx).ty;
                 if self.is_pointer_ty(ty) {
+                    // If `arg` is `&T`, also send pointer fields inside `*arg`.
+                    for leaf_spec in self.ref_pointee_leaf_specs_from_place(tcx, body, p) {
+                        let kind = if let Some(callee_id) = direct_call_arg_callee_id {
+                            InstrKind::CallArgLeafPush {
+                                callee_id,
+                                arg_index: arg_index as u64,
+                                leaf_key: leaf_spec.transport_key(),
+                            }
+                        } else {
+                            InstrKind::IndirectCallArgLeafPush {
+                                arg_index: arg_index as u64,
+                                leaf_key: leaf_spec.transport_key(),
+                            }
+                        };
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: leaf_spec.place,
+                            kind,
+                        });
+                    }
                     continue;
                 }
                 if self.supports_call_boundary_whole_slot_anchor_local(tcx, body, p.local)
@@ -2446,8 +2469,10 @@ impl MyOptimizationPass {
                         }
                     }
                 }
-                if self.supports_call_boundary_leaf_shadow_ty(tcx, body, ty) {
-                    for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(tcx, body, p, ty) {
+                if self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, ty) {
+                    // Send each inner pointer field by exact field key.
+                    for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(tcx, body, p, ty)
+                    {
                         let kind = if let Some(callee_id) = direct_call_arg_callee_id {
                             InstrKind::CallArgLeafPush {
                                 callee_id,
@@ -2469,6 +2494,70 @@ impl MyOptimizationPass {
                             kind,
                         });
                     }
+                }
+            }
+        }
+
+        if !callee_instrumented && callee_id_opt.is_some() {
+            let mut cleanup_callees: HashSet<u64> = HashSet::new();
+            // Some std/core helpers call a closure without being instrumented.
+            // Push the closure captures into the closure body side channel.
+            for a in args.iter() {
+                let Some(p) = self.place_from_operand(&a.node) else {
+                    continue;
+                };
+                let ty = p.ty(&body.local_decls, tcx).ty;
+                let (closure_callee_id, leaf_specs) =
+                    if let Some(closure_callee_id) = self.closure_like_callee_id_for_ty(tcx, ty) {
+                        if !self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, ty) {
+                            continue;
+                        }
+                        (
+                            closure_callee_id,
+                            self.call_boundary_leaf_ptr_specs_from_place(tcx, body, p, ty),
+                        )
+                    } else if let TyKind::Ref(_, pointee_ty, _) = ty.kind() {
+                        let Some(closure_callee_id) =
+                            self.closure_like_callee_id_for_ty(tcx, *pointee_ty)
+                        else {
+                            continue;
+                        };
+                        (
+                            closure_callee_id,
+                            self.ref_pointee_leaf_specs_from_place(tcx, body, p),
+                        )
+                    } else {
+                        continue;
+                    };
+                if leaf_specs.is_empty() {
+                    continue;
+                }
+                for leaf_spec in leaf_specs {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: leaf_spec.place,
+                        kind: InstrKind::CallArgLeafPush {
+                            callee_id: closure_callee_id,
+                            arg_index: 0,
+                            leaf_key: leaf_spec.transport_key(),
+                        },
+                    });
+                    cleanup_callees.insert(closure_callee_id);
+                }
+            }
+            if let Some(tgt_bb) = call_target_bb {
+                for callee_id in cleanup_callees {
+                    insert_points.push(InsertPoint {
+                        bb: tgt_bb,
+                        stmt_idx: 0,
+                        insert_before: true,
+                        source_info: term.source_info,
+                        place: *destination,
+                        kind: InstrKind::CallArgLeafClear { callee_id },
+                    });
                 }
             }
         }
@@ -2614,7 +2703,7 @@ impl MyOptimizationPass {
                                 },
                             });
                             let pointee_ty = body.local_decls[pointee_local].ty;
-                            for dst_leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                            for dst_leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
                                 tcx,
                                 body,
                                 Place::from(pointee_local),
@@ -2660,9 +2749,10 @@ impl MyOptimizationPass {
         // Caller-side return recovery.
         //
         // Plain pointer returns use `RetPush` / `RetTake` (or `RetRoot` for opaque callees).
-        // Non-pointer carriers with embedded source-level refs use `RetAnchorPush` /
-        // `RetAnchorTake` (or `RetAnchorRoot` for opaque callees) so the destination local keeps
-        // a whole-slot borrow family even though the MIR return place itself is not pointer-typed.
+        // Non-pointer return carriers use two separate channels:
+        // exact pointer leaves always travel with `RetLeafPush` / `RetLeafTake`, while an outer
+        // `RetAnchorPush` / `RetAnchorTake` is kept only for owner/container returns that also
+        // need a whole-slot borrow family for later borrows of the returned value.
         //
         // Keep the carrier cases outside the pointer-return classifier: wrapper returns such as
         // `Result<(), BytesMut>` must still import or seed an anchor even though
@@ -2842,13 +2932,22 @@ impl MyOptimizationPass {
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && callee_instrumented
-                && self.supports_call_boundary_leaf_shadow_ty(tcx, body, dst_ty)
+                && self.supports_call_boundary_return_anchor_local(tcx, body, dst_local)
             {
                 if let Some(callee_id) = callee_id_opt {
-                    // Raw-owner aggregates such as `BytesMut` export pointer leaf shadow from the
-                    // callee, but they do not qualify for the ref-carrier anchor path. Import the
-                    // returned leaf provenance directly into the caller's destination slots.
-                    for dst_leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                    projectionless_anchor_suppressed_locals.insert(dst_local);
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: Place::from(dst_local),
+                        kind: InstrKind::RetAnchorTake {
+                            callee_id,
+                            local: dst_local,
+                        },
+                    });
+                    for dst_leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
                         tcx,
                         body,
                         Place::from(dst_local),
@@ -2869,22 +2968,11 @@ impl MyOptimizationPass {
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && callee_instrumented
-                && self.supports_call_boundary_anchor_local(tcx, body, dst_local)
+                && self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, dst_ty)
             {
                 if let Some(callee_id) = callee_id_opt {
-                    projectionless_anchor_suppressed_locals.insert(dst_local);
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: Place::from(dst_local),
-                        kind: InstrKind::RetAnchorTake {
-                            callee_id,
-                            local: dst_local,
-                        },
-                    });
-                    for dst_leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                    // Leaf-only return: restore the inner pointer fields, not an outer anchor.
+                    for dst_leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
                         tcx,
                         body,
                         Place::from(dst_local),
@@ -2904,7 +2992,7 @@ impl MyOptimizationPass {
                     }
                 }
             } else if !self.is_pointer_ty(dst_ty)
-                && self.supports_call_boundary_anchor_local(tcx, body, dst_local)
+                && self.supports_call_boundary_return_anchor_local(tcx, body, dst_local)
             {
                 projectionless_anchor_suppressed_locals.insert(dst_local);
                 insert_points.push(InsertPoint {

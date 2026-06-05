@@ -184,8 +184,26 @@ impl MyOptimizationPass {
                         },
                     });
                 }
+                // A reference argument can point at a struct that stores pointers.
+                // Restore those inner pointer fields too.
+                for leaf_spec in
+                    self.ref_pointee_leaf_specs_from_place(tcx, body, Place::from(arg_local))
+                {
+                    insert_points.push(InsertPoint {
+                        bb: entry_bb,
+                        stmt_idx: entry_stmt_idx,
+                        insert_before: false,
+                        source_info: entry_source_info,
+                        place: leaf_spec.place,
+                        kind: InstrKind::ArgLeafTake {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            leaf_key: leaf_spec.transport_key(),
+                        },
+                    });
+                }
             } else {
-                let arg_leaf_specs = self.shadowable_leaf_ptr_specs_from_place(
+                let arg_leaf_specs = self.call_boundary_leaf_ptr_specs_from_place(
                     tcx,
                     body,
                     Place::from(arg_local),
@@ -208,7 +226,7 @@ impl MyOptimizationPass {
                         },
                     });
                 }
-                if self.supports_call_boundary_leaf_shadow_local(tcx, body, arg_local) {
+                if self.supports_call_boundary_exact_leaf_shadow_local(tcx, body, arg_local) {
                     for leaf_spec in arg_leaf_specs {
                         insert_points.push(InsertPoint {
                             bb: entry_bb,
@@ -508,7 +526,7 @@ impl MyOptimizationPass {
                             },
                         });
                     }
-                    if self.supports_call_boundary_anchor_local(tcx, body, RETURN_PLACE) {
+                    if self.supports_call_boundary_return_anchor_local(tcx, body, RETURN_PLACE) {
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
@@ -521,8 +539,12 @@ impl MyOptimizationPass {
                             },
                         });
                     }
-                    if self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty()) {
-                        let leaf_ptrs = self.shadowable_leaf_ptr_places_from_place(
+                    // Return exact pointer fields separately from the outer return slot.
+                    // Example: `Option<&T>` returns the inner `&T` leaf.
+                    if self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, body.return_ty())
+                        || self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty())
+                    {
+                        let leaf_ptrs = self.call_boundary_leaf_ptr_places_from_place(
                             tcx,
                             body,
                             Place::from(RETURN_PLACE),
@@ -541,7 +563,7 @@ impl MyOptimizationPass {
                                 },
                             });
                         }
-                        for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                        for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
                             tcx,
                             body,
                             Place::from(RETURN_PLACE),
@@ -589,7 +611,7 @@ impl MyOptimizationPass {
                                 ptr_local: arg_local,
                             },
                         });
-                        for leaf_spec in self.shadowable_leaf_ptr_specs_from_place(
+                        for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
                             tcx,
                             body,
                             Place::from(arg_local).project_deeper(&[PlaceElem::Deref], tcx),

@@ -154,19 +154,21 @@ impl MyOptimizationPass {
         }
     }
 
-    pub(in crate::instrumentation) fn align_operand_for_deref<'tcx>(
+    /// Alignment for the actual projected access, not the root pointer type.
+    ///
+    /// Example: `(*p).byte` may need align 1 even when `*p` has align 8.
+    pub(in crate::instrumentation) fn align_operand_for_deref_access<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
-        ptr_local: Local,
+        access_place: Place<'tcx>,
+        access_ty: Ty<'tcx>,
         span: Span,
     ) -> SizeOperand<'tcx> {
-        let ptr_ty = body.local_decls[ptr_local].ty;
-        let pointee = match ptr_ty.kind() {
-            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => *pointee,
-            _ => return SizeOperand::Const(self.const_usize(tcx, span, 0)),
-        };
-        self.align_operand_for_ty(tcx, body, pointee, span)
+        if self.place_may_cross_packed_field(tcx, body, access_place) {
+            return SizeOperand::Const(self.const_usize(tcx, span, 1));
+        }
+        self.align_operand_for_ty(tcx, body, access_ty, span)
     }
 
     pub(in crate::instrumentation) fn align_operand_for_ptr_local<'tcx>(

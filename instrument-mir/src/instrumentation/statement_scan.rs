@@ -36,34 +36,42 @@ impl MyOptimizationPass {
         let is_ref = matches!(ptr_ty.kind(), TyKind::Ref(..));
         let projected_src =
             self.recover_projected_pointer_rhs_source(tcx, body, bb, stmt_idx, ptr_local);
+        if let Some((def_bb, def_stmt_idx, src_place)) = projected_src {
+            tagged_ptr_locals.insert(ptr_local);
+            ptr_locals_needing_tag.insert(ptr_local);
+            insert_points.push(InsertPoint {
+                bb: def_bb,
+                stmt_idx: def_stmt_idx,
+                insert_before: false,
+                source_info,
+                place: src_place,
+                kind: InstrKind::ShadowLoad {
+                    dst_local: ptr_local,
+                    require_tag: false,
+                    validate_ref: is_ref,
+                },
+            });
+            insert_points.push(InsertPoint {
+                bb: def_bb,
+                stmt_idx: def_stmt_idx,
+                insert_before: false,
+                source_info,
+                place: Place::from(ptr_local),
+                kind: InstrKind::ShadowStore {
+                    src_local: ptr_local,
+                },
+            });
+            return;
+        }
         tagged_ptr_locals.insert(ptr_local);
         ptr_locals_needing_tag.insert(ptr_local);
         insert_points.push(InsertPoint {
-            bb: projected_src.map_or(bb, |(def_bb, _, _)| def_bb),
-            stmt_idx: projected_src.map_or(stmt_idx, |(_, def_stmt_idx, _)| def_stmt_idx),
-            insert_before: projected_src.is_none(),
+            bb,
+            stmt_idx,
+            insert_before: true,
             source_info,
             place: Place::from(ptr_local),
-            kind: if let Some((_def_bb, _def_stmt_idx, src_place)) = projected_src {
-                if is_ref {
-                    let bk = match ptr_ty.kind() {
-                        TyKind::Ref(_, _, Mutability::Mut) => BorrowKind::Mut {
-                            kind: MutBorrowKind::Default,
-                        },
-                        _ => BorrowKind::Shared,
-                    };
-                    InstrKind::Ref {
-                        bk,
-                        src: src_place,
-                        projected_reborrow_anchor_key: None,
-                    }
-                } else {
-                    InstrKind::Raw {
-                        is_mut,
-                        src: src_place,
-                    }
-                }
-            } else if is_ref {
+            kind: if is_ref {
                 InstrKind::RetRoot {
                     dst_local: ptr_local,
                     is_mut,
@@ -311,10 +319,11 @@ impl MyOptimizationPass {
                                     loaded_ty,
                                     stmt.source_info.span,
                                 );
-                                let align_op = self.align_operand_for_deref(
+                                let align_op = self.align_operand_for_deref_access(
                                     tcx,
                                     body,
-                                    ptr_local,
+                                    p.clone(),
+                                    read_ty,
                                     stmt.source_info.span,
                                 );
 
@@ -376,8 +385,13 @@ impl MyOptimizationPass {
                         lhs_ty,
                         stmt.source_info.span,
                     );
-                    let align_op =
-                        self.align_operand_for_deref(tcx, body, ptr_local, stmt.source_info.span);
+                    let align_op = self.align_operand_for_deref_access(
+                        tcx,
+                        body,
+                        lhs_place.clone(),
+                        lhs_ty,
+                        stmt.source_info.span,
+                    );
 
                     self.ensure_raw_root_before(
                         tcx,
@@ -461,25 +475,10 @@ impl MyOptimizationPass {
                                 && (!matches!(src_ty.kind(), TyKind::Ref(..))
                                     || self.place_contains_deref(src_place)
                                     || !self.is_pointer_ty(src_base_ty));
-                            // Projected pointer fields inside non-pointer carriers (for example
-                            // `BytesMut.3` or `Option<&T>.0`) should load their leaf shadow
-                            // when available. Falling back straight to the carrier-family
-                            // reborrow path turns internal raw fields into stack-slot parents.
-                            //
-                            // Keep the old suppression only for by-value carrier reference
-                            // fields: those still rely on the carrier-anchor repair path when
-                            // an ABI copy did not reconstruct a concrete leaf shadow slot.
-                            let projected_carrier_field_load = !src_place.projection.is_empty()
-                                && !self.is_pointer_ty(src_base_ty)
-                                && src_place
-                                    .projection
-                                    .iter()
-                                    .all(|pe| !matches!(pe, ProjectionElem::Downcast(..)))
-                                && matches!(src_ty.kind(), TyKind::Ref(..));
-                            if !projected_carrier_field_load
-                                && !src_place.projection.is_empty()
-                                && shadow_load_ok
-                            {
+                            // A projected pointer field is a stored pointer value. Copying it into
+                            // a local should transport that field's shadow, not synthesize a new
+                            // borrow from the outer carrier.
+                            if !src_place.projection.is_empty() && shadow_load_ok {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 tagged_ptr_locals.insert(dst_local);
                                 rz_pass_trace!(
@@ -537,7 +536,6 @@ impl MyOptimizationPass {
                         let src_ty = src_place.ty(&body.local_decls, tcx).ty;
                         if !src_place.projection.is_empty()
                             && self.is_pointer_ty(src_ty)
-                            && self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
                         {
                             if self.log_enabled(PassLogLevel::Trace) {
                                 rz_pass_trace!(
@@ -548,7 +546,6 @@ impl MyOptimizationPass {
                                     dst_ty
                                 );
                             }
-                            let is_mut = self.ptr_is_mut(dst_ty);
                             ptr_locals_needing_tag.insert(dst_local);
                             tagged_ptr_locals.insert(dst_local);
                             insert_points.push(InsertPoint {
@@ -556,38 +553,23 @@ impl MyOptimizationPass {
                                 stmt_idx,
                                 insert_before: false,
                                 source_info: stmt.source_info,
-                                place: Place::from(dst_local),
-                                kind: if matches!(dst_ty.kind(), TyKind::Ref(..)) {
-                                    let bk = match dst_ty.kind() {
-                                        TyKind::Ref(_, _, Mutability::Mut) => BorrowKind::Mut {
-                                            kind: MutBorrowKind::Default,
-                                        },
-                                        _ => BorrowKind::Shared,
-                                    };
-                                    InstrKind::Ref {
-                                        bk,
-                                        src: src_place,
-                                        projected_reborrow_anchor_key: None,
-                                    }
-                                } else {
-                                    InstrKind::Raw {
-                                        is_mut,
-                                        src: src_place,
-                                    }
+                                place: src_place,
+                                kind: InstrKind::ShadowLoad {
+                                    dst_local,
+                                    require_tag: false,
+                                    validate_ref: matches!(dst_ty.kind(), TyKind::Ref(..)),
                                 },
                             });
-                            if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
-                                insert_points.push(InsertPoint {
-                                    bb,
-                                    stmt_idx,
-                                    insert_before: false,
-                                    source_info: stmt.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::ShadowStore {
-                                        src_local: dst_local,
-                                    },
-                                });
-                            }
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info: stmt.source_info,
+                                place: Place::from(dst_local),
+                                kind: InstrKind::ShadowStore {
+                                    src_local: dst_local,
+                                },
+                            });
                             skip_tag_prop = true;
                         }
                     }
@@ -1029,22 +1011,24 @@ impl MyOptimizationPass {
                                 // reference semantics for projected `&T` / `&mut T` copies;
                                 // rooting them as raw pointers loses ref-kind behavior and can
                                 // desynchronize later access metadata from the actual pointee.
-                                if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                                let projected_src_place = match rvalue {
+                                    Rvalue::Use(op) => self.place_from_operand(op),
+                                    Rvalue::CopyForDeref(p) => Some(*p),
+                                    Rvalue::Cast(
+                                        CastKind::PtrToPtr
+                                        | CastKind::PointerCoercion(_, _)
+                                        | CastKind::Transmute
+                                        | CastKind::PointerWithExposedProvenance,
+                                        op,
+                                        _,
+                                    ) => self.place_from_operand(op),
+                                    _ => None,
+                                };
+                                if projected_src_place.is_some()
+                                    || self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
+                                {
                                     let is_mut = self.ptr_is_mut(dst_ty);
                                     let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-                                    let projected_src_place = match rvalue {
-                                        Rvalue::Use(op) => self.place_from_operand(op),
-                                        Rvalue::CopyForDeref(p) => Some(*p),
-                                        Rvalue::Cast(
-                                            CastKind::PtrToPtr
-                                            | CastKind::PointerCoercion(_, _)
-                                            | CastKind::Transmute
-                                            | CastKind::PointerWithExposedProvenance,
-                                            op,
-                                            _,
-                                        ) => self.place_from_operand(op),
-                                        _ => None,
-                                    };
                                     let anchor_key = self.normalized_ptr_copy_anchor_key(
                                         tcx,
                                         body,
@@ -1098,15 +1082,6 @@ impl MyOptimizationPass {
                                             },
                                         });
                                     } else {
-                                        let projected_reborrow_anchor_key = projected_src_place
-                                            .and_then(|src_place| {
-                                                self.maybe_projected_reborrow_anchor_key(
-                                                    body,
-                                                    src_place,
-                                                    anchor_key.as_ref(),
-                                                    projected_reborrow_anchor_specs,
-                                                )
-                                            });
                                         if trace_ssa_anchor {
                                             rz_pass_trace!(
                                                 self,
@@ -1118,53 +1093,57 @@ impl MyOptimizationPass {
                                                     .unwrap_or("<none>")
                                             );
                                         }
-                                        insert_points.push(InsertPoint {
-                                            bb,
-                                            stmt_idx,
-                                            insert_before: false,
-                                            source_info: stmt.source_info,
-                                            place: Place::from(dst_local),
-                                            kind: if let Some(src_place) = projected_src_place {
-                                                if is_ref {
-                                                    let bk = match dst_ty.kind() {
-                                                        TyKind::Ref(_, _, Mutability::Mut) => {
-                                                            BorrowKind::Mut {
-                                                                kind: MutBorrowKind::Default,
-                                                            }
-                                                        }
-                                                        _ => BorrowKind::Shared,
-                                                    };
-                                                    InstrKind::Ref {
-                                                        bk,
-                                                        src: src_place,
-                                                        projected_reborrow_anchor_key,
+                                        if let Some(src_place) = projected_src_place {
+                                            insert_points.push(InsertPoint {
+                                                bb,
+                                                stmt_idx,
+                                                insert_before: false,
+                                                source_info: stmt.source_info,
+                                                place: src_place,
+                                                kind: InstrKind::ShadowLoad {
+                                                    dst_local,
+                                                    require_tag: false,
+                                                    validate_ref: is_ref,
+                                                },
+                                            });
+                                            insert_points.push(InsertPoint {
+                                                bb,
+                                                stmt_idx,
+                                                insert_before: false,
+                                                source_info: stmt.source_info,
+                                                place: Place::from(dst_local),
+                                                kind: InstrKind::ShadowStore {
+                                                    src_local: dst_local,
+                                                },
+                                            });
+                                        } else {
+                                            insert_points.push(InsertPoint {
+                                                bb,
+                                                stmt_idx,
+                                                insert_before: false,
+                                                source_info: stmt.source_info,
+                                                place: Place::from(dst_local),
+                                                kind: if is_ref {
+                                                    InstrKind::RetRoot {
+                                                        dst_local,
+                                                        is_mut,
+                                                        is_ref: true,
                                                     }
                                                 } else {
-                                                    InstrKind::Raw {
+                                                    InstrKind::RawRoot {
+                                                        ptr_local: dst_local,
                                                         is_mut,
-                                                        src: src_place,
+                                                        exposed_provenance: matches!(
+                                                            rvalue,
+                                                            Rvalue::Cast(
+                                                                CastKind::PointerWithExposedProvenance,
+                                                                ..,
+                                                            )
+                                                        ),
                                                     }
-                                                }
-                                            } else if is_ref {
-                                                InstrKind::RetRoot {
-                                                    dst_local,
-                                                    is_mut,
-                                                    is_ref: true,
-                                                }
-                                            } else {
-                                                InstrKind::RawRoot {
-                                                    ptr_local: dst_local,
-                                                    is_mut,
-                                                    exposed_provenance: matches!(
-                                                        rvalue,
-                                                        Rvalue::Cast(
-                                                            CastKind::PointerWithExposedProvenance,
-                                                            ..,
-                                                        )
-                                                    ),
-                                                }
-                                            },
-                                        });
+                                                },
+                                            });
+                                        }
                                         if let Some((key, deps)) = anchor_key {
                                             ssa_anchor_for_expr.insert(
                                                 key,

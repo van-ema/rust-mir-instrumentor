@@ -1748,10 +1748,26 @@ fn scoped_call_arg_leaf_shadow(
     let scoped = {
         let scopes = call_arg_leaf_scopes().lock().unwrap();
         let stack = scopes.get(&thread_id)?;
-        stack
-            .iter()
-            .rev()
-            .find_map(|scope| scope.leaf_shadows.get(&(leaf_key, slot_addr)).copied())?
+        let mut found = None;
+        for scope in stack.iter().rev() {
+            if let Some(shadow) = scope.leaf_shadows.get(&(leaf_key, slot_addr)).copied() {
+                found = Some(shadow);
+                break;
+            }
+
+            // If the callee stack slot moved, a unique leaf key is still exact enough.
+            let mut by_key = scope
+                .leaf_shadows
+                .iter()
+                .filter_map(|((key, _source_slot), shadow)| (*key == leaf_key).then_some(*shadow));
+            if let Some(first) = by_key.next() {
+                if by_key.next().is_none() {
+                    found = Some(first);
+                }
+                break;
+            }
+        }
+        found?
     };
     Some(current_slot_shadow(slot_addr).unwrap_or(scoped))
 }
@@ -1922,6 +1938,21 @@ fn export_return_tag(callee_id: u64, tag: u64, addr: usize, boundary_survivor: b
         active_alias_model().on_ret_export(tag, addr);
     }
     remember_boundary_survivor_tag(callee_id, tag);
+}
+
+fn validate_and_export_return_tag(callee_id: u64, tag: u64, addr: usize, boundary_survivor: bool) {
+    let kind = tag_store::get(tag).map(|meta| meta.kind);
+    let validate_before_export =
+        active_alias_model().name() != "tb_lite" || matches!(kind, Some(PtrKind::RefShared));
+    if validate_before_export {
+        // Check shared refs before export can revive a boundary family.
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
+    export_return_tag(callee_id, tag, addr, boundary_survivor);
+    if !validate_before_export {
+        // `&mut` survivor returns validate after the export repair.
+        rz_validate_ref_boundary_use(tag, "RET");
+    }
 }
 
 #[inline]
@@ -5578,7 +5609,7 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
 }
 
-/// Push the exact shadow of one internal pointer leaf of a by-value raw-owner aggregate argument.
+/// Push the exact shadow of one internal pointer leaf of a by-value aggregate argument.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_leaf_shadow(
     callee_id: u64,
@@ -5593,6 +5624,13 @@ pub extern "C" fn __rz_push_call_arg_leaf_shadow(
         (thread_id, callee_id, arg_index, leaf_key),
         (slot_addr, shadow),
     );
+}
+
+/// Drop unconsumed exact call-argument leaf shadows for `callee_id`.
+#[no_mangle]
+pub extern "C" fn __rz_clear_call_arg_leaf_shadows(callee_id: u64) {
+    let _g = RzRuntimeGuard::enter();
+    clear_unconsumed_call_arg_leaf_shadows(callee_id);
 }
 
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
@@ -5773,7 +5811,8 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
             })
             .map(|(_slot_addr, shadow)| shadow)
     })
-    .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr));
+    .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr))
+    .or_else(|| current_slot_shadow(slot_addr));
     let (tag, ref_ancestor, export_parent, export_parent_recovered) =
         shadow.unwrap_or((0, 0, 0, 0));
     ptr_shadow::store_ptr(
@@ -5925,22 +5964,8 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
     let _g = RzRuntimeGuard::enter();
-    let kind = tag_store::get(tag).map(|meta| meta.kind);
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    let validate_before_export =
-        active_alias_model().name() != "tb_lite" || matches!(kind, Some(PtrKind::RefShared));
-    if validate_before_export {
-        // Validate the original exported ref before any return-side repair/revival. Otherwise
-        // `on_ret_export` can resurrect an already-invalid family and mask the boundary violation.
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
-    export_return_tag(callee_id, tag, addr, boundary_survivor);
-    if !validate_before_export {
-        // Ordinary returned `&mut` values stay on the strict return path. A caller-owned survivor
-        // that is being forwarded as a return uses the mut-arg-ret repair above, then validates the
-        // repaired family before it becomes visible to the caller.
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
+    validate_and_export_return_tag(callee_id, tag, addr, boundary_survivor);
     let thread_id = std::thread::current().id();
     ret_tags()
         .lock()
@@ -5956,15 +5981,25 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
     let export_parent = ptr_shadow::load_export_parent(slot_addr);
     let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
-    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    if active_alias_model().name() == "sb_lite" {
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
-    export_return_tag(callee_id, tag, 0, boundary_survivor);
+    let recovered_from_boundary = export_parent_recovered != 0 && export_parent != 0;
+    let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) =
+        if recovered_from_boundary {
+            // Do not return a callee-local helper tag; return its boundary parent.
+            (export_parent, export_parent, export_parent, 0)
+        } else {
+            (tag, ref_ancestor, export_parent, export_parent_recovered)
+        };
+    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
+    validate_and_export_return_tag(callee_id, ret_tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();
     ret_leaf_shadows().lock().unwrap().insert(
         (thread_id, callee_id, leaf_key),
-        (tag, ref_ancestor, export_parent, export_parent_recovered),
+        (
+            ret_tag,
+            ret_ref_ancestor,
+            ret_export_parent,
+            ret_export_parent_recovered,
+        ),
     );
 }
 
@@ -5973,11 +6008,8 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
 pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
     let _g = RzRuntimeGuard::enter();
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    if active_alias_model().name() == "sb_lite" {
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
+    validate_and_export_return_tag(callee_id, tag, 0, boundary_survivor);
     if tag != 0 {
-        export_return_tag(callee_id, tag, 0, boundary_survivor);
         let thread_id = std::thread::current().id();
         ret_tags()
             .lock()

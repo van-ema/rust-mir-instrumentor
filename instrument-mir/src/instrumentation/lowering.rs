@@ -1047,6 +1047,7 @@ impl MyOptimizationPass {
                 | InstrKind::CallArgValidate { .. }
                 | InstrKind::CallArgLeafPush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
+                | InstrKind::CallArgLeafClear { .. }
                 | InstrKind::PtrUse { .. }
                 | InstrKind::RetValidate { .. }
                 | InstrKind::RetAnchorTake { .. }
@@ -5539,7 +5540,9 @@ impl MyOptimizationPass {
                     };
                     (Some(slot_stmt1), slot_stmt2)
                 }
-                InstrKind::CallArgValidate { .. } | InstrKind::RetValidate { .. } => (
+                InstrKind::CallArgValidate { .. }
+                | InstrKind::CallArgLeafClear { .. }
+                | InstrKind::RetValidate { .. } => (
                     None,
                     Statement::new(
                         source_info,
@@ -6274,6 +6277,18 @@ impl MyOptimizationPass {
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = arg_vec.into_boxed_slice();
 
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::CallArgLeafClear { callee_id } => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    }]
+                    .into_boxed_slice();
                     (args, Place::from(tmp_unit))
                 }
 
