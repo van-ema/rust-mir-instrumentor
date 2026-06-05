@@ -16,61 +16,12 @@ use static_image::StaticRange;
 mod alias_model;
 use alias_model::{active_alias_model, AliasAccessKind};
 mod dead_epoch_cleanup;
-#[cfg(feature = "runtime_lineage_repair")]
-mod exact_parent_index;
-#[cfg(feature = "runtime_lineage_repair")]
-mod lineage_cache;
 mod live_alloc_cache;
 mod ptr_shadow;
 mod tag_history;
 mod tag_lookup_cache;
 mod tag_pruning;
 mod tag_store;
-
-#[cfg(not(feature = "runtime_lineage_repair"))]
-mod exact_parent_index {
-    use crate::TagMeta;
-
-    #[inline]
-    pub(crate) fn lookup(
-        _addr: usize,
-        _alloc_epoch: u64,
-        _require_mut_parent: bool,
-    ) -> Option<u64> {
-        None
-    }
-
-    #[inline]
-    pub(crate) fn remove_alloc_epoch(_base_addr: usize, _alloc_epoch: u64) {}
-
-    #[inline]
-    pub(crate) fn len() -> usize {
-        0
-    }
-
-    #[inline]
-    pub(crate) fn remember_non_root_tag(_tag: u64, _meta: &TagMeta) {}
-}
-
-#[cfg(not(feature = "runtime_lineage_repair"))]
-mod lineage_cache {
-    use crate::TagMeta;
-
-    #[inline]
-    pub(crate) fn lookup_repaired_parent(
-        _addr: usize,
-        _alloc_epoch: u64,
-        _require_mut_parent: bool,
-    ) -> Option<u64> {
-        None
-    }
-
-    #[inline]
-    pub(crate) fn note_dead_epoch(_base_addr: usize, _alloc_epoch: u64) {}
-
-    #[inline]
-    pub(crate) fn remember_non_root_tag(_tag: u64, _meta: &TagMeta) {}
-}
 
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
@@ -154,11 +105,8 @@ struct HookProfileCounters {
     ref_create_total_ns: AtomicU64,
     ref_create_validate_ns: AtomicU64,
     ref_create_alloc_snapshot_ns: AtomicU64,
-    ref_create_lineage_repair_ns: AtomicU64,
     ref_create_insert_ns: AtomicU64,
     ref_create_tag_store_insert_ns: AtomicU64,
-    ref_create_exact_parent_update_ns: AtomicU64,
-    ref_create_lineage_cache_update_ns: AtomicU64,
     ref_create_alias_on_tag_created_ns: AtomicU64,
     raw_create_calls: AtomicU64,
     raw_create_total_ns: AtomicU64,
@@ -185,11 +133,8 @@ impl HookProfileCounters {
             ref_create_total_ns: AtomicU64::new(0),
             ref_create_validate_ns: AtomicU64::new(0),
             ref_create_alloc_snapshot_ns: AtomicU64::new(0),
-            ref_create_lineage_repair_ns: AtomicU64::new(0),
             ref_create_insert_ns: AtomicU64::new(0),
             ref_create_tag_store_insert_ns: AtomicU64::new(0),
-            ref_create_exact_parent_update_ns: AtomicU64::new(0),
-            ref_create_lineage_cache_update_ns: AtomicU64::new(0),
             ref_create_alias_on_tag_created_ns: AtomicU64::new(0),
             raw_create_calls: AtomicU64::new(0),
             raw_create_total_ns: AtomicU64::new(0),
@@ -227,23 +172,6 @@ fn rz_dump_hook_profile_at_exit_enabled() -> bool {
             .ok()
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     })
-}
-
-#[cfg(feature = "runtime_lineage_repair")]
-#[inline]
-fn rz_runtime_lineage_repair_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var("RZ_DISABLE_RUNTIME_LINEAGE_REPAIR")
-            .ok()
-            .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    })
-}
-
-#[cfg(not(feature = "runtime_lineage_repair"))]
-#[inline(always)]
-fn rz_runtime_lineage_repair_enabled() -> bool {
-    false
 }
 
 #[inline]
@@ -2206,171 +2134,6 @@ fn lookup_alloc_origin_snapshot(addr: usize) -> Option<(usize, AllocMeta)> {
     find_alloc_origin_candidate(&amap, addr).map(|(base, meta)| (base, *meta))
 }
 
-/// Best-effort lineage repair for roots whose provenance was lost in optimized MIR.
-///
-/// First try exact same-address recovery from the side indices. If that misses, fall back to the
-/// smallest live enclosing non-root tag in the same allocation epoch. The enclosing-range fallback
-/// is needed for carrier/container writes where optimized MIR materializes an interior byte/field
-/// as a fresh root even though the surrounding object already has a live borrow family.
-#[inline]
-fn recover_parent_for_alloc_root(
-    pointee_addr: usize,
-    alloc_epoch: u64,
-    require_mut_parent: bool,
-) -> u64 {
-    if !rz_runtime_lineage_repair_enabled() || alloc_epoch == 0 || pointee_addr == 0 {
-        return 0;
-    }
-
-    if let Some(tag) =
-        lineage_cache::lookup_repaired_parent(pointee_addr, alloc_epoch, require_mut_parent)
-    {
-        return tag;
-    }
-
-    if let Some(tag) = exact_parent_index::lookup(pointee_addr, alloc_epoch, require_mut_parent) {
-        if let Some(meta) = tag_store::get(tag) {
-            lineage_cache::remember_non_root_tag(tag, &meta);
-        }
-        return tag;
-    }
-
-    recover_enclosing_parent_for_alloc_root(pointee_addr, alloc_epoch, require_mut_parent)
-}
-
-#[inline]
-/// Return the candidate range that should be considered for alloc-root parent repair.
-///
-/// Prefer explicit bounds when available; otherwise fall back to the recorded allocation-origin
-/// range for wider carriers such as `BytesMut`.
-fn repaired_parent_candidate_range(meta: &TagMeta) -> Option<(usize, usize)> {
-    if bounds_len_is_known_nonempty(meta.bounds_len) {
-        let end = meta.pointee_addr.checked_add(meta.bounds_len)?;
-        return Some((meta.pointee_addr, end));
-    }
-    if meta.origin_known && meta.origin_end > meta.origin_base {
-        return Some((meta.origin_base, meta.origin_end));
-    }
-    None
-}
-
-#[inline]
-/// True if `meta` describes a live non-root family that covers `addr`.
-fn repaired_parent_candidate_covers_addr(meta: &TagMeta, addr: usize) -> bool {
-    repaired_parent_candidate_range(meta)
-        .map(|(start, end)| addr >= start && addr < end)
-        .unwrap_or(meta.pointee_addr == addr)
-}
-
-/// Slow-path alloc-root repair for interior addresses.
-///
-/// This handles cases where optimized MIR loses ancestry for a byte/field inside a carrier object.
-/// We choose the smallest enclosing live non-root family in the same allocation epoch so the new
-/// root rejoins the existing borrow tree instead of becoming a detached foreign write.
-fn recover_enclosing_parent_for_alloc_root(
-    pointee_addr: usize,
-    alloc_epoch: u64,
-    require_mut_parent: bool,
-) -> u64 {
-    if pointee_addr == 0 || alloc_epoch == 0 {
-        return 0;
-    }
-
-    let tmap = tags().lock().unwrap();
-    let mut best_tag = 0u64;
-    let mut best_range_len = usize::MAX;
-    let mut best_exact_start = false;
-    let mut best_mut_like = false;
-
-    for (tag, meta) in tmap.iter() {
-        if meta.parent == 0 || meta.alloc_epoch != alloc_epoch {
-            continue;
-        }
-        if require_mut_parent && !matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut) {
-            continue;
-        }
-        if !rz_can_recover_parent_tag(*tag)
-            || !repaired_parent_candidate_covers_addr(meta, pointee_addr)
-        {
-            continue;
-        }
-
-        let range_len = repaired_parent_candidate_range(meta)
-            .map(|(start, end)| end.saturating_sub(start))
-            .unwrap_or(1);
-        let exact_start = meta.pointee_addr == pointee_addr;
-        let mut_like = matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut);
-
-        let better = range_len < best_range_len
-            || (range_len == best_range_len && exact_start && !best_exact_start)
-            || (range_len == best_range_len
-                && exact_start == best_exact_start
-                && mut_like
-                && !best_mut_like)
-            || (range_len == best_range_len
-                && exact_start == best_exact_start
-                && mut_like == best_mut_like
-                && *tag > best_tag);
-
-        if better {
-            best_tag = *tag;
-            best_range_len = range_len;
-            best_exact_start = exact_start;
-            best_mut_like = mut_like;
-        }
-    }
-
-    if best_tag != 0 {
-        if let Some(meta) = tag_store::get(best_tag) {
-            lineage_cache::remember_non_root_tag(best_tag, &meta);
-        }
-        rz_trace!(
-            "[rusteze-runtime] alloc-root enclosing repair addr=0x{:x} epoch={} require_mut={} -> tag={} range_len={} exact_start={}",
-            pointee_addr,
-            alloc_epoch,
-            require_mut_parent,
-            best_tag,
-            best_range_len,
-            best_exact_start
-        );
-    }
-
-    best_tag
-}
-
-#[inline]
-fn recover_projected_mut_parent_from_const_raw(parent_tag: u64, pointee_addr: usize) -> u64 {
-    if !rz_runtime_lineage_repair_enabled() || parent_tag == 0 || pointee_addr == 0 {
-        return 0;
-    }
-
-    let tmap = tags().lock().unwrap();
-    let Some(parent_meta) = tmap.get(&parent_tag) else {
-        return 0;
-    };
-    if !matches!(parent_meta.kind, PtrKind::RawConst) {
-        return 0;
-    }
-
-    let mut cursor = parent_meta.parent;
-    let mut depth = 0usize;
-    while cursor != 0 && depth < 8 {
-        let Some(meta) = tmap.get(&cursor) else {
-            break;
-        };
-        if matches!(meta.kind, PtrKind::RefMut | PtrKind::RawMut)
-            && rz_can_recover_parent_tag(cursor)
-            && repaired_parent_candidate_covers_addr(meta, pointee_addr)
-        {
-            return cursor;
-        }
-        cursor = meta.parent;
-        depth += 1;
-    }
-
-    0
-}
-
 #[inline]
 fn rz_allow_untracked_stack_ref(tmeta: &TagMeta, addr: usize) -> bool {
     matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
@@ -3722,13 +3485,8 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.ref_create_total_ns.store(0, Ordering::Relaxed);
     p.ref_create_validate_ns.store(0, Ordering::Relaxed);
     p.ref_create_alloc_snapshot_ns.store(0, Ordering::Relaxed);
-    p.ref_create_lineage_repair_ns.store(0, Ordering::Relaxed);
     p.ref_create_insert_ns.store(0, Ordering::Relaxed);
     p.ref_create_tag_store_insert_ns.store(0, Ordering::Relaxed);
-    p.ref_create_exact_parent_update_ns
-        .store(0, Ordering::Relaxed);
-    p.ref_create_lineage_cache_update_ns
-        .store(0, Ordering::Relaxed);
     p.ref_create_alias_on_tag_created_ns
         .store(0, Ordering::Relaxed);
     p.raw_create_calls.store(0, Ordering::Relaxed);
@@ -3761,13 +3519,8 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let ref_create_total_ns = p.ref_create_total_ns.load(Ordering::Relaxed);
     let ref_create_validate_ns = p.ref_create_validate_ns.load(Ordering::Relaxed);
     let ref_create_alloc_snapshot_ns = p.ref_create_alloc_snapshot_ns.load(Ordering::Relaxed);
-    let ref_create_lineage_repair_ns = p.ref_create_lineage_repair_ns.load(Ordering::Relaxed);
     let ref_create_insert_ns = p.ref_create_insert_ns.load(Ordering::Relaxed);
     let ref_create_tag_store_insert_ns = p.ref_create_tag_store_insert_ns.load(Ordering::Relaxed);
-    let ref_create_exact_parent_update_ns =
-        p.ref_create_exact_parent_update_ns.load(Ordering::Relaxed);
-    let ref_create_lineage_cache_update_ns =
-        p.ref_create_lineage_cache_update_ns.load(Ordering::Relaxed);
     let ref_create_alias_on_tag_created_ns =
         p.ref_create_alias_on_tag_created_ns.load(Ordering::Relaxed);
     let raw_create_calls = p.raw_create_calls.load(Ordering::Relaxed);
@@ -3796,7 +3549,6 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let historical_live_tag_entries = tag_store::historical_live_len();
     let invalidated_tag_entries = tag_store::invalidated_len();
     let dead_tag_entries = tag_store::dead_len();
-    let exact_parent_entries = exact_parent_index::len();
     let tag_history_stats = tag_pruning::stats();
     let call_arg_entries = call_arg_tags().lock().unwrap().len();
     let ret_tag_entries = ret_tags().lock().unwrap().len();
@@ -3811,7 +3563,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
         read_calls, read_total_ns, read_avg_ns, read_tag_ns, read_alias_ns, read_alloc_ns
     );
     eprintln!(
-        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} lineage_repair={} insert={} tag_store_insert={} exact_parent_update={} lineage_cache_update={} alias_on_tag_created={}",
+        "  ref_create:  calls={} total={} avg_per_call={:.1} validate={} alloc_snapshot={} insert={} tag_store_insert={} alias_on_tag_created={}",
         ref_create_calls,
         ref_create_total_ns,
         if ref_create_calls == 0 {
@@ -3821,11 +3573,8 @@ pub extern "C" fn __rz_dump_hook_profile() {
         },
         ref_create_validate_ns,
         ref_create_alloc_snapshot_ns,
-        ref_create_lineage_repair_ns,
         ref_create_insert_ns,
         ref_create_tag_store_insert_ns,
-        ref_create_exact_parent_update_ns,
-        ref_create_lineage_cache_update_ns,
         ref_create_alias_on_tag_created_ns
     );
     eprintln!(
@@ -3859,8 +3608,8 @@ pub extern "C" fn __rz_dump_hook_profile() {
         }
     );
     eprintln!(
-        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
-        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, invalidated_tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
+        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_tag_entries={} call_arg_entries={} ret_tag_entries={}",
+        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, invalidated_tag_entries, dead_tag_entries, call_arg_entries, ret_tag_entries
     );
     eprintln!(
         "  tag_pruning: active_epoch_buckets={} active_tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
@@ -6381,84 +6130,6 @@ pub extern "C" fn __record_ref_creation_with_extent(
         rz_profile_add_elapsed(&p.ref_create_alloc_snapshot_ns, start);
     }
 
-    // Optimized MIR can lose parent tags for same-address ref reborrows on both stack and heap
-    // objects. Example:
-    //   let kind = self.kind();   // emits `&self` on a `BytesMut`
-    //   self.set_vec_pos(pos);    // later `&mut self` write must stay in the same lineage
-    // Exact same-address recovery is low-risk for refs across any tracked allocation, so keep
-    // that repair even when we reject broader overlap-based guessing.
-    let lineage_repair_start = profile.map(|_| Instant::now());
-    if resolved_parent_tag == 0 && alloc_epoch != 0 {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RefMut),
-        );
-        if repaired_parent != 0 {
-            resolved_parent_tag = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                if bounds_len_is_unknown(inherited_bounds_len) {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_ref_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
-                pointee_addr,
-                parent_tag,
-                resolved_parent_tag,
-                alloc_epoch,
-                alloc_size
-            );
-        }
-    }
-    if let (Some(p), Some(start)) = (profile, lineage_repair_start) {
-        rz_profile_add_elapsed(&p.ref_create_lineage_repair_ns, start);
-    }
-    // Optimized MIR may create `&mut (*raw_root)` or `&(*raw_root)` from a root raw tag that was
-    // synthesized only because provenance was temporarily lost while extracting a pointee from a
-    // wrapper (e.g. Box/NonNull/Result wrappers). If we can recover a same-address non-root tag
-    // in the same allocation epoch, prefer it over the raw root to keep the borrow tree intact.
-    if resolved_parent_tag != 0 && alloc_epoch != 0 {
-        let parent_is_root_raw = tag_store::get(resolved_parent_tag)
-            .as_ref()
-            .is_some_and(|meta| {
-                meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
-            });
-        if parent_is_root_raw {
-            let repaired_parent = recover_parent_for_alloc_root(
-                pointee_addr,
-                alloc_epoch,
-                matches!(kind, PtrKind::RefMut),
-            );
-            if repaired_parent != 0 && repaired_parent != resolved_parent_tag {
-                let previous_parent = resolved_parent_tag;
-                resolved_parent_tag = repaired_parent;
-                if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-                    if bounds_len_is_unknown(inherited_bounds_len) {
-                        inherited_bounds_len = parent_meta.bounds_len;
-                    }
-                    if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                        alloc_epoch = parent_meta.alloc_epoch;
-                        alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                    }
-                }
-                rz_trace!(
-                    "__record_ref_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
-                    pointee_addr,
-                    parent_tag,
-                    previous_parent,
-                    resolved_parent_tag,
-                    alloc_epoch,
-                    alloc_size
-                );
-            }
-        }
-    }
-
     let bounds_len = if bounds_len_is_known(bounds_len) {
         bounds_len
     } else {
@@ -6507,18 +6178,6 @@ pub extern "C" fn __record_ref_creation_with_extent(
     tag_pruning::remember_live_tag(tag, &tmeta);
     if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
         rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
-    }
-    if rz_runtime_lineage_repair_enabled() {
-        let exact_parent_update_start = profile.map(|_| Instant::now());
-        exact_parent_index::remember_non_root_tag(tag, &tmeta);
-        if let (Some(p), Some(start)) = (profile, exact_parent_update_start) {
-            rz_profile_add_elapsed(&p.ref_create_exact_parent_update_ns, start);
-        }
-        let lineage_cache_update_start = profile.map(|_| Instant::now());
-        lineage_cache::remember_non_root_tag(tag, &tmeta);
-        if let (Some(p), Some(start)) = (profile, lineage_cache_update_start) {
-            rz_profile_add_elapsed(&p.ref_create_lineage_cache_update_ns, start);
-        }
     }
     let alias_on_tag_created_start = profile.map(|_| Instant::now());
     active_alias_model().on_tag_created(tag, &tmeta);
@@ -6636,25 +6295,9 @@ pub extern "C" fn __record_raw_ptr_creation(
     // - bit7: deref-projected raw creation; strict mode rejects exposed provenance, while default
     //   mode requires the projected address to stay inside the same live allocation
     let mut resolved_parent = derived_from;
-    if strong_projected_raw_hint && matches!(kind, PtrKind::RawMut) {
-        let repaired_parent =
-            recover_projected_mut_parent_from_const_raw(resolved_parent, pointee_addr);
-        if repaired_parent != 0 && repaired_parent != resolved_parent {
-            rz_trace!(
-                "__record_raw_ptr_creation projected-mut repair: pointee=0x{:x} from={} {}->{}",
-                pointee_addr,
-                derived_from,
-                resolved_parent,
-                repaired_parent
-            );
-            resolved_parent = repaired_parent;
-        }
-    }
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
     let mut parent_alloc_mismatch = false;
-    let mut parent_is_root = false;
-    let mut parent_pointee_addr: Option<usize> = None;
 
     // IMPORTANT: On retagging/derived pointers (derived_from != 0), prefer inheriting the
     // parent's alloc_epoch to keep the original allocation-instance snapshot and make
@@ -6663,7 +6306,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     // allocation epoch (example: `&mut Vec<u8>` on the stack -> `Vec::as_mut_ptr()` heap buffer).
     let (mut alloc_epoch, mut alloc_live_at_creation, mut inherited_bounds_len) =
         if derived_from != 0 {
-            let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len, parent_parent) =
+            let (parent_epoch, parent_live, parent_pointee, inherited_bounds_len) =
                 tag_store::get(derived_from)
                     .as_ref()
                     .map(|p| {
@@ -6672,12 +6315,9 @@ pub extern "C" fn __record_raw_ptr_creation(
                             p.alloc_live_at_creation,
                             Some(p.pointee_addr),
                             p.bounds_len,
-                            p.parent,
                         )
                     })
-                    .unwrap_or((0, false, None, BOUNDS_LEN_UNKNOWN, 0));
-            parent_is_root = parent_parent == 0;
-            parent_pointee_addr = parent_pointee;
+                    .unwrap_or((0, false, None, BOUNDS_LEN_UNKNOWN));
 
             if let Some(parent_pointee) = parent_pointee {
                 let parent_alloc = lookup_alloc_snapshot(parent_pointee);
@@ -6728,76 +6368,6 @@ pub extern "C" fn __record_raw_ptr_creation(
             }
         };
 
-    // Optimized MIR can materialize projected raw pointers from wrapper/owner internals
-    // (e.g. Pin/Box/NonNull/Unique field extraction) without a recoverable source tag and emit
-    // `derived_from=0`. When this happens on a tracked allocation, attach to a same-address
-    // recent non-root tag in the same epoch to preserve lineage instead of seeding a fresh raw
-    // root that can later freeze an otherwise-valid borrow family.
-    if resolved_parent == 0 && projected_raw_hint && alloc_epoch != 0 {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RawMut),
-        );
-        if repaired_parent != 0 {
-            resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if bounds_len_is_unknown(inherited_bounds_len) {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_raw_ptr_creation lineage repair: pointee=0x{:x} from={} -> {} epoch={} size={}",
-                pointee_addr,
-                derived_from,
-                resolved_parent,
-                alloc_epoch,
-                alloc_size
-            );
-        }
-    }
-
-    // Derived pointer creation can still lose effective lineage in optimized async lowering:
-    // a raw pointer may be emitted as "derived" from a freshly synthesized root that points to
-    // a different stack slot than the raw pointee. In that shape we prefer exact same-address
-    // non-root recovery over keeping the mismatched root parent.
-    if resolved_parent != 0
-        && parent_is_root
-        && (parent_alloc_mismatch || parent_pointee_addr.map_or(false, |pp| pp != pointee_addr))
-        && alloc_epoch != 0
-    {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RawMut),
-        );
-        if repaired_parent != 0 && repaired_parent != resolved_parent {
-            let previous_parent = resolved_parent;
-            resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if bounds_len_is_unknown(inherited_bounds_len) {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_raw_ptr_creation parent-mismatch repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
-                pointee_addr,
-                derived_from,
-                previous_parent,
-                resolved_parent,
-                alloc_epoch,
-                alloc_size
-            );
-        }
-    }
     // A strong projected root on a live allocation is a provenance-preserving owner/payload
     // reconstruction. Do not poison it just because an older tag at the same address was exposed.
     let provenance_preserving_alloc_root = derived_from == 0
@@ -6827,41 +6397,6 @@ pub extern "C" fn __record_raw_ptr_creation(
             if poisoned_same_addr {
                 exposed_provenance_root = true;
             }
-        }
-    }
-
-    // Projected raw wrappers such as `self.ptr.as_ptr()` on carrier structs can still arrive
-    // with a non-root stack parent even though the derived pointer clearly points into a tracked
-    // heap allocation. In that shape the parent family is definitely wrong: reattach to the
-    // pointee allocation's live non-root family instead of keeping the carrier stack slot as
-    // provenance and later tripping RAW_DERIVE_OOB on the stack-origin range.
-    if projected_raw_hint && resolved_parent != 0 && parent_alloc_mismatch && alloc_epoch != 0 {
-        let repaired_parent = recover_parent_for_alloc_root(
-            pointee_addr,
-            alloc_epoch,
-            matches!(kind, PtrKind::RawMut),
-        );
-        if repaired_parent != 0 && repaired_parent != resolved_parent {
-            let previous_parent = resolved_parent;
-            resolved_parent = repaired_parent;
-            if let Some(parent_meta) = tag_store::get(resolved_parent) {
-                if bounds_len_is_unknown(inherited_bounds_len) {
-                    inherited_bounds_len = parent_meta.bounds_len;
-                }
-                if alloc_epoch == 0 && parent_meta.alloc_epoch != 0 {
-                    alloc_epoch = parent_meta.alloc_epoch;
-                    alloc_live_at_creation = parent_meta.alloc_live_at_creation;
-                }
-            }
-            rz_trace!(
-                "__record_raw_ptr_creation projected-parent repair: pointee=0x{:x} from={} {}->{} epoch={} size={}",
-                pointee_addr,
-                derived_from,
-                previous_parent,
-                resolved_parent,
-                alloc_epoch,
-                alloc_size
-            );
         }
     }
 
@@ -6943,10 +6478,6 @@ pub extern "C" fn __record_raw_ptr_creation(
         tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
     }
     tag_pruning::remember_live_tag(tag, &tmeta);
-    if rz_runtime_lineage_repair_enabled() {
-        exact_parent_index::remember_non_root_tag(tag, &tmeta);
-        lineage_cache::remember_non_root_tag(tag, &tmeta);
-    }
     active_alias_model().on_tag_created(tag, &tmeta);
     let kind_str = match kind {
         PtrKind::RawConst => "const",

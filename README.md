@@ -195,6 +195,11 @@ Project-specific environment variables are grouped below by component/script.
 - `RZ_ALIAS_MODEL`: alias model selector: `tb_lite` (default), `sb_lite`, `none`.
 - `RZ_TB_LITE`: tree-borrows-lite on/off (`1` default, `0` disables checks inside `tb_lite` model).
 - `RZ_TB_DUMP`: `1/true` adds extra TB-lite diagnostic context.
+- `RZ_TB_TRACE`: `1/true` enables verbose TB-lite transition tracing.
+- `RZ_TB_COMPACT_INVALIDATED_TAGS`: experimental opt-in (`0` default). When set to `1/true`,
+  TB-lite compacts unreachable invalidated helper tags into exact tombstones instead of keeping
+  them in the active tree. Stale-tag diagnostics remain exact; this is currently a memory/metadata
+  growth experiment, not a default performance optimization.
 - `RZ_SB_LITE`: stacked-borrows-lite on/off (`1` default when using `sb_lite` model).
 - `RZ_SB_DUMP`: `1/true` adds SB-lite stack/ancestry details in violation output.
 - `RZ_STACK_REF_OOB_NOISE`: stack-ref OOB-noise suppression (`1` default, set `0` for strict reporting).
