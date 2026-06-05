@@ -11,6 +11,8 @@ struct CompactTagMeta {
     kind: crate::PtrKind,
     alloc_epoch: u64,
     alloc_live_at_creation: bool,
+    alias_exempt: bool,
+    lineage_hint: u8,
     exposed_provenance_root: bool,
     bounds_len: usize,
     interior_mut_extent_base: usize,
@@ -21,6 +23,59 @@ struct CompactTagMeta {
     origin_end: usize,
 }
 
+impl CompactTagMeta {
+    #[inline]
+    fn from_tag_meta(meta: TagMeta) -> Self {
+        Self {
+            pointee_addr: meta.pointee_addr,
+            kind: meta.kind,
+            alloc_epoch: meta.alloc_epoch,
+            alloc_live_at_creation: meta.alloc_live_at_creation,
+            alias_exempt: meta.alias_exempt,
+            lineage_hint: meta.lineage_hint,
+            exposed_provenance_root: meta.exposed_provenance_root,
+            bounds_len: meta.bounds_len,
+            interior_mut_extent_base: meta.interior_mut_extent_base,
+            interior_mut_extent_len: meta.interior_mut_extent_len,
+            align_req: meta.align_req,
+            origin_known: meta.origin_known,
+            origin_base: meta.origin_base,
+            origin_end: meta.origin_end,
+        }
+    }
+
+    #[inline]
+    fn into_tag_meta(self) -> TagMeta {
+        TagMeta {
+            pointee_addr: self.pointee_addr,
+            kind: self.kind,
+            parent: 0,
+            escaped: false,
+            alloc_epoch: self.alloc_epoch,
+            alloc_live_at_creation: self.alloc_live_at_creation,
+            alias_exempt: self.alias_exempt,
+            lineage_hint: self.lineage_hint,
+            exposed_provenance_root: self.exposed_provenance_root,
+            bounds_len: self.bounds_len,
+            interior_mut_extent_base: self.interior_mut_extent_base,
+            interior_mut_extent_len: self.interior_mut_extent_len,
+            align_req: self.align_req,
+            origin_known: self.origin_known,
+            origin_base: self.origin_base,
+            origin_end: self.origin_end,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TagLifecycleState {
+    Active,
+    HistoricalLive,
+    Invalidated,
+    DeadAlloc,
+    Missing,
+}
+
 struct TagShard {
     map: Mutex<HashMap<u64, TagMeta>>,
     gen: AtomicU64,
@@ -28,6 +83,7 @@ struct TagShard {
 
 static TAG_SHARDS: OnceLock<Vec<TagShard>> = OnceLock::new();
 static HISTORICAL_LIVE_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
+static INVALIDATED_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
 static DEAD_TAGS: OnceLock<Mutex<HashMap<u64, CompactTagMeta>>> = OnceLock::new();
 static ALLOC_EPOCH_TAGS: OnceLock<Mutex<HashMap<(usize, u64), Vec<u64>>>> = OnceLock::new();
 static LOCAL_HOLDER_COUNTS: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
@@ -49,6 +105,11 @@ fn shards() -> &'static [TagShard] {
 #[inline]
 fn historical_live_tags() -> &'static Mutex<HashMap<u64, CompactTagMeta>> {
     HISTORICAL_LIVE_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[inline]
+fn invalidated_tags() -> &'static Mutex<HashMap<u64, CompactTagMeta>> {
+    INVALIDATED_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[inline]
@@ -81,6 +142,13 @@ pub(crate) fn gen_for_tag(tag: u64) -> u64 {
 }
 
 #[inline]
+fn remove_shard_entry_and_bump(tag: u64) {
+    let idx = shard_index(tag);
+    shards()[idx].map.lock().unwrap().remove(&tag);
+    shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
 pub(crate) fn get(tag: u64) -> Option<TagMeta> {
     let idx = shard_index(tag);
     if let Some(meta) = shards()[idx].map.lock().unwrap().get(&tag).copied() {
@@ -98,24 +166,11 @@ pub(crate) fn get(tag: u64) -> Option<TagMeta> {
     }
 
     if let Some(m) = historical_live_tags().lock().unwrap().get(&tag).copied() {
-        return Some(TagMeta {
-            pointee_addr: m.pointee_addr,
-            kind: m.kind,
-            parent: 0,
-            escaped: false,
-            alloc_epoch: m.alloc_epoch,
-            alloc_live_at_creation: m.alloc_live_at_creation,
-            alias_exempt: false,
-            lineage_hint: 0,
-            exposed_provenance_root: m.exposed_provenance_root,
-            bounds_len: m.bounds_len,
-            interior_mut_extent_base: m.interior_mut_extent_base,
-            interior_mut_extent_len: m.interior_mut_extent_len,
-            align_req: m.align_req,
-            origin_known: m.origin_known,
-            origin_base: m.origin_base,
-            origin_end: m.origin_end,
-        });
+        return Some(m.into_tag_meta());
+    }
+
+    if let Some(m) = invalidated_tags().lock().unwrap().get(&tag).copied() {
+        return Some(m.into_tag_meta());
     }
 
     dead_tags()
@@ -123,24 +178,7 @@ pub(crate) fn get(tag: u64) -> Option<TagMeta> {
         .unwrap()
         .get(&tag)
         .copied()
-        .map(|m| TagMeta {
-            pointee_addr: m.pointee_addr,
-            kind: m.kind,
-            parent: 0,
-            escaped: false,
-            alloc_epoch: m.alloc_epoch,
-            alloc_live_at_creation: m.alloc_live_at_creation,
-            alias_exempt: false,
-            lineage_hint: 0,
-            exposed_provenance_root: m.exposed_provenance_root,
-            bounds_len: m.bounds_len,
-            interior_mut_extent_base: m.interior_mut_extent_base,
-            interior_mut_extent_len: m.interior_mut_extent_len,
-            align_req: m.align_req,
-            origin_known: m.origin_known,
-            origin_base: m.origin_base,
-            origin_end: m.origin_end,
-        })
+        .map(CompactTagMeta::into_tag_meta)
 }
 
 #[inline]
@@ -233,8 +271,33 @@ pub(crate) fn dead_len() -> usize {
 }
 
 #[inline]
+pub(crate) fn invalidated_len() -> usize {
+    invalidated_tags().lock().unwrap().len()
+}
+
+#[inline]
 pub(crate) fn historical_live_len() -> usize {
     historical_live_tags().lock().unwrap().len()
+}
+
+#[inline]
+pub(crate) fn tag_lifecycle_state(tag: u64) -> TagLifecycleState {
+    if tag == 0 {
+        return TagLifecycleState::Missing;
+    }
+    if tags().lock().unwrap().contains_key(&tag) {
+        return TagLifecycleState::Active;
+    }
+    if historical_live_tags().lock().unwrap().contains_key(&tag) {
+        return TagLifecycleState::HistoricalLive;
+    }
+    if invalidated_tags().lock().unwrap().contains_key(&tag) {
+        return TagLifecycleState::Invalidated;
+    }
+    if dead_tags().lock().unwrap().contains_key(&tag) {
+        return TagLifecycleState::DeadAlloc;
+    }
+    TagLifecycleState::Missing
 }
 
 #[inline]
@@ -261,35 +324,47 @@ pub(crate) fn compact_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
 
     let mut active = tags().lock().unwrap();
     let mut historical_live = historical_live_tags().lock().unwrap();
+    let mut invalidated = invalidated_tags().lock().unwrap();
     let mut dead = dead_tags().lock().unwrap();
     for tag in tags_for_epoch {
         if let Some(meta) = active.remove(&tag) {
-            dead.insert(
-                tag,
-                CompactTagMeta {
-                    pointee_addr: meta.pointee_addr,
-                    kind: meta.kind,
-                    alloc_epoch: meta.alloc_epoch,
-                    alloc_live_at_creation: meta.alloc_live_at_creation,
-                    exposed_provenance_root: meta.exposed_provenance_root,
-                    bounds_len: meta.bounds_len,
-                    interior_mut_extent_base: meta.interior_mut_extent_base,
-                    interior_mut_extent_len: meta.interior_mut_extent_len,
-                    align_req: meta.align_req,
-                    origin_known: meta.origin_known,
-                    origin_base: meta.origin_base,
-                    origin_end: meta.origin_end,
-                },
-            );
-            let idx = shard_index(tag);
-            let mut smap = shards()[idx].map.lock().unwrap();
-            if smap.remove(&tag).is_some() {
-                shards()[idx].gen.fetch_add(1, Ordering::Relaxed);
-            }
+            dead.insert(tag, CompactTagMeta::from_tag_meta(meta));
+            remove_shard_entry_and_bump(tag);
         } else if let Some(meta) = historical_live.remove(&tag) {
+            dead.insert(tag, meta);
+        } else if let Some(meta) = invalidated.remove(&tag) {
             dead.insert(tag, meta);
         }
     }
+}
+
+#[inline]
+pub(crate) fn compact_invalidated_tag(tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+
+    if invalidated_tags().lock().unwrap().contains_key(&tag) {
+        return true;
+    }
+
+    let mut compact = tags()
+        .lock()
+        .unwrap()
+        .remove(&tag)
+        .map(CompactTagMeta::from_tag_meta);
+
+    if compact.is_none() {
+        compact = historical_live_tags().lock().unwrap().remove(&tag);
+    }
+
+    let Some(compact) = compact else {
+        return false;
+    };
+
+    invalidated_tags().lock().unwrap().insert(tag, compact);
+    remove_shard_entry_and_bump(tag);
+    true
 }
 
 #[inline]
@@ -301,23 +376,10 @@ pub(crate) fn compact_live_tag(tag: u64) -> bool {
     let Some(meta) = tags().lock().unwrap().remove(&tag) else {
         return false;
     };
-    historical_live_tags().lock().unwrap().insert(
-        tag,
-        CompactTagMeta {
-            pointee_addr: meta.pointee_addr,
-            kind: meta.kind,
-            alloc_epoch: meta.alloc_epoch,
-            alloc_live_at_creation: meta.alloc_live_at_creation,
-            exposed_provenance_root: meta.exposed_provenance_root,
-            bounds_len: meta.bounds_len,
-            interior_mut_extent_base: meta.interior_mut_extent_base,
-            interior_mut_extent_len: meta.interior_mut_extent_len,
-            align_req: meta.align_req,
-            origin_known: meta.origin_known,
-            origin_base: meta.origin_base,
-            origin_end: meta.origin_end,
-        },
-    );
+    historical_live_tags()
+        .lock()
+        .unwrap()
+        .insert(tag, CompactTagMeta::from_tag_meta(meta));
 
     let idx = shard_index(tag);
     let mut smap = shards()[idx].map.lock().unwrap();

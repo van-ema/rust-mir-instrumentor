@@ -6,6 +6,7 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) enum TagHistoryState {
     Active,
     HistoricalLive,
+    Invalidated,
     DeadCompacted,
 }
 
@@ -40,6 +41,7 @@ pub(crate) struct TagHistoryStats {
     pub active_epoch_buckets: usize,
     pub active_tag_entries: usize,
     pub historical_live_tag_entries: usize,
+    pub invalidated_tag_entries: usize,
     pub dead_epoch_buckets: usize,
     pub dead_tag_entries: usize,
     pub shadowed_old_live_tag_candidates: usize,
@@ -129,7 +131,9 @@ pub(crate) fn mark_tag_escaped(tag: u64, tmeta: &TagMeta) {
     };
     let key = (location.origin_base, location.alloc_epoch);
     let history = match location.state {
-        TagHistoryState::Active | TagHistoryState::HistoricalLive => active_history(),
+        TagHistoryState::Active
+        | TagHistoryState::HistoricalLive
+        | TagHistoryState::Invalidated => active_history(),
         TagHistoryState::DeadCompacted => dead_history(),
     };
     let mut buckets = history.lock().unwrap();
@@ -173,6 +177,34 @@ pub(crate) fn note_live_tag_pruned(tag: u64) {
     }
     if let Some(loc) = tag_locations().lock().unwrap().get_mut(&tag) {
         loc.state = TagHistoryState::HistoricalLive;
+    }
+}
+
+#[inline]
+pub(crate) fn note_invalidated_tag_compacted(tag: u64) {
+    if tag == 0 {
+        return;
+    }
+    let Some(location) = tag_locations().lock().unwrap().get(&tag).copied() else {
+        return;
+    };
+    if matches!(location.state, TagHistoryState::DeadCompacted) {
+        return;
+    }
+    let key = (location.origin_base, location.alloc_epoch);
+    let mut active = active_history().lock().unwrap();
+    let Some(bucket) = active.get_mut(&key) else {
+        return;
+    };
+    if let Some(entry) = bucket.entries.iter_mut().find(|entry| entry.tag == tag) {
+        if entry.shadowed_candidate {
+            entry.shadowed_candidate = false;
+            bucket.shadowed_candidate_count = bucket.shadowed_candidate_count.saturating_sub(1);
+        }
+        entry.state = TagHistoryState::Invalidated;
+    }
+    if let Some(loc) = tag_locations().lock().unwrap().get_mut(&tag) {
+        loc.state = TagHistoryState::Invalidated;
     }
 }
 
@@ -267,6 +299,16 @@ pub(crate) fn stats() -> TagHistoryStats {
                     .entries
                     .iter()
                     .filter(|entry| entry.state == TagHistoryState::HistoricalLive)
+                    .count()
+            })
+            .sum(),
+        invalidated_tag_entries: active
+            .values()
+            .map(|bucket| {
+                bucket
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == TagHistoryState::Invalidated)
                     .count()
             })
             .sum(),

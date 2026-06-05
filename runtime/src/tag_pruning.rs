@@ -76,6 +76,11 @@ pub(crate) fn note_dead_epoch(base_addr: usize, alloc_epoch: u64) {
 }
 
 #[inline]
+pub(crate) fn note_invalidated_tag_compacted(tag: u64) {
+    tag_history::note_invalidated_tag_compacted(tag);
+}
+
+#[inline]
 pub(crate) fn stats() -> TagHistoryStats {
     tag_history::stats()
 }

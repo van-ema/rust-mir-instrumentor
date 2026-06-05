@@ -3794,6 +3794,7 @@ pub extern "C" fn __rz_dump_hook_profile() {
     };
     let tag_entries = tag_store::len();
     let historical_live_tag_entries = tag_store::historical_live_len();
+    let invalidated_tag_entries = tag_store::invalidated_len();
     let dead_tag_entries = tag_store::dead_len();
     let exact_parent_entries = exact_parent_index::len();
     let tag_history_stats = tag_pruning::stats();
@@ -3858,14 +3859,15 @@ pub extern "C" fn __rz_dump_hook_profile() {
         }
     );
     eprintln!(
-        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
-        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
+        "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_tag_entries={} exact_parent_entries={} call_arg_entries={} ret_tag_entries={}",
+        alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, invalidated_tag_entries, dead_tag_entries, exact_parent_entries, call_arg_entries, ret_tag_entries
     );
     eprintln!(
-        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} historical_live_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
+        "  tag_pruning: active_epoch_buckets={} active_tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_epoch_buckets={} dead_tag_entries={} shadowed_old_live_tag_candidates={}",
         tag_history_stats.active_epoch_buckets,
         tag_history_stats.active_tag_entries,
         tag_history_stats.historical_live_tag_entries,
+        tag_history_stats.invalidated_tag_entries,
         tag_history_stats.dead_epoch_buckets,
         tag_history_stats.dead_tag_entries,
         tag_history_stats.shadowed_old_live_tag_candidates
@@ -6997,7 +6999,16 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
         return;
     }
 
-    if let Some(tmeta) = tag_store::mark_escaped(tag) {
+    let mut marked_active = false;
+    let tmeta_for_use = match tag_store::mark_escaped(tag) {
+        Some(tmeta) => {
+            marked_active = true;
+            Some(tmeta)
+        }
+        None => tag_store::get(tag),
+    };
+
+    if let Some(tmeta) = tmeta_for_use {
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
             let promised_align = if bounds_len_is_zero_sized_known(tmeta.bounds_len) {
                 0
@@ -7015,7 +7026,9 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
                 Some(&tmeta),
             );
         }
-        tag_pruning::mark_tag_escaped(tag, &tmeta);
+        if marked_active {
+            tag_pruning::mark_tag_escaped(tag, &tmeta);
+        }
         rz_trace!(
             "[rusteze-runtime] USE: tag={} addr=0x{:x} kind={:?} alloc_epoch={} parent={} escaped={}",
             tag,
