@@ -188,6 +188,37 @@ impl MyOptimizationPass {
         })
     }
 
+    fn ty_any_child_matches<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+        mut matches_child: impl FnMut(Ty<'tcx>) -> bool,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Tuple(field_tys) => field_tys.iter().any(&mut matches_child),
+            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .any(|field| matches_child(field.ty(tcx, args)))
+            }),
+            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => matches_child(*elem_ty),
+            TyKind::Closure(_, args) => {
+                args.as_closure().upvar_tys().iter().any(&mut matches_child)
+            }
+            TyKind::Coroutine(_, args) => rustc_middle::ty::UpvarArgs::Coroutine(args)
+                .upvar_tys()
+                .iter()
+                .any(&mut matches_child),
+            TyKind::CoroutineClosure(_, args) => args
+                .as_coroutine_closure()
+                .upvar_tys()
+                .iter()
+                .any(&mut matches_child),
+            _ => false,
+        }
+    }
+
     /// Shallow boundary-carrier check for non-pointer values that directly carry a source-level
     /// reference. Raw-only owner/control aggregates are intentionally excluded.
     pub(in crate::instrumentation) fn ty_contains_direct_ref_fields<'tcx>(
@@ -254,34 +285,9 @@ impl MyOptimizationPass {
         if matches!(ty.kind(), TyKind::Ref(..)) {
             return true;
         }
-        match ty.kind() {
-            TyKind::Tuple(field_tys) => field_tys
-                .iter()
-                .any(|field_ty| self.ty_contains_ref_fields_recursive(tcx, field_ty, depth - 1)),
-            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
-                variant.fields.iter().any(|field| {
-                    self.ty_contains_ref_fields_recursive(tcx, field.ty(tcx, args), depth - 1)
-                })
-            }),
-            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
-                self.ty_contains_ref_fields_recursive(tcx, *elem_ty, depth - 1)
-            }
-            TyKind::Closure(_, args) => args
-                .as_closure()
-                .upvar_tys()
-                .iter()
-                .any(|field_ty| self.ty_contains_ref_fields_recursive(tcx, field_ty, depth - 1)),
-            TyKind::Coroutine(_, args) => rustc_middle::ty::UpvarArgs::Coroutine(args)
-                .upvar_tys()
-                .iter()
-                .any(|field_ty| self.ty_contains_ref_fields_recursive(tcx, field_ty, depth - 1)),
-            TyKind::CoroutineClosure(_, args) => args
-                .as_coroutine_closure()
-                .upvar_tys()
-                .iter()
-                .any(|field_ty| self.ty_contains_ref_fields_recursive(tcx, field_ty, depth - 1)),
-            _ => false,
-        }
+        self.ty_any_child_matches(tcx, ty, |field_ty| {
+            self.ty_contains_ref_fields_recursive(tcx, field_ty, depth - 1)
+        })
     }
 
     /// Recursive check for aggregates that store raw-pointer leaves anywhere inside.
@@ -301,38 +307,9 @@ impl MyOptimizationPass {
         match ty.kind() {
             TyKind::RawPtr(..) => true,
             TyKind::Ref(..) => false,
-            TyKind::Tuple(field_tys) => field_tys.iter().any(|field_ty| {
+            _ => self.ty_any_child_matches(tcx, ty, |field_ty| {
                 self.ty_contains_raw_pointer_fields_recursive(tcx, field_ty, depth - 1)
             }),
-            TyKind::Adt(adt, args) => adt.variants().iter().any(|variant| {
-                variant.fields.iter().any(|field| {
-                    self.ty_contains_raw_pointer_fields_recursive(
-                        tcx,
-                        field.ty(tcx, args),
-                        depth - 1,
-                    )
-                })
-            }),
-            TyKind::Array(elem_ty, _) | TyKind::Slice(elem_ty) => {
-                self.ty_contains_raw_pointer_fields_recursive(tcx, *elem_ty, depth - 1)
-            }
-            TyKind::Closure(_, args) => args.as_closure().upvar_tys().iter().any(|field_ty| {
-                self.ty_contains_raw_pointer_fields_recursive(tcx, field_ty, depth - 1)
-            }),
-            TyKind::Coroutine(_, args) => rustc_middle::ty::UpvarArgs::Coroutine(args)
-                .upvar_tys()
-                .iter()
-                .any(|field_ty| {
-                    self.ty_contains_raw_pointer_fields_recursive(tcx, field_ty, depth - 1)
-                }),
-            TyKind::CoroutineClosure(_, args) => args
-                .as_coroutine_closure()
-                .upvar_tys()
-                .iter()
-                .any(|field_ty| {
-                    self.ty_contains_raw_pointer_fields_recursive(tcx, field_ty, depth - 1)
-                }),
-            _ => false,
         }
     }
 

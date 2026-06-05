@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum LeafPtrMode {
+    Shadowable,
+    CallBoundaryExact,
+}
+
 impl MyOptimizationPass {
     pub(in crate::instrumentation) fn place_from_operand<'tcx>(
         &self,
@@ -187,11 +193,25 @@ impl MyOptimizationPass {
             .wrapping_add(field_idx as u64 + 1)
     }
 
-    pub(in crate::instrumentation) fn collect_shadowable_leaf_ptr_specs_from_place<'tcx>(
+    fn leaf_ptr_matches_mode<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        mode: LeafPtrMode,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match mode {
+            LeafPtrMode::Shadowable => self.is_shadowable_ptr_ty(tcx, body, ty),
+            LeafPtrMode::CallBoundaryExact => self.is_pointer_ty(ty),
+        }
+    }
+
+    fn collect_leaf_ptr_specs_from_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         base_place: Place<'tcx>,
+        mode: LeafPtrMode,
         depth: usize,
         byte_offset: Option<u64>,
         path_key: u64,
@@ -199,7 +219,7 @@ impl MyOptimizationPass {
     ) {
         let place_ty = base_place.ty(&body.local_decls, tcx);
         let ty = place_ty.ty;
-        if self.is_shadowable_ptr_ty(tcx, body, ty) {
+        if self.leaf_ptr_matches_mode(tcx, body, mode, ty) {
             out.push(ShadowableLeafPtrSpec {
                 place: base_place,
                 ty,
@@ -215,7 +235,7 @@ impl MyOptimizationPass {
             return;
         };
         for (field_idx, field_ty) in field_tys.into_iter().enumerate() {
-            if !self.is_shadowable_ptr_ty(tcx, body, field_ty)
+            if !self.leaf_ptr_matches_mode(tcx, body, mode, field_ty)
                 && !self.ty_contains_pointer_fields(tcx, body, field_ty, depth - 1)
             {
                 continue;
@@ -233,10 +253,11 @@ impl MyOptimizationPass {
                 (Some(base), Some(field)) => Some(base.wrapping_add(field)),
                 _ => None,
             };
-            self.collect_shadowable_leaf_ptr_specs_from_place(
+            self.collect_leaf_ptr_specs_from_place(
                 tcx,
                 body,
                 field_place,
+                mode,
                 depth - 1,
                 child_offset,
                 Self::leaf_path_key_child(path_key, field_idx),
@@ -253,77 +274,17 @@ impl MyOptimizationPass {
         _ty: Ty<'tcx>,
     ) -> Vec<ShadowableLeafPtrSpec<'tcx>> {
         let mut out = Vec::new();
-        self.collect_shadowable_leaf_ptr_specs_from_place(
+        self.collect_leaf_ptr_specs_from_place(
             tcx,
             body,
             base_place,
+            LeafPtrMode::Shadowable,
             SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
             Some(0),
             0,
             &mut out,
         );
         out
-    }
-
-    /// Find pointer fields that can be copied exactly across a call boundary.
-    ///
-    /// This is for metadata transport only. It does not create a borrow for the whole carrier.
-    pub(in crate::instrumentation) fn collect_call_boundary_leaf_ptr_specs_from_place<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        base_place: Place<'tcx>,
-        depth: usize,
-        byte_offset: Option<u64>,
-        path_key: u64,
-        out: &mut Vec<ShadowableLeafPtrSpec<'tcx>>,
-    ) {
-        let place_ty = base_place.ty(&body.local_decls, tcx);
-        let ty = place_ty.ty;
-        if self.is_pointer_ty(ty) {
-            out.push(ShadowableLeafPtrSpec {
-                place: base_place,
-                ty,
-                byte_offset,
-                path_key,
-            });
-            return;
-        }
-        if depth == 0 {
-            return;
-        }
-        let Some(field_tys) = self.aggregate_field_tys(tcx, ty) else {
-            return;
-        };
-        for (field_idx, field_ty) in field_tys.into_iter().enumerate() {
-            if !self.is_pointer_ty(field_ty)
-                && !self.ty_contains_pointer_fields(tcx, body, field_ty, depth - 1)
-            {
-                continue;
-            }
-            let field_place =
-                self.pointer_field_place_from_place(tcx, base_place, field_idx, field_ty);
-            let field_offset = self.field_offset_bytes(
-                tcx,
-                body,
-                place_ty.ty,
-                place_ty.variant_index,
-                FieldIdx::from_usize(field_idx),
-            );
-            let child_offset = match (byte_offset, field_offset) {
-                (Some(base), Some(field)) => Some(base.wrapping_add(field)),
-                _ => None,
-            };
-            self.collect_call_boundary_leaf_ptr_specs_from_place(
-                tcx,
-                body,
-                field_place,
-                depth - 1,
-                child_offset,
-                Self::leaf_path_key_child(path_key, field_idx),
-                out,
-            );
-        }
     }
 
     pub(in crate::instrumentation) fn call_boundary_leaf_ptr_specs_from_place<'tcx>(
@@ -334,10 +295,13 @@ impl MyOptimizationPass {
         _ty: Ty<'tcx>,
     ) -> Vec<ShadowableLeafPtrSpec<'tcx>> {
         let mut out = Vec::new();
-        self.collect_call_boundary_leaf_ptr_specs_from_place(
+        // Call boundaries copy exact pointer-field metadata. This can include wide refs that are
+        // not safe for ordinary slot shadowing.
+        self.collect_leaf_ptr_specs_from_place(
             tcx,
             body,
             base_place,
+            LeafPtrMode::CallBoundaryExact,
             SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
             Some(0),
             0,

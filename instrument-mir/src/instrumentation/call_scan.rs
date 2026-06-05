@@ -3,6 +3,100 @@
 use super::*;
 
 impl MyOptimizationPass {
+    fn call_arg_leaf_push_kind<'tcx>(
+        direct_callee_id: Option<u64>,
+        arg_index: usize,
+        leaf_key: u64,
+    ) -> InstrKind<'tcx> {
+        if let Some(callee_id) = direct_callee_id {
+            InstrKind::CallArgLeafPush {
+                callee_id,
+                arg_index: arg_index as u64,
+                leaf_key,
+            }
+        } else {
+            InstrKind::IndirectCallArgLeafPush {
+                arg_index: arg_index as u64,
+                leaf_key,
+            }
+        }
+    }
+
+    fn push_call_arg_leaf_insert<'tcx>(
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        direct_callee_id: Option<u64>,
+        arg_index: usize,
+        leaf_spec: ShadowableLeafPtrSpec<'tcx>,
+    ) {
+        insert_points.push(InsertPoint {
+            bb,
+            stmt_idx,
+            insert_before: false,
+            source_info,
+            place: leaf_spec.place,
+            kind: Self::call_arg_leaf_push_kind(
+                direct_callee_id,
+                arg_index,
+                leaf_spec.transport_key(),
+            ),
+        });
+    }
+
+    fn push_direct_call_arg_leaf_insert<'tcx>(
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        callee_id: u64,
+        arg_index: usize,
+        leaf_spec: ShadowableLeafPtrSpec<'tcx>,
+    ) {
+        insert_points.push(InsertPoint {
+            bb,
+            stmt_idx,
+            insert_before: false,
+            source_info,
+            place: leaf_spec.place,
+            kind: InstrKind::CallArgLeafPush {
+                callee_id,
+                arg_index: arg_index as u64,
+                leaf_key: leaf_spec.transport_key(),
+            },
+        });
+    }
+
+    fn push_ret_leaf_take_inserts<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        source_info: SourceInfo,
+        callee_id: u64,
+        dst_local: Local,
+        dst_ty: Ty<'tcx>,
+    ) {
+        for dst_leaf_spec in
+            self.call_boundary_leaf_ptr_specs_from_place(tcx, body, Place::from(dst_local), dst_ty)
+        {
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx,
+                insert_before: false,
+                source_info,
+                place: dst_leaf_spec.place,
+                kind: InstrKind::RetLeafTake {
+                    callee_id,
+                    leaf_key: dst_leaf_spec.transport_key(),
+                },
+            });
+        }
+    }
+
     /// Best-effort check: does this span come from the Rust std/core/alloc sources?
     /// This is used to suppress noisy PtrUse hooks for std wrappers (e.g. println!).
     pub(in crate::instrumentation) fn span_is_stdlib<'tcx>(
@@ -2406,26 +2500,15 @@ impl MyOptimizationPass {
                 if self.is_pointer_ty(ty) {
                     // If `arg` is `&T`, also send pointer fields inside `*arg`.
                     for leaf_spec in self.ref_pointee_leaf_specs_from_place(tcx, body, p) {
-                        let kind = if let Some(callee_id) = direct_call_arg_callee_id {
-                            InstrKind::CallArgLeafPush {
-                                callee_id,
-                                arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
-                            }
-                        } else {
-                            InstrKind::IndirectCallArgLeafPush {
-                                arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
-                            }
-                        };
-                        insert_points.push(InsertPoint {
+                        Self::push_call_arg_leaf_insert(
+                            insert_points,
                             bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: leaf_spec.place,
-                            kind,
-                        });
+                            block_data.statements.len(),
+                            term.source_info,
+                            direct_call_arg_callee_id,
+                            arg_index,
+                            leaf_spec,
+                        );
                     }
                     continue;
                 }
@@ -2473,26 +2556,15 @@ impl MyOptimizationPass {
                     // Send each inner pointer field by exact field key.
                     for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(tcx, body, p, ty)
                     {
-                        let kind = if let Some(callee_id) = direct_call_arg_callee_id {
-                            InstrKind::CallArgLeafPush {
-                                callee_id,
-                                arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
-                            }
-                        } else {
-                            InstrKind::IndirectCallArgLeafPush {
-                                arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
-                            }
-                        };
-                        insert_points.push(InsertPoint {
+                        Self::push_call_arg_leaf_insert(
+                            insert_points,
                             bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: leaf_spec.place,
-                            kind,
-                        });
+                            block_data.statements.len(),
+                            term.source_info,
+                            direct_call_arg_callee_id,
+                            arg_index,
+                            leaf_spec,
+                        );
                     }
                 }
             }
@@ -2533,18 +2605,15 @@ impl MyOptimizationPass {
                     continue;
                 }
                 for leaf_spec in leaf_specs {
-                    insert_points.push(InsertPoint {
+                    Self::push_direct_call_arg_leaf_insert(
+                        insert_points,
                         bb,
-                        stmt_idx: block_data.statements.len(),
-                        insert_before: false,
-                        source_info: term.source_info,
-                        place: leaf_spec.place,
-                        kind: InstrKind::CallArgLeafPush {
-                            callee_id: closure_callee_id,
-                            arg_index: 0,
-                            leaf_key: leaf_spec.transport_key(),
-                        },
-                    });
+                        block_data.statements.len(),
+                        term.source_info,
+                        closure_callee_id,
+                        0,
+                        leaf_spec,
+                    );
                     cleanup_callees.insert(closure_callee_id);
                 }
             }
@@ -2947,24 +3016,17 @@ impl MyOptimizationPass {
                             local: dst_local,
                         },
                     });
-                    for dst_leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
+                    self.push_ret_leaf_take_inserts(
                         tcx,
                         body,
-                        Place::from(dst_local),
+                        insert_points,
+                        bb,
+                        block_data.statements.len(),
+                        term.source_info,
+                        callee_id,
+                        dst_local,
                         dst_ty,
-                    ) {
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: dst_leaf_spec.place,
-                            kind: InstrKind::RetLeafTake {
-                                callee_id,
-                                leaf_key: dst_leaf_spec.transport_key(),
-                            },
-                        });
-                    }
+                    );
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && callee_instrumented
@@ -2972,24 +3034,17 @@ impl MyOptimizationPass {
             {
                 if let Some(callee_id) = callee_id_opt {
                     // Leaf-only return: restore the inner pointer fields, not an outer anchor.
-                    for dst_leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
+                    self.push_ret_leaf_take_inserts(
                         tcx,
                         body,
-                        Place::from(dst_local),
+                        insert_points,
+                        bb,
+                        block_data.statements.len(),
+                        term.source_info,
+                        callee_id,
+                        dst_local,
                         dst_ty,
-                    ) {
-                        insert_points.push(InsertPoint {
-                            bb,
-                            stmt_idx: block_data.statements.len(),
-                            insert_before: false,
-                            source_info: term.source_info,
-                            place: dst_leaf_spec.place,
-                            kind: InstrKind::RetLeafTake {
-                                callee_id,
-                                leaf_key: dst_leaf_spec.transport_key(),
-                            },
-                        });
-                    }
+                    );
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && self.supports_call_boundary_return_anchor_local(tcx, body, dst_local)

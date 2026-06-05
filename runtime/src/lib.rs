@@ -1740,6 +1740,19 @@ fn current_slot_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
     (shadow.0 != 0 || shadow.1 != 0 || shadow.2 != 0).then_some(shadow)
 }
 
+fn canonical_return_leaf_shadow(slot_addr: usize) -> PtrShadowTransport {
+    let tag = ptr_shadow::load_tag(slot_addr);
+    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
+    let export_parent = ptr_shadow::load_export_parent(slot_addr);
+    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
+    if export_parent_recovered != 0 && export_parent != 0 {
+        // Do not return a callee-local helper tag; return its boundary parent.
+        (export_parent, export_parent, export_parent, 0)
+    } else {
+        (tag, ref_ancestor, export_parent, export_parent_recovered)
+    }
+}
+
 fn scoped_call_arg_leaf_shadow(
     thread_id: ThreadId,
     leaf_key: u64,
@@ -5977,18 +5990,8 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
-    let tag = ptr_shadow::load_tag(slot_addr);
-    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
-    let export_parent = ptr_shadow::load_export_parent(slot_addr);
-    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
-    let recovered_from_boundary = export_parent_recovered != 0 && export_parent != 0;
     let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) =
-        if recovered_from_boundary {
-            // Do not return a callee-local helper tag; return its boundary parent.
-            (export_parent, export_parent, export_parent, 0)
-        } else {
-            (tag, ref_ancestor, export_parent, export_parent_recovered)
-        };
+        canonical_return_leaf_shadow(slot_addr);
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
     validate_and_export_return_tag(callee_id, ret_tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();
