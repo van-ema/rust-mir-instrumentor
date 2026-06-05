@@ -1740,11 +1740,35 @@ fn current_slot_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
     (shadow.0 != 0 || shadow.1 != 0 || shadow.2 != 0).then_some(shadow)
 }
 
-fn canonical_return_leaf_shadow(slot_addr: usize) -> PtrShadowTransport {
-    let tag = ptr_shadow::load_tag(slot_addr);
-    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
-    let export_parent = ptr_shadow::load_export_parent(slot_addr);
-    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
+fn report_stale_return_ref_leaf_shadow(slot_addr: usize) {
+    let stale_tag = ptr_shadow::load_tag(slot_addr);
+    if stale_tag == 0 {
+        return;
+    }
+    let ptr_addr = shadow_slot_value_addr(slot_addr);
+    let tag_pointee = tag_store::get(stale_tag)
+        .map(|meta| meta.pointee_addr)
+        .unwrap_or(0);
+    rz_violation(
+        "WILD_POINTER",
+        append_location_if_enabled(
+            format!(
+                "RET stale ref leaf shadow slot=0x{slot_addr:x} ptr=0x{ptr_addr:x} tag={stale_tag} tag_pointee=0x{tag_pointee:x}\nreason=STALE_RETURN_REF_LEAF_SHADOW"
+            ),
+            "RZ_LOG_LOC",
+        ),
+    );
+}
+
+fn canonical_return_leaf_shadow(slot_addr: usize, leaf_is_ref: bool) -> PtrShadowTransport {
+    let Some((tag, ref_ancestor, export_parent, export_parent_recovered)) =
+        current_slot_shadow(slot_addr)
+    else {
+        if leaf_is_ref {
+            report_stale_return_ref_leaf_shadow(slot_addr);
+        }
+        return (0, 0, 0, 0);
+    };
     if export_parent_recovered != 0 && export_parent != 0 {
         // Do not return a callee-local helper tag; return its boundary parent.
         (export_parent, export_parent, export_parent, 0)
@@ -5988,10 +6012,15 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
 
 /// Push the exact shadow of one returned carrier leaf so the caller can recreate its slot shadow.
 #[no_mangle]
-pub extern "C" fn __rz_push_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
+pub extern "C" fn __rz_push_ret_leaf_shadow(
+    callee_id: u64,
+    leaf_key: u64,
+    slot_addr: usize,
+    leaf_is_ref: u8,
+) {
     let _g = RzRuntimeGuard::enter();
     let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) =
-        canonical_return_leaf_shadow(slot_addr);
+        canonical_return_leaf_shadow(slot_addr, leaf_is_ref != 0);
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
     validate_and_export_return_tag(callee_id, ret_tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();

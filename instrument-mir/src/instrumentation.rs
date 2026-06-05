@@ -578,6 +578,7 @@ impl MyOptimizationPass {
                                 kind: InstrKind::RetLeafPush {
                                     callee_id,
                                     leaf_key: leaf_spec.transport_key(),
+                                    leaf_is_ref: matches!(leaf_spec.ty.kind(), TyKind::Ref(..)),
                                 },
                             });
                         }

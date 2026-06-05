@@ -346,6 +346,7 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     RetLeafPush {
         callee_id: u64,
         leaf_key: u64,
+        leaf_is_ref: bool,
     },
     /// Callee-side: export a whole-slot return anchor when leaf transport is not enough.
     ///

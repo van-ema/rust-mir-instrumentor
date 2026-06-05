@@ -4061,6 +4061,7 @@ impl MyOptimizationPass {
             if let InstrKind::RetLeafPush {
                 callee_id,
                 leaf_key,
+                leaf_is_ref,
             } = creation_kind
             {
                 let addr_local = body
@@ -4093,6 +4094,10 @@ impl MyOptimizationPass {
                     },
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: self.const_u8(tcx, source_info.span, u8::from(leaf_is_ref)),
                         span: source_info.span,
                     },
                 ]

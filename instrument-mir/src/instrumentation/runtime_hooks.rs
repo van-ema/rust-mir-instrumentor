@@ -300,7 +300,7 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_tag", 2)
             .expect("missing '__rz_take_ret_tag' definition");
         let def_id_push_ret_leaf_shadow = self
-            .find_runtime_fn_def_id(tcx, "__rz_push_ret_leaf_shadow", 3)
+            .find_runtime_fn_def_id(tcx, "__rz_push_ret_leaf_shadow", 4)
             .expect("missing '__rz_push_ret_leaf_shadow' definition");
         let def_id_take_ret_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_leaf_shadow", 3)
