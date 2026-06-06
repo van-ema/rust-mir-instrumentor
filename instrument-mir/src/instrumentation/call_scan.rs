@@ -1796,14 +1796,14 @@ impl MyOptimizationPass {
                     }
                 }
 
-                CallEffect::CarrierCopyArg0 => {
+                CallEffect::CarrierCopyArg(source_arg_index) => {
                     if let (Some(dst_local), Some(tgt_bb)) =
                         (destination.as_local(), call_target_bb)
                     {
                         let dst_ty = body.local_decls[dst_local].ty;
                         if !self.is_pointer_ty(dst_ty) {
                             if let Some(src_place) = args
-                                .get(0)
+                                .get(source_arg_index)
                                 .and_then(|arg| self.place_from_operand(&arg.node))
                             {
                                 let src_ty = src_place.ty(&body.local_decls, tcx).ty;
@@ -1828,7 +1828,7 @@ impl MyOptimizationPass {
                                     })
                                     .filter(|leafs| !leafs.is_empty());
                                 if let Some(matched_leafs) =
-                                    structural_transport::pair_return_leafs_from_arg0(
+                                    structural_transport::pair_return_leafs_from_source_arg(
                                         self,
                                         &dst_leafs,
                                         &direct_src_leafs,
@@ -1972,7 +1972,7 @@ impl MyOptimizationPass {
                                         })
                                         .filter(|leafs| !leafs.is_empty());
                                     if let Some(matched_leafs) =
-                                        structural_transport::pair_return_leafs_from_arg0(
+                                        structural_transport::pair_return_leafs_from_source_arg(
                                             self,
                                             &dst_leafs,
                                             &direct_src_leafs,

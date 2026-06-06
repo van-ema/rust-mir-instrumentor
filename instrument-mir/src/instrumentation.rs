@@ -541,14 +541,16 @@ impl MyOptimizationPass {
                     }
                     // Return exact pointer fields separately from the outer return slot.
                     // Example: `Option<&T>` returns the inner `&T` leaf.
-                    if self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, body.return_ty())
-                        || self.ty_contains_direct_pointer_fields(tcx, body, body.return_ty())
+                    let return_ty = body.return_ty();
+                    if !self.is_pointer_ty(return_ty)
+                        && (self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, return_ty)
+                            || self.ty_contains_direct_pointer_fields(tcx, body, return_ty))
                     {
                         let leaf_ptrs = self.call_boundary_leaf_ptr_places_from_place(
                             tcx,
                             body,
                             Place::from(RETURN_PLACE),
-                            body.return_ty(),
+                            return_ty,
                         );
                         if leaf_ptrs.is_empty() {
                             insert_points.push(InsertPoint {
@@ -567,7 +569,7 @@ impl MyOptimizationPass {
                             tcx,
                             body,
                             Place::from(RETURN_PLACE),
-                            body.return_ty(),
+                            return_ty,
                         ) {
                             insert_points.push(InsertPoint {
                                 bb,

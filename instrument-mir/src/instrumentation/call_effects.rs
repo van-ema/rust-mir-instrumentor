@@ -28,8 +28,8 @@ pub(in crate::instrumentation) enum CallEffect {
     PtrDerive,
     /// Pointer-returning helpers that create a raw root from an integer/exposed address.
     ExposedProvenanceRoot,
-    /// Wrapper constructors that return a non-pointer carrier whose pointer leaves come from arg0.
-    CarrierCopyArg0,
+    /// Wrapper constructors that return a non-pointer carrier whose pointer leaves come from one arg.
+    CarrierCopyArg(usize),
     /// Iterator-style helpers that return aggregate reference items derived from arg0's pointee carrier.
     RefRetFromArg0PointeeLeafs,
     /// Box boundary modeling.
@@ -319,28 +319,28 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::iter::traits::iterator::Iterator",
         MatchKind::EndsWith,
         "::take",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::iter::Iterator",
         MatchKind::EndsWith,
         "::take",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::iter::traits::collect::IntoIterator",
         MatchKind::EndsWith,
         "::into_iter",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::iter::IntoIterator",
         MatchKind::EndsWith,
         "::into_iter",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     // `next` is only modeled structurally when the returned aggregate carries reference leaves
     // and those leaves can be recovered from the pointee carrier behind `&mut self`.
@@ -364,14 +364,14 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::iter",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::iter_mut",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     // ---- PtrDerive wrappers (pointer arithmetic + slice/vec pointer extraction) ----
 
@@ -664,14 +664,14 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::ops::RangeBounds",
         MatchKind::EndsWith,
         "::start_bound",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::ops::RangeBounds",
         MatchKind::EndsWith,
         "::end_bound",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -799,27 +799,43 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::index",
         CallEffect::PtrDerive,
     ),
+    // `SliceIndex::get{,_mut}` is called as `(range_or_index, slice)`, so the
+    // returned `Option<&T>` leaf comes from arg1, not from the index/range value.
+    EffectRule::two(
+        MatchKind::Contains,
+        "SliceIndex",
+        MatchKind::EndsWith,
+        "::get",
+        CallEffect::CarrierCopyArg(1),
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "SliceIndex",
+        MatchKind::EndsWith,
+        "::get_mut",
+        CallEffect::CarrierCopyArg(1),
+    ),
     // Slice helpers.
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::get",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::get_mut",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::last_mut",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -840,14 +856,14 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::split_at",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
         "::slice::<impl [",
         MatchKind::EndsWith,
         "::split_at_mut",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -958,7 +974,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::collections::VecDeque",
         MatchKind::EndsWith,
         "::as_slices",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     // String / str helpers.
     EffectRule::two(
@@ -1111,7 +1127,7 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::sync::atomic::AtomicPtr",
         MatchKind::EndsWith,
         "::new",
-        CallEffect::CarrierCopyArg0,
+        CallEffect::CarrierCopyArg(0),
     ),
     EffectRule::two(
         MatchKind::Contains,
@@ -1340,7 +1356,7 @@ fn call_effect_label(effect: CallEffect) -> &'static str {
         CallEffect::StoreUnaligned => "StoreUnaligned",
         CallEffect::PtrDerive => "PtrDerive",
         CallEffect::ExposedProvenanceRoot => "ExposedProvenanceRoot",
-        CallEffect::CarrierCopyArg0 => "CarrierCopyArg0",
+        CallEffect::CarrierCopyArg(_) => "CarrierCopyArg",
         CallEffect::RefRetFromArg0PointeeLeafs => "RefRetFromArg0PointeeLeafs",
         CallEffect::BoxIntoRaw => "BoxIntoRaw",
         CallEffect::BoxFromRaw => "BoxFromRaw",
@@ -1375,23 +1391,23 @@ mod tests {
     fn classify_common_helpers() {
         assert_eq!(
             effect_for("core::slice::<impl [T]>::get"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::iter"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::iter_mut"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::iter::Iterator::take"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::iter::IntoIterator::into_iter"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::iter::Iterator::next"),
@@ -1407,11 +1423,11 @@ mod tests {
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::split_at"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::slice::<impl [T]>::split_at_mut"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::str::<impl str>::as_bytes"),
@@ -1444,12 +1460,20 @@ mod tests {
             CallEffect::PtrDerive
         );
         assert_eq!(
+            effect_for("<std::ops::Range<usize> as std::slice::SliceIndex<str>>::get"),
+            CallEffect::CarrierCopyArg(1)
+        );
+        assert_eq!(
+            effect_for("<std::ops::Range<usize> as std::slice::SliceIndex<[u8]>>::get_mut"),
+            CallEffect::CarrierCopyArg(1)
+        );
+        assert_eq!(
             effect_for("core::ops::RangeBounds::start_bound"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::ops::RangeBounds::end_bound"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("alloc::vec::Vec::<T, A>::len"),
@@ -1469,7 +1493,7 @@ mod tests {
         );
         assert_eq!(
             effect_for("core::sync::atomic::AtomicPtr::<T>::new"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(effect_for("core::ptr::null"), CallEffect::Ignore);
         assert_eq!(
@@ -1482,7 +1506,7 @@ mod tests {
         );
         assert_eq!(
             effect_for("alloc::collections::VecDeque::<T>::as_slices"),
-            CallEffect::CarrierCopyArg0
+            CallEffect::CarrierCopyArg(0)
         );
         assert_eq!(
             effect_for("core::sync::atomic::AtomicUsize::load"),

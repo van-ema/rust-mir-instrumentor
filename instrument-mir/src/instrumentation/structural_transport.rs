@@ -339,12 +339,12 @@ impl MyOptimizationPass {
     }
 }
 
-/// Pair returned aggregate pointer leaves with the structural source leaves of arg0.
+/// Pair returned aggregate pointer leaves with the structural source leaves of one call argument.
 ///
-/// If arg0 is a reference to a carrier, prefer leaves inside the pointee. For example,
+/// If the source arg is a reference to a carrier, prefer leaves inside the pointee. For example,
 /// `clone_like(&bytes) -> Bytes` should copy the returned `Bytes.ptr` shadow from
-/// `(*arg0).ptr`, not from the `&Bytes` receiver tag.
-pub(in crate::instrumentation) fn pair_return_leafs_from_arg0<'tcx>(
+/// `(*arg).ptr`, not from the `&Bytes` receiver tag.
+pub(in crate::instrumentation) fn pair_return_leafs_from_source_arg<'tcx>(
     pass: &MyOptimizationPass,
     dst_leafs: &[ShadowableLeafPtrSpec<'tcx>],
     direct_src_leafs: &[ShadowableLeafPtrSpec<'tcx>],

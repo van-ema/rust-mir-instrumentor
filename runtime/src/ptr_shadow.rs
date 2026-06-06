@@ -1,4 +1,4 @@
-use crate::{lookup_alloc_snapshot, tag_pruning, tag_store};
+use crate::{lookup_alloc_snapshot, tag_pruning, tag_store, PtrKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -433,7 +433,31 @@ fn entry_matches_ptr_value(entry: PtrShadowEntry, ptr_addr: usize) -> bool {
     if entry.tag == 0 {
         return false;
     }
-    tag_store::get(entry.tag).is_some_and(|meta| meta.pointee_addr == ptr_addr)
+    tag_store::get(entry.tag).is_some_and(|meta| {
+        if meta.pointee_addr == ptr_addr {
+            return true;
+        }
+        if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+            return false;
+        }
+        if meta.pointee_addr == 0 || ptr_addr == 0 {
+            return false;
+        }
+
+        let Some((tag_base, tag_alloc)) = lookup_alloc_snapshot(meta.pointee_addr) else {
+            return false;
+        };
+        let Some((ptr_base, ptr_alloc)) = lookup_alloc_snapshot(ptr_addr) else {
+            return false;
+        };
+
+        // View-producing calls can move the concrete ref pointer inside the same allocation
+        // while keeping the original borrow provenance.
+        tag_alloc.live
+            && ptr_alloc.live
+            && tag_base == ptr_base
+            && (tag_alloc.epoch == ptr_alloc.epoch || tag_alloc.epoch == 0 || ptr_alloc.epoch == 0)
+    })
 }
 
 /// Load pointer shadow only if it still describes the pointer value in the slot.

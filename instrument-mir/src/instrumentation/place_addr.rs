@@ -231,6 +231,52 @@ impl MyOptimizationPass {
         if depth == 0 {
             return;
         }
+        if let TyKind::Adt(adt, args) = ty.kind() {
+            if adt.is_enum() {
+                for (variant_idx_usize, variant) in adt.variants().iter().enumerate() {
+                    let variant_idx = VariantIdx::from_usize(variant_idx_usize);
+                    let variant_key = Self::leaf_path_key_child(path_key, variant_idx.as_usize());
+                    for (field_idx, field) in variant.fields.iter().enumerate() {
+                        let field_ty = field.ty(tcx, args);
+                        if !self.leaf_ptr_matches_mode(tcx, body, mode, field_ty)
+                            && !self.ty_contains_pointer_fields(tcx, body, field_ty, depth - 1)
+                        {
+                            continue;
+                        }
+                        let field_place = self.pointer_field_place_from_place_in_variant(
+                            tcx,
+                            base_place,
+                            Some(variant_idx),
+                            field_idx,
+                            field_ty,
+                        );
+                        let field_offset = self.field_offset_bytes(
+                            tcx,
+                            body,
+                            place_ty.ty,
+                            Some(variant_idx),
+                            FieldIdx::from_usize(field_idx),
+                        );
+                        let child_offset = match (byte_offset, field_offset) {
+                            (Some(base), Some(field)) => Some(base.wrapping_add(field)),
+                            _ => None,
+                        };
+                        self.collect_leaf_ptr_specs_from_place(
+                            tcx,
+                            body,
+                            field_place,
+                            mode,
+                            depth - 1,
+                            child_offset,
+                            Self::leaf_path_key_child(variant_key, field_idx),
+                            out,
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
         let Some(field_tys) = self.aggregate_field_tys(tcx, ty) else {
             return;
         };

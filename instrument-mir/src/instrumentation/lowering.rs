@@ -2,6 +2,27 @@
 
 use super::*;
 
+// The pointee type is alias-exempt, usually because it contains interior mutability.
+const CREATION_FLAG_ALIAS_EXEMPT: u8 = 0b0000_0001;
+// Ref-only: the bounds length came from wide-pointer metadata and must be enforced eagerly.
+const CREATION_FLAG_REF_DYNAMIC_BOUNDS: u8 = 0b0000_0010;
+// Raw-only: keep exposed-provenance poison sticky when no tracked parent remains.
+const CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE: u8 = 0b0000_0010;
+// The source is a projected helper path, so parent/slot shape matters to TB-lite.
+const CREATION_FLAG_PROJECTED_HELPER_PARENT: u8 = 0b0000_0100;
+// Ref-only bit 3: this ref reroots a returned by-value carrier in the caller.
+const CREATION_FLAG_REF_RETURNED_CARRIER_REROOT: u8 = 0b0000_1000;
+// Raw-only bit 3: carry precise wide-pointer bounds from the source pointer.
+const CREATION_FLAG_RAW_CARRY_BOUNDS_FROM_SOURCE: u8 = 0b0000_1000;
+// Raw-only: derived raw views reuse the parent TB family until a raw write needs a node.
+const CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
+// Raw-only: this is an int-to-ptr or exposed-provenance root.
+const CREATION_FLAG_EXPOSED_PROVENANCE_ROOT: u8 = 0b0010_0000;
+// Raw-only: validate this derived raw pointer immediately.
+const CREATION_FLAG_STRICT_RAW_CREATION_CHECK: u8 = 0b0100_0000;
+// Raw-only: this raw pointer came from a deref projection like `(*p).field`.
+const CREATION_FLAG_DEREF_RAW_CREATION: u8 = 0b1000_0000;
+
 impl MyOptimizationPass {
     pub(in crate::instrumentation) fn materialize_size_operand<'tcx>(
         &self,
@@ -367,6 +388,140 @@ impl MyOptimizationPass {
                 .get(&ptr_local)
                 .copied(),
         })
+    }
+
+    fn append_ptr_state_shadow_store_after_apply<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &mut Body<'tcx>,
+        source_info: SourceInfo,
+        is_cleanup: bool,
+        apply_bb: BasicBlock,
+        target_bb: BasicBlock,
+        ptr_local: Local,
+        ptr_state: PtrStateLocals,
+        local_slot_shadow_store_locals: &HashSet<Local>,
+        hooks: Hooks,
+    ) {
+        let slot_addr_local = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.usize, source_info.span));
+        let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+            tcx,
+            body,
+            source_info,
+            Place::from(ptr_local),
+            slot_addr_local,
+            true,
+        ) else {
+            return;
+        };
+
+        let tmp_unit = body
+            .local_decls
+            .push(LocalDecl::new(tcx.types.unit, source_info.span));
+        let store_func = if self.shadow_store_uses_local_slot_store(
+            local_slot_shadow_store_locals,
+            Place::from(ptr_local),
+            ptr_local,
+        ) {
+            hooks.def_id_shadow_store_ptr_local
+        } else {
+            hooks.def_id_shadow_store_ptr
+        };
+        let ref_ancestor_op = ptr_state
+            .ref_ancestor_local
+            .map(|local| Operand::Copy(Place::from(local)))
+            .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0));
+        let export_parent_op = ptr_state
+            .boundary_parent_local
+            .map(|local| Operand::Copy(Place::from(local)))
+            .unwrap_or_else(|| Operand::Copy(Place::from(ptr_state.tag_local)));
+        let recovered_op = ptr_state
+            .boundary_recovered_local
+            .map(|local| Operand::Copy(Place::from(local)))
+            .unwrap_or_else(|| self.const_u8(tcx, source_info.span, 0));
+
+        let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+            Spanned {
+                node: Operand::Copy(Place::from(slot_addr_local)),
+                span: source_info.span,
+            },
+            Spanned {
+                node: Operand::Copy(Place::from(ptr_state.tag_local)),
+                span: source_info.span,
+            },
+            Spanned {
+                node: ref_ancestor_op,
+                span: source_info.span,
+            },
+            Spanned {
+                node: export_parent_op,
+                span: source_info.span,
+            },
+            Spanned {
+                node: recovered_op,
+                span: source_info.span,
+            },
+        ]
+        .into_boxed_slice();
+        let mut store_bd = BasicBlockData::new(
+            Some(Terminator {
+                source_info,
+                kind: TerminatorKind::Call {
+                    func: Operand::function_handle(
+                        tcx,
+                        store_func,
+                        std::iter::empty(),
+                        source_info.span,
+                    ),
+                    args,
+                    destination: Place::from(tmp_unit),
+                    target: Some(target_bb),
+                    unwind: UnwindAction::Continue,
+                    call_source: CallSource::Misc,
+                    fn_span: source_info.span,
+                },
+            }),
+            is_cleanup,
+        );
+        // Keep the pointer slot shadow in sync with the restored caller tag.
+        store_bd.statements.push(slot_stmt1);
+        store_bd.statements.push(slot_stmt2);
+        let store_bb = body.basic_blocks_mut().push(store_bd);
+        body.basic_blocks_mut()[apply_bb].terminator = Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Goto { target: store_bb },
+        });
+    }
+
+    fn downcast_guards_for_place<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        place: Place<'tcx>,
+    ) -> Vec<(Place<'tcx>, VariantIdx)> {
+        let mut guards = Vec::new();
+        let mut base = Place::from(place.local);
+        for elem in place.projection.iter() {
+            if let ProjectionElem::Downcast(_, variant_idx) = elem {
+                guards.push((base, variant_idx));
+            }
+            base = base.project_deeper(&[elem.clone()], tcx);
+        }
+        guards
+    }
+
+    fn discriminant_value_for_variant<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        place: Place<'tcx>,
+        variant_idx: VariantIdx,
+    ) -> u128 {
+        match place.ty(&body.local_decls, tcx).ty.kind() {
+            TyKind::Adt(adt, _) => adt.discriminant_for_variant(tcx, variant_idx).val,
+            _ => variant_idx.as_usize() as u128,
+        }
     }
 
     pub(in crate::instrumentation) fn carrier_slot_locals_for_local(
@@ -1372,7 +1527,7 @@ impl MyOptimizationPass {
                         .local_decls
                         .push(LocalDecl::new(tcx.types.bool, source_info.span));
                     let validate_target = validate_block.unwrap_or(cont_block);
-                    let repair_cont_block = body.basic_blocks_mut().push(BasicBlockData::new(
+                    let materialize_cont_block = body.basic_blocks_mut().push(BasicBlockData::new(
                         Some(Terminator {
                             source_info,
                             kind: TerminatorKind::Goto {
@@ -1381,7 +1536,7 @@ impl MyOptimizationPass {
                         }),
                         is_cleanup,
                     ));
-                    body.basic_blocks_mut()[repair_cont_block]
+                    body.basic_blocks_mut()[materialize_cont_block]
                         .statements
                         .push(Statement::new(
                             source_info,
@@ -1391,7 +1546,7 @@ impl MyOptimizationPass {
                             ))),
                         ));
                     if let Some(dst_export_parent_local) = dst_export_parent_local {
-                        body.basic_blocks_mut()[repair_cont_block]
+                        body.basic_blocks_mut()[materialize_cont_block]
                             .statements
                             .push(Statement::new(
                                 source_info,
@@ -1404,7 +1559,7 @@ impl MyOptimizationPass {
                             ));
                     }
                     if let Some(dst_recovered_local) = dst_recovered_local {
-                        body.basic_blocks_mut()[repair_cont_block]
+                        body.basic_blocks_mut()[materialize_cont_block]
                             .statements
                             .push(Statement::new(
                                 source_info,
@@ -1415,21 +1570,21 @@ impl MyOptimizationPass {
                             ));
                     }
 
-                    let repair_call_block = body
+                    let materialize_call_block = body
                         .basic_blocks_mut()
                         .push(BasicBlockData::new(None, is_cleanup));
-                    let repair_addr_local = body
+                    let materialize_addr_local = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.usize, source_info.span));
-                    let (repair_addr_stmt1_opt, repair_addr_stmt2) = self
+                    let (materialize_addr_stmt1_opt, materialize_addr_stmt2) = self
                         .addr_stmts_for_place(
                             tcx,
                             body,
                             source_info,
                             Place::from(dst_local),
-                            repair_addr_local,
+                            materialize_addr_local,
                         )
-                        .expect("ShadowLoad projected ref repair on non-pointer local");
+                        .expect("ShadowLoad projected ref materialization on non-pointer local");
                     let bounds_len_op = self.ref_creation_bounds_len_operand_for_ptr_local(
                         tcx,
                         body,
@@ -1448,20 +1603,22 @@ impl MyOptimizationPass {
                         _ => 0,
                     };
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                    let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
-                    // Missing field-slot shadow on projected carrier refs should be repaired
-                    // by rebuilding a ref tag from the loaded pointer value, not by copying the
-                    // outer carrier anchor into the local tag directly.
-                    alias_flags |= 0b10;
-                    let repair_ref_func = Operand::function_handle(
+                    let alias_flags: u8 = if alias_exempt {
+                        CREATION_FLAG_ALIAS_EXEMPT
+                    } else {
+                        0
+                    };
+                    // Projected carrier refs get a fresh ref tag for the loaded data pointer
+                    // with the carrier anchor as parent.
+                    let materialize_ref_func = Operand::function_handle(
                         tcx,
                         hooks.def_id_ref,
                         std::iter::empty(),
                         source_info.span,
                     );
-                    let repair_ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    let materialize_ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
-                            node: Operand::Copy(Place::from(repair_addr_local)),
+                            node: Operand::Copy(Place::from(materialize_addr_local)),
                             span: source_info.span,
                         },
                         Spanned {
@@ -1486,24 +1643,24 @@ impl MyOptimizationPass {
                         },
                     ]
                     .into_boxed_slice();
-                    let repair_bd = &mut body.basic_blocks_mut()[repair_call_block];
-                    if let Some(stmt) = repair_addr_stmt1_opt {
-                        repair_bd.statements.push(stmt);
+                    let materialize_bd = &mut body.basic_blocks_mut()[materialize_call_block];
+                    if let Some(stmt) = materialize_addr_stmt1_opt {
+                        materialize_bd.statements.push(stmt);
                     }
-                    repair_bd.statements.push(repair_addr_stmt2);
+                    materialize_bd.statements.push(materialize_addr_stmt2);
                     if !bounds_len_stmts.is_empty() {
-                        repair_bd.statements.append(&mut bounds_len_stmts);
+                        materialize_bd.statements.append(&mut bounds_len_stmts);
                     }
                     if !align_stmts.is_empty() {
-                        repair_bd.statements.append(&mut align_stmts);
+                        materialize_bd.statements.append(&mut align_stmts);
                     }
-                    repair_bd.terminator = Some(Terminator {
+                    materialize_bd.terminator = Some(Terminator {
                         source_info,
                         kind: TerminatorKind::Call {
-                            func: repair_ref_func,
-                            args: repair_ref_args,
+                            func: materialize_ref_func,
+                            args: materialize_ref_args,
                             destination: Place::from(dst_ptr_state.tag_local),
-                            target: Some(repair_cont_block),
+                            target: Some(materialize_cont_block),
                             unwind: UnwindAction::Continue,
                             call_source: CallSource::Misc,
                             fn_span: source_info.span,
@@ -1532,7 +1689,7 @@ impl MyOptimizationPass {
                             targets: SwitchTargets::static_if(
                                 0,
                                 validate_target,
-                                repair_call_block,
+                                materialize_call_block,
                             ),
                         },
                     });
@@ -2074,6 +2231,15 @@ impl MyOptimizationPass {
                     std::iter::empty(),
                     source_info.span,
                 );
+                let mut root_alias_flags = if alias_exempt {
+                    CREATION_FLAG_ALIAS_EXEMPT
+                } else {
+                    0
+                };
+                if exposed_provenance && !raw_root_is_ref {
+                    root_alias_flags |= CREATION_FLAG_EXPOSED_PROVENANCE_ROOT;
+                }
+
                 let args_root: Box<[Spanned<Operand<'tcx>>]> = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
@@ -2088,12 +2254,7 @@ impl MyOptimizationPass {
                         span: source_info.span,
                     },
                     Spanned {
-                        node: self.const_u8(
-                            tcx,
-                            source_info.span,
-                            (if alias_exempt { 1 } else { 0 })
-                                | (if exposed_provenance { 0b10_0000 } else { 0 }),
-                        ),
+                        node: self.const_u8(tcx, source_info.span, root_alias_flags),
                         span: source_info.span,
                     },
                     Spanned {
@@ -2433,6 +2594,11 @@ impl MyOptimizationPass {
 
                     let ptr_ref_ancestor_local =
                         ref_ancestor_local_for_ptr_local.get(&ptr_local).copied();
+                    let ptr_export_parent_local =
+                        export_parent_local_for_ptr_local.get(&ptr_local).copied();
+                    let ptr_recovered_local = export_parent_is_recovered_local_for_ptr_local
+                        .get(&ptr_local)
+                        .copied();
                     let mut apply_bd = BasicBlockData::new(
                         Some(Terminator {
                             source_info,
@@ -2450,9 +2616,7 @@ impl MyOptimizationPass {
                             Rvalue::Use(Operand::Copy(Place::from(ptr_selected_local))),
                         ))),
                     ));
-                    if let Some(export_parent_local) =
-                        export_parent_local_for_ptr_local.get(&ptr_local).copied()
-                    {
+                    if let Some(export_parent_local) = ptr_export_parent_local {
                         apply_bd.statements.push(Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
@@ -2461,10 +2625,7 @@ impl MyOptimizationPass {
                             ))),
                         ));
                     }
-                    if let Some(recovered_local) = export_parent_is_recovered_local_for_ptr_local
-                        .get(&ptr_local)
-                        .copied()
-                    {
+                    if let Some(recovered_local) = ptr_recovered_local {
                         apply_bd.statements.push(Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
@@ -2484,6 +2645,23 @@ impl MyOptimizationPass {
                     }
                     let apply_bb = body.basic_blocks_mut().push(apply_bd);
                     manual_holder_managed_tag_assignments.insert((apply_bb, ptr_tag_stmt_idx));
+                    self.append_ptr_state_shadow_store_after_apply(
+                        tcx,
+                        body,
+                        source_info,
+                        is_cleanup,
+                        apply_bb,
+                        orig_target,
+                        ptr_local,
+                        PtrStateLocals {
+                            tag_local: ptr_tag_local,
+                            ref_ancestor_local: ptr_ref_ancestor_local,
+                            boundary_parent_local: ptr_export_parent_local,
+                            boundary_recovered_local: ptr_recovered_local,
+                        },
+                        local_slot_shadow_store_locals,
+                        hooks,
+                    );
 
                     let tmp_kill_unit = body
                         .local_decls
@@ -2608,15 +2786,10 @@ impl MyOptimizationPass {
                     _ => false,
                 };
                 let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                let alias_flags = {
-                    let mut flags = if alias_exempt { 1 } else { 0 };
-                    if matches!(dst_ty.kind(), TyKind::Ref(..)) {
-                        // Call-return ref retagging can lose the caller-side parent tag and
-                        // materialize a fresh root at the same stack address. Mark these for
-                        // runtime same-address lineage repair.
-                        flags |= 0b10;
-                    }
-                    flags
+                let alias_flags = if alias_exempt {
+                    CREATION_FLAG_ALIAS_EXEMPT
+                } else {
+                    0
                 };
                 let bounds_len_op = if matches!(dst_ty.kind(), TyKind::Ref(..)) {
                     self.ref_creation_bounds_len_operand_for_ptr_local(
@@ -3438,6 +3611,11 @@ impl MyOptimizationPass {
 
                     let ptr_ref_ancestor_local =
                         ref_ancestor_local_for_ptr_local.get(&ptr_local).copied();
+                    let ptr_export_parent_local =
+                        export_parent_local_for_ptr_local.get(&ptr_local).copied();
+                    let ptr_recovered_local = export_parent_is_recovered_local_for_ptr_local
+                        .get(&ptr_local)
+                        .copied();
                     let mut apply_bd = BasicBlockData::new(
                         Some(Terminator {
                             source_info,
@@ -3455,9 +3633,7 @@ impl MyOptimizationPass {
                             Rvalue::Use(Operand::Copy(Place::from(ptr_selected_local))),
                         ))),
                     ));
-                    if let Some(export_parent_local) =
-                        export_parent_local_for_ptr_local.get(&ptr_local).copied()
-                    {
+                    if let Some(export_parent_local) = ptr_export_parent_local {
                         apply_bd.statements.push(Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
@@ -3466,10 +3642,7 @@ impl MyOptimizationPass {
                             ))),
                         ));
                     }
-                    if let Some(recovered_local) = export_parent_is_recovered_local_for_ptr_local
-                        .get(&ptr_local)
-                        .copied()
-                    {
+                    if let Some(recovered_local) = ptr_recovered_local {
                         apply_bd.statements.push(Statement::new(
                             source_info,
                             StatementKind::Assign(Box::new((
@@ -3489,6 +3662,23 @@ impl MyOptimizationPass {
                     }
                     let apply_bb = body.basic_blocks_mut().push(apply_bd);
                     manual_holder_managed_tag_assignments.insert((apply_bb, ptr_tag_stmt_idx));
+                    self.append_ptr_state_shadow_store_after_apply(
+                        tcx,
+                        body,
+                        source_info,
+                        is_cleanup,
+                        apply_bb,
+                        orig_target,
+                        ptr_local,
+                        PtrStateLocals {
+                            tag_local: ptr_tag_local,
+                            ref_ancestor_local: ptr_ref_ancestor_local,
+                            boundary_parent_local: ptr_export_parent_local,
+                            boundary_recovered_local: ptr_recovered_local,
+                        },
+                        local_slot_shadow_store_locals,
+                        hooks,
+                    );
 
                     let tmp_kill_unit = body
                         .local_decls
@@ -4155,10 +4345,57 @@ impl MyOptimizationPass {
                         fn_span: source_info.span,
                     },
                 };
-                let bd = &mut body.basic_blocks_mut()[bb];
-                bd.statements.push(addr_stmt1);
-                bd.statements.push(addr_stmt2);
-                bd.terminator = Some(call_term);
+                let guards = self.downcast_guards_for_place(tcx, place);
+                if guards.is_empty() {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    bd.statements.push(addr_stmt1);
+                    bd.statements.push(addr_stmt2);
+                    bd.terminator = Some(call_term);
+                } else {
+                    let mut call_bd = BasicBlockData::new(Some(call_term), is_cleanup);
+                    call_bd.statements.push(addr_stmt1);
+                    call_bd.statements.push(addr_stmt2);
+                    let call_block = body.basic_blocks_mut().push(call_bd);
+
+                    let mut next_block = call_block;
+                    for (guard_place, variant_idx) in guards.into_iter().rev() {
+                        let discr_local = body
+                            .local_decls
+                            .push(LocalDecl::new(tcx.types.isize, source_info.span));
+                        let discr_stmt = Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(discr_local),
+                                Rvalue::Discriminant(guard_place),
+                            ))),
+                        );
+                        let variant_value = self.discriminant_value_for_variant(
+                            tcx,
+                            body,
+                            guard_place,
+                            variant_idx,
+                        );
+                        let guard_term = Terminator {
+                            source_info,
+                            kind: TerminatorKind::SwitchInt {
+                                discr: Operand::Copy(Place::from(discr_local)),
+                                targets: SwitchTargets::static_if(
+                                    variant_value,
+                                    next_block,
+                                    cont_block,
+                                ),
+                            },
+                        };
+                        let mut guard_bd = BasicBlockData::new(Some(guard_term), is_cleanup);
+                        guard_bd.statements.push(discr_stmt);
+                        next_block = body.basic_blocks_mut().push(guard_bd);
+                    }
+
+                    body.basic_blocks_mut()[bb].terminator = Some(Terminator {
+                        source_info,
+                        kind: TerminatorKind::Goto { target: next_block },
+                    });
+                }
                 continue;
             }
 
@@ -4714,15 +4951,10 @@ impl MyOptimizationPass {
                 };
                 let alias_exempt =
                     self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[ptr_local].ty);
-                let alias_flags = {
-                    let mut flags = if alias_exempt { 1 } else { 0 };
-                    if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
-                        // Argument retagging often introduces short-lived receiver borrows at
-                        // call boundaries. If source-tag plumbing drops the parent, allow runtime
-                        // same-address repair instead of creating a sibling root.
-                        flags |= 0b10;
-                    }
-                    flags
+                let alias_flags = if alias_exempt {
+                    CREATION_FLAG_ALIAS_EXEMPT
+                } else {
+                    0
                 };
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.
@@ -6478,8 +6710,15 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let alias_exempt =
                         self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[raw_local].ty);
-                    let arg_alias =
-                        self.const_u8(tcx, source_info.span, if alias_exempt { 1 } else { 0 });
+                    let arg_alias = self.const_u8(
+                        tcx,
+                        source_info.span,
+                        if alias_exempt {
+                            CREATION_FLAG_ALIAS_EXEMPT
+                        } else {
+                            0
+                        },
+                    );
                     let bounds_len_op = self.ref_creation_bounds_len_operand_for_ptr_local(
                         tcx,
                         body,
@@ -6693,19 +6932,19 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let dst_ty = body.local_decls[dst].ty;
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                    // Bitfield semantics match __record_* hooks:
-                    // bit0=alias_exempt, bit1=basic lineage-repair hint, bit2=strong hint,
-                    // bit3=carry wide bounds from src when derivation drops metadata.
-                    // Raw PtrDerive in optimized MIR often comes from projection-heavy lowering
-                    // and benefits from runtime parent repair when stack metadata is coarse.
-                    let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
+                    let mut alias_flags: u8 = if alias_exempt {
+                        CREATION_FLAG_ALIAS_EXEMPT
+                    } else {
+                        0
+                    };
                     if !is_ref {
-                        alias_flags |= 0b10 | 0b100;
+                        alias_flags |= CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE
+                            | CREATION_FLAG_PROJECTED_HELPER_PARENT;
                         if self.should_forward_bounds_from_src_ptr_derive(tcx, body, src, dst) {
-                            alias_flags |= 0b1000;
+                            alias_flags |= CREATION_FLAG_RAW_CARRY_BOUNDS_FROM_SOURCE;
                         }
                         if strict_validity {
-                            alias_flags |= 0b0100_0000;
+                            alias_flags |= CREATION_FLAG_STRICT_RAW_CREATION_CHECK;
                         }
                     }
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
@@ -6774,11 +7013,16 @@ impl MyOptimizationPass {
                     let arg_mut = self.const_u8(tcx, source_info.span, if is_mut { 1 } else { 0 });
                     let dst_ty = body.local_decls[dst].ty;
                     let alias_exempt = self.alias_exempt_for_ptr_ty(tcx, body, dst_ty);
-                    let mut alias_flags: u8 = if alias_exempt { 1 } else { 0 };
+                    let mut alias_flags: u8 = if alias_exempt {
+                        CREATION_FLAG_ALIAS_EXEMPT
+                    } else {
+                        0
+                    };
                     if !is_ref {
-                        alias_flags |= 0b10 | 0b100;
+                        alias_flags |= CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE
+                            | CREATION_FLAG_PROJECTED_HELPER_PARENT;
                         if strict_validity {
-                            alias_flags |= 0b0100_0000;
+                            alias_flags |= CREATION_FLAG_STRICT_RAW_CREATION_CHECK;
                         }
                     }
                     let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
@@ -6946,100 +7190,6 @@ impl MyOptimizationPass {
                         }
                         _ => false,
                     };
-                    // `alias_exempt` argument is a bitfield:
-                    // - bit0: alias-exempt pointee classification (existing behavior)
-                    // - bit1: projected-source creation hint (used by runtime lineage repair)
-                    // - bit2: stronger root-origin repair hint (bounded overlap recovery)
-                    // - bit4: TB-lite raw is a derived same-family view
-                    // - bit6: raw creation should validate projected/derived provenance immediately
-                    // - bit7: deref-based raw creation must reject exposed/no-provenance parents
-                    let alias_flags: u8 = match &creation_kind {
-                        InstrKind::Ref { src, .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
-                            // Even simple reference reborrows can lose their parent tag in
-                            // optimized MIR/call-boundary lowering and show up as fresh roots at
-                            // the same stack address. Always allow exact same-address repair for
-                            // refs; keep the stronger bounded-overlap recovery limited to
-                            // projection-heavy sources.
-                            flags |= 0b10;
-                            if !src.projection.is_empty() {
-                                flags |= 0b100;
-                            }
-                            let src_ty = src.ty(&body.local_decls, tcx).ty;
-                            if self.is_pointer_ty(src_ty) && !self.is_thin_ptr_ty(tcx, body, src_ty)
-                            {
-                                // Wide-pointer reborrows often lower through a temporary thin raw
-                                // data pointer. If that helper raw root loses lineage, the runtime
-                                // should prefer dropping the bad raw-root parent over freezing the
-                                // eventual wide ref/write as a foreign sibling.
-                                flags |= 0b1_0000;
-                            }
-                            if src.projection.is_empty()
-                                && projectionless_anchor_suppressed_locals.contains(&src.local)
-                            {
-                                // Whole-slot reborrows of by-value return carriers (`other:
-                                // BytesMut; &mut other`) need targeted same-slot root retirement
-                                // in TB-lite. Mark only this path so ordinary repeated `&mut`
-                                // call arguments do not invalidate each other.
-                                flags |= 0b1000;
-                            }
-                            flags
-                        }
-                        InstrKind::Raw { src, .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
-                            // Raw creation can still lose lineage when source-tag plumbing is
-                            // missing (e.g. wrapper/projection-heavy optimized MIR). Mark all
-                            // raw creations as eligible for runtime best-effort repair.
-                            flags |= 0b10;
-                            // Tree Borrows treats raw pointer creation as tag-preserving:
-                            // casts, projections, and pointer arithmetic transport the source
-                            // family rather than allocating a new permission-bearing borrow node.
-                            // `InstrKind::Raw` is the structurally derived case; true fresh or
-                            // unknown roots are emitted as `RawRoot`/`RetRoot` below. Mark every
-                            // derived raw view so TB-lite keeps it as tag-store metadata until an
-                            // actual raw write needs access-local raw state.
-                            flags |= 0b0001_0000;
-                            // For projected raw sources (`(*p).field`, etc.) also allow strong
-                            // bounded-overlap parent recovery in the runtime repair path.
-                            if !src.projection.is_empty() {
-                                flags |= 0b100;
-                                flags |= 0b0100_0000;
-                            }
-                            if matches!(src.projection.first(), Some(ProjectionElem::Deref))
-                                && !self
-                                    .raw_creation_allows_no_provenance_transport(tcx, body, *src)
-                            {
-                                flags |= 0b1000_0000;
-                            }
-                            flags
-                        }
-                        // RawRoot is emitted exactly in cases where provenance source recovery
-                        // failed at instrumentation time. Mark for runtime best-effort repair.
-                        InstrKind::RawRoot { .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
-                            flags |= 0b10;
-                            flags
-                        }
-                        InstrKind::RetRoot { dst_local, .. } => {
-                            let mut flags = if alias_exempt { 1 } else { 0 };
-                            // Return-root creation means caller-side provenance recovery failed.
-                            // Mark both refs and raws as eligible for exact same-address repair:
-                            // uninstrumented std/core pointer-returning wrappers can otherwise
-                            // synthesize a fresh root for a pointer that should remain attached to
-                            // an existing live lineage at the same address.
-                            flags |= 0b10;
-                            flags
-                        }
-                        _ => {
-                            if alias_exempt {
-                                1
-                            } else {
-                                0
-                            }
-                        }
-                    };
-                    let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
-
                     let bounds_ptr_local = match &creation_kind {
                         InstrKind::Ref { .. } | InstrKind::Raw { .. } => place.as_local(),
                         InstrKind::RawRoot { ptr_local, .. } => Some(*ptr_local),
@@ -7073,6 +7223,100 @@ impl MyOptimizationPass {
                             ),
                         })
                         .unwrap_or_else(|| self.unknown_bounds_len_operand(tcx, source_info.span));
+
+                    // `alias_exempt` is a creation flag bitfield consumed by the runtime hooks.
+                    let mut alias_flags: u8 = match &creation_kind {
+                        InstrKind::Ref { src, .. } => {
+                            let mut flags = if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            };
+                            if !src.projection.is_empty() {
+                                flags |= CREATION_FLAG_PROJECTED_HELPER_PARENT;
+                            }
+                            if src.projection.is_empty()
+                                && projectionless_anchor_suppressed_locals.contains(&src.local)
+                            {
+                                // Whole-slot reborrows of by-value return carriers (`other:
+                                // BytesMut; &mut other`) need targeted same-slot root retirement
+                                // in TB-lite. Mark only this path so ordinary repeated `&mut`
+                                // call arguments do not invalidate each other.
+                                flags |= CREATION_FLAG_REF_RETURNED_CARRIER_REROOT;
+                            }
+                            flags
+                        }
+                        InstrKind::Raw { src, .. } => {
+                            let mut flags = if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            };
+                            flags |= CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE;
+                            // Tree Borrows treats raw pointer creation as tag-preserving:
+                            // casts, projections, and pointer arithmetic transport the source
+                            // family rather than allocating a new permission-bearing borrow node.
+                            // `InstrKind::Raw` is the structurally derived case; true fresh or
+                            // unknown roots are emitted as `RawRoot`/`RetRoot` below. Mark every
+                            // derived raw view so TB-lite keeps it as tag-store metadata until an
+                            // actual raw write needs access-local raw state.
+                            flags |= CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY;
+                            // For projected raw sources (`(*p).field`, etc.), preserve the helper
+                            // parent shape and validate the derived address eagerly.
+                            if !src.projection.is_empty() {
+                                flags |= CREATION_FLAG_PROJECTED_HELPER_PARENT;
+                                flags |= CREATION_FLAG_STRICT_RAW_CREATION_CHECK;
+                            }
+                            if matches!(src.projection.first(), Some(ProjectionElem::Deref))
+                                && !self
+                                    .raw_creation_allows_no_provenance_transport(tcx, body, *src)
+                            {
+                                flags |= CREATION_FLAG_DEREF_RAW_CREATION;
+                            }
+                            flags
+                        }
+                        // RawRoot is emitted when no structural source tag is available. Keep
+                        // exposed-provenance poison sticky for same-address raw roots.
+                        InstrKind::RawRoot { .. } => {
+                            let mut flags = if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            };
+                            flags |= CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE;
+                            flags
+                        }
+                        InstrKind::RetRoot { is_ref, .. } => {
+                            let mut flags = if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            };
+                            if !*is_ref {
+                                flags |= CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE;
+                            }
+                            flags
+                        }
+                        _ => {
+                            if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    if matches!(
+                        &creation_kind,
+                        InstrKind::Ref { .. } | InstrKind::RetRoot { is_ref: true, .. }
+                    ) && matches!(
+                        bounds_len_op,
+                        SizeOperand::PtrMetadataSlice { .. }
+                            | SizeOperand::PtrMetadataStr { .. }
+                            | SizeOperand::PtrMetadataAdtSlice { .. }
+                    ) {
+                        alias_flags |= CREATION_FLAG_REF_DYNAMIC_BOUNDS;
+                    }
+                    let arg_alias = self.const_u8(tcx, source_info.span, alias_flags);
                     let (arg_bounds_len, mut bounds_len_stmts) =
                         self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                     extra_stmts.append(&mut bounds_len_stmts);
@@ -7226,7 +7470,11 @@ impl MyOptimizationPass {
                         node: self.const_u8(
                             tcx,
                             source_info.span,
-                            if alias_exempt { 1 } else { 0 },
+                            if alias_exempt {
+                                CREATION_FLAG_ALIAS_EXEMPT
+                            } else {
+                                0
+                            },
                         ),
                         span: source_info.span,
                     },
@@ -8347,12 +8595,10 @@ impl MyOptimizationPass {
                 };
                 let alias_exempt =
                     self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[ptr_local].ty);
-                let alias_flags = {
-                    let mut flags = if alias_exempt { 1 } else { 0 };
-                    if matches!(body.local_decls[ptr_local].ty.kind(), TyKind::Ref(..)) {
-                        flags |= 0b10;
-                    }
-                    flags
+                let alias_flags = if alias_exempt {
+                    CREATION_FLAG_ALIAS_EXEMPT
+                } else {
+                    0
                 };
 
                 // Retagging uses the data pointer for wide pointers so derived raw pointers share the tag.

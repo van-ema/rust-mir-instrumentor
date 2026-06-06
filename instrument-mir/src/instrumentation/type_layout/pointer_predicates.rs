@@ -380,23 +380,21 @@ impl MyOptimizationPass {
     ) -> bool {
         match ty.kind() {
             TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
-                // Be conservative for unresolved/generic pointees: if we misclassify a fat pointer
-                // as thin, `PointerExposeProvenance` on the pair-typed value can ICE during codegen.
-                if pointee.has_param()
-                    || pointee.has_infer()
-                    || pointee.has_aliases()
-                    || pointee.has_opaque_types()
-                    || pointee.has_placeholders()
-                    || pointee.has_bound_vars()
-                {
-                    return false;
-                }
-
                 match pointee.kind() {
                     TyKind::Slice(..) | TyKind::Str | TyKind::Dynamic(..) => false,
                     // `extern type` is unsized but uses `()` metadata, so pointers are thin.
                     TyKind::Foreign(..) => true,
-                    _ => pointee.is_sized(tcx, body.typing_env(tcx)),
+                    _ => {
+                        if pointee.has_infer()
+                            || pointee.has_placeholders()
+                            || pointee.has_bound_vars()
+                        {
+                            return false;
+                        }
+                        // Generic `&T` is thin when the function environment proves `T: Sized`.
+                        // This lets enum carriers like `Option<&T>` keep their leaf shadow.
+                        pointee.is_sized(tcx, body.typing_env(tcx))
+                    }
                 }
             }
             _ => false,

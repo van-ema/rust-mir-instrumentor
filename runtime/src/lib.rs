@@ -23,6 +23,31 @@ mod tag_lookup_cache;
 mod tag_pruning;
 mod tag_store;
 
+// The pointee type is alias-exempt, usually because it contains interior mutability.
+const CREATION_FLAG_ALIAS_EXEMPT: u8 = 0b0000_0001;
+// Ref-only: the bounds length came from wide-pointer metadata and must be enforced eagerly.
+const CREATION_FLAG_REF_DYNAMIC_BOUNDS: u8 = 0b0000_0010;
+// Raw-only: keep exposed-provenance poison sticky when no tracked parent remains.
+const CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE: u8 = 0b0000_0010;
+// The source is a projected helper path, so parent/slot shape matters to TB-lite.
+const CREATION_FLAG_PROJECTED_HELPER_PARENT: u8 = 0b0000_0100;
+// Ref-only bit 3: this ref reroots a returned by-value carrier in the caller.
+const CREATION_FLAG_REF_RETURNED_CARRIER_REROOT: u8 = 0b0000_1000;
+// Raw-only bit 3: carry precise wide-pointer bounds from the source pointer.
+const CREATION_FLAG_RAW_CARRY_BOUNDS_FROM_SOURCE: u8 = 0b0000_1000;
+// Raw-only: derived raw views reuse the parent TB family until a raw write needs a node.
+const CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
+// Raw-only: this is an int-to-ptr or exposed-provenance root.
+const CREATION_FLAG_EXPOSED_PROVENANCE_ROOT: u8 = 0b0010_0000;
+// Raw-only: validate this derived raw pointer immediately.
+const CREATION_FLAG_STRICT_RAW_CREATION_CHECK: u8 = 0b0100_0000;
+// Raw-only: this raw pointer came from a deref projection like `(*p).field`.
+const CREATION_FLAG_DEREF_RAW_CREATION: u8 = 0b1000_0000;
+const CREATION_REF_LINEAGE_HINT_MASK: u8 =
+    CREATION_FLAG_PROJECTED_HELPER_PARENT | CREATION_FLAG_REF_RETURNED_CARRIER_REROOT;
+const CREATION_RAW_LINEAGE_HINT_MASK: u8 =
+    CREATION_FLAG_PROJECTED_HELPER_PARENT | CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY;
+
 ::std::thread_local! {
     // Re-entrancy guard to prevent infinite recursion when the runtime allocates
     // while recording allocation metadata.
@@ -470,6 +495,7 @@ fn rz_validate_ref_creation_addr(
     kind: PtrKind,
     parent_tag: u64,
     bounds_len: usize,
+    dynamic_bounds: bool,
 ) -> Option<(&'static str, String)> {
     let access_name = match kind {
         PtrKind::RefMut => "WRITE",
@@ -523,6 +549,7 @@ fn rz_validate_ref_creation_addr(
         )
     };
 
+    let has_covering_alloc = covering_alloc_opt.is_some();
     if let Some((base, ameta)) = covering_alloc_opt.or(containing_alloc_opt) {
         if !ameta.live {
             // Epoch bumps on every live/dead transition, so the natural sequence for a
@@ -566,16 +593,15 @@ fn rz_validate_ref_creation_addr(
             let alloc_end = base.saturating_add(ameta.size);
             if access_end > alloc_end {
                 if parent_tag == 0
+                    && !has_covering_alloc
+                    && !dynamic_bounds
                     && (ameta.is_stack
                         || rz_stack_addr_hint(pointee_addr)
                         || rz_tls_addr_hint(pointee_addr))
-                    && base != pointee_addr
                 {
-                    // Root stack/TLS ref creation sometimes only sees a partially overlapping slot
-                    // in optimized MIR. Without a full-covering tracked allocation, treat that as
-                    // missing metadata and defer to later concrete accesses. If the tracked slot
-                    // starts exactly at the pointee address, keep the OOB: that is the normal
-                    // exact-allocation case rather than a neighboring-slot artifact.
+                    // Optimized MIR can expose only an overlapping stack/TLS slot for a larger
+                    // root ref. Dynamic wide-pointer metadata is different: forged metadata can
+                    // make a real reference too large, so those creations keep the eager OOB check.
                     return None;
                 }
                 return Some((
@@ -1368,10 +1394,9 @@ pub struct TagMeta {
     pub alloc_live_at_creation: bool,
     /// Skip aliasing checks for tags pointing into UnsafeCell / interior mutability.
     pub alias_exempt: bool,
-    /// Lineage-repair/suppression hints emitted by instrumentation (bitfield without bit0).
-    /// bit1=repair hint, bit2=strong repair/suppression hint, bit3=carry wide bounds from source,
-    /// bit4=TB-lite raw is a derived same-family view; keep it out of the borrow tree
-    /// until an actual raw write needs access-local raw state,
+    /// Structural creation hints emitted by instrumentation.
+    /// bit2=projected helper parent, bit3=returned-carrier reroot for refs, bit4=TB-lite raw
+    /// reuses the parent family until an actual raw write needs access-local raw state,
     /// bit5=internal runtime normalization for const refs materialized at alloc end.
     pub lineage_hint: u8,
     /// Root raw pointer came from exposed-provenance/int-to-ptr creation.
@@ -1915,7 +1940,7 @@ fn validate_and_export_return_tag(callee_id: u64, tag: u64, addr: usize, boundar
     }
     export_return_tag(callee_id, tag, addr, boundary_survivor);
     if !validate_before_export {
-        // `&mut` survivor returns validate after the export repair.
+        // `&mut` survivor returns validate after export updates boundary state.
         rz_validate_ref_boundary_use(tag, "RET");
     }
 }
@@ -2401,8 +2426,8 @@ fn rz_allow_projected_raw_stack_slot_oob_noise(
     if !matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         return false;
     }
-    // Strong projected-source hint only; keep this path narrowly targeted.
-    if (tmeta.lineage_hint & 0b0000_0100) == 0 || tmeta.parent == 0 {
+    // Projected helper-parent shape only; keep this path narrowly targeted.
+    if (tmeta.lineage_hint & CREATION_FLAG_PROJECTED_HELPER_PARENT) == 0 || tmeta.parent == 0 {
         return false;
     }
     if !(ameta.is_stack || rz_stack_addr_hint(addr) || rz_stack_addr_hint(tmeta.pointee_addr)) {
@@ -2712,7 +2737,7 @@ fn normalize_const_end_ref_pointee(
 // consistently instead of treating the normalized tag as pointing at the end.
 const LINEAGE_HINT_CONST_END_REF_NORMALIZED: u8 = 0b0010_0000;
 // Example: `q = p.add(1)` stays in `p`'s TB family; it is not a new raw authority.
-const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
+const LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY: u8 = CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY;
 
 #[inline]
 fn normalize_const_end_ref_access_addr(
@@ -4881,7 +4906,7 @@ fn recover_call_arg_parent_tag(addr: usize) -> u64 {
     };
     if rz_trace_call_tags_enabled() && recovered == 0 && !seen.is_empty() {
         eprintln!(
-            "[rusteze-runtime][call-tag] exact-repair miss addr=0x{:x} alloc_epoch={} allow_epochless={} seen={:?}",
+            "[rusteze-runtime][call-tag] exact-boundary lookup miss addr=0x{:x} alloc_epoch={} allow_epochless={} seen={:?}",
             addr, alloc_epoch, allow_epochless_exact, seen
         );
     }
@@ -6003,11 +6028,9 @@ pub extern "C" fn __record_ref_creation_with_extent(
     let normalized_const_end_ref = pointee_addr != 0
         && pointee_addr != normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
     let pointee_addr = normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
-    // `alias_exempt` is a bitfield emitted by instrumentation:
-    // - bit0: alias-exempt classification
-    // - bit1: basic lineage-repair hint
-    // - bit2: strong root-origin repair hint
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    // `alias_exempt` is a creation flag bitfield emitted by instrumentation.
+    let alias_exempt_flag = (alias_exempt & CREATION_FLAG_ALIAS_EXEMPT) != 0;
+    let dynamic_bounds = (alias_exempt & CREATION_FLAG_REF_DYNAMIC_BOUNDS) != 0;
     let requested_align = align_req;
     let promised_align = if bounds_len_is_zero_sized_known(bounds_len) {
         0
@@ -6040,9 +6063,13 @@ pub extern "C" fn __record_ref_creation_with_extent(
         );
     }
     if !alias_exempt_flag {
-        if let Some((vk, msg)) =
-            rz_validate_ref_creation_addr(pointee_addr, kind, parent_tag, bounds_len)
-        {
+        if let Some((vk, msg)) = rz_validate_ref_creation_addr(
+            pointee_addr,
+            kind,
+            parent_tag,
+            bounds_len,
+            dynamic_bounds,
+        ) {
             rz_violation(vk, append_location_if_enabled(msg, "RZ_LOG_LOC"));
         }
     }
@@ -6109,7 +6136,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
                     } else if parent_epoch == 0 && pointee_meta.epoch != 0 {
                         // Parent lineage is correct, but its allocation snapshot was lost.
                         // Keep the parent tag while refreshing the epoch/live snapshot from the
-                        // actual pointee allocation so later exact-address repairs still work.
+                        // actual pointee allocation so later exact-address lookups still work.
                         (
                             pointee_meta.epoch,
                             pointee_meta.live,
@@ -6202,7 +6229,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: (alias_exempt & 0b0000_1110)
+        lineage_hint: (alias_exempt & CREATION_REF_LINEAGE_HINT_MASK)
             | if normalized_const_end_ref {
                 LINEAGE_HINT_CONST_END_REF_NORMALIZED
             } else {
@@ -6304,7 +6331,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _profile_guard = HookProfileGuard::raw_create(profile);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
-    let alias_exempt_flag = (alias_exempt & 0b0000_0001) != 0;
+    let alias_exempt_flag = (alias_exempt & CREATION_FLAG_ALIAS_EXEMPT) != 0;
     let align_req =
         rz_effective_align_req(align_req, derived_from).max(rz_promised_alignment_for_addr(
             pointee_addr,
@@ -6312,18 +6339,19 @@ pub extern "C" fn __record_raw_ptr_creation(
                 .map(|(_, meta)| meta.epoch)
                 .unwrap_or(0),
         ));
-    let projected_raw_hint = (alias_exempt & 0b0000_0010) != 0;
-    let strong_projected_raw_hint = (alias_exempt & 0b0000_0100) != 0;
-    let carry_bounds_from_source = (alias_exempt & 0b0000_1000) != 0;
-    let mut exposed_provenance_root = (alias_exempt & 0b0010_0000) != 0;
-    let strict_creation_check = (alias_exempt & 0b0100_0000) != 0;
-    let _deref_creation_no_provenance_check = (alias_exempt & 0b1000_0000) != 0;
+    let propagate_exposed_provenance =
+        (alias_exempt & CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE) != 0;
+    let projected_helper_parent = (alias_exempt & CREATION_FLAG_PROJECTED_HELPER_PARENT) != 0;
+    let carry_bounds_from_source = (alias_exempt & CREATION_FLAG_RAW_CARRY_BOUNDS_FROM_SOURCE) != 0;
+    let mut exposed_provenance_root = (alias_exempt & CREATION_FLAG_EXPOSED_PROVENANCE_ROOT) != 0;
+    let strict_creation_check = (alias_exempt & CREATION_FLAG_STRICT_RAW_CREATION_CHECK) != 0;
+    let deref_creation_check = (alias_exempt & CREATION_FLAG_DEREF_RAW_CREATION) != 0;
     // MIR and optimized std/alloc lowering often materialize administrative `*const`
     // temporaries from mutable-capable sources (e.g. `NonNull`/`Unique` transmute paths)
     // and then write through them. Preserve the parent's effective write capability so
     // these casts do not freeze an otherwise-valid unique/raw-mutable lineage.
     let inherits_write_capability = derived_from != 0
-        && strong_projected_raw_hint
+        && projected_helper_parent
         && tag_store::get(derived_from)
             .is_some_and(|parent| matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut));
     let kind = if is_mut != 0 || inherits_write_capability {
@@ -6331,16 +6359,15 @@ pub extern "C" fn __record_raw_ptr_creation(
     } else {
         PtrKind::RawConst
     };
-    // `alias_exempt` is a bitfield emitted by instrumentation:
-    // - bit0: alias-exempt classification
-    // - bit1: basic lineage-repair hint
-    // - bit2: strong root-origin repair hint
-    // - bit3: carry wide bounds from the source pointer when metadata is intentionally dropped
-    // - bit4: TB-lite raw is a derived same-family view; defer borrow-tree materialization
-    // - bit5: root came from exposed-provenance/int-to-ptr creation, so provenance is unknown
-    // - bit6: validate projected/derived raw creation immediately against known provenance/bounds
-    // - bit7: deref-projected raw creation; strict mode rejects exposed provenance, while default
-    //   mode requires the projected address to stay inside the same live allocation
+    // `alias_exempt` is a creation flag bitfield:
+    // - alias-exempt pointee classification
+    // - raw exposed-provenance propagation when no tracked parent remains
+    // - projected helper parent shape
+    // - carry wide bounds from the source pointer when metadata is intentionally dropped
+    // - TB-lite raw derived same-family view
+    // - exposed-provenance/int-to-ptr root
+    // - strict projected/derived raw creation validation
+    // - deref-projected raw creation validation
     let mut resolved_parent = derived_from;
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
@@ -6417,12 +6444,10 @@ pub extern "C" fn __record_raw_ptr_creation(
 
     // A strong projected root on a live allocation is a provenance-preserving owner/payload
     // reconstruction. Do not poison it just because an older tag at the same address was exposed.
-    let provenance_preserving_alloc_root = derived_from == 0
-        && strong_projected_raw_hint
-        && alloc_epoch != 0
-        && alloc_live_at_creation;
+    let provenance_preserving_alloc_root =
+        derived_from == 0 && projected_helper_parent && alloc_epoch != 0 && alloc_live_at_creation;
     if !exposed_provenance_root
-        && projected_raw_hint
+        && propagate_exposed_provenance
         && !provenance_preserving_alloc_root
         && pointee_addr != 0
     {
@@ -6459,7 +6484,7 @@ pub extern "C" fn __record_raw_ptr_creation(
             resolved_parent,
             exposed_provenance_root,
             strict_provenance,
-            _deref_creation_no_provenance_check,
+            deref_creation_check,
             if bounds_len_is_known(bounds_len) {
                 bounds_len
             } else if carry_bounds_from_source {
@@ -6510,7 +6535,7 @@ pub extern "C" fn __record_raw_ptr_creation(
         alloc_epoch,
         alloc_live_at_creation,
         alias_exempt: alias_exempt_flag,
-        lineage_hint: alias_exempt & 0b0001_1110,
+        lineage_hint: alias_exempt & CREATION_RAW_LINEAGE_HINT_MASK,
         exposed_provenance_root,
         bounds_len,
         interior_mut_extent_base,
