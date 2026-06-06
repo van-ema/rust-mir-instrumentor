@@ -306,7 +306,7 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_leaf_shadow", 3)
             .expect("missing '__rz_take_ret_leaf_shadow' definition");
         let def_id_validate_loaded_ref_tag = self
-            .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 1)
+            .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 4)
             .expect("missing '__rz_validate_loaded_ref_tag' definition");
         let def_id_require_loaded_ptr_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_require_loaded_ptr_tag", 1)

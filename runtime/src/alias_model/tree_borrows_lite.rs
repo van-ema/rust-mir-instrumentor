@@ -454,6 +454,11 @@ fn tb_lite_validate_ref_creation(
         return None;
     }
 
+    if bounds_len_is_precise_empty(bounds_len) {
+        // Empty slice/str views are metadata transport, not a byte read through the parent.
+        return None;
+    }
+
     let new_len = tb_effective_access_len(bounds_len_bytes_or_zero(bounds_len));
     let new_end = pointee_addr.saturating_add(new_len);
     let base = tb_base_for_addr(pointee_addr);

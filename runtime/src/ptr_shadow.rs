@@ -65,6 +65,7 @@ enum SlotLoc {
         base: usize,
         epoch: u64,
         offset: usize,
+        is_stack: bool,
     },
     Abs {
         addr: usize,
@@ -81,6 +82,7 @@ fn slot_loc(addr: usize) -> SlotLoc {
                         base,
                         epoch: meta.epoch,
                         offset,
+                        is_stack: meta.is_stack,
                     };
                 }
             }
@@ -88,6 +90,20 @@ fn slot_loc(addr: usize) -> SlotLoc {
     }
 
     SlotLoc::Abs { addr }
+}
+
+#[inline]
+fn abs_mirror_entry(entry: PtrShadowEntry, is_stack: bool) -> PtrShadowEntry {
+    if is_stack {
+        // Stack bytes can later be rediscovered through another overlapping MIR stack local.
+        // Keep cleanup tied to the original base, but validate against the live stack address.
+        PtrShadowEntry {
+            alloc_epoch: 0,
+            ..entry
+        }
+    } else {
+        entry
+    }
 }
 
 #[inline]
@@ -197,6 +213,7 @@ pub(crate) fn kill_range(addr: usize, size: usize) {
             base,
             epoch,
             offset,
+            ..
         } => {
             let mut shadow = alloc_ptr_shadow().lock().unwrap();
             if let Some(slots) = shadow.get_mut(&(base, epoch)) {
@@ -270,6 +287,7 @@ pub(crate) fn store_ptr(
             base,
             epoch,
             offset,
+            is_stack,
         } => {
             let entry = PtrShadowEntry {
                 tag,
@@ -284,7 +302,10 @@ pub(crate) fn store_ptr(
                 .entry((base, epoch))
                 .or_default()
                 .insert(offset, entry);
-            abs_ptr_shadow().lock().unwrap().insert(addr, entry);
+            abs_ptr_shadow()
+                .lock()
+                .unwrap()
+                .insert(addr, abs_mirror_entry(entry, is_stack));
         }
         SlotLoc::Abs { addr } => {
             let entry = PtrShadowEntry {
@@ -322,6 +343,7 @@ pub(crate) fn store_ptr_local_slot(
             base,
             epoch,
             offset,
+            is_stack,
         } => {
             let entry = PtrShadowEntry {
                 tag,
@@ -336,7 +358,10 @@ pub(crate) fn store_ptr_local_slot(
                 .entry((base, epoch))
                 .or_default()
                 .insert(offset, entry);
-            abs_ptr_shadow().lock().unwrap().insert(addr, entry);
+            abs_ptr_shadow()
+                .lock()
+                .unwrap()
+                .insert(addr, abs_mirror_entry(entry, is_stack));
         }
         SlotLoc::Abs { addr } => {
             let entry = PtrShadowEntry {
@@ -354,14 +379,16 @@ pub(crate) fn store_ptr_local_slot(
 
 #[inline]
 fn abs_entry_matches(addr: usize, entry: PtrShadowEntry) -> bool {
-    if entry.alloc_epoch == 0 {
+    if entry.alloc_base == 0 && entry.alloc_epoch == 0 {
         return true;
     }
     lookup_alloc_snapshot(addr).is_some_and(|(base, meta)| {
-        meta.live
-            && base == entry.alloc_base
-            && meta.epoch == entry.alloc_epoch
-            && addr.saturating_sub(base).saturating_add(PTR_SLOT_BYTES) <= meta.size
+        let in_bounds =
+            meta.size == 0 || addr.saturating_sub(base).saturating_add(PTR_SLOT_BYTES) <= meta.size;
+        if entry.alloc_epoch == 0 {
+            return meta.live && meta.is_stack && in_bounds;
+        }
+        meta.live && base == entry.alloc_base && meta.epoch == entry.alloc_epoch && in_bounds
     })
 }
 
@@ -376,6 +403,7 @@ fn load_entry(addr: usize) -> Option<PtrShadowEntry> {
             base,
             epoch,
             offset,
+            ..
         } => {
             let primary = alloc_ptr_shadow()
                 .lock()
@@ -447,6 +475,7 @@ fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
             base,
             epoch,
             offset,
+            ..
         } => alloc_ptr_shadow()
             .lock()
             .unwrap()
@@ -564,13 +593,14 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
             base,
             epoch,
             offset,
+            is_stack,
         } => {
             let Some(slot_start) = offset.checked_sub(src_byte_off) else {
                 return;
             };
-            if lookup_alloc_snapshot(base.saturating_add(slot_start))
-                .is_none_or(|(_, meta)| slot_start.saturating_add(PTR_SLOT_BYTES) > meta.size)
-            {
+            if lookup_alloc_snapshot(base.saturating_add(slot_start)).is_none_or(|(_, meta)| {
+                meta.size != 0 && slot_start.saturating_add(PTR_SLOT_BYTES) > meta.size
+            }) {
                 return;
             }
             let bit = 1u128 << src_byte_off;
@@ -634,7 +664,7 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
                 abs_ptr_shadow()
                     .lock()
                     .unwrap()
-                    .insert(abs_slot_start, full);
+                    .insert(abs_slot_start, abs_mirror_entry(full, is_stack));
                 partial.remove(&abs_slot_start);
             }
         }
@@ -728,6 +758,7 @@ pub(crate) fn copy_range(dst_addr: usize, src_addr: usize, size: usize) {
                 base,
                 epoch,
                 offset,
+                ..
             } => {
                 let mut shadow = alloc_ptr_shadow().lock().unwrap();
                 if let Some(slots) = shadow.get_mut(&(base, epoch)) {
@@ -747,6 +778,11 @@ pub(crate) fn copy_range(dst_addr: usize, src_addr: usize, size: usize) {
                     }
                 }
                 let abs_addr = base.saturating_add(offset);
+                let mut abs_shadow = abs_ptr_shadow().lock().unwrap();
+                let doomed = overlapping_offsets(&abs_shadow, abs_addr, 1);
+                for key in doomed {
+                    abs_shadow.remove(&key);
+                }
                 let mut abs_partial = abs_ptr_shadow_partial().lock().unwrap();
                 kill_partial_byte_in_map(&mut abs_partial, abs_addr);
             }
@@ -780,8 +816,8 @@ pub(crate) fn remove_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
         .lock()
         .unwrap()
         .remove(&(base_addr, alloc_epoch));
-    abs_ptr_shadow()
-        .lock()
-        .unwrap()
-        .retain(|_, entry| !(entry.alloc_base == base_addr && entry.alloc_epoch == alloc_epoch));
+    abs_ptr_shadow().lock().unwrap().retain(|_, entry| {
+        !(entry.alloc_base == base_addr
+            && (entry.alloc_epoch == alloc_epoch || entry.alloc_epoch == 0))
+    });
 }

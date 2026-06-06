@@ -4686,6 +4686,15 @@ pub fn __rz_ptr_read_allow_untagged(
 }
 
 fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
+    rz_validate_ref_boundary_use_at(tag, boundary, 0, BOUNDS_LEN_UNKNOWN);
+}
+
+fn rz_validate_ref_boundary_use_at(
+    tag: u64,
+    boundary: &str,
+    access_addr: usize,
+    access_bounds_len: usize,
+) {
     if tag == 0 {
         return;
     }
@@ -4697,18 +4706,28 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
         return;
     }
 
-    if rz_ref_boundary_is_empty_precise_view(&tmeta) {
+    let access_bounds_len = if bounds_len_is_unknown(access_bounds_len) {
+        tmeta.bounds_len
+    } else {
+        access_bounds_len
+    };
+    if bounds_len_is_precise_empty(access_bounds_len) {
         // Empty slice/str-style views do not perform a boundary read. Keep the tag/family, but
         // defer any actual provenance/alignment decision until a later concrete non-empty access.
         return;
     }
 
-    let access_size = bounds_len_bytes_or_zero(tmeta.bounds_len).min(1).max(1);
+    let access_addr = if access_addr != 0 {
+        access_addr
+    } else {
+        tmeta.pointee_addr
+    };
+    let access_size = bounds_len_bytes_or_zero(access_bounds_len).min(1).max(1);
     let Some(msg) = active_alias_model().check_access(
         tag,
         tag,
         &tmeta,
-        tmeta.pointee_addr,
+        access_addr,
         access_size,
         alias_model::AliasAccessKind::Read,
     ) else {
@@ -4720,11 +4739,30 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
         append_location_if_enabled(
             format!(
                 "{boundary} invalid ref tag={tag} pointee=0x{:x} kind={:?}\n{msg}",
-                tmeta.pointee_addr, tmeta.kind
+                access_addr, tmeta.kind
             ),
             "RZ_LOG_LOC",
         ),
     );
+}
+
+fn loaded_ref_validation_tag(
+    exact_tag: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+) -> u64 {
+    if export_parent_recovered != 0
+        && export_parent != 0
+        && tag_store::get(export_parent)
+            .as_ref()
+            .is_some_and(|meta| matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut))
+    {
+        // Recovered shadows carry a stable family in `export_parent`; the exact helper-local
+        // child may be retired before the loaded reference is used again.
+        export_parent
+    } else {
+        exact_tag
+    }
 }
 
 fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
@@ -5803,9 +5841,18 @@ pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
 
 /// Validate a reference tag restored from pointer-shadow memory.
 #[no_mangle]
-pub extern "C" fn __rz_validate_loaded_ref_tag(tag: u64) {
+pub extern "C" fn __rz_validate_loaded_ref_tag(
+    tag: u64,
+    export_parent: u64,
+    export_parent_recovered: u8,
+    pointee_addr: usize,
+) {
     let _g = RzRuntimeGuard::enter();
-    rz_validate_ref_boundary_use(tag, "LOAD");
+    let access_bounds_len = tag_store::get(tag)
+        .map(|meta| meta.bounds_len)
+        .unwrap_or(BOUNDS_LEN_UNKNOWN);
+    let validation_tag = loaded_ref_validation_tag(tag, export_parent, export_parent_recovered);
+    rz_validate_ref_boundary_use_at(validation_tag, "LOAD", pointee_addr, access_bounds_len);
 }
 
 /// Require a nonzero tag when loading a pointer/reference value from memory.

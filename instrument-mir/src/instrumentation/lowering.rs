@@ -1539,21 +1539,52 @@ impl MyOptimizationPass {
                 }
 
                 if let Some(validate_block) = validate_block {
+                    let (validate_def_id, validate_args): (DefId, Box<[Spanned<Operand<'tcx>>]>) =
+                        if require_tag {
+                            (
+                                hooks.def_id_require_loaded_ptr_tag,
+                                vec![Spanned {
+                                    node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
+                                    span: source_info.span,
+                                }]
+                                .into_boxed_slice(),
+                            )
+                        } else {
+                            let export_parent_op = dst_export_parent_local
+                                .map(|local| Operand::Copy(Place::from(local)))
+                                .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0));
+                            let recovered_op = dst_recovered_local
+                                .map(|local| Operand::Copy(Place::from(local)))
+                                .unwrap_or_else(|| self.const_u8(tcx, source_info.span, 0));
+                            (
+                                hooks.def_id_validate_loaded_ref_tag,
+                                vec![
+                                    Spanned {
+                                        node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
+                                        span: source_info.span,
+                                    },
+                                    Spanned {
+                                        node: export_parent_op,
+                                        span: source_info.span,
+                                    },
+                                    Spanned {
+                                        node: recovered_op,
+                                        span: source_info.span,
+                                    },
+                                    Spanned {
+                                        node: Operand::Copy(Place::from(ptr_addr_local)),
+                                        span: source_info.span,
+                                    },
+                                ]
+                                .into_boxed_slice(),
+                            )
+                        };
                     let validate_func = Operand::function_handle(
                         tcx,
-                        if require_tag {
-                            hooks.def_id_require_loaded_ptr_tag
-                        } else {
-                            hooks.def_id_validate_loaded_ref_tag
-                        },
+                        validate_def_id,
                         std::iter::empty(),
                         source_info.span,
                     );
-                    let validate_args: Box<[Spanned<Operand<'tcx>>]> = vec![Spanned {
-                        node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
-                        span: source_info.span,
-                    }]
-                    .into_boxed_slice();
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
@@ -6628,8 +6659,21 @@ impl MyOptimizationPass {
                         .expect("missing tag local for PtrDerive dst");
 
                     let parent_from_src: Operand<'tcx> =
-                        if let Some(tl) = tag_local_for_ptr_local.get(&src) {
-                            Operand::Copy(Place::from(*tl))
+                        if let Some(src_tag_local) = tag_local_for_ptr_local.get(&src).copied() {
+                            let selected_src_tag_local = self
+                                .materialize_boundary_recovered_source_tag_local(
+                                    tcx,
+                                    body,
+                                    source_info,
+                                    src,
+                                    src_tag_local,
+                                    export_parent_local_for_ptr_local,
+                                    export_parent_is_recovered_local_for_ptr_local,
+                                    &mut extra_stmts,
+                                );
+                            // Recovered shared refs carry their stable family in export_parent.
+                            // Use that family as the creation parent instead of a stale helper tag.
+                            Operand::Copy(Place::from(selected_src_tag_local))
                         } else if let Some(tl) = ref_ancestor_local_for_ptr_local.get(&src) {
                             Operand::Copy(Place::from(*tl))
                         } else {
