@@ -23,6 +23,111 @@ const CREATION_FLAG_STRICT_RAW_CREATION_CHECK: u8 = 0b0100_0000;
 // Raw-only: this raw pointer came from a deref projection like `(*p).field`.
 const CREATION_FLAG_DEREF_RAW_CREATION: u8 = 0b1000_0000;
 
+#[inline]
+fn copy_local<'tcx>(local: Local) -> Operand<'tcx> {
+    Operand::Copy(Place::from(local))
+}
+
+#[inline]
+fn lower_arg<'tcx>(span: Span, node: Operand<'tcx>) -> Spanned<Operand<'tcx>> {
+    Spanned { node, span }
+}
+
+fn lower_args<'tcx, const N: usize>(
+    span: Span,
+    nodes: [Operand<'tcx>; N],
+) -> Box<[Spanned<Operand<'tcx>>]> {
+    nodes
+        .into_iter()
+        .map(|node| lower_arg(span, node))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[inline]
+fn runtime_func<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, span: Span) -> Operand<'tcx> {
+    Operand::function_handle(tcx, def_id, std::iter::empty(), span)
+}
+
+fn runtime_call_term<'tcx>(
+    source_info: SourceInfo,
+    func: Operand<'tcx>,
+    args: Box<[Spanned<Operand<'tcx>>]>,
+    destination: Place<'tcx>,
+    target: Option<BasicBlock>,
+    call_source: CallSource,
+) -> Terminator<'tcx> {
+    Terminator {
+        source_info,
+        kind: TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            target,
+            unwind: UnwindAction::Continue,
+            call_source,
+            fn_span: source_info.span,
+        },
+    }
+}
+
+fn lower_split_index(len: usize, stmt_idx: usize, insert_before: bool) -> usize {
+    if stmt_idx >= len {
+        len
+    } else if insert_before {
+        stmt_idx
+    } else {
+        stmt_idx + 1
+    }
+}
+
+fn set_runtime_call_at_split<'tcx>(
+    body: &mut Body<'tcx>,
+    bb: BasicBlock,
+    stmt_idx: usize,
+    insert_before: bool,
+    mut pre_call_stmts: Vec<Statement<'tcx>>,
+    term: Terminator<'tcx>,
+) -> Vec<Statement<'tcx>> {
+    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+    let split_at = lower_split_index(bd.statements.len(), stmt_idx, insert_before);
+    let rem = bd.statements.split_off(split_at);
+    bd.statements.append(&mut pre_call_stmts);
+    bd.terminator = Some(term);
+    rem
+}
+
+fn split_block_with_runtime_call<'tcx>(
+    body: &mut Body<'tcx>,
+    bb: BasicBlock,
+    stmt_idx: usize,
+    insert_before: bool,
+    pre_call_stmts: Vec<Statement<'tcx>>,
+    term: impl FnOnce(BasicBlock) -> Terminator<'tcx>,
+) -> BasicBlock {
+    let (orig_term, is_cleanup) = {
+        let bd = &mut body.basic_blocks_mut()[bb];
+        let term = bd.terminator.take();
+        let cleanup = bd.is_cleanup;
+        (term, cleanup)
+    };
+    let cont_block = body
+        .basic_blocks_mut()
+        .push(BasicBlockData::new(orig_term, is_cleanup));
+    let remaining_stmts = set_runtime_call_at_split(
+        body,
+        bb,
+        stmt_idx,
+        insert_before,
+        pre_call_stmts,
+        term(cont_block),
+    );
+    body.basic_blocks_mut()[cont_block]
+        .statements
+        .extend(remaining_stmts);
+    cont_block
+}
+
 impl MyOptimizationPass {
     pub(in crate::instrumentation) fn materialize_size_operand<'tcx>(
         &self,
@@ -1381,81 +1486,40 @@ impl MyOptimizationPass {
                     None
                 };
 
-                let tag_func = Operand::function_handle(
-                    tcx,
-                    hooks.def_id_shadow_load_tag_for_ptr,
-                    std::iter::empty(),
-                    source_info.span,
-                );
-                let tag_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: Operand::Copy(Place::from(ptr_addr_local)),
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
+                let shadow_load_args = || {
+                    lower_args(
+                        source_info.span,
+                        [copy_local(addr_local), copy_local(ptr_addr_local)],
+                    )
+                };
+                let tag_func =
+                    runtime_func(tcx, hooks.def_id_shadow_load_tag_for_ptr, source_info.span);
+                let tag_args = shadow_load_args();
 
-                let ref_func = Operand::function_handle(
+                let ref_func = runtime_func(
                     tcx,
                     hooks.def_id_shadow_load_ref_ancestor_for_ptr,
-                    std::iter::empty(),
                     source_info.span,
                 );
-                let ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: Operand::Copy(Place::from(ptr_addr_local)),
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
+                let ref_args = shadow_load_args();
 
                 let export_parent_func = dst_export_parent_local.map(|_| {
-                    Operand::function_handle(
+                    runtime_func(
                         tcx,
                         hooks.def_id_shadow_load_export_parent_for_ptr,
-                        std::iter::empty(),
                         source_info.span,
                     )
                 });
-                let export_parent_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: Operand::Copy(Place::from(ptr_addr_local)),
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
+                let export_parent_args = shadow_load_args();
 
                 let recovered_func = dst_recovered_local.map(|_| {
-                    Operand::function_handle(
+                    runtime_func(
                         tcx,
                         hooks.def_id_shadow_load_export_parent_recovered_for_ptr,
-                        std::iter::empty(),
                         source_info.span,
                     )
                 });
-                let recovered_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: Operand::Copy(Place::from(ptr_addr_local)),
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
+                let recovered_args = shadow_load_args();
 
                 let final_post_load_block = post_load_block;
                 let recovered_block = dst_recovered_local.map(|_| {
@@ -1469,18 +1533,14 @@ impl MyOptimizationPass {
                 });
                 let ref_target = export_parent_block.unwrap_or(export_parent_target);
 
-                body.basic_blocks_mut()[ref_block].terminator = Some(Terminator {
+                body.basic_blocks_mut()[ref_block].terminator = Some(runtime_call_term(
                     source_info,
-                    kind: TerminatorKind::Call {
-                        func: ref_func,
-                        args: ref_args,
-                        destination: Place::from(dst_ref_ancestor_local),
-                        target: Some(ref_target),
-                        unwind: UnwindAction::Continue,
-                        call_source: CallSource::Misc,
-                        fn_span: source_info.span,
-                    },
-                });
+                    ref_func,
+                    ref_args,
+                    Place::from(dst_ref_ancestor_local),
+                    Some(ref_target),
+                    CallSource::Misc,
+                ));
 
                 if let (
                     Some(export_parent_block),
@@ -1491,35 +1551,28 @@ impl MyOptimizationPass {
                     dst_export_parent_local,
                     export_parent_func,
                 ) {
-                    body.basic_blocks_mut()[export_parent_block].terminator = Some(Terminator {
-                        source_info,
-                        kind: TerminatorKind::Call {
-                            func: export_parent_func,
-                            args: export_parent_args,
-                            destination: Place::from(export_parent_local),
-                            target: Some(export_parent_target),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
+                    body.basic_blocks_mut()[export_parent_block].terminator =
+                        Some(runtime_call_term(
+                            source_info,
+                            export_parent_func,
+                            export_parent_args,
+                            Place::from(export_parent_local),
+                            Some(export_parent_target),
+                            CallSource::Misc,
+                        ));
                 }
 
                 if let (Some(recovered_block), Some(recovered_local), Some(recovered_func)) =
                     (recovered_block, dst_recovered_local, recovered_func)
                 {
-                    body.basic_blocks_mut()[recovered_block].terminator = Some(Terminator {
+                    body.basic_blocks_mut()[recovered_block].terminator = Some(runtime_call_term(
                         source_info,
-                        kind: TerminatorKind::Call {
-                            func: recovered_func,
-                            args: recovered_args,
-                            destination: Place::from(recovered_local),
-                            target: Some(final_post_load_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
+                        recovered_func,
+                        recovered_args,
+                        Place::from(recovered_local),
+                        Some(final_post_load_block),
+                        CallSource::Misc,
+                    ));
                 }
 
                 if let Some(anchor_local) = projected_carrier_anchor {
@@ -1610,39 +1663,19 @@ impl MyOptimizationPass {
                     };
                     // Projected carrier refs get a fresh ref tag for the loaded data pointer
                     // with the carrier anchor as parent.
-                    let materialize_ref_func = Operand::function_handle(
-                        tcx,
-                        hooks.def_id_ref,
-                        std::iter::empty(),
+                    let materialize_ref_func =
+                        runtime_func(tcx, hooks.def_id_ref, source_info.span);
+                    let materialize_ref_args = lower_args(
                         source_info.span,
+                        [
+                            copy_local(materialize_addr_local),
+                            self.const_u8(tcx, source_info.span, is_mut_u8),
+                            copy_local(anchor_local),
+                            self.const_u8(tcx, source_info.span, alias_flags),
+                            arg_bounds_len,
+                            arg_align,
+                        ],
                     );
-                    let materialize_ref_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                        Spanned {
-                            node: Operand::Copy(Place::from(materialize_addr_local)),
-                            span: source_info.span,
-                        },
-                        Spanned {
-                            node: self.const_u8(tcx, source_info.span, is_mut_u8),
-                            span: source_info.span,
-                        },
-                        Spanned {
-                            node: Operand::Copy(Place::from(anchor_local)),
-                            span: source_info.span,
-                        },
-                        Spanned {
-                            node: self.const_u8(tcx, source_info.span, alias_flags),
-                            span: source_info.span,
-                        },
-                        Spanned {
-                            node: arg_bounds_len,
-                            span: source_info.span,
-                        },
-                        Spanned {
-                            node: arg_align,
-                            span: source_info.span,
-                        },
-                    ]
-                    .into_boxed_slice();
                     let materialize_bd = &mut body.basic_blocks_mut()[materialize_call_block];
                     if let Some(stmt) = materialize_addr_stmt1_opt {
                         materialize_bd.statements.push(stmt);
@@ -1654,18 +1687,14 @@ impl MyOptimizationPass {
                     if !align_stmts.is_empty() {
                         materialize_bd.statements.append(&mut align_stmts);
                     }
-                    materialize_bd.terminator = Some(Terminator {
+                    materialize_bd.terminator = Some(runtime_call_term(
                         source_info,
-                        kind: TerminatorKind::Call {
-                            func: materialize_ref_func,
-                            args: materialize_ref_args,
-                            destination: Place::from(dst_ptr_state.tag_local),
-                            target: Some(materialize_cont_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
+                        materialize_ref_func,
+                        materialize_ref_args,
+                        Place::from(dst_ptr_state.tag_local),
+                        Some(materialize_cont_block),
+                        CallSource::Misc,
+                    ));
 
                     body.basic_blocks_mut()[post_load_block]
                         .statements
@@ -1700,11 +1729,7 @@ impl MyOptimizationPass {
                         if require_tag {
                             (
                                 hooks.def_id_require_loaded_ptr_tag,
-                                vec![Spanned {
-                                    node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
-                                    span: source_info.span,
-                                }]
-                                .into_boxed_slice(),
+                                lower_args(source_info.span, [copy_local(dst_ptr_state.tag_local)]),
                             )
                         } else {
                             let export_parent_op = dst_export_parent_local
@@ -1715,81 +1740,51 @@ impl MyOptimizationPass {
                                 .unwrap_or_else(|| self.const_u8(tcx, source_info.span, 0));
                             (
                                 hooks.def_id_validate_loaded_ref_tag,
-                                vec![
-                                    Spanned {
-                                        node: Operand::Copy(Place::from(dst_ptr_state.tag_local)),
-                                        span: source_info.span,
-                                    },
-                                    Spanned {
-                                        node: export_parent_op,
-                                        span: source_info.span,
-                                    },
-                                    Spanned {
-                                        node: recovered_op,
-                                        span: source_info.span,
-                                    },
-                                    Spanned {
-                                        node: Operand::Copy(Place::from(ptr_addr_local)),
-                                        span: source_info.span,
-                                    },
-                                ]
-                                .into_boxed_slice(),
+                                lower_args(
+                                    source_info.span,
+                                    [
+                                        copy_local(dst_ptr_state.tag_local),
+                                        export_parent_op,
+                                        recovered_op,
+                                        copy_local(ptr_addr_local),
+                                    ],
+                                ),
                             )
                         };
-                    let validate_func = Operand::function_handle(
-                        tcx,
-                        validate_def_id,
-                        std::iter::empty(),
-                        source_info.span,
-                    );
+                    let validate_func = runtime_func(tcx, validate_def_id, source_info.span);
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                    body.basic_blocks_mut()[validate_block].terminator = Some(Terminator {
+                    body.basic_blocks_mut()[validate_block].terminator = Some(runtime_call_term(
                         source_info,
-                        kind: TerminatorKind::Call {
-                            func: validate_func,
-                            args: validate_args,
-                            destination: Place::from(tmp_unit),
-                            target: Some(cont_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
+                        validate_func,
+                        validate_args,
+                        Place::from(tmp_unit),
+                        Some(cont_block),
+                        CallSource::Misc,
+                    ));
                 }
 
-                let remaining_stmts = {
-                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                    let len = bd.statements.len();
-                    let split_at = if stmt_idx >= len {
-                        len
-                    } else if ip.insert_before {
-                        stmt_idx
-                    } else {
-                        stmt_idx + 1
-                    };
-                    let rem = bd.statements.split_off(split_at);
-                    bd.statements.push(slot_addr_stmt1);
-                    bd.statements.push(slot_addr_stmt2);
-                    if let Some(ptr_addr_stmt1) = ptr_addr_stmt1_opt {
-                        bd.statements.push(ptr_addr_stmt1);
-                    }
-                    bd.statements.push(ptr_addr_stmt2);
-                    bd.terminator = Some(Terminator {
+                let mut pre_call_stmts = vec![slot_addr_stmt1, slot_addr_stmt2];
+                if let Some(ptr_addr_stmt1) = ptr_addr_stmt1_opt {
+                    pre_call_stmts.push(ptr_addr_stmt1);
+                }
+                pre_call_stmts.push(ptr_addr_stmt2);
+                let remaining_stmts = set_runtime_call_at_split(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    runtime_call_term(
                         source_info,
-                        kind: TerminatorKind::Call {
-                            func: tag_func,
-                            args: tag_args,
-                            destination: Place::from(dst_ptr_state.tag_local),
-                            target: Some(ref_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
-                    rem
-                };
+                        tag_func,
+                        tag_args,
+                        Place::from(dst_ptr_state.tag_local),
+                        Some(ref_block),
+                        CallSource::Misc,
+                    ),
+                );
 
                 body.basic_blocks_mut()[cont_block]
                     .statements
@@ -1828,68 +1823,34 @@ impl MyOptimizationPass {
                 let tmp_unit = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                let copy_func = Operand::function_handle(
-                    tcx,
-                    hooks.def_id_shadow_copy_slot,
-                    std::iter::empty(),
+                let copy_func = runtime_func(tcx, hooks.def_id_shadow_copy_slot, source_info.span);
+                let copy_args = lower_args(
                     source_info.span,
+                    [copy_local(dst_addr_local), copy_local(src_addr_local)],
                 );
-                let copy_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(dst_addr_local)),
-                        span: source_info.span,
+
+                split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    vec![
+                        dst_addr_stmt1,
+                        dst_addr_stmt2,
+                        src_addr_stmt1,
+                        src_addr_stmt2,
+                    ],
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            copy_func,
+                            copy_args,
+                            Place::from(tmp_unit),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
                     },
-                    Spanned {
-                        node: Operand::Copy(Place::from(src_addr_local)),
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
-
-                let (orig_term, is_cleanup) = {
-                    let bd = &mut body.basic_blocks_mut()[bb];
-                    let term = bd.terminator.take();
-                    let cleanup = bd.is_cleanup;
-                    (term, cleanup)
-                };
-
-                let cont_block = body
-                    .basic_blocks_mut()
-                    .push(BasicBlockData::new(orig_term, is_cleanup));
-
-                let remaining_stmts = {
-                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                    let len = bd.statements.len();
-                    let split_at = if stmt_idx >= len {
-                        len
-                    } else if ip.insert_before {
-                        stmt_idx
-                    } else {
-                        stmt_idx + 1
-                    };
-                    let rem = bd.statements.split_off(split_at);
-                    bd.statements.push(dst_addr_stmt1);
-                    bd.statements.push(dst_addr_stmt2);
-                    bd.statements.push(src_addr_stmt1);
-                    bd.statements.push(src_addr_stmt2);
-                    bd.terminator = Some(Terminator {
-                        source_info,
-                        kind: TerminatorKind::Call {
-                            func: copy_func,
-                            args: copy_args,
-                            destination: Place::from(tmp_unit),
-                            target: Some(cont_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
-                    rem
-                };
-
-                body.basic_blocks_mut()[cont_block]
-                    .statements
-                    .extend(remaining_stmts);
+                );
                 continue;
             }
 
@@ -1926,73 +1887,40 @@ impl MyOptimizationPass {
                 let tmp_unit = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                let copy_func = Operand::function_handle(
-                    tcx,
-                    hooks.def_id_shadow_copy_range,
-                    std::iter::empty(),
+                let copy_func = runtime_func(tcx, hooks.def_id_shadow_copy_range, source_info.span);
+                let copy_args = lower_args(
                     source_info.span,
+                    [
+                        copy_local(dst_addr_local),
+                        copy_local(src_addr_local),
+                        arg_size,
+                    ],
                 );
-                let copy_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(dst_addr_local)),
-                        span: source_info.span,
+
+                let mut pre_call_stmts = vec![
+                    dst_addr_stmt1,
+                    dst_addr_stmt2,
+                    src_addr_stmt1,
+                    src_addr_stmt2,
+                ];
+                pre_call_stmts.append(&mut size_stmts);
+                split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            copy_func,
+                            copy_args,
+                            Place::from(tmp_unit),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
                     },
-                    Spanned {
-                        node: Operand::Copy(Place::from(src_addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: arg_size,
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
-
-                let (orig_term, is_cleanup) = {
-                    let bd = &mut body.basic_blocks_mut()[bb];
-                    let term = bd.terminator.take();
-                    let cleanup = bd.is_cleanup;
-                    (term, cleanup)
-                };
-
-                let cont_block = body
-                    .basic_blocks_mut()
-                    .push(BasicBlockData::new(orig_term, is_cleanup));
-
-                let remaining_stmts = {
-                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                    let len = bd.statements.len();
-                    let split_at = if stmt_idx >= len {
-                        len
-                    } else if ip.insert_before {
-                        stmt_idx
-                    } else {
-                        stmt_idx + 1
-                    };
-                    let rem = bd.statements.split_off(split_at);
-                    bd.statements.push(dst_addr_stmt1);
-                    bd.statements.push(dst_addr_stmt2);
-                    bd.statements.push(src_addr_stmt1);
-                    bd.statements.push(src_addr_stmt2);
-                    bd.statements.append(&mut size_stmts);
-                    bd.terminator = Some(Terminator {
-                        source_info,
-                        kind: TerminatorKind::Call {
-                            func: copy_func,
-                            args: copy_args,
-                            destination: Place::from(tmp_unit),
-                            target: Some(cont_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
-                    rem
-                };
-
-                body.basic_blocks_mut()[cont_block]
-                    .statements
-                    .extend(remaining_stmts);
+                );
                 continue;
             }
 
@@ -2044,78 +1972,35 @@ impl MyOptimizationPass {
                 } else {
                     self.const_u8(tcx, source_info.span, 0)
                 };
-                let store_func = Operand::function_handle(
-                    tcx,
-                    hooks.def_id_shadow_store_ptr,
-                    std::iter::empty(),
+                let store_func = runtime_func(tcx, hooks.def_id_shadow_store_ptr, source_info.span);
+                let store_args = lower_args(
                     source_info.span,
+                    [
+                        copy_local(dst_addr_local),
+                        tag_op,
+                        ref_ancestor_op,
+                        export_parent_op,
+                        recovered_op,
+                    ],
                 );
-                let store_args: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(dst_addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: tag_op,
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: ref_ancestor_op,
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: export_parent_op,
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: recovered_op,
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
 
-                let (orig_term, is_cleanup) = {
-                    let bd = &mut body.basic_blocks_mut()[bb];
-                    let term = bd.terminator.take();
-                    let cleanup = bd.is_cleanup;
-                    (term, cleanup)
-                };
-
-                let cont_block = body
-                    .basic_blocks_mut()
-                    .push(BasicBlockData::new(orig_term, is_cleanup));
-
-                let remaining_stmts = {
-                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
-                    let len = bd.statements.len();
-                    let split_at = if stmt_idx >= len {
-                        len
-                    } else if ip.insert_before {
-                        stmt_idx
-                    } else {
-                        stmt_idx + 1
-                    };
-                    let rem = bd.statements.split_off(split_at);
-                    bd.statements.push(dst_addr_stmt1);
-                    bd.statements.push(dst_addr_stmt2);
-                    bd.terminator = Some(Terminator {
-                        source_info,
-                        kind: TerminatorKind::Call {
-                            func: store_func,
-                            args: store_args,
-                            destination: Place::from(tmp_unit),
-                            target: Some(cont_block),
-                            unwind: UnwindAction::Continue,
-                            call_source: CallSource::Misc,
-                            fn_span: source_info.span,
-                        },
-                    });
-                    rem
-                };
-
-                body.basic_blocks_mut()[cont_block]
-                    .statements
-                    .extend(remaining_stmts);
+                split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    vec![dst_addr_stmt1, dst_addr_stmt2],
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            store_func,
+                            store_args,
+                            Place::from(tmp_unit),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
+                    },
+                );
                 continue;
             }
 
@@ -2221,14 +2106,13 @@ impl MyOptimizationPass {
                         .append(&mut align_stmts);
                 }
 
-                let root_func = Operand::function_handle(
+                let root_func = runtime_func(
                     tcx,
                     if raw_root_is_ref {
                         hooks.def_id_ref
                     } else {
                         hooks.def_id_raw
                     },
-                    std::iter::empty(),
                     source_info.span,
                 );
                 let mut root_alias_flags = if alias_exempt {
@@ -2240,46 +2124,26 @@ impl MyOptimizationPass {
                     root_alias_flags |= CREATION_FLAG_EXPOSED_PROVENANCE_ROOT;
                 }
 
-                let args_root: Box<[Spanned<Operand<'tcx>>]> = vec![
-                    Spanned {
-                        node: Operand::Copy(Place::from(addr_local)),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: self.const_u8(tcx, source_info.span, is_mut_u8),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: self.const_u64(tcx, source_info.span, 0),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: self.const_u8(tcx, source_info.span, root_alias_flags),
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: arg_bounds_len,
-                        span: source_info.span,
-                    },
-                    Spanned {
-                        node: arg_align,
-                        span: source_info.span,
-                    },
-                ]
-                .into_boxed_slice();
+                let args_root = lower_args(
+                    source_info.span,
+                    [
+                        copy_local(addr_local),
+                        self.const_u8(tcx, source_info.span, is_mut_u8),
+                        self.const_u64(tcx, source_info.span, 0),
+                        self.const_u8(tcx, source_info.span, root_alias_flags),
+                        arg_bounds_len,
+                        arg_align,
+                    ],
+                );
 
-                body.basic_blocks_mut()[call_bb].terminator = Some(Terminator {
+                body.basic_blocks_mut()[call_bb].terminator = Some(runtime_call_term(
                     source_info,
-                    kind: TerminatorKind::Call {
-                        func: root_func,
-                        args: args_root,
-                        destination: Place::from(dst_tag),
-                        target: Some(cont_bb),
-                        unwind: UnwindAction::Continue,
-                        call_source: CallSource::Normal,
-                        fn_span: source_info.span,
-                    },
-                });
+                    root_func,
+                    args_root,
+                    Place::from(dst_tag),
+                    Some(cont_bb),
+                    CallSource::Normal,
+                ));
 
                 if let Some(dst_ref_ancestor_local) =
                     ref_ancestor_local_for_ptr_local.get(&ptr_local).copied()
