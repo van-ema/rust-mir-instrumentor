@@ -21,14 +21,6 @@ impl MyOptimizationPass {
             .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
     }
 
-    pub(in crate::instrumentation) fn ret_take_enabled(&self) -> bool {
-        true
-    }
-
-    pub(in crate::instrumentation) fn ret_push_enabled(&self) -> bool {
-        true
-    }
-
     pub(in crate::instrumentation) fn use_storage_dead_enabled(&self) -> bool {
         std::env::var("RZ_USE_STORAGE_DEAD")
             .ok()

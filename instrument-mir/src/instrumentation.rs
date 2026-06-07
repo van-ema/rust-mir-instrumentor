@@ -510,9 +510,7 @@ impl MyOptimizationPass {
 
                 if let TerminatorKind::Return = &term.kind {
                     let callee_id = self.callee_id_u64(tcx, body.source.def_id());
-                    if self.ret_push_enabled()
-                        && self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty())
-                    {
+                    if self.supports_call_boundary_ret_tag_ty(tcx, body, body.return_ty()) {
                         ptr_locals_needing_tag.insert(RETURN_PLACE);
                         insert_points.push(InsertPoint {
                             bb,

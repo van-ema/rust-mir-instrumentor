@@ -1296,7 +1296,6 @@ impl MyOptimizationPass {
         };
         let unresolved_indirect_call =
             callee_id_opt.is_none() && matches!(func.ty(body, tcx).kind(), TyKind::FnPtr(..));
-        let ret_take_enabled = self.ret_take_enabled();
 
         // 6a: Remove is_plain_store/is_plain_load computation.
 
@@ -1935,9 +1934,8 @@ impl MyOptimizationPass {
                     if !call_is_black_box {
                         if let Some(dst_local) = destination.as_local() {
                             let dst_ty = body.local_decls[dst_local].ty;
-                            let prefer_return_boundary_for_ref = callee_instrumented
-                                && ret_take_enabled
-                                && matches!(dst_ty.kind(), TyKind::Ref(..));
+                            let prefer_return_boundary_for_ref =
+                                callee_instrumented && matches!(dst_ty.kind(), TyKind::Ref(..));
                             let src_arg_index = callee_path_opt
                                 .as_deref()
                                 .map(|p| self.ptr_derive_source_arg_index(p))
@@ -2838,56 +2836,7 @@ impl MyOptimizationPass {
                 {
                     // Already modeled by the local PtrDerive insertion above.
                 } else if callee_instrumented {
-                    if !ret_take_enabled {
-                        let is_mut = match dst_ty.kind() {
-                            TyKind::Ref(_, _ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                            TyKind::RawPtr(_ty, mutbl) => matches!(mutbl, Mutability::Mut),
-                            _ => false,
-                        };
-                        let is_ref = matches!(dst_ty.kind(), TyKind::Ref(..));
-
-                        ptr_locals_needing_tag.insert(dst_local);
-                        tagged_ptr_locals.insert(dst_local);
-                        if let Some(tgt_bb) = call_target_bb {
-                            insert_points.push(InsertPoint {
-                                bb: tgt_bb,
-                                stmt_idx: 0,
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::RetRoot {
-                                    dst_local,
-                                    is_mut,
-                                    is_ref,
-                                },
-                            });
-                            if self.is_shadowable_ptr_ty(tcx, body, dst_ty) {
-                                insert_points.push(InsertPoint {
-                                    bb: tgt_bb,
-                                    stmt_idx: 0,
-                                    insert_before: true,
-                                    source_info: term.source_info,
-                                    place: Place::from(dst_local),
-                                    kind: InstrKind::ShadowStore {
-                                        src_local: dst_local,
-                                    },
-                                });
-                            }
-                        } else {
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: Place::from(dst_local),
-                                kind: InstrKind::RetRoot {
-                                    dst_local,
-                                    is_mut,
-                                    is_ref,
-                                },
-                            });
-                        }
-                    } else if let Some(callee_id) = callee_id_opt {
+                    if let Some(callee_id) = callee_id_opt {
                         ptr_locals_needing_tag.insert(dst_local);
                         tagged_ptr_locals.insert(dst_local);
                         insert_points.push(InsertPoint {
