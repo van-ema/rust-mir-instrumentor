@@ -1580,7 +1580,12 @@ fn rz_check_alignment(
         return;
     }
 
-    if guaranteed_align != 0 && guaranteed_align < required_align {
+    let concrete_aligned = addr != 0 && addr % required_align == 0;
+    let live_heap_aligned = concrete_aligned
+        && lookup_alloc_snapshot(addr)
+            .is_some_and(|(_, meta)| meta.live && !meta.is_stack && !meta.is_const);
+
+    if guaranteed_align != 0 && guaranteed_align < required_align && !live_heap_aligned {
         let mut msg = format!(
             "{access_name} via tag={tag} addr=0x{addr:x} size={size}\nrequired_alignment={required_align} guaranteed_alignment={guaranteed_align}"
         );
@@ -1599,7 +1604,9 @@ fn rz_check_alignment(
         return;
     }
 
-    if addr == 0 || addr % required_align == 0 {
+    // Heap raws are checked dynamically: a weak tag alignment is not a violation when the
+    // concrete live heap address satisfies the access alignment.
+    if addr == 0 || concrete_aligned {
         return;
     }
 
@@ -1725,26 +1732,6 @@ fn restore_leaf_shadow(slot_addr: usize, shadow: Option<PtrShadowTransport>) {
     );
 }
 
-fn report_stale_return_ref_leaf_shadow(slot_addr: usize) {
-    let stale_tag = ptr_shadow::load_tag(slot_addr);
-    if stale_tag == 0 {
-        return;
-    }
-    let ptr_addr = shadow_slot_value_addr(slot_addr);
-    let tag_pointee = tag_store::get(stale_tag)
-        .map(|meta| meta.pointee_addr)
-        .unwrap_or(0);
-    rz_violation(
-        "WILD_POINTER",
-        append_location_if_enabled(
-            format!(
-                "RET stale ref leaf shadow slot=0x{slot_addr:x} ptr=0x{ptr_addr:x} tag={stale_tag} tag_pointee=0x{tag_pointee:x}\nreason=STALE_RETURN_REF_LEAF_SHADOW"
-            ),
-            "RZ_LOG_LOC",
-        ),
-    );
-}
-
 fn recovered_return_ref_leaf_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
     let ptr_addr = shadow_slot_value_addr(slot_addr);
     if ptr_addr == 0 {
@@ -1771,7 +1758,6 @@ fn canonical_return_leaf_shadow(slot_addr: usize, leaf_is_ref: bool) -> PtrShado
             if let Some(shadow) = recovered_return_ref_leaf_shadow(slot_addr) {
                 return shadow;
             }
-            report_stale_return_ref_leaf_shadow(slot_addr);
         }
         return (0, 0, 0, 0);
     };
