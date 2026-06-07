@@ -5145,6 +5145,9 @@ fn tag_epoch_matches_current_addr(
     stack_or_tls_addr: bool,
     allow_epochless_exact: bool,
 ) -> bool {
+    if bounds_len_is_precise_empty(meta.bounds_len) {
+        return true;
+    }
     if alloc_epoch != 0 {
         meta.alloc_epoch == alloc_epoch || (stack_or_tls_addr && meta.alloc_epoch == 0)
     } else {
@@ -5163,8 +5166,15 @@ fn ref_bounds_cover_ptr_value(meta: &TagMeta, ptr_addr: usize) -> bool {
     ptr_addr >= meta.pointee_addr && ptr_addr < end
 }
 
-fn ref_tag_match_rank_for_ptr_value(meta: &TagMeta, ptr_addr: usize) -> Option<u8> {
+fn ref_tag_match_rank_for_ptr_value(
+    meta: &TagMeta,
+    ptr_addr: usize,
+    expected_kind: Option<PtrKind>,
+) -> Option<u8> {
     if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return None;
+    }
+    if expected_kind.is_some_and(|kind| meta.kind != kind) {
         return None;
     }
     if meta.pointee_addr == ptr_addr {
@@ -5191,6 +5201,13 @@ fn ref_tag_match_rank_for_ptr_value(meta: &TagMeta, ptr_addr: usize) -> Option<u
 }
 
 fn recover_live_ref_boundary_tag_for_ptr_value(addr: usize) -> u64 {
+    recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, None)
+}
+
+fn recover_live_ref_boundary_tag_for_ptr_value_with_kind(
+    addr: usize,
+    expected_kind: Option<PtrKind>,
+) -> u64 {
     if addr == 0 {
         return 0;
     }
@@ -5206,7 +5223,7 @@ fn recover_live_ref_boundary_tag_for_ptr_value(addr: usize) -> u64 {
     {
         let tmap = tags().lock().unwrap();
         for (tag, meta) in tmap.iter() {
-            let Some(rank) = ref_tag_match_rank_for_ptr_value(meta, addr) else {
+            let Some(rank) = ref_tag_match_rank_for_ptr_value(meta, addr, expected_kind) else {
                 continue;
             };
             if rank == 2
@@ -5445,6 +5462,47 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
     tag
 }
 
+fn valid_or_recovered_call_arg_tag(addr: usize, tag: u64, allow_mut_recovery: bool) -> u64 {
+    let original_kind = tag_store::get(tag).map(|meta| meta.kind);
+    let canonical_tag = canonical_call_arg_tag(addr, tag);
+    let Some(expected_kind @ (PtrKind::RefShared | PtrKind::RefMut)) = original_kind else {
+        return canonical_tag;
+    };
+    let Some(meta) = tag_store::get(canonical_tag) else {
+        return tag;
+    };
+    if meta.kind == expected_kind && rz_ref_boundary_tag_is_valid(canonical_tag) {
+        if expected_kind == PtrKind::RefMut && !allow_mut_recovery && canonical_tag != tag {
+            return tag;
+        }
+        return canonical_tag;
+    }
+    if expected_kind == PtrKind::RefMut && !allow_mut_recovery {
+        return tag;
+    }
+
+    // A call boundary must not export a stale ref tag. Recover a live ref of the
+    // same kind for the concrete pointer value; otherwise leave validation on the
+    // original tag so real dead-provenance exports still report.
+    let recovered =
+        recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, Some(expected_kind));
+    if recovered != 0 {
+        return recovered;
+    }
+
+    tag
+}
+
+fn validate_call_arg_boundary_tag(tag: u64) {
+    let Some(meta) = tag_store::get(tag) else {
+        return;
+    };
+    if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return;
+    }
+    rz_validate_ref_boundary_use(tag, "CALL_ARG");
+}
+
 fn call_arg_boundary_entry(
     addr: usize,
     exact_tag: u64,
@@ -5460,21 +5518,21 @@ fn call_arg_boundary_entry(
     };
     let tag = if recovered_origin {
         let projected_ref_tag = recover_projected_ref_boundary_tag(addr, boundary_parent_tag);
-        let canonical_tag = canonical_call_arg_tag(
+        let tag = valid_or_recovered_call_arg_tag(
             addr,
             if projected_ref_tag != 0 {
                 projected_ref_tag
             } else {
                 boundary_parent_tag
             },
+            true,
         );
-        if rz_ref_boundary_tag_is_valid(canonical_tag) {
-            rz_validate_ref_boundary_use(canonical_tag, "CALL_ARG");
-        }
-        canonical_tag
+        validate_call_arg_boundary_tag(tag);
+        tag
     } else {
-        rz_validate_ref_boundary_use(exact_tag, "CALL_ARG");
-        canonical_call_arg_tag(addr, exact_tag)
+        let tag = valid_or_recovered_call_arg_tag(addr, exact_tag, false);
+        validate_call_arg_boundary_tag(tag);
+        tag
     };
     CallArgTagEntry { tag, flags }
 }
