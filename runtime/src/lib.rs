@@ -377,7 +377,7 @@ fn rz_abort_on_violation() -> bool {
 }
 
 #[inline]
-fn rz_stack_addr_hint(addr: usize) -> bool {
+pub(crate) fn rz_stack_addr_hint(addr: usize) -> bool {
     // Heuristic: treat addresses within +/-8MiB of the current stack pointer as stack.
     let local = 0u8;
     let sp = &local as *const u8 as usize;
@@ -1693,6 +1693,38 @@ fn current_slot_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
     (shadow.0 != 0 || shadow.1 != 0 || shadow.2 != 0).then_some(shadow)
 }
 
+fn shadow_is_present(shadow: PtrShadowTransport) -> bool {
+    shadow.0 != 0 || shadow.1 != 0 || shadow.2 != 0
+}
+
+fn matching_leaf_shadow(
+    slot_addr: usize,
+    shadow: PtrShadowTransport,
+) -> Option<PtrShadowTransport> {
+    if !shadow_is_present(shadow) {
+        return None;
+    }
+    let sanitized =
+        sanitize_shadow_entry_for_slot_value(slot_addr, shadow.0, shadow.1, shadow.2, shadow.3);
+    shadow_is_present(sanitized).then_some(sanitized)
+}
+
+fn restore_leaf_shadow(slot_addr: usize, shadow: Option<PtrShadowTransport>) {
+    let Some((tag, ref_ancestor, export_parent, export_parent_recovered)) =
+        shadow.and_then(|shadow| matching_leaf_shadow(slot_addr, shadow))
+    else {
+        return;
+    };
+    // Leaf side-channels repair missing metadata; they do not model a byte write.
+    ptr_shadow::store_ptr(
+        slot_addr,
+        tag,
+        ref_ancestor,
+        export_parent,
+        export_parent_recovered,
+    );
+}
+
 fn report_stale_return_ref_leaf_shadow(slot_addr: usize) {
     let stale_tag = ptr_shadow::load_tag(slot_addr);
     if stale_tag == 0 {
@@ -1713,11 +1745,32 @@ fn report_stale_return_ref_leaf_shadow(slot_addr: usize) {
     );
 }
 
+fn recovered_return_ref_leaf_shadow(slot_addr: usize) -> Option<PtrShadowTransport> {
+    let ptr_addr = shadow_slot_value_addr(slot_addr);
+    if ptr_addr == 0 {
+        return None;
+    }
+    let tag = recover_live_ref_boundary_tag_for_ptr_value(ptr_addr);
+    if tag != 0 {
+        if rz_trace_call_tags_enabled() {
+            eprintln!(
+                "[rusteze-runtime][call-tag] recover ret leaf slot=0x{:x} ptr=0x{:x} tag={}",
+                slot_addr, ptr_addr, tag
+            );
+        }
+        return Some((tag, tag, tag, 0));
+    }
+    None
+}
+
 fn canonical_return_leaf_shadow(slot_addr: usize, leaf_is_ref: bool) -> PtrShadowTransport {
     let Some((tag, ref_ancestor, export_parent, export_parent_recovered)) =
         current_slot_shadow(slot_addr)
     else {
         if leaf_is_ref {
+            if let Some(shadow) = recovered_return_ref_leaf_shadow(slot_addr) {
+                return shadow;
+            }
             report_stale_return_ref_leaf_shadow(slot_addr);
         }
         return (0, 0, 0, 0);
@@ -1759,7 +1812,7 @@ fn scoped_call_arg_leaf_shadow(
         }
         found?
     };
-    Some(current_slot_shadow(slot_addr).unwrap_or(scoped))
+    current_slot_shadow(slot_addr).or_else(|| matching_leaf_shadow(slot_addr, scoped))
 }
 
 fn clear_unconsumed_call_arg_leaf_shadows(callee_id: u64) {
@@ -3209,10 +3262,8 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
             dst_slot_addr, src_slot_addr
         );
     }
-    let tag = ptr_shadow::load_tag(src_slot_addr);
-    let ref_ancestor = ptr_shadow::load_ref_ancestor(src_slot_addr);
-    let export_parent = ptr_shadow::load_export_parent(src_slot_addr);
-    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(src_slot_addr);
+    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
+        current_slot_shadow(src_slot_addr).unwrap_or((0, 0, 0, 0));
     let (tag, ref_ancestor, export_parent, export_parent_recovered) =
         sanitize_shadow_entry_for_slot_value(
             dst_slot_addr,
@@ -5087,6 +5138,109 @@ fn recover_oldest_live_boundary_tag(addr: usize) -> u64 {
     0
 }
 
+#[inline]
+fn tag_epoch_matches_current_addr(
+    meta: &TagMeta,
+    alloc_epoch: u64,
+    stack_or_tls_addr: bool,
+    allow_epochless_exact: bool,
+) -> bool {
+    if alloc_epoch != 0 {
+        meta.alloc_epoch == alloc_epoch || (stack_or_tls_addr && meta.alloc_epoch == 0)
+    } else {
+        allow_epochless_exact && meta.alloc_epoch == 0
+    }
+}
+
+#[inline]
+fn ref_bounds_cover_ptr_value(meta: &TagMeta, ptr_addr: usize) -> bool {
+    if !bounds_len_has_explicit_byte_bounds(meta.bounds_len) {
+        return true;
+    }
+    let Some(end) = meta.pointee_addr.checked_add(meta.bounds_len) else {
+        return false;
+    };
+    ptr_addr >= meta.pointee_addr && ptr_addr < end
+}
+
+fn ref_tag_match_rank_for_ptr_value(meta: &TagMeta, ptr_addr: usize) -> Option<u8> {
+    if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return None;
+    }
+    if meta.pointee_addr == ptr_addr {
+        return Some(2);
+    }
+    if meta.pointee_addr == 0 || ptr_addr == 0 || !ref_bounds_cover_ptr_value(meta, ptr_addr) {
+        return None;
+    }
+
+    let Some((tag_base, tag_alloc)) = lookup_alloc_snapshot(meta.pointee_addr) else {
+        return None;
+    };
+    let Some((ptr_base, ptr_alloc)) = lookup_alloc_snapshot(ptr_addr) else {
+        return None;
+    };
+
+    // A ref view can move within the same live allocation, but stale epochs must not match.
+    (tag_alloc.live
+        && ptr_alloc.live
+        && tag_base == ptr_base
+        && (tag_alloc.epoch == ptr_alloc.epoch || tag_alloc.epoch == 0 || ptr_alloc.epoch == 0)
+        && (meta.alloc_epoch == ptr_alloc.epoch || meta.alloc_epoch == 0 || ptr_alloc.epoch == 0))
+        .then_some(1)
+}
+
+fn recover_live_ref_boundary_tag_for_ptr_value(addr: usize) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let alloc_epoch = lookup_alloc_snapshot(addr)
+        .map(|(_base, meta)| meta.epoch)
+        .unwrap_or(0);
+    let stack_or_tls_addr = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
+    let allow_epochless_exact = alloc_epoch == 0 && stack_or_tls_addr;
+
+    let mut exact_candidates: Vec<u64> = Vec::new();
+    let mut view_candidates: Vec<u64> = Vec::new();
+    {
+        let tmap = tags().lock().unwrap();
+        for (tag, meta) in tmap.iter() {
+            let Some(rank) = ref_tag_match_rank_for_ptr_value(meta, addr) else {
+                continue;
+            };
+            if rank == 2
+                && !tag_epoch_matches_current_addr(
+                    meta,
+                    alloc_epoch,
+                    stack_or_tls_addr,
+                    allow_epochless_exact,
+                )
+            {
+                continue;
+            }
+            if rank == 2 {
+                exact_candidates.push(*tag);
+            } else {
+                view_candidates.push(*tag);
+            }
+        }
+    }
+
+    exact_candidates.sort_unstable_by(|a, b| b.cmp(a));
+    view_candidates.sort_unstable_by(|a, b| b.cmp(a));
+
+    for tag in exact_candidates
+        .into_iter()
+        .chain(view_candidates.into_iter())
+    {
+        if rz_ref_boundary_tag_is_valid(tag) {
+            return tag;
+        }
+    }
+    0
+}
+
 fn recover_newest_exact_slot_tag(addr: usize) -> u64 {
     if addr == 0 {
         return 0;
@@ -5433,7 +5587,9 @@ pub extern "C" fn __rz_push_indirect_call_arg_leaf_shadow(
     slot_addr: usize,
 ) {
     let _g = RzRuntimeGuard::enter();
-    let shadow = current_slot_shadow(slot_addr).unwrap_or((0, 0, 0, 0));
+    let Some(shadow) = current_slot_shadow(slot_addr) else {
+        return;
+    };
     if rz_trace_call_tags_enabled() {
         eprintln!(
             "[rusteze-runtime][call-tag] push indirect leaf arg={} leaf={} slot=0x{:x} tag={}",
@@ -5470,7 +5626,9 @@ pub extern "C" fn __rz_push_call_arg_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let shadow = current_slot_shadow(slot_addr).unwrap_or((0, 0, 0, 0));
+    let Some(shadow) = current_slot_shadow(slot_addr) else {
+        return;
+    };
     call_arg_leaf_shadows().lock().unwrap().insert(
         (thread_id, callee_id, arg_index, leaf_key),
         (slot_addr, shadow),
@@ -5633,8 +5791,7 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
 
 /// Restore one exact pointer-leaf shadow into an argument slot.
 ///
-/// If no exact or activation-scoped structural leaf fact exists, the slot becomes untracked
-/// instead of inheriting stale shadow from an older stack occupant.
+/// Missing or stale side-channel facts are ignored; real byte writes clear shadow separately.
 #[no_mangle]
 pub extern "C" fn __rz_take_call_arg_leaf_shadow(
     callee_id: u64,
@@ -5662,17 +5819,8 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
             })
             .map(|(_slot_addr, shadow)| shadow)
     })
-    .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr))
-    .or_else(|| current_slot_shadow(slot_addr));
-    let (tag, ref_ancestor, export_parent, export_parent_recovered) =
-        shadow.unwrap_or((0, 0, 0, 0));
-    ptr_shadow::store_ptr(
-        slot_addr,
-        tag,
-        ref_ancestor,
-        export_parent,
-        export_parent_recovered,
-    );
+    .or_else(|| scoped_call_arg_leaf_shadow(thread_id, leaf_key, slot_addr));
+    restore_leaf_shadow(slot_addr, shadow);
 }
 
 /// Export the post-call family for a non-pointer carrier pointee mutated through `&mut T`.
@@ -5765,10 +5913,11 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     slot_addr: usize,
 ) {
     let _g = RzRuntimeGuard::enter();
-    let tag = ptr_shadow::load_tag(slot_addr);
-    let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
-    let export_parent = ptr_shadow::load_export_parent(slot_addr);
-    let export_parent_recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
+    let Some((tag, ref_ancestor, export_parent, export_parent_recovered)) =
+        current_slot_shadow(slot_addr)
+    else {
+        return;
+    };
     if active_alias_model().name() == "sb_lite" {
         rz_validate_ref_boundary_use(tag, "RET");
     }
@@ -5796,18 +5945,11 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 ) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor, export_parent, export_parent_recovered) = mut_arg_ret_leaf_shadows()
+    let shadow = mut_arg_ret_leaf_shadows()
         .lock()
         .unwrap()
-        .remove(&(thread_id, callee_id, arg_index, addr, leaf_key))
-        .unwrap_or((0, 0, 0, 0));
-    ptr_shadow::store_ptr(
-        slot_addr,
-        tag,
-        ref_ancestor,
-        export_parent,
-        export_parent_recovered,
-    );
+        .remove(&(thread_id, callee_id, arg_index, addr, leaf_key));
+    restore_leaf_shadow(slot_addr, shadow);
     clear_boundary_survivor_tags(callee_id);
 }
 
@@ -5833,8 +5975,11 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(
     leaf_is_ref: u8,
 ) {
     let _g = RzRuntimeGuard::enter();
-    let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) =
-        canonical_return_leaf_shadow(slot_addr, leaf_is_ref != 0);
+    let shadow = canonical_return_leaf_shadow(slot_addr, leaf_is_ref != 0);
+    if !shadow_is_present(shadow) {
+        return;
+    }
+    let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) = shadow;
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
     validate_and_export_return_tag(callee_id, ret_tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();
@@ -5914,18 +6059,11 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
 pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
-    let (tag, ref_ancestor, export_parent, export_parent_recovered) = ret_leaf_shadows()
+    let shadow = ret_leaf_shadows()
         .lock()
         .unwrap()
-        .remove(&(thread_id, callee_id, leaf_key))
-        .unwrap_or((0, 0, 0, 0));
-    ptr_shadow::store_ptr(
-        slot_addr,
-        tag,
-        ref_ancestor,
-        export_parent,
-        export_parent_recovered,
-    );
+        .remove(&(thread_id, callee_id, leaf_key));
+    restore_leaf_shadow(slot_addr, shadow);
     clear_boundary_survivor_tags(callee_id);
 }
 

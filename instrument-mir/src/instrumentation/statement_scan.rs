@@ -114,27 +114,8 @@ impl MyOptimizationPass {
                 byte_copy_src_for_local.remove(&local);
                 self.invalidate_ssa_anchors_for_local(ssa_anchor_for_expr, local);
                 let ty = body.local_decls[local].ty;
-                if (self.is_shadowable_ptr_ty(tcx, body, ty)
-                    || self.ty_contains_pointer_fields(tcx, body, ty, 8))
-                    && !self.should_skip_storage_dead_shadow_kill(
-                        tcx, body, block_data, stmt_idx, local,
-                    )
-                {
-                    // Stack slots for pointer-carrying locals are often reused for unrelated
-                    // scalars later in optimized MIR. Clear any residual ptr-shadow metadata at
-                    // the lifetime boundary so a later non-pointer local cannot inherit stale
-                    // reference/raw lineage from the old occupant.
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx,
-                        insert_before: false,
-                        source_info: stmt.source_info,
-                        place: Place::from(local),
-                        kind: InstrKind::ShadowKill {
-                            size_op: self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span),
-                        },
-                    });
-                }
+                // StorageDead does not write bytes. Shadow is killed by assignments/stores so
+                // overlapping stack locals do not erase each other's live pointer fields.
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
@@ -179,25 +160,8 @@ impl MyOptimizationPass {
             }
             StatementKind::StorageLive(local) => {
                 let ty = body.local_decls[local].ty;
-                if self.is_shadowable_ptr_ty(tcx, body, ty)
-                    || self.ty_contains_pointer_fields(tcx, body, ty, 8)
-                {
-                    // This cleanup is independent from stack-allocation tracking: optimized MIR
-                    // regularly reuses caller-frame stack slots for short-lived callee temps
-                    // such as `NonNull<T>` carriers. Clear any residual ptr-shadow as soon as
-                    // the new local becomes live so projected field copies do not inherit
-                    // stale lineage from the previous occupant.
-                    insert_points.push(InsertPoint {
-                        bb,
-                        stmt_idx,
-                        insert_before: false,
-                        source_info: stmt.source_info,
-                        place: Place::from(local),
-                        kind: InstrKind::ShadowKill {
-                            size_op: self.size_operand_for_ty(tcx, body, ty, stmt.source_info.span),
-                        },
-                    });
-                }
+                // StorageLive reserves a local but does not initialize it. Actual writes below
+                // are responsible for clearing or copying byte-level shadow.
                 if (track_all_stack_allocs || interesting_stack_locals.contains(&local))
                     && (local != RETURN_PLACE || interesting_stack_locals.contains(&local))
                 {
@@ -534,9 +498,7 @@ impl MyOptimizationPass {
                     };
                     if let Some(src_place) = direct_projected_src_place {
                         let src_ty = src_place.ty(&body.local_decls, tcx).ty;
-                        if !src_place.projection.is_empty()
-                            && self.is_pointer_ty(src_ty)
-                        {
+                        if !src_place.projection.is_empty() && self.is_pointer_ty(src_ty) {
                             if self.log_enabled(PassLogLevel::Trace) {
                                 rz_pass_trace!(
                                     self,

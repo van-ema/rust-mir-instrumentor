@@ -1,4 +1,8 @@
-use crate::{lookup_alloc_snapshot, tag_pruning, tag_store, PtrKind};
+use crate::{
+    bounds_len_has_explicit_byte_bounds, lookup_alloc_snapshot, rz_stack_addr_hint, tag_pruning,
+    tag_store, PtrKind,
+};
+use core::ptr;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -82,7 +86,7 @@ fn slot_loc(addr: usize) -> SlotLoc {
                         base,
                         epoch: meta.epoch,
                         offset,
-                        is_stack: meta.is_stack,
+                        is_stack: meta.is_stack || rz_stack_addr_hint(addr),
                     };
                 }
             }
@@ -386,7 +390,7 @@ fn abs_entry_matches(addr: usize, entry: PtrShadowEntry) -> bool {
         let in_bounds =
             meta.size == 0 || addr.saturating_sub(base).saturating_add(PTR_SLOT_BYTES) <= meta.size;
         if entry.alloc_epoch == 0 {
-            return meta.live && meta.is_stack && in_bounds;
+            return meta.live && (meta.is_stack || rz_stack_addr_hint(addr)) && in_bounds;
         }
         meta.live && base == entry.alloc_base && meta.epoch == entry.alloc_epoch && in_bounds
     })
@@ -429,35 +433,131 @@ fn load_entry(addr: usize) -> Option<PtrShadowEntry> {
 }
 
 #[inline]
-fn entry_matches_ptr_value(entry: PtrShadowEntry, ptr_addr: usize) -> bool {
-    if entry.tag == 0 {
-        return false;
+fn ptr_value_at_slot(slot_start: usize) -> usize {
+    if slot_start == 0 {
+        return 0;
     }
-    tag_store::get(entry.tag).is_some_and(|meta| {
+    unsafe { ptr::read_unaligned(slot_start as *const usize) }
+}
+
+#[inline]
+fn ref_bounds_cover_ptr_value(meta: crate::TagMeta, ptr_addr: usize) -> bool {
+    if !bounds_len_has_explicit_byte_bounds(meta.bounds_len) {
+        return true;
+    }
+    let Some(end) = meta.pointee_addr.checked_add(meta.bounds_len) else {
+        return false;
+    };
+    ptr_addr >= meta.pointee_addr && ptr_addr < end
+}
+
+#[inline]
+fn entry_match_rank(entry: PtrShadowEntry, ptr_addr: usize) -> Option<u8> {
+    if entry.tag == 0 {
+        return None;
+    }
+    tag_store::get(entry.tag).and_then(|meta| {
         if meta.pointee_addr == ptr_addr {
-            return true;
+            return Some(2);
         }
         if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
-            return false;
+            return None;
         }
         if meta.pointee_addr == 0 || ptr_addr == 0 {
-            return false;
+            return None;
         }
 
         let Some((tag_base, tag_alloc)) = lookup_alloc_snapshot(meta.pointee_addr) else {
-            return false;
+            return None;
         };
         let Some((ptr_base, ptr_alloc)) = lookup_alloc_snapshot(ptr_addr) else {
-            return false;
+            return None;
         };
 
         // View-producing calls can move the concrete ref pointer inside the same allocation
-        // while keeping the original borrow provenance.
-        tag_alloc.live
+        // while keeping the original borrow provenance, but only inside known ref bounds.
+        (tag_alloc.live
             && ptr_alloc.live
             && tag_base == ptr_base
             && (tag_alloc.epoch == ptr_alloc.epoch || tag_alloc.epoch == 0 || ptr_alloc.epoch == 0)
+            && ref_bounds_cover_ptr_value(meta, ptr_addr))
+        .then_some(1)
     })
+}
+
+#[inline]
+fn trace_enabled() -> bool {
+    std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+}
+
+#[inline]
+fn consider_matching_entry(
+    best: &mut Option<(u8, PtrShadowEntry)>,
+    entry: Option<PtrShadowEntry>,
+    ptr_addr: usize,
+) {
+    let Some(entry) = entry else {
+        return;
+    };
+    let Some(rank) = entry_match_rank(entry, ptr_addr) else {
+        return;
+    };
+    if best.is_none_or(|(best_rank, _)| rank > best_rank) {
+        *best = Some((rank, entry));
+    }
+}
+
+#[inline]
+fn select_entry_for_ptr_value(addr: usize, ptr_addr: usize) -> Option<PtrShadowEntry> {
+    if addr == 0 {
+        return None;
+    }
+
+    match slot_loc(addr) {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+            is_stack,
+        } => {
+            let primary = alloc_ptr_shadow()
+                .lock()
+                .unwrap()
+                .get(&(base, epoch))
+                .and_then(|slots| slots.get(&offset).copied());
+            let absolute = abs_ptr_shadow()
+                .lock()
+                .unwrap()
+                .get(&addr)
+                .copied()
+                .filter(|entry| abs_entry_matches(addr, *entry));
+
+            let mut best = None;
+            if is_stack {
+                // Stack MIR locals can overlap. The absolute mirror is tied to the actual byte
+                // address, so prefer it over an ambiguous allocation-local entry on equal rank.
+                consider_matching_entry(&mut best, absolute, ptr_addr);
+                consider_matching_entry(&mut best, primary, ptr_addr);
+            } else {
+                consider_matching_entry(&mut best, primary, ptr_addr);
+                consider_matching_entry(&mut best, absolute, ptr_addr);
+            }
+            best.map(|(_, entry)| entry)
+        }
+        SlotLoc::Abs { addr } => {
+            let entry = abs_ptr_shadow()
+                .lock()
+                .unwrap()
+                .get(&addr)
+                .copied()
+                .filter(|entry| abs_entry_matches(addr, *entry));
+            let mut best = None;
+            consider_matching_entry(&mut best, entry, ptr_addr);
+            best.map(|(_, entry)| entry)
+        }
+    }
 }
 
 /// Load pointer shadow only if it still describes the pointer value in the slot.
@@ -467,15 +567,12 @@ fn entry_matches_ptr_value(entry: PtrShadowEntry, ptr_addr: usize) -> bool {
 /// pointer value.
 #[inline]
 fn load_entry_for_ptr_value(addr: usize, ptr_addr: usize) -> Option<PtrShadowEntry> {
-    let entry = load_entry(addr)?;
-    if entry_matches_ptr_value(entry, ptr_addr) {
+    if let Some(entry) = select_entry_for_ptr_value(addr, ptr_addr) {
         return Some(entry);
     }
 
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if trace_enabled() {
+        let entry = load_entry(addr)?;
         let tag_pointee = tag_store::get(entry.tag)
             .map(|meta| meta.pointee_addr)
             .unwrap_or(0);
@@ -489,6 +586,57 @@ fn load_entry_for_ptr_value(addr: usize, ptr_addr: usize) -> Option<PtrShadowEnt
 }
 
 #[inline]
+fn consider_matching_covering_entry(
+    best: &mut Option<(u8, PtrShadowEntry, usize)>,
+    slot_start: usize,
+    entry: PtrShadowEntry,
+    byte_off: usize,
+) {
+    let ptr_addr = ptr_value_at_slot(slot_start);
+    let Some(rank) = entry_match_rank(entry, ptr_addr) else {
+        return;
+    };
+    if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
+        *best = Some((rank, entry, byte_off));
+    }
+}
+
+type CoveringCandidate = (usize, PtrShadowEntry, usize);
+
+#[inline]
+fn load_alloc_covering_candidate(
+    base: usize,
+    epoch: u64,
+    offset: usize,
+) -> Option<CoveringCandidate> {
+    alloc_ptr_shadow()
+        .lock()
+        .unwrap()
+        .get(&(base, epoch))
+        .and_then(|slots| covering_entry(slots, offset))
+        .map(|(slot_start, entry, byte_off)| (base.saturating_add(slot_start), entry, byte_off))
+}
+
+#[inline]
+fn load_abs_covering_candidate(addr: usize) -> Option<CoveringCandidate> {
+    let slots = abs_ptr_shadow().lock().unwrap();
+    covering_entry(&slots, addr)
+        .filter(|(slot_start, entry, _)| abs_entry_matches(*slot_start, *entry))
+}
+
+#[inline]
+fn select_matching_covering_entries(
+    candidates: impl IntoIterator<Item = CoveringCandidate>,
+) -> Option<(PtrShadowEntry, usize)> {
+    let mut best = None;
+    for candidate in candidates {
+        let (slot_start, entry, byte_off) = candidate;
+        consider_matching_covering_entry(&mut best, slot_start, entry, byte_off);
+    }
+    best.map(|(_, entry, byte_off)| (entry, byte_off))
+}
+
+#[inline]
 fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
     if addr == 0 {
         return None;
@@ -499,37 +647,22 @@ fn load_covering_entry(addr: usize) -> Option<(PtrShadowEntry, usize)> {
             base,
             epoch,
             offset,
-            ..
-        } => alloc_ptr_shadow()
-            .lock()
-            .unwrap()
-            .get(&(base, epoch))
-            .and_then(|slots| covering_entry(slots, offset))
-            .map(|(_slot_start, entry, byte_off)| (entry, byte_off))
-            .or_else(|| {
-                abs_ptr_shadow()
-                    .lock()
-                    .unwrap()
-                    .pipe_ref(|slots| covering_entry(slots, addr))
-                    .filter(|(slot_start, entry, _)| abs_entry_matches(*slot_start, *entry))
-                    .map(|(_slot_start, entry, byte_off)| (entry, byte_off))
-            }),
-        SlotLoc::Abs { addr } => abs_ptr_shadow()
-            .lock()
-            .unwrap()
-            .pipe_ref(|slots| covering_entry(slots, addr))
-            .filter(|(slot_start, entry, _)| abs_entry_matches(*slot_start, *entry))
-            .map(|(_slot_start, entry, byte_off)| (entry, byte_off)),
+            is_stack,
+        } => {
+            let primary = load_alloc_covering_candidate(base, epoch, offset);
+            let absolute = load_abs_covering_candidate(addr);
+            if is_stack {
+                // Stack locals can share bytes; prefer the absolute mirror on equal matches.
+                select_matching_covering_entries([absolute, primary].into_iter().flatten())
+            } else {
+                select_matching_covering_entries([primary, absolute].into_iter().flatten())
+            }
+        }
+        SlotLoc::Abs { addr } => {
+            select_matching_covering_entries(load_abs_covering_candidate(addr))
+        }
     }
 }
-
-trait PipeRef: Sized {
-    fn pipe_ref<R>(self, f: impl FnOnce(&Self) -> R) -> R {
-        f(&self)
-    }
-}
-
-impl<T> PipeRef for T {}
 
 #[inline]
 pub(crate) fn load_tag(addr: usize) -> u64 {
@@ -590,7 +723,7 @@ pub(crate) fn copy_slot(dst_addr: usize, src_addr: usize) {
     if dst_addr == 0 || src_addr == 0 {
         return;
     }
-    let entry = load_entry(src_addr);
+    let entry = load_entry_for_ptr_value(src_addr, ptr_value_at_slot(src_addr));
     kill_range(dst_addr, PTR_SLOT_BYTES);
     if let Some(entry) = entry {
         store_ptr(
@@ -608,9 +741,7 @@ fn store_partial_byte(addr: usize, src_entry: PtrShadowEntry, src_byte_off: usiz
     if addr == 0 || src_byte_off >= PTR_SLOT_BYTES {
         return;
     }
-    let trace = std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false");
+    let trace = trace_enabled();
 
     match slot_loc(addr) {
         SlotLoc::Alloc {
@@ -840,8 +971,10 @@ pub(crate) fn remove_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
         .lock()
         .unwrap()
         .remove(&(base_addr, alloc_epoch));
-    abs_ptr_shadow().lock().unwrap().retain(|_, entry| {
-        !(entry.alloc_base == base_addr
-            && (entry.alloc_epoch == alloc_epoch || entry.alloc_epoch == 0))
-    });
+    // Stack absolute mirrors use epoch 0 because optimized MIR can overlap local lifetimes.
+    // Keep those byte-address shadows until a real write clears them.
+    abs_ptr_shadow()
+        .lock()
+        .unwrap()
+        .retain(|_, entry| !(entry.alloc_base == base_addr && entry.alloc_epoch == alloc_epoch));
 }

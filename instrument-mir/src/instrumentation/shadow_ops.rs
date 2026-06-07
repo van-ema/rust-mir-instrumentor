@@ -14,52 +14,6 @@ impl MyOptimizationPass {
             && local_slot_shadow_store_locals.contains(&src_local)
     }
 
-    pub(in crate::instrumentation) fn operand_mentions_local<'tcx>(
-        &self,
-        operand: &Operand<'tcx>,
-        local: Local,
-    ) -> bool {
-        self.place_from_operand(operand)
-            .and_then(|place| place.as_local())
-            == Some(local)
-    }
-
-    pub(in crate::instrumentation) fn should_skip_storage_dead_shadow_kill<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        body: &Body<'tcx>,
-        block_data: &BasicBlockData<'tcx>,
-        stmt_idx: usize,
-        local: Local,
-    ) -> bool {
-        let Some(prev_stmt) = stmt_idx
-            .checked_sub(1)
-            .and_then(|idx| block_data.statements.get(idx))
-        else {
-            return false;
-        };
-        let StatementKind::Assign(box (dst_place, rvalue)) = &prev_stmt.kind else {
-            return false;
-        };
-        if dst_place.as_local() == Some(local) {
-            return false;
-        }
-        let dst_ty = dst_place.ty(&body.local_decls, tcx).ty;
-        if !self.is_shadowable_ptr_ty(tcx, body, dst_ty)
-            && !self.ty_contains_pointer_fields(tcx, body, dst_ty, 8)
-        {
-            return false;
-        }
-        match rvalue {
-            Rvalue::Aggregate(_, ops) => {
-                ops.iter().any(|op| self.operand_mentions_local(op, local))
-            }
-            Rvalue::Use(op) | Rvalue::Cast(_, op, _) => self.operand_mentions_local(op, local),
-            Rvalue::CopyForDeref(place) => place.as_local() == Some(local),
-            _ => false,
-        }
-    }
-
     pub(in crate::instrumentation) fn aggregate_field_specs_for_kind<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
