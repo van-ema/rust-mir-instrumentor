@@ -3071,6 +3071,38 @@ pub extern "C" fn __rz_shadow_store_ptr_local(
 }
 
 #[no_mangle]
+pub extern "C" fn __rz_shadow_store_alloc_root(
+    slot_addr: usize,
+    ptr_addr: usize,
+    is_mut: u8,
+    bounds_len: usize,
+    align_req: usize,
+) {
+    let _g = RzRuntimeGuard::enter();
+    if slot_addr == 0 {
+        return;
+    }
+    if ptr_addr == 0 {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+
+    // Allocation constructors produce a new owner pointer. Its provenance starts at the
+    // current allocation instance, even if the allocator reused an old numeric address.
+    let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
+    ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
+    if std::env::var("RZ_TRACE_PTR_SHADOW")
+        .ok()
+        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] store_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
+            slot_addr, ptr_addr, tag
+        );
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);

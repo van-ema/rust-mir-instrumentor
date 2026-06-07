@@ -1924,6 +1924,70 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if let InstrKind::ShadowStoreAllocRoot { is_mut } = creation_kind.clone() {
+                let slot_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((slot_addr_stmt1, slot_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    slot_addr_local,
+                    true,
+                ) else {
+                    continue;
+                };
+                let Some((data_ptr_stmt_opt, ptr_addr_stmt)) =
+                    self.addr_stmts_for_place(tcx, body, source_info, place, ptr_addr_local)
+                else {
+                    continue;
+                };
+
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let store_func =
+                    runtime_func(tcx, hooks.def_id_shadow_store_alloc_root, source_info.span);
+                let store_args = lower_args(
+                    source_info.span,
+                    [
+                        copy_local(slot_addr_local),
+                        copy_local(ptr_addr_local),
+                        self.const_u8(tcx, source_info.span, u8::from(is_mut)),
+                        self.const_usize(tcx, source_info.span, usize::MAX),
+                        self.const_usize(tcx, source_info.span, 0),
+                    ],
+                );
+
+                let mut pre_call_stmts = vec![slot_addr_stmt1, slot_addr_stmt2];
+                if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
+                    pre_call_stmts.push(data_ptr_stmt);
+                }
+                pre_call_stmts.push(ptr_addr_stmt);
+                split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            store_func,
+                            store_args,
+                            Place::from(tmp_unit),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
+                    },
+                );
+                continue;
+            }
+
             if let InstrKind::ShadowStoreBoxPointee {
                 box_local,
                 src_local,

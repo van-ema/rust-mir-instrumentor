@@ -65,6 +65,14 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         is_mut: bool,
         exposed_provenance: bool,
     },
+    /// Store a fresh allocation-root tag for a pointer field inside an owner aggregate.
+    ///
+    /// Example: after `Box::new(x)`, the hidden Box pointer field owns the new heap allocation.
+    /// Its shadow must describe that fresh allocation instance, not any old tag at the same
+    /// numeric address.
+    ShadowStoreAllocRoot {
+        is_mut: bool,
+    },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc {
         local: Local,
@@ -574,6 +582,7 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_exit_fn: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_ptr: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_ptr_local: DefId,
+    pub(in crate::instrumentation) def_id_shadow_store_alloc_root: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag_for_ptr: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_ref_ancestor: DefId,

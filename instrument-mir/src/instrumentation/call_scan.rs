@@ -2231,6 +2231,32 @@ impl MyOptimizationPass {
             }
         }
 
+        if let (Some(tgt_bb), Some(dst_local)) = (call_target_bb, destination.as_local()) {
+            let dst_ty = body.local_decls[dst_local].ty;
+            if callee_path_opt
+                .as_deref()
+                .is_some_and(|p| self.is_box_new_wrapper(p))
+                && self.is_box_ty(tcx, dst_ty)
+            {
+                let owner_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                    tcx,
+                    body,
+                    Place::from(dst_local),
+                    dst_ty,
+                );
+                if owner_leafs.len() == 1 {
+                    insert_points.push(InsertPoint {
+                        bb: tgt_bb,
+                        stmt_idx: 0,
+                        insert_before: true,
+                        source_info: term.source_info,
+                        place: owner_leafs[0].place,
+                        kind: InstrKind::ShadowStoreAllocRoot { is_mut: true },
+                    });
+                }
+            }
+        }
+
         // Treat any pointer argument as tag relevant.
         for (arg_index, a) in args.iter().enumerate() {
             let Some(p) = self.place_from_operand(&a.node) else {
