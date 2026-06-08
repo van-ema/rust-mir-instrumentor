@@ -2308,7 +2308,9 @@ impl MyOptimizationPass {
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
-                        from_shadow: !p.projection.is_empty(),
+                        // `*arg` is a value behind a pointer, not a pointer field. There may be
+                        // no ptr-shadow entry for it, so export the source borrow family directly.
+                        from_shadow: false,
                         flags,
                     }
                 } else {
@@ -2316,7 +2318,7 @@ impl MyOptimizationPass {
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
-                        from_shadow: !p.projection.is_empty(),
+                        from_shadow: false,
                         flags,
                     }
                 };

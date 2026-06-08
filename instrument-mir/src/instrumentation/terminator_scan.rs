@@ -106,7 +106,9 @@ impl MyOptimizationPass {
                         arg_index: 0,
                         ptr_local: place.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
-                        from_shadow: !place.projection.is_empty(),
+                        // `Drop(*ptr)` drops a value behind a pointer, not a pointer field.
+                        // Export the pointer's borrow family; ptr shadow may not exist here.
+                        from_shadow: false,
                         flags: self.call_arg_push_flags(false, suppress_protector),
                     },
                 });
