@@ -158,6 +158,27 @@ struct HookProfileCounters {
     tag_kill_release_ns: AtomicU64,
     tag_kill_escape_check_ns: AtomicU64,
     tag_kill_alias_on_tag_killed_ns: AtomicU64,
+    call_scope_calls: AtomicU64,
+    call_scope_total_ns: AtomicU64,
+    call_arg_push_calls: AtomicU64,
+    call_arg_push_total_ns: AtomicU64,
+    call_arg_zero_skipped: AtomicU64,
+    call_arg_take_calls: AtomicU64,
+    call_arg_take_total_ns: AtomicU64,
+    call_arg_leaf_calls: AtomicU64,
+    call_arg_leaf_total_ns: AtomicU64,
+    mut_arg_ret_push_calls: AtomicU64,
+    mut_arg_ret_push_total_ns: AtomicU64,
+    mut_arg_ret_take_calls: AtomicU64,
+    mut_arg_ret_take_total_ns: AtomicU64,
+    ret_push_calls: AtomicU64,
+    ret_push_total_ns: AtomicU64,
+    ret_take_calls: AtomicU64,
+    ret_take_total_ns: AtomicU64,
+    fn_enter_calls: AtomicU64,
+    fn_enter_total_ns: AtomicU64,
+    fn_exit_calls: AtomicU64,
+    fn_exit_total_ns: AtomicU64,
 }
 
 #[cfg(feature = "runtime_hook_profile")]
@@ -204,6 +225,27 @@ impl HookProfileCounters {
             tag_kill_release_ns: AtomicU64::new(0),
             tag_kill_escape_check_ns: AtomicU64::new(0),
             tag_kill_alias_on_tag_killed_ns: AtomicU64::new(0),
+            call_scope_calls: AtomicU64::new(0),
+            call_scope_total_ns: AtomicU64::new(0),
+            call_arg_push_calls: AtomicU64::new(0),
+            call_arg_push_total_ns: AtomicU64::new(0),
+            call_arg_zero_skipped: AtomicU64::new(0),
+            call_arg_take_calls: AtomicU64::new(0),
+            call_arg_take_total_ns: AtomicU64::new(0),
+            call_arg_leaf_calls: AtomicU64::new(0),
+            call_arg_leaf_total_ns: AtomicU64::new(0),
+            mut_arg_ret_push_calls: AtomicU64::new(0),
+            mut_arg_ret_push_total_ns: AtomicU64::new(0),
+            mut_arg_ret_take_calls: AtomicU64::new(0),
+            mut_arg_ret_take_total_ns: AtomicU64::new(0),
+            ret_push_calls: AtomicU64::new(0),
+            ret_push_total_ns: AtomicU64::new(0),
+            ret_take_calls: AtomicU64::new(0),
+            ret_take_total_ns: AtomicU64::new(0),
+            fn_enter_calls: AtomicU64::new(0),
+            fn_enter_total_ns: AtomicU64::new(0),
+            fn_exit_calls: AtomicU64::new(0),
+            fn_exit_total_ns: AtomicU64::new(0),
         }
     }
 }
@@ -486,6 +528,156 @@ impl HookProfileGuard {
             total_counter: Some(&p.tag_kill_total_ns),
         }
     }
+
+    #[inline]
+    fn call_scope(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.call_scope_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.call_scope_total_ns),
+        }
+    }
+
+    #[inline]
+    fn call_arg_push(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.call_arg_push_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.call_arg_push_total_ns),
+        }
+    }
+
+    #[inline]
+    fn call_arg_take(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.call_arg_take_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.call_arg_take_total_ns),
+        }
+    }
+
+    #[inline]
+    fn call_arg_leaf(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.call_arg_leaf_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.call_arg_leaf_total_ns),
+        }
+    }
+
+    #[inline]
+    fn mut_arg_ret_push(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.mut_arg_ret_push_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.mut_arg_ret_push_total_ns),
+        }
+    }
+
+    #[inline]
+    fn mut_arg_ret_take(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.mut_arg_ret_take_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.mut_arg_ret_take_total_ns),
+        }
+    }
+
+    #[inline]
+    fn ret_push(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.ret_push_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.ret_push_total_ns),
+        }
+    }
+
+    #[inline]
+    fn ret_take(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.ret_take_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.ret_take_total_ns),
+        }
+    }
+
+    #[inline]
+    fn fn_enter(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.fn_enter_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.fn_enter_total_ns),
+        }
+    }
+
+    #[inline]
+    fn fn_exit(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.fn_exit_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.fn_exit_total_ns),
+        }
+    }
 }
 
 #[cfg(feature = "runtime_hook_profile")]
@@ -567,6 +759,20 @@ macro_rules! rz_profile_add_opt_field {
 #[cfg(not(feature = "runtime_hook_profile"))]
 macro_rules! rz_profile_add_opt_field {
     ($profile:expr, $field:ident, $start:expr) => {};
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_inc_field {
+    ($profile:expr, $field:ident) => {
+        if let Some(p) = $profile {
+            p.$field.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_inc_field {
+    ($profile:expr, $field:ident) => {};
 }
 
 #[cfg(feature = "runtime_ptr_shadow_trace")]
@@ -1679,6 +1885,13 @@ struct DynamicCallArgScope {
     consumed: bool,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct CallBoundaryActivation {
+    callee_id: u64,
+    boundary_id: u64,
+    direct: bool,
+}
+
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 // A callee still consumes the explicit boundary parent, but TB-lite must not
 // turn that parent into a protected child for unresolved/generic `&mut Self`.
@@ -1686,6 +1899,10 @@ const CALL_ARG_FLAG_NO_PROTECTOR: u8 = 1 << 1;
 const CALL_ARG_BOUNDARY_ORIGIN_EXACT: u8 = 0;
 
 static CALL_ARG_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>>> =
+    OnceLock::new();
+static PENDING_DIRECT_CALL_BOUNDARIES: OnceLock<Mutex<HashMap<ThreadId, Vec<u64>>>> =
+    OnceLock::new();
+static ACTIVE_CALL_BOUNDARIES: OnceLock<Mutex<HashMap<ThreadId, Vec<CallBoundaryActivation>>>> =
     OnceLock::new();
 static CALL_ARG_LEAF_SHADOWS: OnceLock<
     Mutex<HashMap<(ThreadId, u64, u64, u64), CallArgLeafTransport>>,
@@ -1870,6 +2087,111 @@ fn rz_check_alignment(
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>> {
     CALL_ARG_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pending_direct_call_boundaries() -> &'static Mutex<HashMap<ThreadId, Vec<u64>>> {
+    PENDING_DIRECT_CALL_BOUNDARIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_call_boundaries() -> &'static Mutex<HashMap<ThreadId, Vec<CallBoundaryActivation>>> {
+    ACTIVE_CALL_BOUNDARIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn active_call_boundary_id(callee_id: u64) -> u64 {
+    active_call_boundary_activation(callee_id)
+        .map(|activation| activation.boundary_id)
+        .unwrap_or(callee_id)
+}
+
+fn active_call_boundary_activation(callee_id: u64) -> Option<CallBoundaryActivation> {
+    let thread_id = std::thread::current().id();
+    active_call_boundaries()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .and_then(|stack| {
+            stack
+                .iter()
+                .rev()
+                .find(|activation| activation.callee_id == callee_id)
+        })
+        .copied()
+}
+
+fn enter_call_boundary(callee_id: u64) -> u64 {
+    let thread_id = std::thread::current().id();
+    let (boundary_id, direct) = {
+        let mut pending = pending_direct_call_boundaries().lock().unwrap();
+        let popped = pending.get_mut(&thread_id).and_then(|stack| stack.pop());
+        if pending
+            .get(&thread_id)
+            .is_some_and(|stack| stack.is_empty())
+        {
+            pending.remove(&thread_id);
+        }
+        match popped {
+            Some(id) => (id, true),
+            None => (callee_id, false),
+        }
+    };
+    active_call_boundaries()
+        .lock()
+        .unwrap()
+        .entry(thread_id)
+        .or_default()
+        .push(CallBoundaryActivation {
+            callee_id,
+            boundary_id,
+            direct,
+        });
+    boundary_id
+}
+
+fn exit_call_boundary(callee_id: u64) -> CallBoundaryActivation {
+    let thread_id = std::thread::current().id();
+    let mut active = active_call_boundaries().lock().unwrap();
+    let Some(stack) = active.get_mut(&thread_id) else {
+        return CallBoundaryActivation {
+            callee_id,
+            boundary_id: callee_id,
+            direct: false,
+        };
+    };
+    let activation = stack
+        .iter()
+        .rposition(|activation| activation.callee_id == callee_id)
+        .map(|idx| stack.remove(idx))
+        .unwrap_or(CallBoundaryActivation {
+            callee_id,
+            boundary_id: callee_id,
+            direct: false,
+        });
+    if stack.is_empty() {
+        active.remove(&thread_id);
+    }
+    activation
+}
+
+fn exit_direct_call_boundary(boundary_id: u64) -> Option<CallBoundaryActivation> {
+    let thread_id = std::thread::current().id();
+    let mut active = active_call_boundaries().lock().unwrap();
+    let stack = active.get_mut(&thread_id)?;
+    let activation = stack
+        .iter()
+        .rposition(|activation| activation.direct && activation.boundary_id == boundary_id)
+        .map(|idx| stack.remove(idx));
+    if stack.is_empty() {
+        active.remove(&thread_id);
+    }
+    activation
+}
+
+fn finalize_direct_call_boundary(boundary_id: u64) {
+    if let Some(activation) = exit_direct_call_boundary(boundary_id) {
+        clear_unconsumed_call_arg_leaf_shadows(activation.boundary_id);
+        exit_call_arg_leaf_scope(activation.callee_id);
+        active_alias_model().on_call_exit(activation.boundary_id);
+    }
 }
 
 fn call_arg_leaf_shadows(
@@ -3849,6 +4171,27 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.tag_kill_escape_check_ns.store(0, Ordering::Relaxed);
     p.tag_kill_alias_on_tag_killed_ns
         .store(0, Ordering::Relaxed);
+    p.call_scope_calls.store(0, Ordering::Relaxed);
+    p.call_scope_total_ns.store(0, Ordering::Relaxed);
+    p.call_arg_push_calls.store(0, Ordering::Relaxed);
+    p.call_arg_push_total_ns.store(0, Ordering::Relaxed);
+    p.call_arg_zero_skipped.store(0, Ordering::Relaxed);
+    p.call_arg_take_calls.store(0, Ordering::Relaxed);
+    p.call_arg_take_total_ns.store(0, Ordering::Relaxed);
+    p.call_arg_leaf_calls.store(0, Ordering::Relaxed);
+    p.call_arg_leaf_total_ns.store(0, Ordering::Relaxed);
+    p.mut_arg_ret_push_calls.store(0, Ordering::Relaxed);
+    p.mut_arg_ret_push_total_ns.store(0, Ordering::Relaxed);
+    p.mut_arg_ret_take_calls.store(0, Ordering::Relaxed);
+    p.mut_arg_ret_take_total_ns.store(0, Ordering::Relaxed);
+    p.ret_push_calls.store(0, Ordering::Relaxed);
+    p.ret_push_total_ns.store(0, Ordering::Relaxed);
+    p.ret_take_calls.store(0, Ordering::Relaxed);
+    p.ret_take_total_ns.store(0, Ordering::Relaxed);
+    p.fn_enter_calls.store(0, Ordering::Relaxed);
+    p.fn_enter_total_ns.store(0, Ordering::Relaxed);
+    p.fn_exit_calls.store(0, Ordering::Relaxed);
+    p.fn_exit_total_ns.store(0, Ordering::Relaxed);
 }
 
 #[no_mangle]
@@ -3905,6 +4248,27 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let tag_kill_release_ns = p.tag_kill_release_ns.load(Ordering::Relaxed);
     let tag_kill_escape_check_ns = p.tag_kill_escape_check_ns.load(Ordering::Relaxed);
     let tag_kill_alias_on_tag_killed_ns = p.tag_kill_alias_on_tag_killed_ns.load(Ordering::Relaxed);
+    let call_scope_calls = p.call_scope_calls.load(Ordering::Relaxed);
+    let call_scope_total_ns = p.call_scope_total_ns.load(Ordering::Relaxed);
+    let call_arg_push_calls = p.call_arg_push_calls.load(Ordering::Relaxed);
+    let call_arg_push_total_ns = p.call_arg_push_total_ns.load(Ordering::Relaxed);
+    let call_arg_zero_skipped = p.call_arg_zero_skipped.load(Ordering::Relaxed);
+    let call_arg_take_calls = p.call_arg_take_calls.load(Ordering::Relaxed);
+    let call_arg_take_total_ns = p.call_arg_take_total_ns.load(Ordering::Relaxed);
+    let call_arg_leaf_calls = p.call_arg_leaf_calls.load(Ordering::Relaxed);
+    let call_arg_leaf_total_ns = p.call_arg_leaf_total_ns.load(Ordering::Relaxed);
+    let mut_arg_ret_push_calls = p.mut_arg_ret_push_calls.load(Ordering::Relaxed);
+    let mut_arg_ret_push_total_ns = p.mut_arg_ret_push_total_ns.load(Ordering::Relaxed);
+    let mut_arg_ret_take_calls = p.mut_arg_ret_take_calls.load(Ordering::Relaxed);
+    let mut_arg_ret_take_total_ns = p.mut_arg_ret_take_total_ns.load(Ordering::Relaxed);
+    let ret_push_calls = p.ret_push_calls.load(Ordering::Relaxed);
+    let ret_push_total_ns = p.ret_push_total_ns.load(Ordering::Relaxed);
+    let ret_take_calls = p.ret_take_calls.load(Ordering::Relaxed);
+    let ret_take_total_ns = p.ret_take_total_ns.load(Ordering::Relaxed);
+    let fn_enter_calls = p.fn_enter_calls.load(Ordering::Relaxed);
+    let fn_enter_total_ns = p.fn_enter_total_ns.load(Ordering::Relaxed);
+    let fn_exit_calls = p.fn_exit_calls.load(Ordering::Relaxed);
+    let fn_exit_total_ns = p.fn_exit_total_ns.load(Ordering::Relaxed);
 
     let write_avg_ns = if write_calls == 0 {
         0.0
@@ -4055,6 +4419,107 @@ pub extern "C" fn __rz_dump_hook_profile() {
         tag_kill_release_ns,
         tag_kill_escape_check_ns,
         tag_kill_alias_on_tag_killed_ns
+    );
+    eprintln!(
+        "  call_scope:        calls={} total={} avg_per_call={:.1}",
+        call_scope_calls,
+        call_scope_total_ns,
+        if call_scope_calls == 0 {
+            0.0
+        } else {
+            call_scope_total_ns as f64 / call_scope_calls as f64
+        }
+    );
+    eprintln!(
+        "  call_arg_push:     calls={} total={} avg_per_call={:.1} zero_skipped={}",
+        call_arg_push_calls,
+        call_arg_push_total_ns,
+        if call_arg_push_calls == 0 {
+            0.0
+        } else {
+            call_arg_push_total_ns as f64 / call_arg_push_calls as f64
+        },
+        call_arg_zero_skipped
+    );
+    eprintln!(
+        "  call_arg_take:     calls={} total={} avg_per_call={:.1}",
+        call_arg_take_calls,
+        call_arg_take_total_ns,
+        if call_arg_take_calls == 0 {
+            0.0
+        } else {
+            call_arg_take_total_ns as f64 / call_arg_take_calls as f64
+        }
+    );
+    eprintln!(
+        "  call_arg_leaf:     calls={} total={} avg_per_call={:.1}",
+        call_arg_leaf_calls,
+        call_arg_leaf_total_ns,
+        if call_arg_leaf_calls == 0 {
+            0.0
+        } else {
+            call_arg_leaf_total_ns as f64 / call_arg_leaf_calls as f64
+        }
+    );
+    eprintln!(
+        "  mut_arg_ret_push:  calls={} total={} avg_per_call={:.1}",
+        mut_arg_ret_push_calls,
+        mut_arg_ret_push_total_ns,
+        if mut_arg_ret_push_calls == 0 {
+            0.0
+        } else {
+            mut_arg_ret_push_total_ns as f64 / mut_arg_ret_push_calls as f64
+        }
+    );
+    eprintln!(
+        "  mut_arg_ret_take:  calls={} total={} avg_per_call={:.1}",
+        mut_arg_ret_take_calls,
+        mut_arg_ret_take_total_ns,
+        if mut_arg_ret_take_calls == 0 {
+            0.0
+        } else {
+            mut_arg_ret_take_total_ns as f64 / mut_arg_ret_take_calls as f64
+        }
+    );
+    eprintln!(
+        "  ret_push:          calls={} total={} avg_per_call={:.1}",
+        ret_push_calls,
+        ret_push_total_ns,
+        if ret_push_calls == 0 {
+            0.0
+        } else {
+            ret_push_total_ns as f64 / ret_push_calls as f64
+        }
+    );
+    eprintln!(
+        "  ret_take:          calls={} total={} avg_per_call={:.1}",
+        ret_take_calls,
+        ret_take_total_ns,
+        if ret_take_calls == 0 {
+            0.0
+        } else {
+            ret_take_total_ns as f64 / ret_take_calls as f64
+        }
+    );
+    eprintln!(
+        "  fn_enter:          calls={} total={} avg_per_call={:.1}",
+        fn_enter_calls,
+        fn_enter_total_ns,
+        if fn_enter_calls == 0 {
+            0.0
+        } else {
+            fn_enter_total_ns as f64 / fn_enter_calls as f64
+        }
+    );
+    eprintln!(
+        "  fn_exit:           calls={} total={} avg_per_call={:.1}",
+        fn_exit_calls,
+        fn_exit_total_ns,
+        if fn_exit_calls == 0 {
+            0.0
+        } else {
+            fn_exit_total_ns as f64 / fn_exit_calls as f64
+        }
     );
     eprintln!(
         "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_tag_entries={} call_arg_entries={} ret_tag_entries={}",
@@ -5724,7 +6189,13 @@ fn canonical_mut_arg_ret_tag(addr: usize, tag: u64) -> u64 {
 
     let raw_model_tag = active_alias_model().canonicalize_mut_arg_ret_tag(tag, addr);
     if raw_model_tag != 0 {
-        return raw_model_tag;
+        if rz_can_recover_parent_tag(raw_model_tag) && rz_ref_boundary_tag_is_valid(raw_model_tag) {
+            return raw_model_tag;
+        }
+        let valid_model_tag = recover_nearest_valid_lineage_boundary_tag(addr, raw_model_tag);
+        if valid_model_tag != 0 {
+            return valid_model_tag;
+        }
     }
     let valid_raw_tag = recover_nearest_valid_lineage_boundary_tag(addr, tag);
     if valid_raw_tag != 0 {
@@ -5904,6 +6375,27 @@ fn call_arg_boundary_entry(
     CallArgTagEntry { tag, flags }
 }
 
+fn call_arg_shadow_boundary_entry(
+    addr: usize,
+    slot_addr: usize,
+    flags: u8,
+) -> (CallArgTagEntry, u64, u64, u8) {
+    let exact_tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, addr);
+    let export_parent = ptr_shadow::load_export_parent_for_ptr_value(slot_addr, addr);
+    let recovered = ptr_shadow::load_export_parent_recovered_for_ptr_value(slot_addr, addr);
+    let boundary_parent = if export_parent != 0 {
+        export_parent
+    } else {
+        exact_tag
+    };
+    (
+        call_arg_boundary_entry(addr, exact_tag, boundary_parent, recovered, flags),
+        exact_tag,
+        boundary_parent,
+        recovered,
+    )
+}
+
 /// Push explicit call-boundary pointer state so callees can retag on entry.
 ///
 /// `exact_tag` is the caller local's current tag. `boundary_parent_tag` is the family the callee
@@ -5920,12 +6412,24 @@ pub extern "C" fn __rz_push_call_arg_boundary_tag(
     boundary_origin: u8,
     flags: u8,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_push);
     let _g = RzRuntimeGuard::enter();
     let boundary_parent_tag = if boundary_parent_tag != 0 {
         boundary_parent_tag
     } else {
         exact_tag
     };
+    if exact_tag == 0 && boundary_parent_tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        if rz_trace_call_tags_enabled() {
+            eprintln!(
+                "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} exact=0 boundary_parent=0 origin={} tag=0 flags=0x{:x} skipped=zero",
+                callee_id, arg_index, addr, boundary_origin, flags
+            );
+        }
+        return;
+    }
     let entry =
         call_arg_boundary_entry(addr, exact_tag, boundary_parent_tag, boundary_origin, flags);
     if rz_trace_call_tags_enabled() {
@@ -5933,6 +6437,52 @@ pub extern "C" fn __rz_push_call_arg_boundary_tag(
             "[rusteze-runtime][call-tag] push callee={} arg={} addr=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
             callee_id, arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, entry.tag, flags
         );
+    }
+    if entry.tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
+    }
+    let thread_id = std::thread::current().id();
+    call_arg_tags()
+        .lock()
+        .unwrap()
+        .insert((thread_id, callee_id, arg_index, addr), entry);
+}
+
+/// Push call-boundary state for a projected pointer slot.
+///
+/// The instrumentation gives both the pointer value (`addr`) and the slot holding it, so runtime
+/// transport can load the exact shadow entry for that value instead of guessing from the base local.
+#[no_mangle]
+pub extern "C" fn __rz_push_call_arg_boundary_shadow_tag(
+    callee_id: u64,
+    arg_index: u64,
+    addr: usize,
+    slot_addr: usize,
+    flags: u8,
+) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_push);
+    let _g = RzRuntimeGuard::enter();
+    let (entry, exact_tag, boundary_parent, recovered) =
+        call_arg_shadow_boundary_entry(addr, slot_addr, flags);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] push-shadow callee={} arg={} addr=0x{:x} slot=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
+            callee_id,
+            arg_index,
+            addr,
+            slot_addr,
+            exact_tag,
+            boundary_parent,
+            recovered,
+            entry.tag,
+            flags
+        );
+    }
+    if entry.tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
     }
     let thread_id = std::thread::current().id();
     call_arg_tags()
@@ -5944,6 +6494,8 @@ pub extern "C" fn __rz_push_call_arg_boundary_tag(
 /// Open a caller-side side channel for an unresolved function-pointer/vtable call.
 #[no_mangle]
 pub extern "C" fn __rz_begin_indirect_call_arg_scope() {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_scope);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
     dynamic_call_arg_scopes()
@@ -5957,6 +6509,8 @@ pub extern "C" fn __rz_begin_indirect_call_arg_scope() {
 /// Close the caller-side side channel for an unresolved function-pointer/vtable call.
 #[no_mangle]
 pub extern "C" fn __rz_end_indirect_call_arg_scope() {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_scope);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
     let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
@@ -5979,12 +6533,24 @@ pub extern "C" fn __rz_push_indirect_call_arg_boundary_tag(
     boundary_origin: u8,
     flags: u8,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_push);
     let _g = RzRuntimeGuard::enter();
     let boundary_parent_tag = if boundary_parent_tag != 0 {
         boundary_parent_tag
     } else {
         exact_tag
     };
+    if exact_tag == 0 && boundary_parent_tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        if rz_trace_call_tags_enabled() {
+            eprintln!(
+                "[rusteze-runtime][call-tag] push indirect arg={} addr=0x{:x} exact=0 boundary_parent=0 origin={} tag=0 flags=0x{:x} skipped=zero",
+                arg_index, addr, boundary_origin, flags
+            );
+        }
+        return;
+    }
     let entry =
         call_arg_boundary_entry(addr, exact_tag, boundary_parent_tag, boundary_origin, flags);
     if rz_trace_call_tags_enabled() {
@@ -5992,6 +6558,51 @@ pub extern "C" fn __rz_push_indirect_call_arg_boundary_tag(
             "[rusteze-runtime][call-tag] push indirect arg={} addr=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
             arg_index, addr, exact_tag, boundary_parent_tag, boundary_origin, entry.tag, flags
         );
+    }
+    if entry.tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
+    }
+    let thread_id = std::thread::current().id();
+    let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
+    let stack = scopes.entry(thread_id).or_default();
+    if stack.is_empty() {
+        stack.push(DynamicCallArgScope::default());
+    }
+    if let Some(scope) = stack.last_mut() {
+        scope.arg_tags.insert((arg_index, addr), entry);
+    }
+}
+
+/// Push projected-slot call-boundary state for an unresolved function-pointer/vtable call.
+#[no_mangle]
+pub extern "C" fn __rz_push_indirect_call_arg_boundary_shadow_tag(
+    arg_index: u64,
+    addr: usize,
+    slot_addr: usize,
+    flags: u8,
+) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_push);
+    let _g = RzRuntimeGuard::enter();
+    let (entry, exact_tag, boundary_parent, recovered) =
+        call_arg_shadow_boundary_entry(addr, slot_addr, flags);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-tag] push-shadow indirect arg={} addr=0x{:x} slot=0x{:x} exact={} boundary_parent={} origin={} tag={} flags=0x{:x}",
+            arg_index,
+            addr,
+            slot_addr,
+            exact_tag,
+            boundary_parent,
+            recovered,
+            entry.tag,
+            flags
+        );
+    }
+    if entry.tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
     }
     let thread_id = std::thread::current().id();
     let mut scopes = dynamic_call_arg_scopes().lock().unwrap();
@@ -6011,6 +6622,8 @@ pub extern "C" fn __rz_push_indirect_call_arg_leaf_shadow(
     leaf_key: u64,
     slot_addr: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_leaf);
     let _g = RzRuntimeGuard::enter();
     let Some(shadow) = current_slot_shadow(slot_addr) else {
         return;
@@ -6037,6 +6650,8 @@ pub extern "C" fn __rz_push_indirect_call_arg_leaf_shadow(
 /// Validate a non-pointer by-value call argument carrier's inner reference tag.
 #[no_mangle]
 pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_take);
     let _g = RzRuntimeGuard::enter();
     rz_validate_ref_boundary_use(tag, "CALL_ARG");
 }
@@ -6049,6 +6664,8 @@ pub extern "C" fn __rz_push_call_arg_leaf_shadow(
     leaf_key: u64,
     slot_addr: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_leaf);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
     let Some(shadow) = current_slot_shadow(slot_addr) else {
@@ -6063,8 +6680,64 @@ pub extern "C" fn __rz_push_call_arg_leaf_shadow(
 /// Drop unconsumed exact call-argument leaf shadows for `callee_id`.
 #[no_mangle]
 pub extern "C" fn __rz_clear_call_arg_leaf_shadows(callee_id: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_leaf);
     let _g = RzRuntimeGuard::enter();
     clear_unconsumed_call_arg_leaf_shadows(callee_id);
+}
+
+/// Open the explicit boundary key for a direct instrumented call.
+#[no_mangle]
+pub extern "C" fn __rz_begin_direct_call_boundary(boundary_id: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_scope);
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-boundary] begin direct boundary={}",
+            boundary_id
+        );
+    }
+    pending_direct_call_boundaries()
+        .lock()
+        .unwrap()
+        .entry(thread_id)
+        .or_default()
+        .push(boundary_id);
+}
+
+/// Clean up a direct boundary key if the callee never consumed it.
+#[no_mangle]
+pub extern "C" fn __rz_end_direct_call_boundary(boundary_id: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_scope);
+    let _g = RzRuntimeGuard::enter();
+    let thread_id = std::thread::current().id();
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-boundary] end direct boundary={}",
+            boundary_id
+        );
+    }
+    {
+        let mut pending = pending_direct_call_boundaries().lock().unwrap();
+        if let Some(stack) = pending.get_mut(&thread_id) {
+            if stack.last().copied() == Some(boundary_id) {
+                stack.pop();
+            } else if let Some(pos) = stack.iter().rposition(|id| *id == boundary_id) {
+                stack.remove(pos);
+            }
+            if stack.is_empty() {
+                pending.remove(&thread_id);
+            }
+        }
+    }
+    if let Some(activation) = exit_direct_call_boundary(boundary_id) {
+        clear_unconsumed_call_arg_leaf_shadows(activation.boundary_id);
+        exit_call_arg_leaf_scope(activation.callee_id);
+        active_alias_model().on_call_exit(activation.boundary_id);
+    }
 }
 
 /// Take (consume) a pushed pointer-argument tag for a callee/arg/address triple.
@@ -6075,14 +6748,17 @@ pub extern "C" fn __rz_take_call_arg_tag(
     addr: usize,
     _require_mut: u8,
 ) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_take);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
+    let boundary_id = active_call_boundary_id(callee_id);
     let direct_entry = {
         let mut tags = call_arg_tags().lock().unwrap();
-        let mut matched_callee_id = callee_id;
+        let mut matched_callee_id = boundary_id;
         let allow_cross_callee_fallback = rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr);
         let entry = tags
-            .remove(&(thread_id, callee_id, arg_index, addr))
+            .remove(&(thread_id, boundary_id, arg_index, addr))
             .unwrap_or_else(|| {
                 if !allow_cross_callee_fallback {
                     return CallArgTagEntry::default();
@@ -6150,7 +6826,7 @@ pub extern "C" fn __rz_take_call_arg_tag(
                 Some((entry, inplace_alias_parent))
             });
         if let Some((entry, inplace_alias_parent)) = dynamic_entry {
-            (entry, inplace_alias_parent, callee_id)
+            (entry, inplace_alias_parent, boundary_id)
         } else {
             direct_entry
         }
@@ -6192,15 +6868,18 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
     arg_index: u64,
     addr: usize,
 ) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_take);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
+    let boundary_id = active_call_boundary_id(callee_id);
     let tag = {
         let mut tags = call_arg_tags().lock().unwrap();
-        tags.remove(&(thread_id, callee_id, arg_index, addr))
+        tags.remove(&(thread_id, boundary_id, arg_index, addr))
             .or_else(|| {
                 tags.iter()
                     .find(|((tid, cid, idx, _slot_addr), _)| {
-                        *tid == thread_id && *cid == callee_id && *idx == arg_index
+                        *tid == thread_id && *cid == boundary_id && *idx == arg_index
                     })
                     .map(|(key, _)| *key)
                     .and_then(|key| tags.remove(&key))
@@ -6209,7 +6888,7 @@ pub extern "C" fn __rz_take_call_arg_tag_anchor(
             .tag
     };
     if tag != 0 {
-        active_alias_model().on_call_arg_anchor_taken(callee_id, tag);
+        active_alias_model().on_call_arg_anchor_taken(boundary_id, tag);
     }
     tag
 }
@@ -6224,12 +6903,15 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
     leaf_key: u64,
     slot_addr: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_leaf);
     let _g = RzRuntimeGuard::enter();
     let thread_id = std::thread::current().id();
+    let boundary_id = active_call_boundary_id(callee_id);
     let shadow = {
         let mut leafs = call_arg_leaf_shadows().lock().unwrap();
         leafs
-            .remove(&(thread_id, callee_id, arg_index, leaf_key))
+            .remove(&(thread_id, boundary_id, arg_index, leaf_key))
             .map(|(_slot_addr, shadow)| shadow)
     }
     .or_else(|| {
@@ -6251,32 +6933,46 @@ pub extern "C" fn __rz_take_call_arg_leaf_shadow(
 /// Export the post-call family for a non-pointer carrier pointee mutated through `&mut T`.
 #[no_mangle]
 pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr: usize, tag: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, mut_arg_ret_push);
     let _g = RzRuntimeGuard::enter();
+    let boundary_id = active_call_boundary_id(callee_id);
     let raw_tag = tag;
     let newest_exact = recover_newest_exact_slot_tag(addr);
-    let tag = canonical_mut_arg_ret_tag(addr, tag);
+    let tag = if raw_tag == 0 {
+        canonical_mut_arg_ret_tag(addr, raw_tag)
+    } else {
+        raw_tag
+    };
     if rz_trace_call_tags_enabled() {
         eprintln!(
             "[rusteze-runtime][mut-arg-ret] push callee={} arg={} addr=0x{:x} raw_tag={} newest_exact={} tag={}",
-            callee_id, arg_index, addr, raw_tag, newest_exact, tag
+            boundary_id, arg_index, addr, raw_tag, newest_exact, tag
         );
+    }
+    if tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
     }
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
         remember_mut_arg_ret_boundary_lineage(tag);
-        remember_boundary_survivor_tag(callee_id, tag);
+        remember_boundary_survivor_tag(boundary_id, tag);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_tags()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, arg_index, addr), tag);
+        .insert((thread_id, boundary_id, arg_index, addr), tag);
 }
 
 /// Consume the callee-exported family for a non-pointer carrier pointee after a call returns.
 #[no_mangle]
 pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, mut_arg_ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let raw_tag = mut_arg_ret_tags()
         .lock()
@@ -6305,7 +7001,10 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag_or_zero(
     arg_index: u64,
     addr: usize,
 ) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, mut_arg_ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let raw_tag = mut_arg_ret_tags()
         .lock()
@@ -6337,7 +7036,10 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     leaf_key: u64,
     slot_addr: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, mut_arg_ret_push);
     let _g = RzRuntimeGuard::enter();
+    let boundary_id = active_call_boundary_id(callee_id);
     let Some((tag, ref_ancestor, export_parent, export_parent_recovered)) =
         current_slot_shadow(slot_addr)
     else {
@@ -6349,11 +7051,11 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     if tag != 0 {
         active_alias_model().on_mut_arg_ret_export(tag, addr);
         remember_mut_arg_ret_boundary_lineage(tag);
-        remember_boundary_survivor_tag(callee_id, tag);
+        remember_boundary_survivor_tag(boundary_id, tag);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_leaf_shadows().lock().unwrap().insert(
-        (thread_id, callee_id, arg_index, addr, leaf_key),
+        (thread_id, boundary_id, arg_index, addr, leaf_key),
         (tag, ref_ancestor, export_parent, export_parent_recovered),
     );
 }
@@ -6368,7 +7070,10 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
     leaf_key: u64,
     slot_addr: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, mut_arg_ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let shadow = mut_arg_ret_leaf_shadows()
         .lock()
@@ -6381,14 +7086,21 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
 #[no_mangle]
 pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_push);
     let _g = RzRuntimeGuard::enter();
+    if tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
+    }
+    let boundary_id = active_call_boundary_id(callee_id);
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    validate_and_export_return_tag(callee_id, tag, addr, boundary_survivor);
+    validate_and_export_return_tag(boundary_id, tag, addr, boundary_survivor);
     let thread_id = std::thread::current().id();
     ret_tags()
         .lock()
         .unwrap()
-        .insert((thread_id, callee_id, addr), tag);
+        .insert((thread_id, boundary_id, addr), tag);
 }
 
 /// Push the exact shadow of one returned carrier leaf so the caller can recreate its slot shadow.
@@ -6399,17 +7111,20 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(
     slot_addr: usize,
     leaf_is_ref: u8,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_push);
     let _g = RzRuntimeGuard::enter();
+    let boundary_id = active_call_boundary_id(callee_id);
     let shadow = canonical_return_leaf_shadow(slot_addr, leaf_is_ref != 0);
     if !shadow_is_present(shadow) {
         return;
     }
     let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) = shadow;
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
-    validate_and_export_return_tag(callee_id, ret_tag, 0, boundary_survivor);
+    validate_and_export_return_tag(boundary_id, ret_tag, 0, boundary_survivor);
     let thread_id = std::thread::current().id();
     ret_leaf_shadows().lock().unwrap().insert(
-        (thread_id, callee_id, leaf_key),
+        (thread_id, boundary_id, leaf_key),
         (
             ret_tag,
             ret_ref_ancestor,
@@ -6422,15 +7137,22 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(
 /// Validate a non-pointer return carrier's inner reference tag at the return boundary.
 #[no_mangle]
 pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_push);
     let _g = RzRuntimeGuard::enter();
+    if tag == 0 {
+        rz_profile_inc_field!(profile, call_arg_zero_skipped);
+        return;
+    }
+    let boundary_id = active_call_boundary_id(callee_id);
     let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    validate_and_export_return_tag(callee_id, tag, 0, boundary_survivor);
+    validate_and_export_return_tag(boundary_id, tag, 0, boundary_survivor);
     if tag != 0 {
         let thread_id = std::thread::current().id();
         ret_tags()
             .lock()
             .unwrap()
-            .insert((thread_id, callee_id, 0), tag);
+            .insert((thread_id, boundary_id, 0), tag);
     }
 }
 
@@ -6468,7 +7190,10 @@ pub extern "C" fn __rz_require_loaded_ptr_tag(tag: u64) {
 /// Take (consume) a pushed return-tag for a callee/return-address pair.
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let tag = ret_tags()
         .lock()
@@ -6482,7 +7207,10 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
 /// Take one returned carrier-leaf shadow and recreate the caller destination slot shadow.
 #[no_mangle]
 pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_addr: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let shadow = ret_leaf_shadows()
         .lock()
@@ -6505,7 +7233,10 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
     bounds_len: usize,
     align_req: usize,
 ) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ret_take);
     let _g = RzRuntimeGuard::enter();
+    finalize_direct_call_boundary(callee_id);
     let thread_id = std::thread::current().id();
     let tag = {
         ret_tags()
@@ -6525,17 +7256,47 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
 /// Open the per-activation call-argument payload scope for an instrumented function.
 #[no_mangle]
 pub extern "C" fn __rz_enter_fn(callee_id: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, fn_enter);
     let _g = RzRuntimeGuard::enter();
+    // The callee keeps using its function id in MIR, while side channels use the caller's
+    // boundary key for this activation.
+    let boundary_id = enter_call_boundary(callee_id);
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-boundary] enter callee={} boundary={}",
+            callee_id, boundary_id
+        );
+    }
     enter_call_arg_leaf_scope(callee_id);
 }
 
 /// Notify runtime alias models that the current instrumented function is exiting.
 #[no_mangle]
 pub extern "C" fn __rz_exit_fn(callee_id: u64) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, fn_exit);
     let _g = RzRuntimeGuard::enter();
-    clear_unconsumed_call_arg_leaf_shadows(callee_id);
+    if active_call_boundary_activation(callee_id).is_some_and(|activation| activation.direct) {
+        if rz_trace_call_tags_enabled() {
+            eprintln!(
+                "[rusteze-runtime][call-boundary] defer exit callee={}",
+                callee_id
+            );
+        }
+        return;
+    }
+    let activation = exit_call_boundary(callee_id);
+    let boundary_id = activation.boundary_id;
+    if rz_trace_call_tags_enabled() {
+        eprintln!(
+            "[rusteze-runtime][call-boundary] exit callee={} boundary={}",
+            callee_id, boundary_id
+        );
+    }
+    clear_unconsumed_call_arg_leaf_shadows(boundary_id);
     exit_call_arg_leaf_scope(callee_id);
-    active_alias_model().on_call_exit(callee_id);
+    active_alias_model().on_call_exit(boundary_id);
 }
 
 #[macro_export]
