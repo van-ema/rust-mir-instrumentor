@@ -11,6 +11,10 @@ use crate::{
 use super::{AliasAccessKind, AliasModel};
 
 pub(crate) struct TreeBorrowsLiteModel;
+// Source used a projected helper parent, so parent shape is part of the TB-lite decision.
+const TB_LITE_HINT_PROJECTED_HELPER_PARENT: u8 = 0b0000_0100;
+// Returned by-value carrier refs may reroot a caller-visible same-slot family.
+const TB_LITE_HINT_RETURNED_CARRIER_REROOT: u8 = 0b0000_1000;
 // Example: `q = p.add(1)` stays in `p`'s TB family; it is not a new raw authority.
 const TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
 
@@ -52,6 +56,46 @@ struct TbNode {
 #[derive(Default)]
 struct TbAllocState {
     nodes: HashMap<u64, TbNode>,
+    children: HashMap<u64, Vec<u64>>,
+}
+
+impl TbAllocState {
+    fn insert_node(&mut self, node: TbNode) {
+        if let Some(old) = self.nodes.insert(node.tag, node.clone()) {
+            self.unlink_child(old.parent, old.tag);
+        }
+        self.link_child(node.parent, node.tag);
+    }
+
+    fn remove_node(&mut self, tag: u64) -> Option<TbNode> {
+        let node = self.nodes.remove(&tag)?;
+        self.unlink_child(node.parent, tag);
+        self.children.remove(&tag);
+        Some(node)
+    }
+
+    fn link_child(&mut self, parent: u64, child: u64) {
+        if parent == 0 || child == 0 {
+            return;
+        }
+        let children = self.children.entry(parent).or_default();
+        if !children.iter().any(|tag| *tag == child) {
+            children.push(child);
+        }
+    }
+
+    fn unlink_child(&mut self, parent: u64, child: u64) {
+        if parent == 0 || child == 0 {
+            return;
+        }
+        let Some(children) = self.children.get_mut(&parent) else {
+            return;
+        };
+        children.retain(|tag| *tag != child);
+        if children.is_empty() {
+            self.children.remove(&parent);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -323,12 +367,7 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             })
             .cloned();
         if let Some(protected_node) = active_protected_unique {
-            let descendant_tags: Vec<u64> = tree
-                .nodes
-                .values()
-                .filter(|n| n.tag != tag && tb_is_ancestor(&tree.nodes, tag, n.tag))
-                .map(|n| n.tag)
-                .collect();
+            let descendant_tags = tb_descendant_tags(tree, tag);
             for descendant in descendant_tags {
                 if let Some(node) = tree.nodes.get_mut(&descendant) {
                     tb_disable_node_for_protector_end(node);
@@ -387,12 +426,7 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         let Some(tree) = all.get_mut(&base) else {
             continue;
         };
-        let descendant_tags: Vec<u64> = tree
-            .nodes
-            .values()
-            .filter(|n| n.tag != tag && tb_is_ancestor(&tree.nodes, tag, n.tag))
-            .map(|n| n.tag)
-            .collect();
+        let descendant_tags = tb_descendant_tags(tree, tag);
         for descendant in descendant_tags {
             if let Some(node) = tree.nodes.get_mut(&descendant) {
                 tb_disable_node_for_protector_end(node);
@@ -565,7 +599,7 @@ fn tb_lite_resolve_parent_for_new_node(
     }
     let tmap = tags().lock().unwrap();
     let projected_helper_ref_parent = matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
-        && (tmeta.lineage_hint & 0b0000_0100) != 0
+        && (tmeta.lineage_hint & TB_LITE_HINT_PROJECTED_HELPER_PARENT) != 0
         && tmap.get(&tmeta.parent).is_some_and(|meta| {
             meta.parent == 0 && matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)
         });
@@ -657,7 +691,7 @@ fn tb_lite_insert_tag_node(
         protector_shadow_depth: 0,
         poisoned_by_protector_end: false,
     };
-    tree.nodes.insert(tag, node.clone());
+    tree.insert_node(node.clone());
     node
 }
 
@@ -742,7 +776,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
     let node = tb_lite_insert_tag_node(tree, tag, tmeta, kind);
     let parent = node.parent;
     let protected = node.protected;
-    let returned_carrier_reroot = (tmeta.lineage_hint & 0b1000) != 0;
+    let returned_carrier_reroot = (tmeta.lineage_hint & TB_LITE_HINT_RETURNED_CARRIER_REROOT) != 0;
     // Same-slot returned-carrier rerooting is write-like. A shared root is only a read view; it
     // must not retire an older unique family such as a two-phase receiver reservation.
     if returned_carrier_reroot && matches!(kind, BorrowKind::Unique) {
@@ -950,7 +984,7 @@ fn tb_unshadow_same_slot_protected_unique_ancestors(
 
 /// Re-enable an ordinary return family that is exported after call-exit teardown has already run.
 ///
-/// Normal returned refs must not get broad ancestor repair before the return-boundary validation:
+/// Normal returned refs must not get broad ancestor revival before the return-boundary validation:
 /// Tree Borrows intentionally rejects a returned `&mut` that was frozen/invalidated before return.
 /// This helper therefore keeps the green-base behavior:
 /// - always re-enable the exported exact tag itself
@@ -1091,10 +1125,7 @@ fn tb_lite_on_tag_killed(tag: u64) {
     let Some(tree) = all.get_mut(&base) else {
         return;
     };
-    let has_live_descendant = tree
-        .nodes
-        .values()
-        .any(|n| n.tag != tag && tb_is_live_node(n) && tb_is_ancestor(&tree.nodes, tag, n.tag));
+    let has_live_descendant = tb_has_live_descendant(tree, tag);
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
@@ -1157,13 +1188,31 @@ fn tb_protector_frame_tag_snapshot() -> Vec<u64> {
     tags
 }
 
-fn tb_subtree_tags_deepest_first(nodes: &HashMap<u64, TbNode>, root: u64) -> Vec<u64> {
-    let mut tags: Vec<(usize, u64)> = nodes
-        .keys()
-        .copied()
-        .filter(|tag| *tag == root || tb_is_ancestor(nodes, root, *tag))
-        .map(|tag| (tb_node_depth(nodes, tag), tag))
-        .collect();
+fn tb_subtree_tags_deepest_first(tree: &TbAllocState, root: u64) -> Vec<u64> {
+    if !tree.nodes.contains_key(&root) {
+        return Vec::new();
+    }
+    let mut tags = Vec::new();
+    let mut stack = vec![(root, 0usize)];
+    let mut visited = 0usize;
+    while let Some((tag, depth)) = stack.pop() {
+        if visited > tree.nodes.len() {
+            break;
+        }
+        visited = visited.saturating_add(1);
+        if !tree.nodes.contains_key(&tag) {
+            continue;
+        }
+        tags.push((depth, tag));
+        if let Some(children) = tree.children.get(&tag) {
+            stack.extend(
+                children
+                    .iter()
+                    .copied()
+                    .map(|child| (child, depth.saturating_add(1))),
+            );
+        }
+    }
     tags.sort_by(|(left_depth, left_tag), (right_depth, right_tag)| {
         right_depth
             .cmp(left_depth)
@@ -1172,19 +1221,45 @@ fn tb_subtree_tags_deepest_first(nodes: &HashMap<u64, TbNode>, root: u64) -> Vec
     tags.into_iter().map(|(_, tag)| tag).collect()
 }
 
-fn tb_node_depth(nodes: &HashMap<u64, TbNode>, mut tag: u64) -> usize {
-    let mut depth = 0usize;
-    for _ in 0..nodes.len().saturating_add(1) {
-        let Some(node) = nodes.get(&tag) else {
-            break;
-        };
-        if node.parent == 0 {
+fn tb_descendant_tags(tree: &TbAllocState, root: u64) -> Vec<u64> {
+    let mut tags = Vec::new();
+    let mut stack = tree.children.get(&root).cloned().unwrap_or_default();
+    let mut visited = 0usize;
+    while let Some(tag) = stack.pop() {
+        if visited > tree.nodes.len() {
             break;
         }
-        depth = depth.saturating_add(1);
-        tag = node.parent;
+        visited = visited.saturating_add(1);
+        if !tree.nodes.contains_key(&tag) {
+            continue;
+        }
+        tags.push(tag);
+        if let Some(children) = tree.children.get(&tag) {
+            stack.extend(children.iter().copied());
+        }
     }
-    depth
+    tags
+}
+
+fn tb_has_live_descendant(tree: &TbAllocState, root: u64) -> bool {
+    let mut stack = tree.children.get(&root).cloned().unwrap_or_default();
+    let mut visited = 0usize;
+    while let Some(tag) = stack.pop() {
+        if visited > tree.nodes.len() {
+            break;
+        }
+        visited = visited.saturating_add(1);
+        let Some(node) = tree.nodes.get(&tag) else {
+            continue;
+        };
+        if tb_is_live_node(node) {
+            return true;
+        }
+        if let Some(children) = tree.children.get(&tag) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    false
 }
 
 fn tb_node_can_compact_invalidated(node: &TbNode, frame_tags: &[u64]) -> bool {
@@ -1225,7 +1300,7 @@ fn tb_compact_unreachable_invalidated_subtree(
         return 0;
     }
 
-    let subtree = tb_subtree_tags_deepest_first(&tree.nodes, root);
+    let subtree = tb_subtree_tags_deepest_first(tree, root);
     if subtree.is_empty() {
         return 0;
     }
@@ -1264,7 +1339,7 @@ fn tb_compact_unreachable_invalidated_subtree(
     for compacted in compacted_nodes {
         if tag_store::compact_invalidated_tag(compacted.tag) {
             tag_pruning::note_invalidated_tag_compacted(compacted.tag);
-            tree.nodes.remove(&compacted.tag);
+            tree.remove_node(compacted.tag);
             removed = removed.saturating_add(1);
         } else {
             tb_compacted_invalidated()
@@ -1951,13 +2026,31 @@ fn tb_has_live_readonly_descendant(
     addr: usize,
     size: usize,
 ) -> bool {
-    tree.nodes.values().any(|node| {
-        node.tag != ancestor_tag
-            && tb_is_live_node(node)
+    let mut stack = tree
+        .children
+        .get(&ancestor_tag)
+        .cloned()
+        .unwrap_or_default();
+    let mut visited = 0usize;
+    while let Some(tag) = stack.pop() {
+        if visited > tree.nodes.len() {
+            break;
+        }
+        visited = visited.saturating_add(1);
+        let Some(node) = tree.nodes.get(&tag) else {
+            continue;
+        };
+        if tb_is_live_node(node)
             && matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst)
-            && tb_is_ancestor(&tree.nodes, ancestor_tag, node.tag)
             && tb_node_overlaps(node, addr, size)
-    })
+        {
+            return true;
+        }
+        if let Some(children) = tree.children.get(&tag) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    false
 }
 
 /// Retire temporary helper views before a real local mutable write.
@@ -2173,7 +2266,7 @@ fn tb_revive_node_after_protector_end(n: &mut TbNode) {
 ///
 /// Exported exact tags are caller-visible by definition, so once an export hook publishes them we
 /// must drop any frame-local protector bookkeeping and give them a live permission again. Unlike
-/// `tb_revive_node_after_protector_end`, this helper is intentionally broader: it repairs the
+/// `tb_revive_node_after_protector_end`, this helper is intentionally broader: it re-enables the
 /// exported exact node even when it was disabled for reasons other than protector-end poison.
 #[inline]
 fn tb_reenable_exported_exact_node(n: &mut TbNode) {
@@ -2486,10 +2579,13 @@ mod tests {
         tag_store::insert(tag, meta);
 
         let mut tree = TbAllocState::default();
-        tree.nodes.insert(
+        tree.insert_node(test_node(
             tag,
-            test_node(tag, 0, addr, BorrowKind::Shared, TbPerm::Disabled),
-        );
+            0,
+            addr,
+            BorrowKind::Shared,
+            TbPerm::Disabled,
+        ));
 
         let removed = tb_compact_unreachable_invalidated_subtree(&mut tree, tag, &[]);
         assert_eq!(removed, 1);
@@ -2517,14 +2613,20 @@ mod tests {
         tag_store::insert(child, test_meta(addr, PtrKind::RefShared, parent));
 
         let mut tree = TbAllocState::default();
-        tree.nodes.insert(
+        tree.insert_node(test_node(
             parent,
-            test_node(parent, 0, addr, BorrowKind::Unique, TbPerm::Disabled),
-        );
-        tree.nodes.insert(
+            0,
+            addr,
+            BorrowKind::Unique,
+            TbPerm::Disabled,
+        ));
+        tree.insert_node(test_node(
             child,
-            test_node(child, parent, addr, BorrowKind::Shared, TbPerm::Frozen),
-        );
+            parent,
+            addr,
+            BorrowKind::Shared,
+            TbPerm::Frozen,
+        ));
 
         let removed = tb_compact_unreachable_invalidated_subtree(&mut tree, parent, &[]);
         assert_eq!(removed, 0);
