@@ -4,9 +4,10 @@
 #![allow(internal_features)]
 use core::ptr;
 use std::sync::OnceLock;
+#[cfg(feature = "runtime_hook_profile")]
 use std::time::Instant;
 
-#[cfg(unix)]
+#[cfg(all(feature = "runtime_hook_profile", unix))]
 unsafe extern "C" {
     fn atexit(cb: extern "C" fn()) -> i32;
 }
@@ -115,6 +116,7 @@ impl Drop for RelaxEpochGuard {
     }
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 struct HookProfileCounters {
     write_calls: AtomicU64,
     write_total_ns: AtomicU64,
@@ -139,8 +141,26 @@ struct HookProfileCounters {
     ptr_use_total_ns: AtomicU64,
     record_alloc_calls: AtomicU64,
     record_alloc_total_ns: AtomicU64,
+    shadow_store_calls: AtomicU64,
+    shadow_store_total_ns: AtomicU64,
+    shadow_load_calls: AtomicU64,
+    shadow_load_total_ns: AtomicU64,
+    shadow_kill_range_calls: AtomicU64,
+    shadow_kill_range_total_ns: AtomicU64,
+    shadow_copy_slot_calls: AtomicU64,
+    shadow_copy_slot_total_ns: AtomicU64,
+    shadow_copy_range_calls: AtomicU64,
+    shadow_copy_range_total_ns: AtomicU64,
+    tag_retain_calls: AtomicU64,
+    tag_retain_total_ns: AtomicU64,
+    tag_kill_calls: AtomicU64,
+    tag_kill_total_ns: AtomicU64,
+    tag_kill_release_ns: AtomicU64,
+    tag_kill_escape_check_ns: AtomicU64,
+    tag_kill_alias_on_tag_killed_ns: AtomicU64,
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 impl HookProfileCounters {
     const fn new() -> Self {
         Self {
@@ -167,18 +187,38 @@ impl HookProfileCounters {
             ptr_use_total_ns: AtomicU64::new(0),
             record_alloc_calls: AtomicU64::new(0),
             record_alloc_total_ns: AtomicU64::new(0),
+            shadow_store_calls: AtomicU64::new(0),
+            shadow_store_total_ns: AtomicU64::new(0),
+            shadow_load_calls: AtomicU64::new(0),
+            shadow_load_total_ns: AtomicU64::new(0),
+            shadow_kill_range_calls: AtomicU64::new(0),
+            shadow_kill_range_total_ns: AtomicU64::new(0),
+            shadow_copy_slot_calls: AtomicU64::new(0),
+            shadow_copy_slot_total_ns: AtomicU64::new(0),
+            shadow_copy_range_calls: AtomicU64::new(0),
+            shadow_copy_range_total_ns: AtomicU64::new(0),
+            tag_retain_calls: AtomicU64::new(0),
+            tag_retain_total_ns: AtomicU64::new(0),
+            tag_kill_calls: AtomicU64::new(0),
+            tag_kill_total_ns: AtomicU64::new(0),
+            tag_kill_release_ns: AtomicU64::new(0),
+            tag_kill_escape_check_ns: AtomicU64::new(0),
+            tag_kill_alias_on_tag_killed_ns: AtomicU64::new(0),
         }
     }
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 static RZ_HOOK_PROFILE: OnceLock<HookProfileCounters> = OnceLock::new();
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_hook_profile() -> &'static HookProfileCounters {
     rz_maybe_register_hook_profile_atexit();
     RZ_HOOK_PROFILE.get_or_init(HookProfileCounters::new)
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_profile_hooks_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -189,6 +229,7 @@ fn rz_profile_hooks_enabled() -> bool {
     })
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_dump_hook_profile_at_exit_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -199,6 +240,7 @@ fn rz_dump_hook_profile_at_exit_enabled() -> bool {
     })
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_profile_add_elapsed(counter: &AtomicU64, start: Instant) {
     let nanos = start.elapsed().as_nanos();
@@ -206,11 +248,12 @@ fn rz_profile_add_elapsed(counter: &AtomicU64, start: Instant) {
     counter.fetch_add(clipped, Ordering::Relaxed);
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "runtime_hook_profile", unix))]
 extern "C" fn rz_dump_hook_profile_atexit() {
     __rz_dump_hook_profile();
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_maybe_register_hook_profile_atexit() {
     static REGISTERED: OnceLock<()> = OnceLock::new();
@@ -227,11 +270,13 @@ fn rz_maybe_register_hook_profile_atexit() {
     });
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 fn rz_elapsed_ns(start: Instant) -> u64 {
     let ns = start.elapsed().as_nanos();
     core::cmp::min(ns, u64::MAX as u128) as u64
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 #[inline]
 fn rz_profile_add(counter: &AtomicU64, start: Option<Instant>) {
     if let Some(t0) = start {
@@ -239,11 +284,13 @@ fn rz_profile_add(counter: &AtomicU64, start: Option<Instant>) {
     }
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 struct HookProfileGuard {
     start: Option<Instant>,
     total_counter: Option<&'static AtomicU64>,
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 impl HookProfileGuard {
     #[inline]
     fn write(profile: Option<&'static HookProfileCounters>) -> Self {
@@ -334,8 +381,114 @@ impl HookProfileGuard {
             total_counter: Some(&p.record_alloc_total_ns),
         }
     }
+
+    #[inline]
+    fn shadow_store(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.shadow_store_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.shadow_store_total_ns),
+        }
+    }
+
+    #[inline]
+    fn shadow_load(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.shadow_load_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.shadow_load_total_ns),
+        }
+    }
+
+    #[inline]
+    fn shadow_kill_range(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.shadow_kill_range_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.shadow_kill_range_total_ns),
+        }
+    }
+
+    #[inline]
+    fn shadow_copy_slot(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.shadow_copy_slot_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.shadow_copy_slot_total_ns),
+        }
+    }
+
+    #[inline]
+    fn shadow_copy_range(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.shadow_copy_range_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.shadow_copy_range_total_ns),
+        }
+    }
+
+    #[inline]
+    fn tag_retain(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.tag_retain_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.tag_retain_total_ns),
+        }
+    }
+
+    #[inline]
+    fn tag_kill(profile: Option<&'static HookProfileCounters>) -> Self {
+        let Some(p) = profile else {
+            return Self {
+                start: None,
+                total_counter: None,
+            };
+        };
+        p.tag_kill_calls.fetch_add(1, Ordering::Relaxed);
+        Self {
+            start: Some(Instant::now()),
+            total_counter: Some(&p.tag_kill_total_ns),
+        }
+    }
 }
 
+#[cfg(feature = "runtime_hook_profile")]
 impl Drop for HookProfileGuard {
     #[inline]
     fn drop(&mut self) {
@@ -344,6 +497,76 @@ impl Drop for HookProfileGuard {
         };
         total.fetch_add(rz_elapsed_ns(*t0), Ordering::Relaxed);
     }
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_context {
+    () => {
+        rz_profile_hooks_enabled().then(rz_hook_profile)
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_context {
+    () => {
+        ()
+    };
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_guard {
+    ($profile:expr, $kind:ident) => {
+        HookProfileGuard::$kind($profile)
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_guard {
+    ($profile:expr, $kind:ident) => {
+        ()
+    };
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_start {
+    ($profile:expr) => {
+        $profile.map(|_| Instant::now())
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_start {
+    ($profile:expr) => {
+        ()
+    };
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_add_elapsed_field {
+    ($profile:expr, $field:ident, $start:expr) => {
+        if let (Some(p), Some(start)) = ($profile, $start) {
+            rz_profile_add_elapsed(&p.$field, start);
+        }
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_add_elapsed_field {
+    ($profile:expr, $field:ident, $start:expr) => {};
+}
+
+#[cfg(feature = "runtime_hook_profile")]
+macro_rules! rz_profile_add_opt_field {
+    ($profile:expr, $field:ident, $start:expr) => {
+        if let Some(p) = $profile {
+            rz_profile_add(&p.$field, $start);
+        }
+    };
+}
+
+#[cfg(not(feature = "runtime_hook_profile"))]
+macro_rules! rz_profile_add_opt_field {
+    ($profile:expr, $field:ident, $start:expr) => {};
 }
 
 #[inline]
@@ -2827,8 +3050,8 @@ fn normalize_const_end_ref_access_addr(
 /// This is a building block; stack/heap instrumentation will call this later.
 #[no_mangle]
 pub extern "C" fn __rz_record_alloc(base_addr: usize, size: usize, live: u8) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::record_alloc(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, record_alloc);
     let _g = RzRuntimeGuard::enter();
 
     // Record allocation events into a fixed-size ring buffer for post-mortem dumps.
@@ -3008,6 +3231,8 @@ pub extern "C" fn __rz_shadow_store_ptr(
     export_parent: u64,
     export_parent_recovered: u8,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_store);
     let _g = RzRuntimeGuard::enter();
     let (tag, ref_ancestor, export_parent, export_parent_recovered) =
         sanitize_shadow_entry_for_slot_value(
@@ -3043,6 +3268,8 @@ pub extern "C" fn __rz_shadow_store_ptr_local(
     export_parent: u64,
     export_parent_recovered: u8,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_store);
     let _g = RzRuntimeGuard::enter();
     let (tag, ref_ancestor, export_parent, export_parent_recovered) =
         sanitize_shadow_entry_for_slot_value(
@@ -3078,6 +3305,8 @@ pub extern "C" fn __rz_shadow_store_alloc_root(
     bounds_len: usize,
     align_req: usize,
 ) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_store);
     let _g = RzRuntimeGuard::enter();
     if slot_addr == 0 {
         return;
@@ -3104,6 +3333,8 @@ pub extern "C" fn __rz_shadow_store_alloc_root(
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3120,6 +3351,8 @@ pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag_for_ptr(slot_addr: usize, ptr_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3136,6 +3369,8 @@ pub extern "C" fn __rz_shadow_load_tag_for_ptr(slot_addr: usize, ptr_addr: usize
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3152,6 +3387,8 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_ref_ancestor_for_ptr(slot_addr: usize, ptr_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let ref_ancestor = ptr_shadow::load_ref_ancestor_for_ptr_value(slot_addr, ptr_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3168,6 +3405,8 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor_for_ptr(slot_addr: usize, ptr_ad
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_export_parent(slot_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let export_parent = ptr_shadow::load_export_parent(slot_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3184,6 +3423,8 @@ pub extern "C" fn __rz_shadow_load_export_parent(slot_addr: usize) -> u64 {
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_export_parent_for_ptr(slot_addr: usize, ptr_addr: usize) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let export_parent = ptr_shadow::load_export_parent_for_ptr_value(slot_addr, ptr_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3200,6 +3441,8 @@ pub extern "C" fn __rz_shadow_load_export_parent_for_ptr(slot_addr: usize, ptr_a
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_load_export_parent_recovered(slot_addr: usize) -> u8 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3219,6 +3462,8 @@ pub extern "C" fn __rz_shadow_load_export_parent_recovered_for_ptr(
     slot_addr: usize,
     ptr_addr: usize,
 ) -> u8 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let recovered = ptr_shadow::load_export_parent_recovered_for_ptr_value(slot_addr, ptr_addr);
     if std::env::var("RZ_TRACE_PTR_SHADOW")
@@ -3235,6 +3480,8 @@ pub extern "C" fn __rz_shadow_load_export_parent_recovered_for_ptr(
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_kill_range);
     let _g = RzRuntimeGuard::enter();
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
@@ -3253,9 +3500,25 @@ pub extern "C" fn __rz_tag_kill(tag: u64) {
     if tag == 0 {
         return;
     }
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, tag_kill);
     let _g = RzRuntimeGuard::enter();
-    if tag_store::release_local_holder(tag) && !tag_store::active_tag_escaped(tag) {
-        active_alias_model().on_tag_killed(tag);
+    let release_start = rz_profile_start!(profile);
+    let released = tag_store::release_local_holder(tag);
+    rz_profile_add_elapsed_field!(profile, tag_kill_release_ns, release_start);
+    if released {
+        let escape_check_start = rz_profile_start!(profile);
+        let escaped = tag_store::active_tag_escaped(tag);
+        rz_profile_add_elapsed_field!(profile, tag_kill_escape_check_ns, escape_check_start);
+        if !escaped {
+            let alias_on_tag_killed_start = rz_profile_start!(profile);
+            active_alias_model().on_tag_killed(tag);
+            rz_profile_add_elapsed_field!(
+                profile,
+                tag_kill_alias_on_tag_killed_ns,
+                alias_on_tag_killed_start
+            );
+        }
     }
 }
 
@@ -3264,12 +3527,16 @@ pub extern "C" fn __rz_tag_retain(tag: u64) {
     if tag == 0 {
         return;
     }
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, tag_retain);
     let _g = RzRuntimeGuard::enter();
     tag_store::retain_local_holder(tag);
 }
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_copy_slot);
     let _g = RzRuntimeGuard::enter();
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
@@ -3301,6 +3568,8 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
 
 #[no_mangle]
 pub extern "C" fn __rz_shadow_copy_range(dst_addr: usize, src_addr: usize, size: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_copy_range);
     let _g = RzRuntimeGuard::enter();
     if std::env::var("RZ_TRACE_PTR_SHADOW")
         .ok()
@@ -3561,6 +3830,7 @@ pub extern "C" fn __rz_dump_state() {
 }
 
 #[no_mangle]
+#[cfg(feature = "runtime_hook_profile")]
 pub extern "C" fn __rz_reset_hook_profile() {
     let Some(p) = RZ_HOOK_PROFILE.get() else {
         return;
@@ -3589,9 +3859,32 @@ pub extern "C" fn __rz_reset_hook_profile() {
     p.ptr_use_total_ns.store(0, Ordering::Relaxed);
     p.record_alloc_calls.store(0, Ordering::Relaxed);
     p.record_alloc_total_ns.store(0, Ordering::Relaxed);
+    p.shadow_store_calls.store(0, Ordering::Relaxed);
+    p.shadow_store_total_ns.store(0, Ordering::Relaxed);
+    p.shadow_load_calls.store(0, Ordering::Relaxed);
+    p.shadow_load_total_ns.store(0, Ordering::Relaxed);
+    p.shadow_kill_range_calls.store(0, Ordering::Relaxed);
+    p.shadow_kill_range_total_ns.store(0, Ordering::Relaxed);
+    p.shadow_copy_slot_calls.store(0, Ordering::Relaxed);
+    p.shadow_copy_slot_total_ns.store(0, Ordering::Relaxed);
+    p.shadow_copy_range_calls.store(0, Ordering::Relaxed);
+    p.shadow_copy_range_total_ns.store(0, Ordering::Relaxed);
+    p.tag_retain_calls.store(0, Ordering::Relaxed);
+    p.tag_retain_total_ns.store(0, Ordering::Relaxed);
+    p.tag_kill_calls.store(0, Ordering::Relaxed);
+    p.tag_kill_total_ns.store(0, Ordering::Relaxed);
+    p.tag_kill_release_ns.store(0, Ordering::Relaxed);
+    p.tag_kill_escape_check_ns.store(0, Ordering::Relaxed);
+    p.tag_kill_alias_on_tag_killed_ns
+        .store(0, Ordering::Relaxed);
 }
 
 #[no_mangle]
+#[cfg(not(feature = "runtime_hook_profile"))]
+pub extern "C" fn __rz_reset_hook_profile() {}
+
+#[no_mangle]
+#[cfg(feature = "runtime_hook_profile")]
 pub extern "C" fn __rz_dump_hook_profile() {
     let _runtime_guard = RzRuntimeGuard::enter();
     if !rz_profile_hooks_enabled() {
@@ -3623,6 +3916,23 @@ pub extern "C" fn __rz_dump_hook_profile() {
     let ptr_use_total_ns = p.ptr_use_total_ns.load(Ordering::Relaxed);
     let record_alloc_calls = p.record_alloc_calls.load(Ordering::Relaxed);
     let record_alloc_total_ns = p.record_alloc_total_ns.load(Ordering::Relaxed);
+    let shadow_store_calls = p.shadow_store_calls.load(Ordering::Relaxed);
+    let shadow_store_total_ns = p.shadow_store_total_ns.load(Ordering::Relaxed);
+    let shadow_load_calls = p.shadow_load_calls.load(Ordering::Relaxed);
+    let shadow_load_total_ns = p.shadow_load_total_ns.load(Ordering::Relaxed);
+    let shadow_kill_range_calls = p.shadow_kill_range_calls.load(Ordering::Relaxed);
+    let shadow_kill_range_total_ns = p.shadow_kill_range_total_ns.load(Ordering::Relaxed);
+    let shadow_copy_slot_calls = p.shadow_copy_slot_calls.load(Ordering::Relaxed);
+    let shadow_copy_slot_total_ns = p.shadow_copy_slot_total_ns.load(Ordering::Relaxed);
+    let shadow_copy_range_calls = p.shadow_copy_range_calls.load(Ordering::Relaxed);
+    let shadow_copy_range_total_ns = p.shadow_copy_range_total_ns.load(Ordering::Relaxed);
+    let tag_retain_calls = p.tag_retain_calls.load(Ordering::Relaxed);
+    let tag_retain_total_ns = p.tag_retain_total_ns.load(Ordering::Relaxed);
+    let tag_kill_calls = p.tag_kill_calls.load(Ordering::Relaxed);
+    let tag_kill_total_ns = p.tag_kill_total_ns.load(Ordering::Relaxed);
+    let tag_kill_release_ns = p.tag_kill_release_ns.load(Ordering::Relaxed);
+    let tag_kill_escape_check_ns = p.tag_kill_escape_check_ns.load(Ordering::Relaxed);
+    let tag_kill_alias_on_tag_killed_ns = p.tag_kill_alias_on_tag_killed_ns.load(Ordering::Relaxed);
 
     let write_avg_ns = if write_calls == 0 {
         0.0
@@ -3702,6 +4012,79 @@ pub extern "C" fn __rz_dump_hook_profile() {
         }
     );
     eprintln!(
+        "  shadow_store:      calls={} total={} avg_per_call={:.1}",
+        shadow_store_calls,
+        shadow_store_total_ns,
+        if shadow_store_calls == 0 {
+            0.0
+        } else {
+            shadow_store_total_ns as f64 / shadow_store_calls as f64
+        }
+    );
+    eprintln!(
+        "  shadow_load:       calls={} total={} avg_per_call={:.1}",
+        shadow_load_calls,
+        shadow_load_total_ns,
+        if shadow_load_calls == 0 {
+            0.0
+        } else {
+            shadow_load_total_ns as f64 / shadow_load_calls as f64
+        }
+    );
+    eprintln!(
+        "  shadow_kill_range: calls={} total={} avg_per_call={:.1}",
+        shadow_kill_range_calls,
+        shadow_kill_range_total_ns,
+        if shadow_kill_range_calls == 0 {
+            0.0
+        } else {
+            shadow_kill_range_total_ns as f64 / shadow_kill_range_calls as f64
+        }
+    );
+    eprintln!(
+        "  shadow_copy_slot:  calls={} total={} avg_per_call={:.1}",
+        shadow_copy_slot_calls,
+        shadow_copy_slot_total_ns,
+        if shadow_copy_slot_calls == 0 {
+            0.0
+        } else {
+            shadow_copy_slot_total_ns as f64 / shadow_copy_slot_calls as f64
+        }
+    );
+    eprintln!(
+        "  shadow_copy_range: calls={} total={} avg_per_call={:.1}",
+        shadow_copy_range_calls,
+        shadow_copy_range_total_ns,
+        if shadow_copy_range_calls == 0 {
+            0.0
+        } else {
+            shadow_copy_range_total_ns as f64 / shadow_copy_range_calls as f64
+        }
+    );
+    eprintln!(
+        "  tag_retain:        calls={} total={} avg_per_call={:.1}",
+        tag_retain_calls,
+        tag_retain_total_ns,
+        if tag_retain_calls == 0 {
+            0.0
+        } else {
+            tag_retain_total_ns as f64 / tag_retain_calls as f64
+        }
+    );
+    eprintln!(
+        "  tag_kill:          calls={} total={} avg_per_call={:.1} release={} escape_check={} alias_on_tag_killed={}",
+        tag_kill_calls,
+        tag_kill_total_ns,
+        if tag_kill_calls == 0 {
+            0.0
+        } else {
+            tag_kill_total_ns as f64 / tag_kill_calls as f64
+        },
+        tag_kill_release_ns,
+        tag_kill_escape_check_ns,
+        tag_kill_alias_on_tag_killed_ns
+    );
+    eprintln!(
         "  state: alloc_entries={} live_alloc_entries={} tag_entries={} historical_live_tag_entries={} invalidated_tag_entries={} dead_tag_entries={} call_arg_entries={} ret_tag_entries={}",
         alloc_entries, live_alloc_entries, tag_entries, historical_live_tag_entries, invalidated_tag_entries, dead_tag_entries, call_arg_entries, ret_tag_entries
     );
@@ -3715,6 +4098,12 @@ pub extern "C" fn __rz_dump_hook_profile() {
         tag_history_stats.dead_tag_entries,
         tag_history_stats.shadowed_old_live_tag_candidates
     );
+}
+
+#[no_mangle]
+#[cfg(not(feature = "runtime_hook_profile"))]
+pub extern "C" fn __rz_dump_hook_profile() {
+    eprintln!("[rusteze-runtime] hook profile: compiled out (enable feature runtime_hook_profile)");
 }
 
 /// Record/validate a write through a tracked pointer tag.
@@ -3731,8 +4120,8 @@ pub fn __rz_ptr_write(
     align_req: usize,
     access_alias_exempt: u8,
 ) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::write(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, write);
 
     let tag = if tag == 0 {
         if rz_allow_untagged() {
@@ -3757,7 +4146,7 @@ pub fn __rz_ptr_write(
         return;
     }
     let _g = RzRuntimeGuard::enter();
-    let tag_lookup_start = profile.map(|_| Instant::now());
+    let tag_lookup_start = rz_profile_start!(profile);
     let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("WRITE unknown tag={tag} addr=0x{addr:x} size={size}"),
@@ -3855,12 +4244,10 @@ pub fn __rz_ptr_write(
     } else {
         Some(tag)
     };
-    if let Some(p) = profile {
-        rz_profile_add(&p.write_tag_lookup_ns, tag_lookup_start);
-    }
+    rz_profile_add_opt_field!(profile, write_tag_lookup_ns, tag_lookup_start);
 
     if let Some(sb_tag) = sb_tag_opt {
-        let alias_check_start = profile.map(|_| Instant::now());
+        let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
             sb_tag,
             tag,
@@ -3869,9 +4256,7 @@ pub fn __rz_ptr_write(
             size,
             AliasAccessKind::Write,
         );
-        if let Some(p) = profile {
-            rz_profile_add(&p.write_alias_check_ns, alias_check_start);
-        }
+        rz_profile_add_opt_field!(profile, write_alias_check_ns, alias_check_start);
         if let Some(msg) = alias_violation {
             rz_violation(
                 active_alias_model().violation_kind(),
@@ -3883,7 +4268,7 @@ pub fn __rz_ptr_write(
 
     // Fast path: tag-cached origin bounds + exact-base alloc lookup.
     // Slow path falls back to range lookup only when cache is missing/invalid.
-    let alloc_lookup_start = profile.map(|_| Instant::now());
+    let alloc_lookup_start = rz_profile_start!(profile);
     let trace_enabled = rz_log_enabled(LogLevel::Trace);
     let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
     let origin_base_alloc = alloc_from_origin_base(&tmeta);
@@ -3938,9 +4323,7 @@ pub fn __rz_ptr_write(
     if let Some((base, ameta)) = alloc_opt {
         refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
     }
-    if let Some(p) = profile {
-        rz_profile_add(&p.write_alloc_lookup_ns, alloc_lookup_start);
-    }
+    rz_profile_add_opt_field!(profile, write_alloc_lookup_ns, alloc_lookup_start);
 
     let Some((base, ameta)) = alloc_opt else {
         if rz_handle_untracked_region("WRITE", tag, &tmeta, addr, size) {
@@ -4303,8 +4686,8 @@ pub fn __rz_ptr_read(
     align_req: usize,
     access_alias_exempt: u8,
 ) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::read(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, read);
 
     let tag = if tag == 0 {
         if rz_allow_untagged() {
@@ -4329,7 +4712,7 @@ pub fn __rz_ptr_read(
         return;
     }
     let _g = RzRuntimeGuard::enter();
-    let tag_lookup_start = profile.map(|_| Instant::now());
+    let tag_lookup_start = rz_profile_start!(profile);
     let Some(mut tmeta) = tag_lookup_cache::get_cached(tag, || tag_store::get(tag)) else {
         let msg = append_location_if_enabled(
             format!("READ unknown tag={tag} addr=0x{addr:x} size={size}"),
@@ -4427,12 +4810,10 @@ pub fn __rz_ptr_read(
     } else {
         Some(tag)
     };
-    if let Some(p) = profile {
-        rz_profile_add(&p.read_tag_lookup_ns, tag_lookup_start);
-    }
+    rz_profile_add_opt_field!(profile, read_tag_lookup_ns, tag_lookup_start);
 
     if let Some(sb_tag) = sb_tag_opt {
-        let alias_check_start = profile.map(|_| Instant::now());
+        let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
             sb_tag,
             tag,
@@ -4441,9 +4822,7 @@ pub fn __rz_ptr_read(
             size,
             AliasAccessKind::Read,
         );
-        if let Some(p) = profile {
-            rz_profile_add(&p.read_alias_check_ns, alias_check_start);
-        }
+        rz_profile_add_opt_field!(profile, read_alias_check_ns, alias_check_start);
         if let Some(msg) = alias_violation {
             rz_violation(
                 active_alias_model().violation_kind(),
@@ -4455,7 +4834,7 @@ pub fn __rz_ptr_read(
 
     // Fast path: tag-cached origin bounds + exact-base alloc lookup.
     // Slow path falls back to range lookup only when cache is missing/invalid.
-    let alloc_lookup_start = profile.map(|_| Instant::now());
+    let alloc_lookup_start = rz_profile_start!(profile);
     let trace_enabled = rz_log_enabled(LogLevel::Trace);
     let cached_origin_oob = tag_origin_oob_cached(&tmeta, addr, size);
     let origin_base_alloc = alloc_from_origin_base(&tmeta);
@@ -4488,9 +4867,7 @@ pub fn __rz_ptr_read(
     if let Some((base, ameta)) = alloc_opt {
         refresh_tag_origin_cache(tag, &mut tmeta, base, &ameta);
     }
-    if let Some(p) = profile {
-        rz_profile_add(&p.read_alloc_lookup_ns, alloc_lookup_start);
-    }
+    rz_profile_add_opt_field!(profile, read_alloc_lookup_ns, alloc_lookup_start);
 
     let Some((base, ameta)) = alloc_opt else {
         if rz_handle_untracked_region("READ", tag, &tmeta, addr, size) {
@@ -6230,8 +6607,8 @@ pub extern "C" fn __record_ref_creation_with_extent(
     interior_mut_extent_base: usize,
     interior_mut_extent_len: usize,
 ) -> u64 {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::ref_create(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ref_create);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 {
@@ -6264,7 +6641,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
         align_req
     };
 
-    let validate_start = profile.map(|_| Instant::now());
+    let validate_start = rz_profile_start!(profile);
     if required_align != 0 && align_req != 0 && align_req < required_align {
         rz_check_alignment(
             "REF_CREATE",
@@ -6299,9 +6676,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
             append_location_if_enabled(msg, "RZ_LOG_LOC"),
         );
     }
-    if let (Some(p), Some(start)) = (profile, validate_start) {
-        rz_profile_add_elapsed(&p.ref_create_validate_ns, start);
-    }
+    rz_profile_add_elapsed_field!(profile, ref_create_validate_ns, validate_start);
 
     // IMPORTANT: On retagging/reborrows (parent_tag != 0), prefer inheriting the parent's
     // allocation snapshot to keep stack-slot reuse detectable.
@@ -6309,7 +6684,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
     // pointee, refresh to the pointee allocation snapshot (common in projection-heavy code).
     let mut alloc_is_stack = false;
     let mut alloc_size = 0usize;
-    let alloc_snapshot_start = profile.map(|_| Instant::now());
+    let alloc_snapshot_start = rz_profile_start!(profile);
     let (
         mut alloc_epoch,
         mut alloc_live_at_creation,
@@ -6414,9 +6789,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
             })
             .unwrap_or((0, false, BOUNDS_LEN_UNKNOWN, 0))
     };
-    if let (Some(p), Some(start)) = (profile, alloc_snapshot_start) {
-        rz_profile_add_elapsed(&p.ref_create_alloc_snapshot_ns, start);
-    }
+    rz_profile_add_elapsed_field!(profile, ref_create_alloc_snapshot_ns, alloc_snapshot_start);
 
     let bounds_len = if bounds_len_is_known(bounds_len) {
         bounds_len
@@ -6431,7 +6804,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
             interior_mut_extent_len = parent_meta.interior_mut_extent_len;
         }
     }
-    let insert_start = profile.map(|_| Instant::now());
+    let insert_start = rz_profile_start!(profile);
     let (origin_known, origin_base, origin_end) =
         snapshot_tag_origin(pointee_addr, resolved_parent_tag);
 
@@ -6458,23 +6831,25 @@ pub extern "C" fn __record_ref_creation_with_extent(
         origin_base,
         origin_end,
     };
-    let tag_store_insert_start = profile.map(|_| Instant::now());
+    let tag_store_insert_start = rz_profile_start!(profile);
     tag_store::insert(tag, tmeta);
     if tmeta.alloc_epoch != 0 && tmeta.origin_known {
         tag_store::remember_alloc_epoch_tag(tmeta.origin_base, tmeta.alloc_epoch, tag);
     }
     tag_pruning::remember_live_tag(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, tag_store_insert_start) {
-        rz_profile_add_elapsed(&p.ref_create_tag_store_insert_ns, start);
-    }
-    let alias_on_tag_created_start = profile.map(|_| Instant::now());
+    rz_profile_add_elapsed_field!(
+        profile,
+        ref_create_tag_store_insert_ns,
+        tag_store_insert_start
+    );
+    let alias_on_tag_created_start = rz_profile_start!(profile);
     active_alias_model().on_tag_created(tag, &tmeta);
-    if let (Some(p), Some(start)) = (profile, alias_on_tag_created_start) {
-        rz_profile_add_elapsed(&p.ref_create_alias_on_tag_created_ns, start);
-    }
-    if let (Some(p), Some(start)) = (profile, insert_start) {
-        rz_profile_add_elapsed(&p.ref_create_insert_ns, start);
-    }
+    rz_profile_add_elapsed_field!(
+        profile,
+        ref_create_alias_on_tag_created_ns,
+        alias_on_tag_created_start
+    );
+    rz_profile_add_elapsed_field!(profile, ref_create_insert_ns, insert_start);
 
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
@@ -6541,8 +6916,8 @@ pub extern "C" fn __record_raw_ptr_creation(
     bounds_len: usize,
     align_req: usize,
 ) -> u64 {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::raw_create(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, raw_create);
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let alias_exempt_flag = (alias_exempt & CREATION_FLAG_ALIAS_EXEMPT) != 0;
@@ -6805,8 +7180,8 @@ pub extern "C" fn __record_raw_ptr_creation(
 /// `addr` is the pointer value (exposed provenance), not an interior offset.
 #[no_mangle]
 pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
-    let profile = rz_profile_hooks_enabled().then(rz_hook_profile);
-    let _profile_guard = HookProfileGuard::ptr_use(profile);
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ptr_use);
     let _g = RzRuntimeGuard::enter();
     if tag == 0 {
         rz_trace!(
