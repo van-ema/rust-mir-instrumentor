@@ -178,6 +178,15 @@ RZ_INTERPROC_UNSAFE_SUMMARIES=1 CARGO_INCREMENTAL=0 python3 scripts/run_example_
 Project-specific environment variables are grouped below by component/script.
 
 ### Runtime (`runtime/src/lib.rs`, `runtime/src/alias_model/*`)
+
+Compile-time runtime debug features are default-off so fuzzing builds do not pay for disabled
+diagnostics:
+
+- `runtime_hook_profile`: compiles in `RZ_PROFILE_HOOKS` counters and
+  `RZ_DUMP_HOOK_PROFILE_AT_EXIT` support.
+- `runtime_ptr_shadow_trace`: compiles in pointer-shadow trace logging controlled by
+  `RZ_TRACE_PTR_SHADOW`.
+
 - `RZ_LOG`: Runtime log level (`trace`, `info`, `warn`); default `warn`.
 - `RZ_LOG_LOC`: `1/true` adds caller source location in violation output.
 - `RZ_BACKTRACE_UNKNOWN_TAG`: `1/true` adds backtrace on `UNKNOWN_TAG` reports.
@@ -209,6 +218,8 @@ Project-specific environment variables are grouped below by component/script.
   hooks, and tag retain/kill hooks.
 - `RZ_DUMP_HOOK_PROFILE_AT_EXIT`: `1/true` dumps the aggregated runtime hook profile to stderr at
   process exit. Use this with `RZ_PROFILE_HOOKS=1` for one-shot repro/benchmark runs.
+- `RZ_TRACE_PTR_SHADOW`: `1/true` enables pointer-shadow trace logs when the runtime is built with
+  `--features runtime_ptr_shadow_trace`. Default builds compile this trace path out.
 
 - **Global allocator wrapper (enabled by default)**: the runtime installs a
   `#[global_allocator]` wrapper around `std::alloc::System` to intercept heap

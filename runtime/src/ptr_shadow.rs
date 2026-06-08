@@ -487,9 +487,7 @@ fn entry_match_rank(entry: PtrShadowEntry, ptr_addr: usize) -> Option<u8> {
 
 #[inline]
 fn trace_enabled() -> bool {
-    std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    crate::rz_trace_ptr_shadow_enabled()
 }
 
 #[inline]

@@ -569,6 +569,23 @@ macro_rules! rz_profile_add_opt_field {
     ($profile:expr, $field:ident, $start:expr) => {};
 }
 
+#[cfg(feature = "runtime_ptr_shadow_trace")]
+#[inline]
+pub(crate) fn rz_trace_ptr_shadow_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("RZ_TRACE_PTR_SHADOW")
+            .ok()
+            .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+    })
+}
+
+#[cfg(not(feature = "runtime_ptr_shadow_trace"))]
+#[inline]
+pub(crate) fn rz_trace_ptr_shadow_enabled() -> bool {
+    false
+}
+
 #[inline]
 fn rz_in_runtime_hook() -> bool {
     RZ_IN_RUNTIME_HOOK.with(|c| c.get() != 0)
@@ -3211,10 +3228,7 @@ fn sanitize_shadow_entry_for_slot_value(
         return (tag, ref_ancestor, export_parent, export_parent_recovered);
     }
 
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] sanitize slot=0x{:x} value=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
             slot_addr, value_addr, tag, ref_ancestor, export_parent, export_parent_recovered
@@ -3242,10 +3256,7 @@ pub extern "C" fn __rz_shadow_store_ptr(
             export_parent,
             export_parent_recovered,
         );
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] store slot=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
             slot_addr, tag, ref_ancestor, export_parent, export_parent_recovered
@@ -3279,10 +3290,7 @@ pub extern "C" fn __rz_shadow_store_ptr_local(
             export_parent,
             export_parent_recovered,
         );
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] store_local slot=0x{:x} tag={} ref_ancestor={} export_parent={} recovered={}",
             slot_addr, tag, ref_ancestor, export_parent, export_parent_recovered
@@ -3320,10 +3328,7 @@ pub extern "C" fn __rz_shadow_store_alloc_root(
     // current allocation instance, even if the allocator reused an old numeric address.
     let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
     ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] store_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
             slot_addr, ptr_addr, tag
@@ -3337,10 +3342,7 @@ pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_tag slot=0x{:x} -> {}",
             slot_addr, tag
@@ -3355,10 +3357,7 @@ pub extern "C" fn __rz_shadow_load_tag_for_ptr(slot_addr: usize, ptr_addr: usize
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_tag_for_ptr slot=0x{:x} ptr=0x{:x} -> {}",
             slot_addr, ptr_addr, tag
@@ -3373,10 +3372,7 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor(slot_addr: usize) -> u64 {
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let ref_ancestor = ptr_shadow::load_ref_ancestor(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_ref_ancestor slot=0x{:x} -> {}",
             slot_addr, ref_ancestor
@@ -3391,10 +3387,7 @@ pub extern "C" fn __rz_shadow_load_ref_ancestor_for_ptr(slot_addr: usize, ptr_ad
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let ref_ancestor = ptr_shadow::load_ref_ancestor_for_ptr_value(slot_addr, ptr_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_ref_ancestor_for_ptr slot=0x{:x} ptr=0x{:x} -> {}",
             slot_addr, ptr_addr, ref_ancestor
@@ -3409,10 +3402,7 @@ pub extern "C" fn __rz_shadow_load_export_parent(slot_addr: usize) -> u64 {
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let export_parent = ptr_shadow::load_export_parent(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_export_parent slot=0x{:x} -> {}",
             slot_addr, export_parent
@@ -3427,10 +3417,7 @@ pub extern "C" fn __rz_shadow_load_export_parent_for_ptr(slot_addr: usize, ptr_a
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let export_parent = ptr_shadow::load_export_parent_for_ptr_value(slot_addr, ptr_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_export_parent_for_ptr slot=0x{:x} ptr=0x{:x} -> {}",
             slot_addr, ptr_addr, export_parent
@@ -3445,10 +3432,7 @@ pub extern "C" fn __rz_shadow_load_export_parent_recovered(slot_addr: usize) -> 
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let recovered = ptr_shadow::load_export_parent_recovered(slot_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_export_parent_recovered slot=0x{:x} -> {}",
             slot_addr, recovered
@@ -3466,10 +3450,7 @@ pub extern "C" fn __rz_shadow_load_export_parent_recovered_for_ptr(
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
     let _g = RzRuntimeGuard::enter();
     let recovered = ptr_shadow::load_export_parent_recovered_for_ptr_value(slot_addr, ptr_addr);
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] load_export_parent_recovered_for_ptr slot=0x{:x} ptr=0x{:x} -> {}",
             slot_addr, ptr_addr, recovered
@@ -3483,10 +3464,7 @@ pub extern "C" fn __rz_shadow_kill_range(slot_addr: usize, size: usize) {
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, shadow_kill_range);
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] kill slot=0x{:x} size={}",
             slot_addr, size
@@ -3538,10 +3516,7 @@ pub extern "C" fn __rz_shadow_copy_slot(dst_slot_addr: usize, src_slot_addr: usi
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, shadow_copy_slot);
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] copy dst=0x{:x} src=0x{:x}",
             dst_slot_addr, src_slot_addr
@@ -3571,10 +3546,7 @@ pub extern "C" fn __rz_shadow_copy_range(dst_addr: usize, src_addr: usize, size:
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, shadow_copy_range);
     let _g = RzRuntimeGuard::enter();
-    if std::env::var("RZ_TRACE_PTR_SHADOW")
-        .ok()
-        .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
-    {
+    if rz_trace_ptr_shadow_enabled() {
         eprintln!(
             "[rusteze-runtime][ptr-shadow] copy_range dst=0x{:x} src=0x{:x} size={}",
             dst_addr, src_addr, size
