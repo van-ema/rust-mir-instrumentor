@@ -6032,6 +6032,33 @@ fn ref_tag_match_rank_for_ptr_value(
         .then_some(1)
 }
 
+fn exact_ref_call_arg_tag_is_valid_for_addr(tag: u64, meta: &TagMeta, addr: usize) -> bool {
+    if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return false;
+    }
+    if addr != 0 && ref_tag_match_rank_for_ptr_value(meta, addr, None).is_none() {
+        return false;
+    }
+    rz_ref_boundary_tag_is_valid(tag)
+}
+
+fn projected_exact_call_arg_tag_fast_path(
+    addr: usize,
+    exact_tag: u64,
+    boundary_parent_tag: u64,
+) -> Option<u64> {
+    let meta = tag_store::get(exact_tag)?;
+    if !exact_ref_call_arg_tag_is_valid_for_addr(exact_tag, &meta, addr) {
+        return None;
+    }
+    if boundary_parent_tag == 0 || boundary_parent_tag == exact_tag {
+        return Some(exact_tag);
+    }
+
+    let tmap = tags().lock().unwrap();
+    tag_lineage_contains_locked(&tmap, exact_tag, boundary_parent_tag).then_some(exact_tag)
+}
+
 fn recover_live_ref_boundary_tag_for_ptr_value(addr: usize) -> u64 {
     recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, None)
 }
@@ -6254,6 +6281,9 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
     }
     if addr != 0 {
         if let Some(meta) = tag_store::get(tag) {
+            if exact_ref_call_arg_tag_is_valid_for_addr(tag, &meta, addr) {
+                return tag;
+            }
             if meta.pointee_addr != 0 && meta.pointee_addr != addr {
                 let recovered = recover_call_arg_parent_tag(addr);
                 if recovered != 0 {
@@ -6355,7 +6385,9 @@ fn call_arg_boundary_entry(
         exact_tag
     };
     let tag = if recovered_origin {
-        let projected_ref_tag = recover_projected_ref_boundary_tag(addr, boundary_parent_tag);
+        let projected_ref_tag =
+            projected_exact_call_arg_tag_fast_path(addr, exact_tag, boundary_parent_tag)
+                .unwrap_or_else(|| recover_projected_ref_boundary_tag(addr, boundary_parent_tag));
         let tag = valid_or_recovered_call_arg_tag(
             addr,
             if projected_ref_tag != 0 {
