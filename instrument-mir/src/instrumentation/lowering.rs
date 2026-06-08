@@ -6840,6 +6840,7 @@ impl MyOptimizationPass {
                 }
 
                 InstrKind::PtrUse { ptr_local } => {
+                    let ptr_ty = body.local_decls[ptr_local].ty;
                     let tag_op: Operand<'tcx> = if place.projection.is_empty() {
                         if let Some(debug_tag_local) = self.active_debug_ref_binding_tag_local(
                             body,
@@ -6874,6 +6875,41 @@ impl MyOptimizationPass {
                     let tmp_unit = body
                         .local_decls
                         .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let align_op =
+                        self.align_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
+                    let (arg_align, mut align_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, &align_op);
+                    extra_stmts.append(&mut align_stmts);
+
+                    let is_dyn_ref = matches!(
+                        ptr_ty.kind(),
+                        TyKind::Ref(_, pointee, _) if matches!(pointee.kind(), TyKind::Dynamic(..))
+                    );
+                    let dyn_slot_arg = if is_dyn_ref {
+                        let dyn_slot_local = body
+                            .local_decls
+                            .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                        if let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
+                            tcx,
+                            body,
+                            source_info,
+                            Place::from(ptr_local),
+                            dyn_slot_local,
+                            false,
+                        ) {
+                            // For `&dyn Trait`, runtime needs the fat-pointer slot to read vtable
+                            // alignment. Thin/non-dyn refs pass zero below.
+                            extra_stmts.push(slot_stmt1);
+                            extra_stmts.push(slot_stmt2);
+                            Operand::Copy(Place::from(dyn_slot_local))
+                        } else {
+                            self.const_usize(tcx, source_info.span, 0)
+                        }
+                    } else {
+                        self.const_usize(tcx, source_info.span, 0)
+                    };
+                    let arg_is_mut =
+                        self.const_u8(tcx, source_info.span, self.ptr_is_mut(ptr_ty) as u8);
 
                     let args: Box<[Spanned<Operand<'tcx>>]> = vec![
                         Spanned {
@@ -6882,6 +6918,18 @@ impl MyOptimizationPass {
                         },
                         Spanned {
                             node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_align,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_is_mut,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: dyn_slot_arg,
                             span: source_info.span,
                         },
                     ]

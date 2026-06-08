@@ -224,6 +224,16 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_on_call_exit(callee_id);
     }
 
+    fn validate_ref_mut_boundary_retag(
+        &self,
+        tag: u64,
+        tmeta: &TagMeta,
+        addr: usize,
+        size: usize,
+    ) -> Option<String> {
+        tb_lite_validate_ref_mut_boundary_retag(tag, tmeta, addr, size)
+    }
+
     fn find_ref_ancestor_tag(&self, tmap: &HashMap<u64, TagMeta>, tag: u64) -> Option<u64> {
         tb_lite_find_ref_ancestor_tag(tmap, tag)
     }
@@ -438,6 +448,59 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             tb_disable_node_for_protector_end(node);
         }
     }
+}
+
+/// Check a returned `&mut` as a TB retag, without pretending the caller wrote through it.
+///
+/// Miri rejects a mutable reference that is already frozen or disabled at the return boundary.
+/// We report that as a boundary READ because no concrete caller write has happened yet.
+fn tb_lite_validate_ref_mut_boundary_retag(
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> Option<String> {
+    if !rz_tb_lite_enabled()
+        || tmeta.alias_exempt
+        || rz_sb_suppressed()
+        || !matches!(tmeta.kind, PtrKind::RefMut)
+    {
+        return None;
+    }
+
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let tree = all.get(&base)?;
+    let node = tree.nodes.get(&tag)?;
+    if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
+        return None;
+    }
+
+    let dump = if rz_tb_dump_enabled() {
+        tb_dump(tree, tag, addr, size, AliasAccessKind::Read)
+    } else {
+        String::new()
+    };
+    let reason = if !tb_is_live_node(node) {
+        Some("TB_LITE_INVALIDATED")
+    } else {
+        match node.perm {
+            TbPerm::Reserved { conflicted: true } if tb_protector_active(node) => {
+                Some("TB_LITE_2PHASE_CONFLICT")
+            }
+            TbPerm::Reserved { .. } | TbPerm::Active => None,
+            TbPerm::Frozen => Some("TB_LITE_FROZEN_WRITE"),
+            TbPerm::ShadowedLocal => Some("TB_LITE_SHADOWED_LOCAL"),
+            TbPerm::Disabled => Some("TB_LITE_DISABLED_WRITE"),
+        }
+    }?;
+
+    let mut msg = format!(
+        "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason={}",
+        tag, addr, size, tmeta.kind, reason
+    );
+    msg.push_str(&dump);
+    Some(msg)
 }
 
 fn tb_lite_check_protected_dealloc(base_addr: usize) {

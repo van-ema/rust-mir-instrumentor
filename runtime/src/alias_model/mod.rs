@@ -62,6 +62,20 @@ pub(crate) trait AliasModel: Sync {
     /// Called at instrumented function return.
     fn on_call_exit(&self, _callee_id: u64) {}
 
+    /// Validate returning a mutable reference before the caller can use it.
+    ///
+    /// The default keeps the old boundary-read behavior. Models with a richer borrow state can
+    /// require that the exact returned `&mut` is still uniquely usable without performing a write.
+    fn validate_ref_mut_boundary_retag(
+        &self,
+        tag: u64,
+        tmeta: &TagMeta,
+        addr: usize,
+        size: usize,
+    ) -> Option<String> {
+        self.check_access(tag, tag, tmeta, addr, size, AliasAccessKind::Read)
+    }
+
     fn find_ref_ancestor_tag(&self, _tmap: &HashMap<u64, TagMeta>, _tag: u64) -> Option<u64> {
         None
     }

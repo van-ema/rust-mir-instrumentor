@@ -260,7 +260,7 @@ impl MyOptimizationPass {
             .find_runtime_fn_def_id(tcx, "__rz_ptr_read_allow_untagged", 5)
             .expect("missing '__rz_ptr_read_allow_untagged' definition");
         let def_id_use = self
-            .find_runtime_fn_def_id(tcx, "__rz_ptr_use", 2)
+            .find_runtime_fn_def_id(tcx, "__rz_ptr_use", 5)
             .expect("missing '__rz_ptr_use' definition");
         let def_id_push_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_boundary_tag", 7)

@@ -1892,6 +1892,24 @@ struct CallBoundaryActivation {
     direct: bool,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BoundarySurvivorKind {
+    /// A returned tag that writes back into a mutable argument's caller-visible family.
+    MutArgRet,
+    /// A normal returned tag whose family must survive call-exit cleanup.
+    Return,
+    /// A pointer-field tag inside a returned aggregate.
+    ReturnLeaf,
+}
+
+/// One tag that must remain usable after the callee boundary is closed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct BoundarySurvivorRecord {
+    tag: u64,
+    addr: usize,
+    kind: BoundarySurvivorKind,
+}
+
 const CALL_ARG_FLAG_INPLACE_EXACT_SOURCE: u8 = 1;
 // A callee still consumes the explicit boundary parent, but TB-lite must not
 // turn that parent into a protected child for unresolved/generic `&mut Self`.
@@ -1918,8 +1936,9 @@ static MUT_ARG_RET_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64, u64, usize), u64
 static MUT_ARG_RET_LEAF_SHADOWS: OnceLock<
     Mutex<HashMap<(ThreadId, u64, u64, usize, u64), PtrShadowTransport>>,
 > = OnceLock::new();
-static BOUNDARY_SURVIVOR_TAGS: OnceLock<Mutex<HashMap<(ThreadId, u64), HashSet<u64>>>> =
-    OnceLock::new();
+static BOUNDARY_SURVIVOR_RECORDS: OnceLock<
+    Mutex<HashMap<(ThreadId, u64), Vec<BoundarySurvivorRecord>>>,
+> = OnceLock::new();
 static MUT_ARG_RET_BOUNDARY_LINEAGES: OnceLock<Mutex<HashMap<ThreadId, HashSet<u64>>>> =
     OnceLock::new();
 static CALL_ARG_LEAF_SCOPES: OnceLock<Mutex<HashMap<ThreadId, Vec<CallArgLeafScope>>>> =
@@ -2118,6 +2137,20 @@ fn active_call_boundary_activation(callee_id: u64) -> Option<CallBoundaryActivat
         .copied()
 }
 
+/// Return true while a direct or indirect call boundary is still on this thread's stack.
+fn active_call_boundary_is_open(boundary_id: u64) -> bool {
+    let thread_id = std::thread::current().id();
+    active_call_boundaries()
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .is_some_and(|stack| {
+            stack
+                .iter()
+                .any(|activation| activation.boundary_id == boundary_id)
+        })
+}
+
 fn enter_call_boundary(callee_id: u64) -> u64 {
     let thread_id = std::thread::current().id();
     let (boundary_id, direct) = {
@@ -2186,11 +2219,42 @@ fn exit_direct_call_boundary(boundary_id: u64) -> Option<CallBoundaryActivation>
     activation
 }
 
+/// Close one call boundary in TB order: clear temporary import state, end protectors, then replay exports.
+fn finish_call_boundary_activation(activation: CallBoundaryActivation) {
+    // Direct calls export return tags before the caller imports them. Run protector teardown
+    // first, then repair only the tags explicitly recorded as boundary survivors.
+    clear_unconsumed_call_arg_leaf_shadows(activation.boundary_id);
+    exit_call_arg_leaf_scope(activation.callee_id);
+    active_alias_model().on_call_exit(activation.boundary_id);
+    apply_deferred_boundary_survivor_exports(activation.boundary_id);
+    clear_boundary_survivor_tags(activation.boundary_id);
+}
+
 fn finalize_direct_call_boundary(boundary_id: u64) {
     if let Some(activation) = exit_direct_call_boundary(boundary_id) {
-        clear_unconsumed_call_arg_leaf_shadows(activation.boundary_id);
-        exit_call_arg_leaf_scope(activation.callee_id);
-        active_alias_model().on_call_exit(activation.boundary_id);
+        finish_call_boundary_activation(activation);
+    }
+}
+
+/// Replay tags that were exported before call-exit so they survive protector teardown.
+fn apply_deferred_boundary_survivor_exports(callee_id: u64) {
+    // Replay export hooks after call-exit so TB-lite does not clear protectors too early.
+    for record in boundary_survivor_records_for_callee(callee_id) {
+        let export_addr = if record.addr != 0 {
+            record.addr
+        } else {
+            tag_store::get(record.tag)
+                .map(|meta| meta.pointee_addr)
+                .unwrap_or(0)
+        };
+        match record.kind {
+            BoundarySurvivorKind::MutArgRet => {
+                active_alias_model().on_mut_arg_ret_export(record.tag, export_addr);
+            }
+            BoundarySurvivorKind::Return | BoundarySurvivorKind::ReturnLeaf => {
+                active_alias_model().on_ret_export(record.tag, export_addr);
+            }
+        }
     }
 }
 
@@ -2421,9 +2485,30 @@ pub(crate) fn mut_arg_ret_leaf_shadows(
     MUT_ARG_RET_LEAF_SHADOWS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Return only the survivor tag IDs for alias-model call-exit code that does not need their kind.
 pub(crate) fn boundary_survivor_tags_for_callee(callee_id: u64) -> HashSet<u64> {
     let thread_id = std::thread::current().id();
-    boundary_survivor_tags()
+    boundary_survivor_records()
+        .lock()
+        .unwrap()
+        .get(&(thread_id, callee_id))
+        .map(|records| records.iter().map(|record| record.tag).collect())
+        .unwrap_or_default()
+}
+
+fn boundary_survivor_records(
+) -> &'static Mutex<HashMap<(ThreadId, u64), Vec<BoundarySurvivorRecord>>> {
+    BOUNDARY_SURVIVOR_RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mut_arg_ret_boundary_lineages() -> &'static Mutex<HashMap<ThreadId, HashSet<u64>>> {
+    MUT_ARG_RET_BOUNDARY_LINEAGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the full survivor records so replay can distinguish returns from mut-arg-ret exports.
+fn boundary_survivor_records_for_callee(callee_id: u64) -> Vec<BoundarySurvivorRecord> {
+    let thread_id = std::thread::current().id();
+    boundary_survivor_records()
         .lock()
         .unwrap()
         .get(&(thread_id, callee_id))
@@ -2431,25 +2516,19 @@ pub(crate) fn boundary_survivor_tags_for_callee(callee_id: u64) -> HashSet<u64> 
         .unwrap_or_default()
 }
 
-fn boundary_survivor_tags() -> &'static Mutex<HashMap<(ThreadId, u64), HashSet<u64>>> {
-    BOUNDARY_SURVIVOR_TAGS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn mut_arg_ret_boundary_lineages() -> &'static Mutex<HashMap<ThreadId, HashSet<u64>>> {
-    MUT_ARG_RET_BOUNDARY_LINEAGES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn remember_boundary_survivor_tag(callee_id: u64, tag: u64) {
+/// Remember that `tag` crossed this boundary and must be re-exported after call-exit.
+fn remember_boundary_survivor(callee_id: u64, tag: u64, addr: usize, kind: BoundarySurvivorKind) {
     if tag == 0 {
         return;
     }
+    // Keep the survivor kind: ordinary returns and mut-arg-ret writeback have different TB meaning.
     let thread_id = std::thread::current().id();
-    boundary_survivor_tags()
-        .lock()
-        .unwrap()
-        .entry((thread_id, callee_id))
-        .or_default()
-        .insert(tag);
+    let mut records = boundary_survivor_records().lock().unwrap();
+    let entry = records.entry((thread_id, callee_id)).or_default();
+    let record = BoundarySurvivorRecord { tag, addr, kind };
+    if !entry.contains(&record) {
+        entry.push(record);
+    }
 }
 
 fn remember_mut_arg_ret_boundary_lineage(tag: u64) {
@@ -2467,7 +2546,7 @@ fn remember_mut_arg_ret_boundary_lineage(tag: u64) {
 
 fn clear_boundary_survivor_tags(callee_id: u64) {
     let thread_id = std::thread::current().id();
-    boundary_survivor_tags()
+    boundary_survivor_records()
         .lock()
         .unwrap()
         .remove(&(thread_id, callee_id));
@@ -2511,39 +2590,68 @@ fn return_tag_is_mut_arg_ret_boundary_survivor(tag: u64) -> bool {
         && tag_is_in_mut_arg_ret_boundary_lineage(tag)
 }
 
-fn export_return_tag(callee_id: u64, tag: u64, addr: usize, boundary_survivor: bool) {
+/// Apply a boundary export now, or store it until the callee's call-exit cleanup has run.
+fn apply_or_defer_boundary_survivor(
+    callee_id: u64,
+    tag: u64,
+    addr: usize,
+    kind: BoundarySurvivorKind,
+) {
     if tag == 0 {
         return;
     }
-    if boundary_survivor {
-        let export_addr = if addr != 0 {
-            addr
-        } else {
-            tag_store::get(tag)
-                .map(|meta| meta.pointee_addr)
-                .unwrap_or(0)
-        };
-        active_alias_model().on_mut_arg_ret_export(tag, export_addr);
-        remember_mut_arg_ret_boundary_lineage(tag);
-    } else {
-        active_alias_model().on_ret_export(tag, addr);
+    remember_boundary_survivor(callee_id, tag, addr, kind);
+    if active_call_boundary_is_open(callee_id) {
+        // The callee has not run alias-model exit yet; repair will happen after protector teardown.
+        return;
     }
-    remember_boundary_survivor_tag(callee_id, tag);
+
+    let export_addr = if addr != 0 {
+        addr
+    } else {
+        tag_store::get(tag)
+            .map(|meta| meta.pointee_addr)
+            .unwrap_or(0)
+    };
+    match kind {
+        BoundarySurvivorKind::MutArgRet => {
+            active_alias_model().on_mut_arg_ret_export(tag, export_addr);
+        }
+        BoundarySurvivorKind::Return | BoundarySurvivorKind::ReturnLeaf => {
+            active_alias_model().on_ret_export(tag, export_addr);
+        }
+    }
 }
 
-fn validate_and_export_return_tag(callee_id: u64, tag: u64, addr: usize, boundary_survivor: bool) {
+/// Export a return tag, deferring the alias-model replay if the boundary is still open.
+fn export_return_tag(callee_id: u64, tag: u64, addr: usize, survivor_kind: BoundarySurvivorKind) {
+    if tag == 0 {
+        return;
+    }
+    if matches!(survivor_kind, BoundarySurvivorKind::MutArgRet) {
+        remember_mut_arg_ret_boundary_lineage(tag);
+    }
+    apply_or_defer_boundary_survivor(callee_id, tag, addr, survivor_kind);
+}
+
+/// Validate the returned reference at the boundary, then record it as a survivor.
+fn validate_and_export_return_tag(
+    callee_id: u64,
+    tag: u64,
+    addr: usize,
+    survivor_kind: BoundarySurvivorKind,
+) {
     let kind = tag_store::get(tag).map(|meta| meta.kind);
-    let validate_before_export =
-        active_alias_model().name() != "tb_lite" || matches!(kind, Some(PtrKind::RefShared));
-    if validate_before_export {
-        // Check shared refs before export can revive a boundary family.
+    if matches!(kind, Some(PtrKind::RefMut))
+        && !matches!(survivor_kind, BoundarySurvivorKind::MutArgRet)
+    {
+        // Returning `&mut` is a boundary retag. It must still have unique authority, but the
+        // diagnostic remains a boundary READ because no caller write has happened yet.
+        rz_validate_mut_ref_boundary_retag(tag, "RET");
+    } else {
         rz_validate_ref_boundary_use(tag, "RET");
     }
-    export_return_tag(callee_id, tag, addr, boundary_survivor);
-    if !validate_before_export {
-        // `&mut` survivor returns validate after export updates boundary state.
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
+    export_return_tag(callee_id, tag, addr, survivor_kind);
 }
 
 #[inline]
@@ -2553,6 +2661,50 @@ fn rz_promised_alignment_for_addr(addr: usize, alloc_epoch: u64) -> usize {
         .copied()
         .or_else(|| map.get(&(addr, 0)).copied())
         .unwrap_or(0)
+}
+
+/// Read the dynamic alignment from a live `&dyn Trait` fat-pointer local.
+fn rz_dyn_ref_align_from_slot(slot_addr: usize) -> usize {
+    if slot_addr == 0 {
+        return 0;
+    }
+    let word = std::mem::size_of::<usize>();
+    let vtable_slot = slot_addr.saturating_add(word);
+
+    // `slot_addr` is emitted by instrumentation as the live local that stores the fat pointer.
+    // Read its vtable word directly; then validate the vtable before reading its header.
+    let vtable = unsafe { std::ptr::read_unaligned(vtable_slot as *const usize) };
+    if vtable == 0
+        || (rz_static_range_for_addr(vtable).is_none() && lookup_alloc_snapshot(vtable).is_none())
+    {
+        return 0;
+    }
+    let align_slot = vtable.saturating_add(2 * word);
+    // A Rust trait-object vtable header stores drop/size/align, so word 2 is the
+    // dynamic pointee alignment that Miri checks for `&dyn Trait`.
+    let align = unsafe { std::ptr::read_unaligned(align_slot as *const usize) };
+    if align.is_power_of_two() {
+        align
+    } else {
+        0
+    }
+}
+
+/// Check alignment for untagged reference uses, where provenance was missing but MIR still has a ref.
+fn rz_check_tagless_ref_alignment(addr: usize, align_req: usize, kind: PtrKind) {
+    if align_req <= 1 || addr == 0 || addr % align_req == 0 {
+        return;
+    }
+    let found_align = rz_addr_alignment(addr);
+    rz_violation(
+        "MISALIGNED_ACCESS",
+        append_location_if_enabled(
+            format!(
+                "REF_USE via tag=0 addr=0x{addr:x} kind={kind:?}\nrequired_alignment={align_req} found_alignment={found_align}"
+            ),
+            "RZ_LOG_LOC",
+        ),
+    );
 }
 
 #[no_mangle]
@@ -5597,6 +5749,45 @@ fn rz_validate_ref_boundary_use(tag: u64, boundary: &str) {
     rz_validate_ref_boundary_use_at(tag, boundary, 0, BOUNDS_LEN_UNKNOWN);
 }
 
+/// Check that a returned `&mut` is still uniquely usable before the caller receives it.
+fn rz_validate_mut_ref_boundary_retag(tag: u64, boundary: &str) {
+    if tag == 0 {
+        return;
+    }
+
+    let Some(tmeta) = tag_store::get(tag) else {
+        return;
+    };
+    if !matches!(tmeta.kind, PtrKind::RefMut) {
+        rz_validate_ref_boundary_use(tag, boundary);
+        return;
+    }
+    if rz_ref_boundary_is_empty_precise_view(&tmeta) {
+        return;
+    }
+
+    let access_size = bounds_len_bytes_or_zero(tmeta.bounds_len).min(1).max(1);
+    let Some(msg) = active_alias_model().validate_ref_mut_boundary_retag(
+        tag,
+        &tmeta,
+        tmeta.pointee_addr,
+        access_size,
+    ) else {
+        return;
+    };
+
+    rz_violation(
+        active_alias_model().violation_kind(),
+        append_location_if_enabled(
+            format!(
+                "{boundary} invalid ref tag={tag} pointee=0x{:x} kind={:?}\n{msg}",
+                tmeta.pointee_addr, tmeta.kind
+            ),
+            "RZ_LOG_LOC",
+        ),
+    );
+}
+
 fn rz_validate_ref_boundary_use_at(
     tag: u64,
     boundary: &str,
@@ -6766,9 +6957,7 @@ pub extern "C" fn __rz_end_direct_call_boundary(boundary_id: u64) {
         }
     }
     if let Some(activation) = exit_direct_call_boundary(boundary_id) {
-        clear_unconsumed_call_arg_leaf_shadows(activation.boundary_id);
-        exit_call_arg_leaf_scope(activation.callee_id);
-        active_alias_model().on_call_exit(activation.boundary_id);
+        finish_call_boundary_activation(activation);
     }
 }
 
@@ -6987,9 +7176,8 @@ pub extern "C" fn __rz_push_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
         return;
     }
     if tag != 0 {
-        active_alias_model().on_mut_arg_ret_export(tag, addr);
         remember_mut_arg_ret_boundary_lineage(tag);
-        remember_boundary_survivor_tag(boundary_id, tag);
+        apply_or_defer_boundary_survivor(boundary_id, tag, addr, BoundarySurvivorKind::MutArgRet);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_tags()
@@ -7081,9 +7269,8 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
         rz_validate_ref_boundary_use(tag, "RET");
     }
     if tag != 0 {
-        active_alias_model().on_mut_arg_ret_export(tag, addr);
         remember_mut_arg_ret_boundary_lineage(tag);
-        remember_boundary_survivor_tag(boundary_id, tag);
+        apply_or_defer_boundary_survivor(boundary_id, tag, addr, BoundarySurvivorKind::MutArgRet);
     }
     let thread_id = std::thread::current().id();
     mut_arg_ret_leaf_shadows().lock().unwrap().insert(
@@ -7126,8 +7313,12 @@ pub extern "C" fn __rz_push_ret_tag(callee_id: u64, addr: usize, tag: u64) {
         return;
     }
     let boundary_id = active_call_boundary_id(callee_id);
-    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    validate_and_export_return_tag(boundary_id, tag, addr, boundary_survivor);
+    let survivor_kind = if return_tag_is_mut_arg_ret_boundary_survivor(tag) {
+        BoundarySurvivorKind::MutArgRet
+    } else {
+        BoundarySurvivorKind::Return
+    };
+    validate_and_export_return_tag(boundary_id, tag, addr, survivor_kind);
     let thread_id = std::thread::current().id();
     ret_tags()
         .lock()
@@ -7152,8 +7343,12 @@ pub extern "C" fn __rz_push_ret_leaf_shadow(
         return;
     }
     let (ret_tag, ret_ref_ancestor, ret_export_parent, ret_export_parent_recovered) = shadow;
-    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(ret_tag);
-    validate_and_export_return_tag(boundary_id, ret_tag, 0, boundary_survivor);
+    let survivor_kind = if return_tag_is_mut_arg_ret_boundary_survivor(ret_tag) {
+        BoundarySurvivorKind::MutArgRet
+    } else {
+        BoundarySurvivorKind::ReturnLeaf
+    };
+    validate_and_export_return_tag(boundary_id, ret_tag, 0, survivor_kind);
     let thread_id = std::thread::current().id();
     ret_leaf_shadows().lock().unwrap().insert(
         (thread_id, boundary_id, leaf_key),
@@ -7177,8 +7372,12 @@ pub extern "C" fn __rz_validate_ret_tag(callee_id: u64, tag: u64) {
         return;
     }
     let boundary_id = active_call_boundary_id(callee_id);
-    let boundary_survivor = return_tag_is_mut_arg_ret_boundary_survivor(tag);
-    validate_and_export_return_tag(boundary_id, tag, 0, boundary_survivor);
+    let survivor_kind = if return_tag_is_mut_arg_ret_boundary_survivor(tag) {
+        BoundarySurvivorKind::MutArgRet
+    } else {
+        BoundarySurvivorKind::Return
+    };
+    validate_and_export_return_tag(boundary_id, tag, 0, survivor_kind);
     if tag != 0 {
         let thread_id = std::thread::current().id();
         ret_tags()
@@ -7329,6 +7528,8 @@ pub extern "C" fn __rz_exit_fn(callee_id: u64) {
     clear_unconsumed_call_arg_leaf_shadows(boundary_id);
     exit_call_arg_leaf_scope(callee_id);
     active_alias_model().on_call_exit(boundary_id);
+    apply_deferred_boundary_survivor_exports(boundary_id);
+    clear_boundary_survivor_tags(boundary_id);
 }
 
 #[macro_export]
@@ -7943,12 +8144,30 @@ pub extern "C" fn __record_raw_ptr_creation(
 /// a pointer value was used/observed, but we did not (yet) classify it as a read or write.
 ///
 /// `addr` is the pointer value (exposed provenance), not an interior offset.
+/// `align_req` is the static MIR alignment, and `dyn_ref_slot_addr` is nonzero only for
+/// `&dyn Trait` locals whose vtable supplies a stricter dynamic alignment.
 #[no_mangle]
-pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
+pub extern "C" fn __rz_ptr_use(
+    tag: u64,
+    addr: usize,
+    align_req: usize,
+    is_mut: u8,
+    dyn_ref_slot_addr: usize,
+) {
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, ptr_use);
     let _g = RzRuntimeGuard::enter();
+    let dyn_align = rz_dyn_ref_align_from_slot(dyn_ref_slot_addr);
+    let required_ref_align = align_req.max(dyn_align);
     if tag == 0 {
+        if dyn_ref_slot_addr != 0 {
+            let kind = if is_mut != 0 {
+                PtrKind::RefMut
+            } else {
+                PtrKind::RefShared
+            };
+            rz_check_tagless_ref_alignment(addr, required_ref_align, kind);
+        }
         rz_trace!(
             "[rusteze-runtime] USE: untagged ptr addr=0x{:x} (likely untracked/propagation missing)",
             addr
@@ -7972,7 +8191,7 @@ pub extern "C" fn __rz_ptr_use(tag: u64, addr: usize) {
             } else {
                 rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch)
             };
-            let required_align = tmeta.align_req.max(promised_align);
+            let required_align = tmeta.align_req.max(promised_align).max(required_ref_align);
             rz_check_alignment(
                 "REF_USE",
                 tag,
