@@ -594,12 +594,10 @@ impl MyOptimizationPass {
                         let pointee_ty = tcx
                             .try_normalize_erasing_regions(body.typing_env(tcx), *pointee_ty)
                             .unwrap_or(*pointee_ty);
-                        if !pointee_ty.is_sized(tcx, body.typing_env(tcx)) {
-                            continue;
-                        }
-                        if !self.ty_contains_pointer_fields(tcx, body, pointee_ty, 4) {
-                            continue;
-                        }
+                        // Always return the live `&mut` arg tag; only sized pointees can also
+                        // return exact inner pointer-field shadows.
+                        let can_export_leafs = pointee_ty.is_sized(tcx, body.typing_env(tcx))
+                            && self.ty_contains_pointer_fields(tcx, body, pointee_ty, 4);
                         insert_points.push(InsertPoint {
                             bb,
                             stmt_idx: block_data.statements.len(),
@@ -612,25 +610,27 @@ impl MyOptimizationPass {
                                 ptr_local: arg_local,
                             },
                         });
-                        for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
-                            tcx,
-                            body,
-                            Place::from(arg_local).project_deeper(&[PlaceElem::Deref], tcx),
-                            pointee_ty,
-                        ) {
-                            insert_points.push(InsertPoint {
-                                bb,
-                                stmt_idx: block_data.statements.len(),
-                                insert_before: false,
-                                source_info: term.source_info,
-                                place: leaf_spec.place,
-                                kind: InstrKind::MutArgRetLeafPush {
-                                    callee_id,
-                                    arg_index: arg_index as u64,
-                                    ptr_local: arg_local,
-                                    leaf_key: leaf_spec.transport_key(),
-                                },
-                            });
+                        if can_export_leafs {
+                            for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(
+                                tcx,
+                                body,
+                                Place::from(arg_local).project_deeper(&[PlaceElem::Deref], tcx),
+                                pointee_ty,
+                            ) {
+                                insert_points.push(InsertPoint {
+                                    bb,
+                                    stmt_idx: block_data.statements.len(),
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: leaf_spec.place,
+                                    kind: InstrKind::MutArgRetLeafPush {
+                                        callee_id,
+                                        arg_index: arg_index as u64,
+                                        ptr_local: arg_local,
+                                        leaf_key: leaf_spec.transport_key(),
+                                    },
+                                });
+                            }
                         }
                     }
                     insert_points.push(InsertPoint {
@@ -887,7 +887,7 @@ impl MyOptimizationPass {
                         insert_before: false,
                         source_info: *source_info,
                         place: Place::from(*tag_local),
-                        kind: InstrKind::TagLocalKill {
+                        kind: InstrKind::ExitTagLocalKill {
                             tag_local: *tag_local,
                         },
                     });

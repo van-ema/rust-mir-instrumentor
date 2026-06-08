@@ -628,7 +628,6 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         | InstrKind::Raw { .. }
         | InstrKind::RawRoot { .. }
         | InstrKind::ArgRetag { .. }
-        | InstrKind::FnExit { .. }
         | InstrKind::RetRoot { .. }
         | InstrKind::PtrDerive { .. } => 0,
         // Metadata propagation must be ordered after tag-creating hooks but before
@@ -639,12 +638,13 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         | InstrKind::PtrWrite { .. }
         | InstrKind::PtrReadAllowUntagged { .. }
         | InstrKind::PtrWriteAllowUntagged { .. } => 2,
-        InstrKind::IndirectCallScopeBegin => 2,
+        InstrKind::DirectCallScopeBegin { .. } | InstrKind::IndirectCallScopeBegin => 2,
         InstrKind::CallArgPush { .. }
         | InstrKind::IndirectCallArgPush { .. }
         | InstrKind::IndirectCallArgLeafPush { .. }
-        | InstrKind::PtrUse { .. } => 3,
-        InstrKind::IndirectCallScopeEnd => 4,
+        | InstrKind::PtrUse { .. }
+        | InstrKind::FnExit { .. } => 3,
+        InstrKind::DirectCallScopeEnd { .. } | InstrKind::IndirectCallScopeEnd => 4,
         _ => 4,
     }
 }

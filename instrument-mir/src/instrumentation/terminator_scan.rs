@@ -65,6 +65,7 @@ impl MyOptimizationPass {
                         arg_index: 0,
                         ptr_local: place.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow: !place.projection.is_empty(),
                         flags: self.call_arg_push_flags(false, suppress_protector),
                     },
                 });
@@ -105,6 +106,7 @@ impl MyOptimizationPass {
                         arg_index: 0,
                         ptr_local: place.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow: !place.projection.is_empty(),
                         flags: self.call_arg_push_flags(false, suppress_protector),
                     },
                 });
@@ -128,6 +130,7 @@ impl MyOptimizationPass {
                     arg_index: 0,
                     ptr_local: place.local,
                     parent_mode: ParentSelectionMode::SlotFamily,
+                    from_shadow: false,
                     flags: 0,
                 },
             });

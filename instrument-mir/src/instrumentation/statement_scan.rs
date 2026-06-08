@@ -3,6 +3,22 @@
 use super::*;
 
 impl MyOptimizationPass {
+    fn ref_pointer_coercion_preserves_tag<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        rvalue: &Rvalue<'tcx>,
+        dst_ty: Ty<'tcx>,
+    ) -> bool {
+        let Rvalue::Cast(CastKind::PointerCoercion(_, _), op, _) = rvalue else {
+            return false;
+        };
+        let src_ty = op.ty(&body.local_decls, tcx);
+        // Example: `&mut T` coerced to `&mut dyn Trait`.
+        // The data pointer is unchanged, so the borrow tag is unchanged too.
+        matches!(src_ty.kind(), TyKind::Ref(..)) && matches!(dst_ty.kind(), TyKind::Ref(..))
+    }
+
     /// Ensure `ptr_local` has a tag by synthesizing a `RawRoot` before the current statement
     /// if it hasn't been tagged yet.
     ///
@@ -410,7 +426,7 @@ impl MyOptimizationPass {
                         source_info: stmt.source_info,
                         place: lhs_place.clone(),
                         kind: InstrKind::StackSlotWriteAllowUntagged {
-                            local: lhs_place.local,
+                            place: lhs_place.clone(),
                             size_op,
                             align_op: self.align_operand_for_ty(
                                 tcx,
@@ -767,6 +783,13 @@ impl MyOptimizationPass {
                                         ) =>
                                     {
                                         true
+                                    }
+                                    Rvalue::Cast(CastKind::PointerCoercion(_, _), _, _)
+                                        if self.ref_pointer_coercion_preserves_tag(
+                                            tcx, body, rvalue, dst_ty,
+                                        ) =>
+                                    {
+                                        false
                                     }
                                     Rvalue::CopyForDeref(_)
                                     | Rvalue::Cast(

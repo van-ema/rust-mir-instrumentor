@@ -117,7 +117,7 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     /// A write directly to a stack slot tracked via a reborrow anchor tag.
     /// Uses the allow-untagged runtime path so untouched locals do not report.
     StackSlotWriteAllowUntagged {
-        local: Local,
+        place: Place<'tcx>,
         size_op: SizeOperand<'tcx>,
         align_op: SizeOperand<'tcx>,
     },
@@ -179,6 +179,10 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     },
     /// Retire the current tag carried by a specific hidden tag local.
     TagLocalKill {
+        tag_local: Local,
+    },
+    /// Retire a hidden tag local during function-exit cleanup, after boundary exports.
+    ExitTagLocalKill {
         tag_local: Local,
     },
     /// Retain the tag currently written into a hidden tag local so it stays live while any MIR
@@ -259,8 +263,18 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
         parent_mode: ParentSelectionMode,
+        /// The argument is a projected pointer slot; load its tag/export parent from ptr shadow.
+        from_shadow: bool,
         /// Bit 0 marks the custom-MIR exact in-place source shape `Move(*ptr)`.
         flags: u8,
+    },
+    /// Caller-side activation key for a direct instrumented call.
+    DirectCallScopeBegin {
+        callee_id: u64,
+    },
+    /// Caller-side cleanup for a direct instrumented call boundary.
+    DirectCallScopeEnd {
+        callee_id: u64,
     },
     /// Caller-side scope marker for an unresolved function-pointer/vtable call.
     IndirectCallScopeBegin,
@@ -271,6 +285,7 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         arg_index: u64,
         ptr_local: Local,
         parent_mode: ParentSelectionMode,
+        from_shadow: bool,
         flags: u8,
     },
     /// Caller-side leaf-shadow push for an unresolved function-pointer/vtable call.
@@ -555,9 +570,13 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_read_allow_untagged: DefId,
     pub(in crate::instrumentation) def_id_use: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_push_call_arg_shadow_tag: DefId,
+    pub(in crate::instrumentation) def_id_begin_direct_call_boundary: DefId,
+    pub(in crate::instrumentation) def_id_end_direct_call_boundary: DefId,
     pub(in crate::instrumentation) def_id_begin_indirect_call_arg_scope: DefId,
     pub(in crate::instrumentation) def_id_end_indirect_call_arg_scope: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_push_indirect_call_arg_shadow_tag: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_validate_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag: DefId,

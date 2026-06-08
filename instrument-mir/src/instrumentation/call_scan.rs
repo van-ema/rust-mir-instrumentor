@@ -3,6 +3,12 @@
 use super::*;
 
 impl MyOptimizationPass {
+    fn trace_call_boundary_scan_enabled(&self) -> bool {
+        std::env::var("RZ_TRACE_CALL_BOUNDARY_SCAN")
+            .ok()
+            .map_or(false, |v| v != "0" && v.to_ascii_lowercase() != "false")
+    }
+
     fn call_arg_leaf_push_kind<'tcx>(
         direct_callee_id: Option<u64>,
         arg_index: usize,
@@ -1332,6 +1338,26 @@ impl MyOptimizationPass {
             TerminatorKind::Call { target, .. } => *target,
             _ => None,
         };
+        if let Some(callee_id) = direct_call_arg_callee_id {
+            insert_points.push(InsertPoint {
+                bb,
+                stmt_idx: block_data.statements.len(),
+                insert_before: false,
+                source_info: term.source_info,
+                place: *destination,
+                kind: InstrKind::DirectCallScopeBegin { callee_id },
+            });
+            if let Some(tgt_bb) = call_target_bb {
+                insert_points.push(InsertPoint {
+                    bb: tgt_bb,
+                    stmt_idx: 0,
+                    insert_before: true,
+                    source_info: term.source_info,
+                    place: *destination,
+                    kind: InstrKind::DirectCallScopeEnd { callee_id },
+                });
+            }
+        }
         let indirect_call_needs_transport = unresolved_indirect_call
             && args.iter().any(|arg| {
                 let Some(p) = self.place_from_operand(&arg.node) else {
@@ -2282,6 +2308,7 @@ impl MyOptimizationPass {
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow: !p.projection.is_empty(),
                         flags,
                     }
                 } else {
@@ -2289,6 +2316,7 @@ impl MyOptimizationPass {
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow: !p.projection.is_empty(),
                         flags,
                     }
                 };
@@ -2415,12 +2443,28 @@ impl MyOptimizationPass {
                 let suppress_protector =
                     !self.tb_call_arg_protector_supported_for_ty(tcx, body, ty);
                 let flags = self.call_arg_push_flags(false, suppress_protector);
+                let from_shadow = !p.projection.is_empty();
+                if self.trace_call_boundary_scan_enabled() {
+                    eprintln!(
+                        "[rusteze][call-boundary-scan] caller={} callee_id={:?} callee={:?} arg={} place={:?} ty={:?} was_tagged={} from_shadow={} flags=0x{:x}",
+                        tcx.def_path_str(body.source.def_id()),
+                        direct_call_arg_callee_id,
+                        callee_path_opt.as_deref(),
+                        arg_index,
+                        p,
+                        ty,
+                        was_tagged,
+                        from_shadow,
+                        flags
+                    );
+                }
                 let kind = if let Some(callee_id) = direct_call_arg_callee_id {
                     InstrKind::CallArgPush {
                         callee_id,
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow,
                         flags,
                     }
                 } else {
@@ -2428,6 +2472,7 @@ impl MyOptimizationPass {
                         arg_index: arg_index as u64,
                         ptr_local: p.local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
+                        from_shadow,
                         flags,
                     }
                 };
@@ -2545,6 +2590,7 @@ impl MyOptimizationPass {
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
                             parent_mode: ParentSelectionMode::SlotFamily,
+                            from_shadow: false,
                             flags: 0,
                         }
                     } else {
@@ -2552,6 +2598,7 @@ impl MyOptimizationPass {
                             arg_index: arg_index as u64,
                             ptr_local: p.local,
                             parent_mode: ParentSelectionMode::SlotFamily,
+                            from_shadow: false,
                             flags: 0,
                         }
                     };

@@ -323,7 +323,7 @@ fn tb_lite_on_call_arg_inplace_alias(callee_id: u64, parent_tag: u64, addr: usiz
 /// End the current call-frame protector scope.
 ///
 /// Protected children created for this callee are released, any same-slot ancestor protectors
-/// shadowed by nested `&mut self` calls are restored, and non-returned protected tags are
+/// shadowed by nested `&mut self` calls are restored, and non-returned protected unique tags are
 /// retired at protector end.
 fn tb_lite_on_call_exit(callee_id: u64) {
     if !rz_tb_lite_enabled() {
@@ -406,7 +406,9 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             if !returned_tags.contains(&tag) {
                 if returned_descendant && matches!(node.kind, BorrowKind::Unique) {
                     tb_shadow_local_node(node);
-                } else if !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant) {
+                } else if matches!(node.kind, BorrowKind::Unique)
+                    && !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant)
+                {
                     tb_disable_node_for_protector_end(node);
                 }
             }

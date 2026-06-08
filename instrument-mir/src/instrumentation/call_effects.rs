@@ -680,6 +680,35 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::contains",
         CallEffect::Ignore,
     ),
+    // These `Option` entry helpers return `&mut T` inside the `&mut Option<T>` receiver.
+    EffectRule::two(
+        MatchKind::Contains,
+        "::option::Option",
+        MatchKind::EndsWith,
+        "::insert",
+        CallEffect::PtrDerive,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::option::Option",
+        MatchKind::EndsWith,
+        "::get_or_insert",
+        CallEffect::PtrDerive,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::option::Option",
+        MatchKind::EndsWith,
+        "::get_or_insert_with",
+        CallEffect::PtrDerive,
+    ),
+    EffectRule::two(
+        MatchKind::Contains,
+        "::option::Option",
+        MatchKind::EndsWith,
+        "::get_or_insert_default",
+        CallEffect::PtrDerive,
+    ),
     EffectRule::two(
         MatchKind::Contains,
         "::option::Option",
@@ -1474,6 +1503,22 @@ mod tests {
         assert_eq!(
             effect_for("core::ops::RangeBounds::end_bound"),
             CallEffect::CarrierCopyArg(0)
+        );
+        assert_eq!(
+            effect_for("core::option::Option::<T>::get_or_insert_with"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::option::Option::<T>::get_or_insert"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::option::Option::<T>::get_or_insert_default"),
+            CallEffect::PtrDerive
+        );
+        assert_eq!(
+            effect_for("core::option::Option::<T>::insert"),
+            CallEffect::PtrDerive
         );
         assert_eq!(
             effect_for("alloc::vec::Vec::<T, A>::len"),

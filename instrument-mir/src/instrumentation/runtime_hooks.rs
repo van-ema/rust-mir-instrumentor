@@ -42,7 +42,9 @@ impl MyOptimizationPass {
             InstrKind::ShadowCopyRange { .. } => hooks.def_id_shadow_copy_range,
             InstrKind::ShadowKill { .. } => hooks.def_id_shadow_kill_range,
             InstrKind::TagKill { .. } => hooks.def_id_tag_kill,
-            InstrKind::TagLocalKill { .. } => hooks.def_id_tag_kill,
+            InstrKind::TagLocalKill { .. } | InstrKind::ExitTagLocalKill { .. } => {
+                hooks.def_id_tag_kill
+            }
             InstrKind::TagRetain { .. } => hooks.def_id_tag_retain,
             InstrKind::TagProp { .. } | InstrKind::TagPropFromRefAncestor { .. } => {
                 hooks.def_id_use // should never become a call (handled as a plain Assign)
@@ -61,6 +63,8 @@ impl MyOptimizationPass {
                 }
             }
             InstrKind::CallArgPush { .. } => hooks.def_id_push_call_arg_tag,
+            InstrKind::DirectCallScopeBegin { .. } => hooks.def_id_begin_direct_call_boundary,
+            InstrKind::DirectCallScopeEnd { .. } => hooks.def_id_end_direct_call_boundary,
             InstrKind::IndirectCallScopeBegin => hooks.def_id_begin_indirect_call_arg_scope,
             InstrKind::IndirectCallScopeEnd => hooks.def_id_end_indirect_call_arg_scope,
             InstrKind::IndirectCallArgPush { .. } => hooks.def_id_push_indirect_call_arg_tag,
@@ -261,6 +265,15 @@ impl MyOptimizationPass {
         let def_id_push_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_boundary_tag", 7)
             .expect("missing '__rz_push_call_arg_boundary_tag' definition");
+        let def_id_push_call_arg_shadow_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_boundary_shadow_tag", 5)
+            .expect("missing '__rz_push_call_arg_boundary_shadow_tag' definition");
+        let def_id_begin_direct_call_boundary = self
+            .find_runtime_fn_def_id(tcx, "__rz_begin_direct_call_boundary", 1)
+            .expect("missing '__rz_begin_direct_call_boundary' definition");
+        let def_id_end_direct_call_boundary = self
+            .find_runtime_fn_def_id(tcx, "__rz_end_direct_call_boundary", 1)
+            .expect("missing '__rz_end_direct_call_boundary' definition");
         let def_id_begin_indirect_call_arg_scope = self
             .find_runtime_fn_def_id(tcx, "__rz_begin_indirect_call_arg_scope", 0)
             .expect("missing '__rz_begin_indirect_call_arg_scope' definition");
@@ -270,6 +283,9 @@ impl MyOptimizationPass {
         let def_id_push_indirect_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_boundary_tag", 6)
             .expect("missing '__rz_push_indirect_call_arg_boundary_tag' definition");
+        let def_id_push_indirect_call_arg_shadow_tag = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_boundary_shadow_tag", 4)
+            .expect("missing '__rz_push_indirect_call_arg_boundary_shadow_tag' definition");
         let def_id_push_indirect_call_arg_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_leaf_shadow", 3)
             .expect("missing '__rz_push_indirect_call_arg_leaf_shadow' definition");
@@ -398,9 +414,13 @@ impl MyOptimizationPass {
             def_id_read_allow_untagged,
             def_id_use,
             def_id_push_call_arg_tag,
+            def_id_push_call_arg_shadow_tag,
+            def_id_begin_direct_call_boundary,
+            def_id_end_direct_call_boundary,
             def_id_begin_indirect_call_arg_scope,
             def_id_end_indirect_call_arg_scope,
             def_id_push_indirect_call_arg_tag,
+            def_id_push_indirect_call_arg_shadow_tag,
             def_id_push_indirect_call_arg_leaf_shadow,
             def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
