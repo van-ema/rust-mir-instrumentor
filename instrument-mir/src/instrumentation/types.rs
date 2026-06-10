@@ -73,6 +73,13 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     ShadowStoreAllocRoot {
         is_mut: bool,
     },
+    /// Store an allocation-root tag for an owner pointer returned by uninstrumented std code.
+    ///
+    /// Unlike Box allocation roots, this only imports when runtime already saw a live allocation.
+    /// Example: the data pointer in `Vec<u8>` returned by `std::fs::read`.
+    ShadowStoreExternalAllocRoot {
+        is_mut: bool,
+    },
     /// Stack allocation lifetime event for a MIR local.
     StackAlloc {
         local: Local,
@@ -602,6 +609,7 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_shadow_store_ptr: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_ptr_local: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_alloc_root: DefId,
+    pub(in crate::instrumentation) def_id_shadow_store_external_alloc_root: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag_for_ptr: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_ref_ancestor: DefId,

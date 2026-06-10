@@ -440,6 +440,31 @@ impl MyOptimizationPass {
             }
         }
 
+        if let StatementKind::Assign(box (dst_place, rvalue)) = &stmt.kind {
+            if let Some(dst_local) = dst_place.as_local() {
+                let dst_ty = body.local_decls[dst_local].ty;
+                if let Rvalue::Use(Operand::Copy(src_place))
+                | Rvalue::Use(Operand::Move(src_place))
+                | Rvalue::CopyForDeref(src_place) = rvalue
+                {
+                    if self.is_std_fs_read_ok_vec_payload(tcx, body, *src_place, dst_ty)
+                        && self.push_external_vec_u8_owner_import(
+                            tcx,
+                            body,
+                            bb,
+                            stmt_idx,
+                            false,
+                            stmt.source_info,
+                            dst_local,
+                            insert_points,
+                        )
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
         // Tag propagation across pointer-to-pointer casts and plain copies or moves of pointer locals.
         // Include wide pointers so tags survive unsize and reborrow patterns before a thin data
         // pointer is extracted later in MIR.

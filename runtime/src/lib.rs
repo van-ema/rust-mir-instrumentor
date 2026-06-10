@@ -3811,6 +3811,46 @@ pub extern "C" fn __rz_shadow_store_alloc_root(
 }
 
 #[no_mangle]
+pub extern "C" fn __rz_shadow_store_external_alloc_root(
+    slot_addr: usize,
+    ptr_addr: usize,
+    is_mut: u8,
+    bounds_len: usize,
+    align_req: usize,
+) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_store);
+    let _g = RzRuntimeGuard::enter();
+    if slot_addr == 0 {
+        return;
+    }
+    if ptr_addr == 0 {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+
+    let Some((_base, alloc_meta)) = lookup_alloc_snapshot(ptr_addr) else {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    };
+    if !alloc_meta.live {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+
+    // External owner imports are for allocations created by uninstrumented std code and recorded
+    // by the allocator wrapper. A zero-capacity Vec has no live allocation, so it stays untagged.
+    let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
+    ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
+    if rz_trace_ptr_shadow_enabled() {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] store_external_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
+            slot_addr, ptr_addr, tag
+        );
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, shadow_load);

@@ -194,6 +194,134 @@ impl MyOptimizationPass {
             && def_path.contains("::from_raw")
     }
 
+    pub(in crate::instrumentation) fn is_std_fs_read_fn(&self, def_path: &str) -> bool {
+        def_path == "std::fs::read"
+    }
+
+    pub(in crate::instrumentation) fn is_result_unwrap_or_expect_fn(&self, def_path: &str) -> bool {
+        def_path.contains("::result::Result")
+            && (def_path.ends_with("::unwrap") || def_path.ends_with("::expect"))
+    }
+
+    pub(in crate::instrumentation) fn local_is_std_fs_read_result<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        for block_data in body.basic_blocks.iter() {
+            let Some(term) = &block_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call {
+                func, destination, ..
+            } = &term.kind
+            else {
+                continue;
+            };
+            if destination.as_local() != Some(local) {
+                continue;
+            }
+            let Some((did, _)) = self.direct_callee(tcx, body, block_data, func) else {
+                continue;
+            };
+            if self.is_std_fs_read_fn(&tcx.def_path_str(did)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(in crate::instrumentation) fn is_std_fs_read_ok_vec_payload<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        src_place: Place<'tcx>,
+        dst_ty: Ty<'tcx>,
+    ) -> bool {
+        if !self.is_vec_u8_ty(tcx, dst_ty) || src_place.projection.len() != 2 {
+            return false;
+        }
+
+        let ProjectionElem::Downcast(_, variant_idx) = src_place.projection[0] else {
+            return false;
+        };
+        let ProjectionElem::Field(field_idx, field_ty) = src_place.projection[1] else {
+            return false;
+        };
+        if field_idx.index() != 0 || field_ty != dst_ty {
+            return false;
+        }
+
+        let src_ty = body.local_decls[src_place.local].ty;
+        let TyKind::Adt(adt, args) = src_ty.kind() else {
+            return false;
+        };
+        if !tcx.def_path_str(adt.did()).contains("::result::Result") {
+            return false;
+        }
+        let variant = adt.variant(variant_idx);
+        if variant.name.as_str() != "Ok" || variant.fields[field_idx].ty(tcx, args) != dst_ty {
+            return false;
+        }
+
+        self.local_is_std_fs_read_result(tcx, body, src_place.local)
+    }
+
+    pub(in crate::instrumentation) fn call_returns_std_fs_read_vec_payload<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        callee_path: Option<&str>,
+        args: &Box<[Spanned<Operand<'tcx>>]>,
+        dst_ty: Ty<'tcx>,
+    ) -> bool {
+        if !self.is_vec_u8_ty(tcx, dst_ty)
+            || !callee_path.is_some_and(|path| self.is_result_unwrap_or_expect_fn(path))
+        {
+            return false;
+        }
+        let Some(src_place) = args
+            .get(0)
+            .and_then(|arg| self.place_from_operand(&arg.node))
+        else {
+            return false;
+        };
+        src_place.projection.is_empty()
+            && self.local_is_std_fs_read_result(tcx, body, src_place.local)
+    }
+
+    pub(in crate::instrumentation) fn push_external_vec_u8_owner_import<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        bb: BasicBlock,
+        stmt_idx: usize,
+        insert_before: bool,
+        source_info: SourceInfo,
+        dst_local: Local,
+        insert_points: &mut Vec<InsertPoint<'tcx>>,
+    ) -> bool {
+        let dst_ty = body.local_decls[dst_local].ty;
+        if !self.is_vec_u8_ty(tcx, dst_ty) {
+            return false;
+        }
+        let leafs =
+            self.shadowable_leaf_ptr_specs_from_place(tcx, body, Place::from(dst_local), dst_ty);
+        let [leaf] = leafs.as_slice() else {
+            return false;
+        };
+        insert_points.push(InsertPoint {
+            bb,
+            stmt_idx,
+            insert_before,
+            source_info,
+            place: leaf.place,
+            kind: InstrKind::ShadowStoreExternalAllocRoot { is_mut: true },
+        });
+        true
+    }
+
     pub(in crate::instrumentation) fn direct_callee<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -2223,6 +2351,28 @@ impl MyOptimizationPass {
                 CallEffect::Unknown => {
                     // No special emission here.
                 }
+            }
+        }
+
+        if let (Some(tgt_bb), Some(dst_local)) = (call_target_bb, destination.as_local()) {
+            let dst_ty = body.local_decls[dst_local].ty;
+            if self.call_returns_std_fs_read_vec_payload(
+                tcx,
+                body,
+                callee_path_opt.as_deref(),
+                args,
+                dst_ty,
+            ) {
+                self.push_external_vec_u8_owner_import(
+                    tcx,
+                    body,
+                    tgt_bb,
+                    0,
+                    true,
+                    term.source_info,
+                    dst_local,
+                    insert_points,
+                );
             }
         }
 
