@@ -234,6 +234,16 @@ impl AliasModel for TreeBorrowsLiteModel {
         tb_lite_validate_ref_mut_boundary_retag(tag, tmeta, addr, size)
     }
 
+    fn validate_call_arg_boundary_parent(
+        &self,
+        tag: u64,
+        tmeta: &TagMeta,
+        addr: usize,
+        size: usize,
+    ) -> Option<String> {
+        tb_lite_validate_call_arg_boundary_parent(tag, tmeta, addr, size)
+    }
+
     fn find_ref_ancestor_tag(&self, tmap: &HashMap<u64, TagMeta>, tag: u64) -> Option<u64> {
         tb_lite_find_ref_ancestor_tag(tmap, tag)
     }
@@ -510,6 +520,125 @@ fn tb_lite_validate_ref_mut_boundary_retag(
     );
     msg.push_str(&dump);
     Some(msg)
+}
+
+/// Check that a call argument can be used as the parent for callee-entry retagging.
+///
+/// This deliberately does not perform the full TB read transition: transporting a ref argument is
+/// not a pointee load. Actual retags and reads/writes in the callee still go through the normal
+/// creation/access paths.
+fn tb_lite_validate_call_arg_boundary_parent(
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> Option<String> {
+    if !rz_tb_lite_enabled()
+        || tmeta.alias_exempt
+        || rz_sb_suppressed()
+        || !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
+    {
+        return None;
+    }
+
+    if matches!(tmeta.kind, PtrKind::RefMut)
+        && tmeta.parent != 0
+        && tag_store::get(tmeta.parent)
+            .as_ref()
+            .is_some_and(|parent| matches!(parent.kind, PtrKind::RawConst | PtrKind::RawMut))
+    {
+        // A raw-to-`&mut` call argument is not just exporting an existing ref family: this boundary
+        // materializes mutable reference authority from raw provenance. Keep the TB read-retag
+        // transition here so protector/lazy-interior-mutability cases observe the same state change
+        // they would get from a real retag, while ordinary ref-rooted arguments use the cheap path.
+        return tb_lite_check(tag, tag, tmeta, addr, size, AliasAccessKind::Read);
+    }
+
+    if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+        return Some(tb_lite_invalidated_tombstone_msg(
+            compacted,
+            tmeta,
+            addr,
+            size,
+            AliasAccessKind::Read,
+        ));
+    }
+
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let Some(tree) = all.get(&base) else {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+            return Some(tb_lite_invalidated_tombstone_msg(
+                compacted,
+                tmeta,
+                addr,
+                size,
+                AliasAccessKind::Read,
+            ));
+        }
+        return None;
+    };
+
+    let Some(node) = tree.nodes.get(&tag) else {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+            return Some(tb_lite_invalidated_tombstone_msg(
+                compacted,
+                tmeta,
+                addr,
+                size,
+                AliasAccessKind::Read,
+            ));
+        }
+        // Missing TB metadata is best-effort loss, not proof of a bad program.
+        return None;
+    };
+
+    if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
+        return None;
+    }
+
+    let dump = if rz_tb_dump_enabled() {
+        tb_dump(tree, tag, addr, size, AliasAccessKind::Read)
+    } else {
+        String::new()
+    };
+    if tb_lite_inplace_protected_tag(tag) {
+        let mut msg = format!(
+            "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INPLACE_CALL_ARG",
+            tag, addr, size, tmeta.kind
+        );
+        msg.push_str(&dump);
+        return Some(msg);
+    }
+    if !tb_is_live_node(node) {
+        let mut msg = format!(
+            "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
+            tag, addr, size, tmeta.kind
+        );
+        msg.push_str(&dump);
+        return Some(msg);
+    }
+
+    if matches!(tmeta.kind, PtrKind::RefMut) {
+        let lineage = tb_collect_lineage(&tree.nodes, tag);
+        for ancestor_tag in lineage.iter().copied().skip(1) {
+            let Some(ancestor) = tree.nodes.get(&ancestor_tag) else {
+                continue;
+            };
+            if matches!(ancestor.kind, BorrowKind::Unique)
+                && matches!(ancestor.perm, TbPerm::Disabled)
+            {
+                let mut msg = format!(
+                    "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
+                    tag, addr, size, tmeta.kind, ancestor.tag
+                );
+                msg.push_str(&dump);
+                return Some(msg);
+            }
+        }
+    }
+
+    None
 }
 
 fn tb_lite_check_protected_dealloc(base_addr: usize) {

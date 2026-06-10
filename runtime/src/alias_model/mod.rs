@@ -76,6 +76,20 @@ pub(crate) trait AliasModel: Sync {
         self.check_access(tag, tag, tmeta, addr, size, AliasAccessKind::Read)
     }
 
+    /// Validate that a caller ref tag is a live parent for callee-entry retagging.
+    ///
+    /// This is narrower than a memory read: passing `&T`/`&mut T` over a call boundary transports
+    /// parent authority, while the callee's retag/access hooks model the actual borrow actions.
+    fn validate_call_arg_boundary_parent(
+        &self,
+        tag: u64,
+        tmeta: &TagMeta,
+        addr: usize,
+        size: usize,
+    ) -> Option<String> {
+        self.check_access(tag, tag, tmeta, addr, size, AliasAccessKind::Read)
+    }
+
     fn find_ref_ancestor_tag(&self, _tmap: &HashMap<u64, TagMeta>, _tag: u64) -> Option<u64> {
         None
     }

@@ -37,6 +37,9 @@ impl MyOptimizationPass {
             InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
             InstrKind::ShadowStoreAllocRoot { .. } => hooks.def_id_shadow_store_alloc_root,
+            InstrKind::ShadowStoreExternalAllocRoot { .. } => {
+                hooks.def_id_shadow_store_external_alloc_root
+            }
             InstrKind::ShadowStoreBoxPointee { .. } => hooks.def_id_shadow_store_ptr,
             InstrKind::ShadowCopySlot { .. } => hooks.def_id_shadow_copy_slot,
             InstrKind::ShadowCopyRange { .. } => hooks.def_id_shadow_copy_range,
@@ -361,6 +364,9 @@ impl MyOptimizationPass {
         let def_id_shadow_store_alloc_root = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_store_alloc_root", 5)
             .expect("missing '__rz_shadow_store_alloc_root' definition");
+        let def_id_shadow_store_external_alloc_root = self
+            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_external_alloc_root", 5)
+            .expect("missing '__rz_shadow_store_external_alloc_root' definition");
         let def_id_shadow_load_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_load_tag", 1)
             .expect("missing '__rz_shadow_load_tag' definition");
@@ -446,6 +452,7 @@ impl MyOptimizationPass {
             def_id_shadow_store_ptr,
             def_id_shadow_store_ptr_local,
             def_id_shadow_store_alloc_root,
+            def_id_shadow_store_external_alloc_root,
             def_id_shadow_load_tag,
             def_id_shadow_load_tag_for_ptr,
             def_id_shadow_load_ref_ancestor,

@@ -1927,7 +1927,9 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::ShadowStoreAllocRoot { is_mut } = creation_kind.clone() {
+            if let InstrKind::ShadowStoreAllocRoot { is_mut }
+            | InstrKind::ShadowStoreExternalAllocRoot { is_mut } = creation_kind.clone()
+            {
                 let slot_addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
@@ -1953,8 +1955,13 @@ impl MyOptimizationPass {
                 let tmp_unit = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                let store_func =
-                    runtime_func(tcx, hooks.def_id_shadow_store_alloc_root, source_info.span);
+                let store_def_id = match creation_kind {
+                    InstrKind::ShadowStoreExternalAllocRoot { .. } => {
+                        hooks.def_id_shadow_store_external_alloc_root
+                    }
+                    _ => hooks.def_id_shadow_store_alloc_root,
+                };
+                let store_func = runtime_func(tcx, store_def_id, source_info.span);
                 let store_args = lower_args(
                     source_info.span,
                     [

@@ -14,6 +14,18 @@ impl MyOptimizationPass {
         matches!(ty.kind(), TyKind::RawPtr(..))
     }
 
+    pub(in crate::instrumentation) fn is_vec_u8_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        let TyKind::Adt(adt, args) = ty.kind() else {
+            return false;
+        };
+        let def_path = tcx.def_path_str(adt.did());
+        def_path.contains("::vec::Vec") && args.type_at(0) == tcx.types.u8
+    }
+
     pub(in crate::instrumentation) fn is_shadowable_ptr_ty<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,

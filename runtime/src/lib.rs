@@ -3811,6 +3811,46 @@ pub extern "C" fn __rz_shadow_store_alloc_root(
 }
 
 #[no_mangle]
+pub extern "C" fn __rz_shadow_store_external_alloc_root(
+    slot_addr: usize,
+    ptr_addr: usize,
+    is_mut: u8,
+    bounds_len: usize,
+    align_req: usize,
+) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, shadow_store);
+    let _g = RzRuntimeGuard::enter();
+    if slot_addr == 0 {
+        return;
+    }
+    if ptr_addr == 0 {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+
+    let Some((_base, alloc_meta)) = lookup_alloc_snapshot(ptr_addr) else {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    };
+    if !alloc_meta.live {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+
+    // External owner imports are for allocations created by uninstrumented std code and recorded
+    // by the allocator wrapper. A zero-capacity Vec has no live allocation, so it stays untagged.
+    let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
+    ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
+    if rz_trace_ptr_shadow_enabled() {
+        eprintln!(
+            "[rusteze-runtime][ptr-shadow] store_external_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
+            slot_addr, ptr_addr, tag
+        );
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn __rz_shadow_load_tag(slot_addr: usize) -> u64 {
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, shadow_load);
@@ -5893,6 +5933,29 @@ fn rz_ref_boundary_tag_is_valid(tag: u64) -> bool {
         .is_none()
 }
 
+fn rz_call_arg_boundary_tag_is_valid_for_addr(tag: u64, addr: usize) -> bool {
+    if tag == 0 {
+        return true;
+    }
+
+    let Some(tmeta) = tag_store::get(tag) else {
+        return false;
+    };
+    if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return true;
+    }
+
+    if rz_ref_boundary_is_empty_precise_view(&tmeta) {
+        return true;
+    }
+
+    let access_addr = if addr != 0 { addr } else { tmeta.pointee_addr };
+    let access_size = bounds_len_bytes_or_zero(tmeta.bounds_len).min(1).max(1);
+    active_alias_model()
+        .validate_call_arg_boundary_parent(tag, &tmeta, access_addr, access_size)
+        .is_none()
+}
+
 fn rz_ref_boundary_is_empty_precise_view(tmeta: &TagMeta) -> bool {
     bounds_len_is_precise_empty(tmeta.bounds_len)
 }
@@ -6023,7 +6086,7 @@ fn recover_projected_ref_boundary_tag(addr: usize, boundary_parent_tag: u64) -> 
     if !matches!(
         boundary_parent_meta.kind,
         PtrKind::RefShared | PtrKind::RefMut
-    ) || !rz_ref_boundary_tag_is_valid(boundary_parent_tag)
+    ) || !rz_call_arg_boundary_tag_is_valid_for_addr(boundary_parent_tag, 0)
     {
         return 0;
     }
@@ -6061,7 +6124,7 @@ fn recover_projected_ref_boundary_tag(addr: usize, boundary_parent_tag: u64) -> 
 
     candidates.sort_unstable_by(|a, b| b.cmp(a));
     for tag in candidates {
-        if rz_can_recover_parent_tag(tag) && rz_ref_boundary_tag_is_valid(tag) {
+        if rz_can_recover_parent_tag(tag) && rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr) {
             return tag;
         }
     }
@@ -6230,7 +6293,7 @@ fn exact_ref_call_arg_tag_is_valid_for_addr(tag: u64, meta: &TagMeta, addr: usiz
     if addr != 0 && ref_tag_match_rank_for_ptr_value(meta, addr, None).is_none() {
         return false;
     }
-    rz_ref_boundary_tag_is_valid(tag)
+    rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr)
 }
 
 fn projected_exact_call_arg_tag_fast_path(
@@ -6251,13 +6314,26 @@ fn projected_exact_call_arg_tag_fast_path(
 }
 
 fn recover_live_ref_boundary_tag_for_ptr_value(addr: usize) -> u64 {
-    recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, None)
+    recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, None, rz_ref_boundary_tag_is_valid)
 }
 
-fn recover_live_ref_boundary_tag_for_ptr_value_with_kind(
+fn recover_live_call_arg_boundary_tag_for_ptr_value_with_kind(
     addr: usize,
     expected_kind: Option<PtrKind>,
 ) -> u64 {
+    recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, expected_kind, |tag| {
+        rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr)
+    })
+}
+
+fn recover_live_ref_boundary_tag_for_ptr_value_with_kind<F>(
+    addr: usize,
+    expected_kind: Option<PtrKind>,
+    tag_is_valid: F,
+) -> u64
+where
+    F: Fn(u64) -> bool,
+{
     if addr == 0 {
         return 0;
     }
@@ -6301,7 +6377,7 @@ fn recover_live_ref_boundary_tag_for_ptr_value_with_kind(
         .into_iter()
         .chain(view_candidates.into_iter())
     {
-        if rz_ref_boundary_tag_is_valid(tag) {
+        if tag_is_valid(tag) {
             return tag;
         }
     }
@@ -6363,6 +6439,23 @@ fn recover_newest_exact_slot_tag(addr: usize) -> u64 {
 }
 
 fn recover_nearest_valid_lineage_boundary_tag(addr: usize, start_tag: u64) -> u64 {
+    recover_nearest_valid_lineage_boundary_tag_with(addr, start_tag, rz_ref_boundary_tag_is_valid)
+}
+
+fn recover_nearest_valid_call_arg_lineage_boundary_tag(addr: usize, start_tag: u64) -> u64 {
+    recover_nearest_valid_lineage_boundary_tag_with(addr, start_tag, |tag| {
+        rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr)
+    })
+}
+
+fn recover_nearest_valid_lineage_boundary_tag_with<F>(
+    addr: usize,
+    start_tag: u64,
+    tag_is_valid: F,
+) -> u64
+where
+    F: Fn(u64) -> bool,
+{
     if addr == 0 || start_tag == 0 {
         return 0;
     }
@@ -6388,7 +6481,7 @@ fn recover_nearest_valid_lineage_boundary_tag(addr: usize, start_tag: u64) -> u6
     }
 
     for tag in lineage {
-        if rz_can_recover_parent_tag(tag) && rz_ref_boundary_tag_is_valid(tag) {
+        if rz_can_recover_parent_tag(tag) && tag_is_valid(tag) {
             return tag;
         }
     }
@@ -6482,7 +6575,7 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
                 }
                 if rz_stack_addr_hint(addr) || rz_tls_addr_hint(addr) {
                     if matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut)
-                        && rz_ref_boundary_tag_is_valid(tag)
+                        && rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr)
                     {
                         // By-value wrapper arguments (for example `Newtype(&mut T)` or
                         // `Option<&T>`) key the side channel by the carrier stack slot, not by the
@@ -6495,22 +6588,22 @@ fn canonical_call_arg_tag(addr: usize, tag: u64) -> u64 {
             }
         }
     }
-    if rz_ref_boundary_tag_is_valid(tag) {
+    if rz_call_arg_boundary_tag_is_valid_for_addr(tag, addr) {
         return tag;
     }
 
     let model_tag = active_alias_model().canonicalize_mut_arg_ret_tag(tag, addr);
-    if model_tag != 0 && rz_ref_boundary_tag_is_valid(model_tag) {
+    if model_tag != 0 && rz_call_arg_boundary_tag_is_valid_for_addr(model_tag, addr) {
         return model_tag;
     }
 
-    let valid_lineage_tag = recover_nearest_valid_lineage_boundary_tag(addr, tag);
+    let valid_lineage_tag = recover_nearest_valid_call_arg_lineage_boundary_tag(addr, tag);
     if valid_lineage_tag != 0 {
         return valid_lineage_tag;
     }
 
     let recovered = recover_call_arg_parent_tag(addr);
-    if recovered != 0 && rz_ref_boundary_tag_is_valid(recovered) {
+    if recovered != 0 && rz_call_arg_boundary_tag_is_valid_for_addr(recovered, addr) {
         return recovered;
     }
 
@@ -6530,7 +6623,8 @@ fn valid_or_recovered_call_arg_tag(addr: usize, tag: u64, allow_mut_recovery: bo
     let Some(meta) = tag_store::get(canonical_tag) else {
         return tag;
     };
-    if meta.kind == expected_kind && rz_ref_boundary_tag_is_valid(canonical_tag) {
+    if meta.kind == expected_kind && rz_call_arg_boundary_tag_is_valid_for_addr(canonical_tag, addr)
+    {
         if expected_kind == PtrKind::RefMut && !allow_mut_recovery && canonical_tag != tag {
             return tag;
         }
@@ -6544,7 +6638,7 @@ fn valid_or_recovered_call_arg_tag(addr: usize, tag: u64, allow_mut_recovery: bo
     // same kind for the concrete pointer value; otherwise leave validation on the
     // original tag so real dead-provenance exports still report.
     let recovered =
-        recover_live_ref_boundary_tag_for_ptr_value_with_kind(addr, Some(expected_kind));
+        recover_live_call_arg_boundary_tag_for_ptr_value_with_kind(addr, Some(expected_kind));
     if recovered != 0 {
         return recovered;
     }
@@ -6552,14 +6646,38 @@ fn valid_or_recovered_call_arg_tag(addr: usize, tag: u64, allow_mut_recovery: bo
     tag
 }
 
-fn validate_call_arg_boundary_tag(tag: u64) {
+fn validate_call_arg_boundary_tag(tag: u64, addr: usize) {
     let Some(meta) = tag_store::get(tag) else {
         return;
     };
     if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
         return;
     }
-    rz_validate_ref_boundary_use(tag, "CALL_ARG");
+    if rz_ref_boundary_is_empty_precise_view(&meta) {
+        return;
+    }
+
+    let access_addr = if addr != 0 { addr } else { meta.pointee_addr };
+    let access_size = bounds_len_bytes_or_zero(meta.bounds_len).min(1).max(1);
+    let Some(msg) = active_alias_model().validate_call_arg_boundary_parent(
+        tag,
+        &meta,
+        access_addr,
+        access_size,
+    ) else {
+        return;
+    };
+
+    rz_violation(
+        active_alias_model().violation_kind(),
+        append_location_if_enabled(
+            format!(
+                "CALL_ARG invalid ref tag={tag} pointee=0x{:x} kind={:?}\n{msg}",
+                access_addr, meta.kind
+            ),
+            "RZ_LOG_LOC",
+        ),
+    );
 }
 
 fn call_arg_boundary_entry(
@@ -6588,11 +6706,11 @@ fn call_arg_boundary_entry(
             },
             true,
         );
-        validate_call_arg_boundary_tag(tag);
+        validate_call_arg_boundary_tag(tag, addr);
         tag
     } else {
         let tag = valid_or_recovered_call_arg_tag(addr, exact_tag, false);
-        validate_call_arg_boundary_tag(tag);
+        validate_call_arg_boundary_tag(tag, addr);
         tag
     };
     CallArgTagEntry { tag, flags }
@@ -6876,7 +6994,7 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, call_arg_take);
     let _g = RzRuntimeGuard::enter();
-    rz_validate_ref_boundary_use(tag, "CALL_ARG");
+    validate_call_arg_boundary_tag(tag, 0);
 }
 
 /// Push the exact shadow of one internal pointer leaf of a by-value aggregate argument.
