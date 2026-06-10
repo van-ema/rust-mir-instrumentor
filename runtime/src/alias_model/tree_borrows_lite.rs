@@ -411,10 +411,19 @@ fn tb_lite_on_call_exit(callee_id: u64) {
             .iter()
             .copied()
             .any(|ret_tag| ret_tag != tag && tb_is_ancestor(&tree.nodes, tag, ret_tag));
+        // A shadowed protected parent is an obsolete local handle while a nested same-slot
+        // `&mut` child is active. Keep it as lineage if that child family survives the call.
+        let shadowed_live_descendant = tree.nodes.get(&tag).is_some_and(|node| {
+            matches!(node.kind, BorrowKind::Unique)
+                && node.protector_shadow_depth != 0
+                && tb_has_live_same_slot_unique_descendant(tree, tag, node.start, node.len)
+        });
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
             if !returned_tags.contains(&tag) {
-                if returned_descendant && matches!(node.kind, BorrowKind::Unique) {
+                if (returned_descendant || shadowed_live_descendant)
+                    && matches!(node.kind, BorrowKind::Unique)
+                {
                     tb_shadow_local_node(node);
                 } else if matches!(node.kind, BorrowKind::Unique)
                     && !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant)
@@ -1318,6 +1327,36 @@ fn tb_has_live_descendant(tree: &TbAllocState, root: u64) -> bool {
             continue;
         };
         if tb_is_live_node(node) {
+            return true;
+        }
+        if let Some(children) = tree.children.get(&tag) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    false
+}
+
+fn tb_has_live_same_slot_unique_descendant(
+    tree: &TbAllocState,
+    root: u64,
+    start: usize,
+    len: usize,
+) -> bool {
+    let mut stack = tree.children.get(&root).cloned().unwrap_or_default();
+    let mut visited = 0usize;
+    while let Some(tag) = stack.pop() {
+        if visited > tree.nodes.len() {
+            break;
+        }
+        visited = visited.saturating_add(1);
+        let Some(node) = tree.nodes.get(&tag) else {
+            continue;
+        };
+        if tb_is_live_node(node)
+            && matches!(node.kind, BorrowKind::Unique)
+            && node.start == start
+            && node.len == len
+        {
             return true;
         }
         if let Some(children) = tree.children.get(&tag) {
@@ -2701,5 +2740,32 @@ mod tests {
             tag_store::tag_lifecycle_state(parent),
             tag_store::TagLifecycleState::Active
         );
+    }
+
+    #[test]
+    fn live_same_slot_unique_descendant_is_detected() {
+        let parent = next_test_tag();
+        let child = next_test_tag();
+        let addr = test_addr(parent);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(test_node(
+            parent,
+            0,
+            addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+        tree.insert_node(test_node(
+            child,
+            parent,
+            addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+
+        assert!(tb_has_live_same_slot_unique_descendant(
+            &tree, parent, addr, 1
+        ));
     }
 }
