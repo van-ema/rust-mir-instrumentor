@@ -2552,6 +2552,13 @@ fn clear_boundary_survivor_tags(callee_id: u64) {
         .remove(&(thread_id, callee_id));
 }
 
+fn clear_boundary_survivor_tags_if_closed(callee_id: u64) {
+    // Direct-call take hooks can run before boundary cleanup; keep survivors until call-exit.
+    if !active_call_boundary_is_open(callee_id) {
+        clear_boundary_survivor_tags(callee_id);
+    }
+}
+
 fn tag_is_in_mut_arg_ret_boundary_lineage(tag: u64) -> bool {
     if tag == 0 {
         return false;
@@ -7324,7 +7331,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag(callee_id: u64, arg_index: u64, addr
             callee_id, arg_index, addr, raw_tag, tag
         );
     }
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
     tag
 }
 
@@ -7360,7 +7367,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_tag_or_zero(
             callee_id, arg_index, addr, raw_tag, tag
         );
     }
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
     tag
 }
 
@@ -7417,7 +7424,7 @@ pub extern "C" fn __rz_take_mut_arg_ret_leaf_shadow(
         .unwrap()
         .remove(&(thread_id, callee_id, arg_index, addr, leaf_key));
     restore_leaf_shadow(slot_addr, shadow);
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
 }
 
 /// Push a return-tag into a runtime side-channel so the caller can recover it after the call.
@@ -7549,7 +7556,7 @@ pub extern "C" fn __rz_take_ret_tag(callee_id: u64, addr: usize) -> u64 {
         .unwrap()
         .remove(&(thread_id, callee_id, addr))
         .unwrap_or(0);
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
     tag
 }
 
@@ -7566,7 +7573,7 @@ pub extern "C" fn __rz_take_ret_leaf_shadow(callee_id: u64, leaf_key: u64, slot_
         .unwrap()
         .remove(&(thread_id, callee_id, leaf_key));
     restore_leaf_shadow(slot_addr, shadow);
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
 }
 
 /// Take a pushed return-tag, or fall back to a fresh raw-pointer tag if missing.
@@ -7594,7 +7601,7 @@ pub extern "C" fn __rz_take_ret_tag_or_root(
             .remove(&(thread_id, callee_id, addr))
             .unwrap_or(0)
     };
-    clear_boundary_survivor_tags(callee_id);
+    clear_boundary_survivor_tags_if_closed(callee_id);
     if tag != 0 {
         return tag;
     }

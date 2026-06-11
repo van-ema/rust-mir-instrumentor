@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -389,6 +389,10 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         if let Some(protected_node) = active_protected_unique {
             let descendant_tags = tb_descendant_tags(tree, tag);
             for descendant in descendant_tags {
+                // A returned descendant is caller-visible; only retire non-returned call locals.
+                if tb_returned_lineage_needs_tag(tree, descendant, &returned_tags) {
+                    continue;
+                }
                 if let Some(node) = tree.nodes.get_mut(&descendant) {
                     tb_disable_node_for_protector_end(node);
                 }
@@ -459,6 +463,10 @@ fn tb_lite_on_call_exit(callee_id: u64) {
         };
         let descendant_tags = tb_descendant_tags(tree, tag);
         for descendant in descendant_tags {
+            // A returned descendant is caller-visible; only retire non-returned call locals.
+            if tb_returned_lineage_needs_tag(tree, descendant, &returned_tags) {
+                continue;
+            }
             if let Some(node) = tree.nodes.get_mut(&descendant) {
                 tb_disable_node_for_protector_end(node);
             }
@@ -1493,6 +1501,16 @@ fn tb_has_live_same_slot_unique_descendant(
         }
     }
     false
+}
+
+fn tb_returned_lineage_needs_tag(
+    tree: &TbAllocState,
+    tag: u64,
+    returned_tags: &HashSet<u64>,
+) -> bool {
+    returned_tags
+        .iter()
+        .any(|returned| *returned == tag || tb_is_ancestor(&tree.nodes, tag, *returned))
 }
 
 fn tb_node_can_compact_invalidated(node: &TbNode, frame_tags: &[u64]) -> bool {
