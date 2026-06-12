@@ -76,6 +76,7 @@ pub(crate) fn note_dead_epoch(base_addr: usize, alloc_epoch: u64) {
 }
 
 #[inline]
+#[cfg(feature = "runtime_tb_compaction")]
 pub(crate) fn note_invalidated_tag_compacted(tag: u64) {
     tag_history::note_invalidated_tag_compacted(tag);
 }

@@ -5,8 +5,11 @@ use std::thread::ThreadId;
 use crate::{
     allocs, append_location_if_enabled, boundary_survivor_tags_for_callee,
     bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing, rz_sb_suppressed,
-    rz_violation, tag_pruning, tag_store, tags, PtrKind, TagMeta,
+    rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
+
+#[cfg(feature = "runtime_tb_compaction")]
+use crate::tag_pruning;
 
 use super::{AliasAccessKind, AliasModel};
 
@@ -179,6 +182,7 @@ impl TbAllocState {
     }
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 #[derive(Copy, Clone, Debug)]
 struct TbCompactedNode {
     tag: u64,
@@ -200,6 +204,7 @@ struct TbProtectorFrame {
 
 static TB_STATE: OnceLock<Mutex<HashMap<usize, TbAllocState>>> = OnceLock::new();
 static TB_PROTECTOR_FRAMES: OnceLock<Mutex<Vec<TbProtectorFrame>>> = OnceLock::new();
+#[cfg(feature = "runtime_tb_compaction")]
 static TB_COMPACTED_INVALIDATED: OnceLock<Mutex<HashMap<u64, TbCompactedNode>>> = OnceLock::new();
 
 fn tb_state() -> &'static Mutex<HashMap<usize, TbAllocState>> {
@@ -210,6 +215,7 @@ fn tb_protector_frames() -> &'static Mutex<Vec<TbProtectorFrame>> {
     TB_PROTECTOR_FRAMES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_compacted_invalidated() -> &'static Mutex<HashMap<u64, TbCompactedNode>> {
     TB_COMPACTED_INVALIDATED.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -241,6 +247,7 @@ fn rz_tb_trace_enabled() -> bool {
 }
 
 #[inline]
+#[cfg(feature = "runtime_tb_compaction")]
 fn rz_tb_compact_invalidated_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -263,6 +270,7 @@ impl AliasModel for TreeBorrowsLiteModel {
         if !new_live && rz_tb_lite_enabled() {
             tb_lite_check_protected_dealloc(base_addr);
             tb_state().lock().unwrap().remove(&base_addr);
+            #[cfg(feature = "runtime_tb_compaction")]
             tb_compacted_invalidated()
                 .lock()
                 .unwrap()
@@ -644,19 +652,8 @@ fn tb_lite_validate_call_arg_boundary_parent(
         return tb_lite_check(tag, tag, tmeta, addr, size, AliasAccessKind::Read);
     }
 
-    if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
-        return Some(tb_lite_invalidated_tombstone_msg(
-            compacted,
-            tmeta,
-            addr,
-            size,
-            AliasAccessKind::Read,
-        ));
-    }
-
-    let base = tb_base_for_addr(addr);
-    let all = tb_state().lock().unwrap();
-    let Some(tree) = all.get(&base) else {
+    #[cfg(feature = "runtime_tb_compaction")]
+    {
         if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
             return Some(tb_lite_invalidated_tombstone_msg(
                 compacted,
@@ -666,18 +663,38 @@ fn tb_lite_validate_call_arg_boundary_parent(
                 AliasAccessKind::Read,
             ));
         }
+    }
+
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let Some(tree) = all.get(&base) else {
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted,
+                    tmeta,
+                    addr,
+                    size,
+                    AliasAccessKind::Read,
+                ));
+            }
+        }
         return None;
     };
 
     let Some(node) = tree.nodes.get(&tag) else {
-        if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
-            return Some(tb_lite_invalidated_tombstone_msg(
-                compacted,
-                tmeta,
-                addr,
-                size,
-                AliasAccessKind::Read,
-            ));
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted,
+                    tmeta,
+                    addr,
+                    size,
+                    AliasAccessKind::Read,
+                ));
+            }
         }
         // Missing TB metadata is best-effort loss, not proof of a bad program.
         return None;
@@ -1415,6 +1432,7 @@ fn tb_lite_on_tag_killed(tag: u64) {
         return;
     }
 
+    #[cfg(feature = "runtime_tb_compaction")]
     let compact_invalidated = rz_tb_compact_invalidated_enabled();
     let Some(tmeta) = tags().lock().unwrap().get(&tag).copied() else {
         return;
@@ -1439,9 +1457,11 @@ fn tb_lite_on_tag_killed(tag: u64) {
     if killed_readonly {
         tb_reactivate_frozen_unique_ancestors_without_readers(tree, parent);
     }
+    #[cfg(feature = "runtime_tb_compaction")]
     let _ = tb_compact_invalidated_roots(tree, &[tag], compact_invalidated);
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_compacted_invalidated_hit(tags: &[u64]) -> Option<TbCompactedNode> {
     let compacted = tb_compacted_invalidated().lock().unwrap();
     tags.iter()
@@ -1450,6 +1470,7 @@ fn tb_compacted_invalidated_hit(tags: &[u64]) -> Option<TbCompactedNode> {
         .find_map(|tag| compacted.get(&tag).copied())
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_lite_invalidated_tombstone_msg(
     compacted: TbCompactedNode,
     tmeta: &TagMeta,
@@ -1471,6 +1492,7 @@ fn tb_lite_invalidated_tombstone_msg(
     )
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_protector_frame_tag_snapshot() -> Vec<u64> {
     let frames = tb_protector_frames().lock().unwrap();
     let mut tags = Vec::new();
@@ -1488,6 +1510,7 @@ fn tb_protector_frame_tag_snapshot() -> Vec<u64> {
     tags
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_subtree_tags_deepest_first(tree: &TbAllocState, root: u64) -> Vec<u64> {
     if !tree.nodes.contains_key(&root) {
         return Vec::new();
@@ -1602,6 +1625,7 @@ fn tb_returned_lineage_needs_tag(
         .any(|returned| *returned == tag || tb_is_ancestor(&tree.nodes, tag, *returned))
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_node_can_compact_invalidated(node: &TbNode, frame_tags: &[u64]) -> bool {
     if node.tag == 0 || tb_is_live_node(node) {
         return false;
@@ -1631,6 +1655,7 @@ fn tb_node_can_compact_invalidated(node: &TbNode, frame_tags: &[u64]) -> bool {
     )
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_compact_invalidated_roots(
     tree: &mut TbAllocState,
     roots: &[u64],
@@ -1657,6 +1682,7 @@ fn tb_compact_invalidated_roots(
     removed
 }
 
+#[cfg(feature = "runtime_tb_compaction")]
 fn tb_compact_unreachable_invalidated_subtree(
     tree: &mut TbAllocState,
     root: u64,
@@ -1829,23 +1855,30 @@ fn tb_lite_check(
         return None;
     }
 
-    if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
-        return Some(tb_lite_invalidated_tombstone_msg(
-            compacted, tmeta, addr, size, access,
-        ));
+    #[cfg(feature = "runtime_tb_compaction")]
+    {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+            return Some(tb_lite_invalidated_tombstone_msg(
+                compacted, tmeta, addr, size, access,
+            ));
+        }
     }
 
     // The env-gate cache may allocate on first use. Initialize it before holding TB_STATE so
     // allocation bookkeeping cannot re-enter this alias model while the tree mutex is held.
+    #[cfg(feature = "runtime_tb_compaction")]
     let compact_invalidated = rz_tb_compact_invalidated_enabled();
 
     let base = tb_base_for_addr(addr);
     let mut all = tb_state().lock().unwrap();
     let Some(tree) = all.get_mut(&base) else {
-        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
-            return Some(tb_lite_invalidated_tombstone_msg(
-                compacted, tmeta, addr, size, access,
-            ));
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted, tmeta, addr, size, access,
+                ));
+            }
         }
         return None;
     };
@@ -1871,10 +1904,13 @@ fn tb_lite_check(
     };
 
     let Some(mut node) = tree.nodes.get(&access_tag).cloned() else {
-        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag, access_tag]) {
-            return Some(tb_lite_invalidated_tombstone_msg(
-                compacted, tmeta, addr, size, access,
-            ));
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag, access_tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted, tmeta, addr, size, access,
+                ));
+            }
         }
         // Best-effort: missing node means missing model metadata, not definite UB.
         return None;
@@ -1981,6 +2017,7 @@ fn tb_lite_check(
             addr,
             size,
             tmeta.alloc_epoch,
+            #[cfg(feature = "runtime_tb_compaction")]
             compact_invalidated,
         );
         if let Some(prepared_node) = tree.nodes.get(&access_tag).cloned() {
@@ -2244,7 +2281,12 @@ fn tb_lite_check(
     };
 
     let access_len = tb_effective_access_len(size);
-    let mut compact_roots = Vec::new();
+    #[cfg(feature = "runtime_tb_compaction")]
+    let mut compact_roots = if compact_invalidated {
+        Some(Vec::new())
+    } else {
+        None
+    };
     let current_read_epoch = tree.foreign_read_epoch;
     for (tag, next, covered) in updates {
         if let Some(n) = tree.nodes.get_mut(&tag) {
@@ -2253,8 +2295,12 @@ fn tb_lite_check(
                 n.alive = next != TbPerm::Disabled;
                 if next != TbPerm::Disabled {
                     n.poisoned_by_protector_end = false;
-                } else {
-                    compact_roots.push(tag);
+                }
+                #[cfg(feature = "runtime_tb_compaction")]
+                if next == TbPerm::Disabled {
+                    if let Some(roots) = compact_roots.as_mut() {
+                        roots.push(tag);
+                    }
                 }
             } else {
                 tb_set_lazy_perm(n, next, current_read_epoch);
@@ -2281,8 +2327,11 @@ fn tb_lite_check(
                 n.perm = n.lazy_perm;
                 n.alive = n.perm != TbPerm::Disabled;
                 extra_ranges_to_index.push((tag, addr, access_len));
+                #[cfg(feature = "runtime_tb_compaction")]
                 if !n.alive {
-                    compact_roots.push(tag);
+                    if let Some(roots) = compact_roots.as_mut() {
+                        roots.push(tag);
+                    }
                 }
             }
         }
@@ -2290,7 +2339,10 @@ fn tb_lite_check(
     for (tag, start, len) in extra_ranges_to_index {
         tree.index_range(tag, start, len);
     }
-    let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
+    #[cfg(feature = "runtime_tb_compaction")]
+    if let Some(roots) = compact_roots.as_ref() {
+        let _ = tb_compact_invalidated_roots(tree, roots, compact_invalidated);
+    }
 
     None
 }
@@ -2591,7 +2643,7 @@ fn tb_lite_prepare_local_write(
     addr: usize,
     size: usize,
     alloc_epoch: u64,
-    compact_invalidated: bool,
+    #[cfg(feature = "runtime_tb_compaction")] compact_invalidated: bool,
 ) {
     let Some(access_node) = tree.nodes.get(&access_tag) else {
         return;
@@ -2649,9 +2701,12 @@ fn tb_lite_prepare_local_write(
         tb_reactivate_frozen_unique_ancestors_without_readers_for_access(
             tree, access_tag, addr, size,
         );
-        let mut compact_roots = readonly_blockers.clone();
-        compact_roots.extend(raw_lineage_helpers.iter().copied());
-        let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
+        #[cfg(feature = "runtime_tb_compaction")]
+        if compact_invalidated {
+            let mut compact_roots = readonly_blockers.clone();
+            compact_roots.extend(raw_lineage_helpers.iter().copied());
+            let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
+        }
     }
 }
 
@@ -3098,6 +3153,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "runtime_tb_compaction")]
     fn compacted_invalidated_tag_reports_exact_stale_hit() {
         std::env::set_var("RZ_TB_COMPACT_INVALIDATED_TAGS", "1");
 
@@ -3131,6 +3187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "runtime_tb_compaction")]
     fn compact_invalidated_keeps_parent_with_live_child() {
         std::env::set_var("RZ_TB_COMPACT_INVALIDATED_TAGS", "1");
 
@@ -3167,6 +3224,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "runtime_tb_compaction")]
     fn compaction_dispatcher_prunes_dead_shared_sibling() {
         std::env::set_var("RZ_TB_COMPACT_INVALIDATED_TAGS", "1");
 

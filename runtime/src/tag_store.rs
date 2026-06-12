@@ -340,6 +340,7 @@ pub(crate) fn compact_alloc_epoch(base_addr: usize, alloc_epoch: u64) {
 }
 
 #[inline]
+#[cfg(feature = "runtime_tb_compaction")]
 pub(crate) fn compact_invalidated_tag(tag: u64) -> bool {
     if tag == 0 {
         return false;

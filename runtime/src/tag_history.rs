@@ -181,6 +181,7 @@ pub(crate) fn note_live_tag_pruned(tag: u64) {
 }
 
 #[inline]
+#[cfg(feature = "runtime_tb_compaction")]
 pub(crate) fn note_invalidated_tag_compacted(tag: u64) {
     if tag == 0 {
         return;

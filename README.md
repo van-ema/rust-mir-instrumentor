@@ -179,13 +179,21 @@ Project-specific environment variables are grouped below by component/script.
 
 ### Runtime (`runtime/src/lib.rs`, `runtime/src/alias_model/*`)
 
-Compile-time runtime debug features are default-off so fuzzing builds do not pay for disabled
-diagnostics:
+Compile-time runtime features are default-off so fuzzing builds do not pay for disabled diagnostics
+or experimental cleanup paths:
 
 - `runtime_hook_profile`: compiles in `RZ_PROFILE_HOOKS` counters and
   `RZ_DUMP_HOOK_PROFILE_AT_EXIT` support.
 - `runtime_ptr_shadow_trace`: compiles in pointer-shadow trace logging controlled by
   `RZ_TRACE_PTR_SHADOW`.
+- `runtime_tb_compaction`: compiles in the experimental TB-lite invalidated-tag compaction
+  path controlled by `RZ_TB_COMPACT_INVALIDATED_TAGS`.
+
+Pass these through AFL builds with `RUNTIME_FEATURES`, for example:
+
+```bash
+RUNTIME_FEATURES=runtime_tb_compaction TARGET=smallvec PROFILE=release ./scripts/afl_build.sh
+```
 
 - `RZ_LOG`: Runtime log level (`trace`, `info`, `warn`); default `warn`.
 - `RZ_LOG_LOC`: `1/true` adds caller source location in violation output.
@@ -205,10 +213,11 @@ diagnostics:
 - `RZ_TB_LITE`: tree-borrows-lite on/off (`1` default, `0` disables checks inside `tb_lite` model).
 - `RZ_TB_DUMP`: `1/true` adds extra TB-lite diagnostic context.
 - `RZ_TB_TRACE`: `1/true` enables verbose TB-lite transition tracing.
-- `RZ_TB_COMPACT_INVALIDATED_TAGS`: experimental opt-in (`0` default). When set to `1/true`,
-  TB-lite compacts unreachable invalidated helper tags into exact tombstones instead of keeping
-  them in the active tree. Stale-tag diagnostics remain exact; this is currently a memory/metadata
-  growth experiment, not a default performance optimization.
+- `RZ_TB_COMPACT_INVALIDATED_TAGS`: experimental opt-in (`0` default) available only when the
+  runtime is built with `--features runtime_tb_compaction`. When set to `1/true`, TB-lite compacts
+  unreachable invalidated helper tags into exact tombstones instead of keeping them in the active
+  tree. Stale-tag diagnostics remain exact; this is currently a memory/metadata growth experiment,
+  not a default performance optimization. Default builds compile this path out.
 - `RZ_SB_LITE`: stacked-borrows-lite on/off (`1` default when using `sb_lite` model).
 - `RZ_SB_DUMP`: `1/true` adds SB-lite stack/ancestry details in violation output.
 - `RZ_STACK_REF_OOB_NOISE`: stack-ref OOB-noise suppression (`1` default, set `0` for strict reporting).
@@ -286,7 +295,8 @@ diagnostics:
 - `TARGET`: harness target (`bytes`, `smallvec`, `serde_json`/`serde`, `toml`, `base64`, `uuid`, `itoa`, `quick_xml`/`quick-xml`, `simd_json`/`simd-json`, `simd_json_borrowed`/`simd-json-borrowed`, `simd_json_tape`/`simd-json-tape`, `zip`, `rkyv`, `hyper`, `image`).
 - `PROFILE`: cargo profile (`debug` or `release`; default depends on script, usually `release`).
 - `HARNESS_TARGET_DIR`: target directory for AFL harness builds.
-- `RUNTIME_FEATURES`: extra features passed when building `runtime` in `afl_build.sh`.
+- `RUNTIME_FEATURES`: extra runtime features passed when building `runtime` in `afl_build.sh`
+  (for example `runtime_hook_profile`, `runtime_ptr_shadow_trace`, `runtime_tb_compaction`).
 - `AFL_PATH`: AFL++ checkout path (used to discover `afl-fuzz` / `afl-compiler-rt.o`).
 - `AFL_COMPILER_RT`: explicit path to `afl-compiler-rt.o`.
 - `AFL_FUZZ`: explicit `afl-fuzz` binary path.
