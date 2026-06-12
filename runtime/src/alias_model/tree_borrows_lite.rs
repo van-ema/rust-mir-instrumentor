@@ -17,6 +17,11 @@ const TB_LITE_HINT_PROJECTED_HELPER_PARENT: u8 = 0b0000_0100;
 const TB_LITE_HINT_RETURNED_CARRIER_REROOT: u8 = 0b0000_1000;
 // Example: `q = p.add(1)` stays in `p`'s TB family; it is not a new raw authority.
 const TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY: u8 = 0b0001_0000;
+const TB_RANGE_INDEX_BUCKET_SIZE: usize = 64;
+const TB_RANGE_INDEX_MAX_BUCKETS_PER_RANGE: usize = 256;
+const TB_RANGE_INDEX_WIDE_BUCKET: usize = usize::MAX;
+// The index path has HashMap and dedupe overhead; use it only for clear scan cuts.
+const TB_RANGE_INDEX_MIN_SCAN_REDUCTION: usize = 8;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BorrowKind {
@@ -44,6 +49,8 @@ struct TbNode {
     perm: TbPerm,
     // Default permission for same-allocation bytes not yet covered by this node's ranges.
     lazy_perm: TbPerm,
+    // Last allocation read epoch folded into `lazy_perm`.
+    lazy_read_epoch: u64,
     start: usize,
     len: usize,
     extra_ranges: Vec<(usize, usize)>,
@@ -57,20 +64,31 @@ struct TbNode {
 struct TbAllocState {
     nodes: HashMap<u64, TbNode>,
     children: HashMap<u64, Vec<u64>>,
+    range_index: HashMap<usize, Vec<u64>>,
+    protected_tags: Vec<u64>,
+    foreign_read_epoch: u64,
 }
 
 impl TbAllocState {
     fn insert_node(&mut self, node: TbNode) {
         if let Some(old) = self.nodes.insert(node.tag, node.clone()) {
             self.unlink_child(old.parent, old.tag);
+            self.unindex_node_ranges(&old);
+            self.unindex_protected_tag(old.tag);
         }
         self.link_child(node.parent, node.tag);
+        self.index_node_ranges(&node);
+        if node.protected {
+            self.index_protected_tag(node.tag);
+        }
     }
 
     fn remove_node(&mut self, tag: u64) -> Option<TbNode> {
         let node = self.nodes.remove(&tag)?;
         self.unlink_child(node.parent, tag);
         self.children.remove(&tag);
+        self.unindex_node_ranges(&node);
+        self.unindex_protected_tag(tag);
         Some(node)
     }
 
@@ -95,6 +113,69 @@ impl TbAllocState {
         if children.is_empty() {
             self.children.remove(&parent);
         }
+    }
+
+    fn index_node_ranges(&mut self, node: &TbNode) {
+        self.index_range(node.tag, node.start, node.len);
+        for (start, len) in &node.extra_ranges {
+            self.index_range(node.tag, *start, *len);
+        }
+    }
+
+    fn unindex_node_ranges(&mut self, node: &TbNode) {
+        self.unindex_range(node.tag, node.start, node.len);
+        for (start, len) in &node.extra_ranges {
+            self.unindex_range(node.tag, *start, *len);
+        }
+    }
+
+    fn index_range(&mut self, tag: u64, start: usize, len: usize) {
+        for key in tb_range_index_keys(start, len) {
+            let tags = self.range_index.entry(key).or_default();
+            if !tags.iter().any(|indexed| *indexed == tag) {
+                tags.push(tag);
+            }
+        }
+    }
+
+    fn unindex_range(&mut self, tag: u64, start: usize, len: usize) {
+        for key in tb_range_index_keys(start, len) {
+            let Some(tags) = self.range_index.get_mut(&key) else {
+                continue;
+            };
+            tags.retain(|indexed| *indexed != tag);
+            if tags.is_empty() {
+                self.range_index.remove(&key);
+            }
+        }
+    }
+
+    fn overlapping_indexed_tags(&self, start: usize, len: usize) -> Vec<u64> {
+        let mut tags = Vec::new();
+        for key in tb_range_index_keys(start, len)
+            .into_iter()
+            .chain(std::iter::once(TB_RANGE_INDEX_WIDE_BUCKET))
+        {
+            let Some(indexed) = self.range_index.get(&key) else {
+                continue;
+            };
+            for tag in indexed {
+                if !tags.iter().any(|seen| seen == tag) {
+                    tags.push(*tag);
+                }
+            }
+        }
+        tags
+    }
+
+    fn index_protected_tag(&mut self, tag: u64) {
+        if tag != 0 && !self.protected_tags.iter().any(|indexed| *indexed == tag) {
+            self.protected_tags.push(tag);
+        }
+    }
+
+    fn unindex_protected_tag(&mut self, tag: u64) {
+        self.protected_tags.retain(|indexed| *indexed != tag);
     }
 }
 
@@ -432,13 +513,14 @@ fn tb_lite_on_call_exit(callee_id: u64) {
                 && node.protector_shadow_depth != 0
                 && tb_has_live_same_slot_unique_descendant(tree, tag, node.start, node.len)
         });
+        let read_epoch = tree.foreign_read_epoch;
         if let Some(node) = tree.nodes.get_mut(&tag) {
             node.protected = false;
             if !returned_tags.contains(&tag) {
                 if (returned_descendant || shadowed_live_descendant)
                     && matches!(node.kind, BorrowKind::Unique)
                 {
-                    tb_shadow_local_node(node);
+                    tb_shadow_local_node(node, read_epoch);
                 } else if matches!(node.kind, BorrowKind::Unique)
                     && !(matches!(node.perm, TbPerm::Reserved { .. }) && returned_descendant)
                 {
@@ -894,6 +976,7 @@ fn tb_lite_insert_tag_node(
         kind,
         perm,
         lazy_perm: perm,
+        lazy_read_epoch: tree.foreign_read_epoch,
         start: tmeta.pointee_addr,
         len: tb_node_len_for_meta(tmeta),
         extra_ranges: Vec::new(),
@@ -1052,9 +1135,10 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
             .map(|n| n.tag)
             .collect();
         for victim in victim_tags {
+            let read_epoch = tree.foreign_read_epoch;
             if let Some(n) = tree.nodes.get_mut(&victim) {
                 n.perm = TbPerm::Frozen;
-                n.lazy_perm = TbPerm::Frozen;
+                tb_set_lazy_perm(n, TbPerm::Frozen, read_epoch);
                 n.alive = true;
                 n.poisoned_by_protector_end = true;
             }
@@ -1222,6 +1306,8 @@ fn tb_lite_on_return_export(tag: u64, addr: usize) {
     let Some(tree) = all.get_mut(&base) else {
         return;
     };
+    tb_sync_node_lazy_reads(tree, tag);
+    let read_epoch = tree.foreign_read_epoch;
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
@@ -1234,21 +1320,23 @@ fn tb_lite_on_return_export(tag: u64, addr: usize) {
         return;
     }
     if !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
-        tb_reenable_exported_exact_node(node);
+        tb_reenable_exported_exact_node(node, read_epoch);
         return;
     }
     let revive_reserved_ancestors = matches!(node.perm, TbPerm::Reserved { .. });
-    tb_reenable_exported_exact_node(node);
+    tb_reenable_exported_exact_node(node, read_epoch);
     if !revive_reserved_ancestors {
         return;
     }
 
     let mut cur = tree.nodes.get(&tag).map(|node| node.parent).unwrap_or(0);
     while cur != 0 {
+        tb_sync_node_lazy_reads(tree, cur);
+        let read_epoch = tree.foreign_read_epoch;
         let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
         if let Some(node) = tree.nodes.get_mut(&cur) {
             if node.poisoned_by_protector_end && matches!(node.lazy_perm, TbPerm::Reserved { .. }) {
-                tb_revive_node_after_protector_end(node);
+                tb_revive_node_after_protector_end(node, read_epoch);
             }
         }
         cur = next;
@@ -1275,6 +1363,8 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     let Some(tree) = all.get_mut(&base) else {
         return;
     };
+    tb_sync_node_lazy_reads(tree, tag);
+    let read_epoch = tree.foreign_read_epoch;
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
@@ -1288,10 +1378,12 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
     }
     let exported_start = node.start;
     let exported_len = node.len;
-    tb_reenable_exported_exact_node(node);
+    tb_reenable_exported_exact_node(node, read_epoch);
 
     let mut cur = tree.nodes.get(&tag).map(|node| node.parent).unwrap_or(0);
     while cur != 0 {
+        tb_sync_node_lazy_reads(tree, cur);
+        let read_epoch = tree.foreign_read_epoch;
         let next = tree.nodes.get(&cur).map(|node| node.parent).unwrap_or(0);
         if let Some(node) = tree.nodes.get_mut(&cur) {
             if tb_range_covers(node.start, node.len, exported_start, exported_len) {
@@ -1301,11 +1393,11 @@ fn tb_lite_on_mut_arg_ret_export(tag: u64, addr: usize) {
                         || (node.poisoned_by_protector_end
                             && matches!(node.lazy_perm, TbPerm::Reserved { .. })))
                 {
-                    tb_shadow_local_node(node);
+                    tb_shadow_local_node(node, read_epoch);
                 } else if node.poisoned_by_protector_end
                     && matches!(node.lazy_perm, TbPerm::Reserved { .. })
                 {
-                    tb_revive_node_after_protector_end(node);
+                    tb_revive_node_after_protector_end(node, read_epoch);
                 }
             }
         }
@@ -1333,13 +1425,14 @@ fn tb_lite_on_tag_killed(tag: u64) {
         return;
     };
     let has_live_descendant = tb_has_live_descendant(tree, tag);
+    let read_epoch = tree.foreign_read_epoch;
     let Some(node) = tree.nodes.get_mut(&tag) else {
         return;
     };
     let parent = node.parent;
     let killed_readonly = matches!(node.kind, BorrowKind::Shared | BorrowKind::RawConst);
     if has_live_descendant && matches!(node.kind, BorrowKind::Unique) {
-        tb_shadow_local_node(node);
+        tb_shadow_local_node(node, read_epoch);
     } else {
         tb_disable_node(node);
     }
@@ -1624,6 +1717,100 @@ fn tb_compact_unreachable_invalidated_subtree(
     removed
 }
 
+fn tb_transition_candidate_node(
+    tree: &TbAllocState,
+    node: &TbNode,
+    access_tag: u64,
+    tmeta: &TagMeta,
+    access: AliasAccessKind,
+) -> bool {
+    let relevant_state = tb_is_live_node(node)
+        || (matches!(node.perm, TbPerm::Disabled)
+            && matches!(node.kind, BorrowKind::Unique)
+            && !(matches!(access, AliasAccessKind::Read)
+                && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
+            && tb_is_ancestor(&tree.nodes, node.tag, access_tag))
+        || (matches!(node.perm, TbPerm::Disabled)
+            && matches!(node.kind, BorrowKind::Shared)
+            && matches!(access, AliasAccessKind::Write)
+            && tb_is_ancestor(&tree.nodes, node.tag, access_tag));
+    if !relevant_state {
+        return false;
+    }
+    tmeta.alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == tmeta.alloc_epoch
+}
+
+fn tb_push_unique_tag(tags: &mut Vec<u64>, tag: u64) {
+    if tag != 0 && !tags.iter().any(|seen| *seen == tag) {
+        tags.push(tag);
+    }
+}
+
+fn tb_indexed_read_candidate_upper_bound(
+    tree: &TbAllocState,
+    access_lineage_len: usize,
+    addr: usize,
+    size: usize,
+) -> usize {
+    let mut count = access_lineage_len.saturating_add(tree.protected_tags.len());
+    for key in tb_range_index_keys(addr, size)
+        .into_iter()
+        .chain(std::iter::once(TB_RANGE_INDEX_WIDE_BUCKET))
+    {
+        if let Some(indexed) = tree.range_index.get(&key) {
+            count = count.saturating_add(indexed.len());
+        }
+    }
+    count
+}
+
+fn tb_indexed_read_candidate_tags(
+    tree: &TbAllocState,
+    access_lineage: &[u64],
+    access_tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> Option<Vec<u64>> {
+    let node_count = tree.nodes.len();
+    let indexed_upper_bound =
+        tb_indexed_read_candidate_upper_bound(tree, access_lineage.len(), addr, size);
+    if indexed_upper_bound.saturating_mul(TB_RANGE_INDEX_MIN_SCAN_REDUCTION) >= node_count {
+        return None;
+    }
+
+    let mut tags = Vec::new();
+    for tag in access_lineage {
+        tb_push_unique_tag(&mut tags, *tag);
+    }
+    for tag in tree.overlapping_indexed_tags(addr, size) {
+        tb_push_unique_tag(&mut tags, tag);
+    }
+    for tag in &tree.protected_tags {
+        tb_push_unique_tag(&mut tags, *tag);
+    }
+
+    tags.retain(|tag| {
+        tree.nodes.get(tag).is_some_and(|node| {
+            tb_transition_candidate_node(tree, node, access_tag, tmeta, AliasAccessKind::Read)
+        })
+    });
+    Some(tags)
+}
+
+fn tb_full_transition_candidate_tags(
+    tree: &TbAllocState,
+    access_tag: u64,
+    tmeta: &TagMeta,
+    access: AliasAccessKind,
+) -> Vec<u64> {
+    tree.nodes
+        .values()
+        .filter(|node| tb_transition_candidate_node(tree, node, access_tag, tmeta, access))
+        .map(|node| node.tag)
+        .collect()
+}
+
 fn tb_lite_check(
     sb_tag: u64,
     orig_tag: u64,
@@ -1801,36 +1988,23 @@ fn tb_lite_check(
         }
     }
 
-    // Apply a TB-lite transition to all nodes of the allocation.
-    // For locations outside the node's currently accessed ranges, `lazy_perm`
-    // approximates the "future initial permission" from the TB state machine.
-    let candidate_tags: Vec<u64> = tree
-        .nodes
-        .values()
-        .filter(|n| {
-            tb_is_live_node(n)
-                || (matches!(n.perm, TbPerm::Disabled)
-                    && matches!(n.kind, BorrowKind::Unique)
-                    && !(matches!(access, AliasAccessKind::Read)
-                        && matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RawConst))
-                    && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
-                || (matches!(n.perm, TbPerm::Disabled)
-                    && matches!(n.kind, BorrowKind::Shared)
-                    && matches!(access, AliasAccessKind::Write)
-                    && tb_is_ancestor(&tree.nodes, n.tag, access_tag))
-        })
-        .filter(|n| {
-            if tmeta.alloc_epoch != 0 && n.alloc_epoch != 0 && n.alloc_epoch != tmeta.alloc_epoch {
-                return false;
-            }
-            true
-        })
-        .map(|n| n.tag)
-        .collect();
+    // Apply a TB-lite transition to the nodes that can observe this access.
+    //
+    // Reads use the range/protector/lineage index. Nodes outside that candidate set are only
+    // affected through their uncovered-range default permission, so they absorb the foreign-read
+    // epoch lazily when they are touched later. Writes keep the conservative full scan because
+    // write lazy semantics include raw-sibling exceptions tied to the current access node.
+    let candidate_tags = if matches!(access, AliasAccessKind::Read) {
+        tb_indexed_read_candidate_tags(tree, &access_lineage, access_tag, tmeta, addr, size)
+            .unwrap_or_else(|| tb_full_transition_candidate_tags(tree, access_tag, tmeta, access))
+    } else {
+        tb_full_transition_candidate_tags(tree, access_tag, tmeta, access)
+    };
 
     let mut updates: Vec<(u64, TbPerm, bool)> = Vec::new();
     let mut newly_accessed_ranges: Vec<u64> = Vec::new();
-    for tag in candidate_tags {
+    for tag in candidate_tags.iter().copied() {
+        tb_sync_node_lazy_reads(tree, tag);
         let Some(n) = tree.nodes.get(&tag).cloned() else {
             continue;
         };
@@ -2005,8 +2179,9 @@ fn tb_lite_check(
         // through the interior-mut path are deliberately not UB under TB.
         let tmap_for_exempt = tags().lock().unwrap();
         let mut protected_nodes: Vec<TbNode> = tree
-            .nodes
-            .values()
+            .protected_tags
+            .iter()
+            .filter_map(|tag| tree.nodes.get(tag))
             .filter(|n| {
                 tb_is_live_node(n)
                     && tb_protector_active(n)
@@ -2060,8 +2235,17 @@ fn tb_lite_check(
         }
     }
 
+    let next_read_epoch = if matches!(access, AliasAccessKind::Read) {
+        let next = tree.foreign_read_epoch.saturating_add(1);
+        tree.foreign_read_epoch = next;
+        Some(next)
+    } else {
+        None
+    };
+
     let access_len = tb_effective_access_len(size);
     let mut compact_roots = Vec::new();
+    let current_read_epoch = tree.foreign_read_epoch;
     for (tag, next, covered) in updates {
         if let Some(n) = tree.nodes.get_mut(&tag) {
             if covered {
@@ -2073,10 +2257,18 @@ fn tb_lite_check(
                     compact_roots.push(tag);
                 }
             } else {
-                n.lazy_perm = next;
+                tb_set_lazy_perm(n, next, current_read_epoch);
             }
         }
     }
+    if let Some(epoch) = next_read_epoch {
+        for tag in &candidate_tags {
+            if let Some(node) = tree.nodes.get_mut(tag) {
+                node.lazy_read_epoch = epoch;
+            }
+        }
+    }
+    let mut extra_ranges_to_index = Vec::new();
     for tag in newly_accessed_ranges {
         if let Some(n) = tree.nodes.get_mut(&tag) {
             if !tb_ranges_overlap(addr, access_len, n.start, n.len)
@@ -2088,11 +2280,15 @@ fn tb_lite_check(
                 n.extra_ranges.push((addr, access_len));
                 n.perm = n.lazy_perm;
                 n.alive = n.perm != TbPerm::Disabled;
+                extra_ranges_to_index.push((tag, addr, access_len));
                 if !n.alive {
                     compact_roots.push(tag);
                 }
             }
         }
+    }
+    for (tag, start, len) in extra_ranges_to_index {
+        tree.index_range(tag, start, len);
     }
     let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
 
@@ -2215,6 +2411,21 @@ fn tb_base_for_addr(addr: usize) -> usize {
         .unwrap_or(addr)
 }
 
+fn tb_range_index_keys(start: usize, len: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let first = start / TB_RANGE_INDEX_BUCKET_SIZE;
+    let last = start.saturating_add(len.saturating_sub(1)) / TB_RANGE_INDEX_BUCKET_SIZE;
+    let bucket_count = last.saturating_sub(first).saturating_add(1);
+    if bucket_count > TB_RANGE_INDEX_MAX_BUCKETS_PER_RANGE {
+        return vec![TB_RANGE_INDEX_WIDE_BUCKET];
+    }
+
+    (first..=last).collect()
+}
+
 #[inline]
 fn tb_ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) -> bool {
     if a_len == 0 || b_len == 0 {
@@ -2284,9 +2495,35 @@ fn tb_is_live_node(n: &TbNode) -> bool {
 }
 
 #[inline]
-fn tb_shadow_local_node(n: &mut TbNode) {
+fn tb_set_lazy_perm(n: &mut TbNode, perm: TbPerm, read_epoch: u64) {
+    n.lazy_perm = perm;
+    n.lazy_read_epoch = read_epoch;
+}
+
+#[inline]
+fn tb_sync_node_lazy_reads_to(n: &mut TbNode, read_epoch: u64) {
+    if n.lazy_read_epoch == read_epoch {
+        return;
+    }
+    n.lazy_perm = match n.lazy_perm {
+        TbPerm::Active | TbPerm::ShadowedLocal => TbPerm::Frozen,
+        perm => perm,
+    };
+    n.lazy_read_epoch = read_epoch;
+}
+
+#[inline]
+fn tb_sync_node_lazy_reads(tree: &mut TbAllocState, tag: u64) {
+    let read_epoch = tree.foreign_read_epoch;
+    if let Some(node) = tree.nodes.get_mut(&tag) {
+        tb_sync_node_lazy_reads_to(node, read_epoch);
+    }
+}
+
+#[inline]
+fn tb_shadow_local_node(n: &mut TbNode, read_epoch: u64) {
     n.perm = TbPerm::ShadowedLocal;
-    n.lazy_perm = TbPerm::ShadowedLocal;
+    tb_set_lazy_perm(n, TbPerm::ShadowedLocal, read_epoch);
     n.alive = true;
     n.poisoned_by_protector_end = false;
 }
@@ -2479,6 +2716,7 @@ fn tb_reactivate_frozen_unique_ancestors_without_readers_inner(
 ) {
     let mut cursor = start_parent;
     for _ in 0..tree.nodes.len().saturating_add(1) {
+        tb_sync_node_lazy_reads(tree, cursor);
         let Some((next, start, len, should_reactivate, restored_perm)) =
             tree.nodes.get(&cursor).map(|node| {
                 let restored_perm = match node.lazy_perm {
@@ -2528,7 +2766,7 @@ fn tb_reactivate_frozen_unique_ancestors_without_readers_inner(
 /// permission from `lazy_perm` when that still carries useful state. We use it for reserved
 /// ancestors that must stay live because a returned descendant still depends on their lineage.
 #[inline]
-fn tb_revive_node_after_protector_end(n: &mut TbNode) {
+fn tb_revive_node_after_protector_end(n: &mut TbNode, read_epoch: u64) {
     if !n.poisoned_by_protector_end {
         return;
     }
@@ -2547,7 +2785,7 @@ fn tb_revive_node_after_protector_end(n: &mut TbNode) {
         };
     }
     if matches!(n.lazy_perm, TbPerm::Disabled) {
-        n.lazy_perm = n.perm;
+        tb_set_lazy_perm(n, n.perm, read_epoch);
     }
 }
 
@@ -2558,7 +2796,7 @@ fn tb_revive_node_after_protector_end(n: &mut TbNode) {
 /// `tb_revive_node_after_protector_end`, this helper is intentionally broader: it re-enables the
 /// exported exact node even when it was disabled for reasons other than protector-end poison.
 #[inline]
-fn tb_reenable_exported_exact_node(n: &mut TbNode) {
+fn tb_reenable_exported_exact_node(n: &mut TbNode, read_epoch: u64) {
     n.protected = false;
     n.protector_shadow_depth = 0;
     n.poisoned_by_protector_end = false;
@@ -2570,7 +2808,7 @@ fn tb_reenable_exported_exact_node(n: &mut TbNode) {
         };
     }
     if matches!(n.lazy_perm, TbPerm::Disabled) {
-        n.lazy_perm = n.perm;
+        tb_set_lazy_perm(n, n.perm, read_epoch);
     }
 }
 
@@ -2848,6 +3086,7 @@ mod tests {
             kind,
             perm,
             lazy_perm: perm,
+            lazy_read_epoch: 0,
             start: addr,
             len: 1,
             extra_ranges: Vec::new(),
@@ -2971,6 +3210,55 @@ mod tests {
         assert!(msg.contains("reason=TB_LITE_INVALIDATED"));
         assert!(msg.contains(&format!("tag={shared}")));
         assert!(tag_store::release_local_holder(shared));
+    }
+
+    #[test]
+    fn range_index_finds_only_overlapping_nodes() {
+        let left = next_test_tag();
+        let right = next_test_tag();
+        let left_addr = test_addr(left);
+        let right_addr = left_addr.saturating_add(TB_RANGE_INDEX_BUCKET_SIZE * 4);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(test_node(
+            left,
+            0,
+            left_addr,
+            BorrowKind::Shared,
+            TbPerm::Frozen,
+        ));
+        tree.insert_node(test_node(
+            right,
+            0,
+            right_addr,
+            BorrowKind::Shared,
+            TbPerm::Frozen,
+        ));
+
+        let left_hits = tree.overlapping_indexed_tags(left_addr, 1);
+        assert!(left_hits.contains(&left));
+        assert!(!left_hits.contains(&right));
+
+        let right_hits = tree.overlapping_indexed_tags(right_addr, 1);
+        assert!(right_hits.contains(&right));
+        assert!(!right_hits.contains(&left));
+    }
+
+    #[test]
+    fn missed_foreign_read_freezes_uncovered_lazy_perm() {
+        let tag = next_test_tag();
+        let addr = test_addr(tag);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(test_node(tag, 0, addr, BorrowKind::Unique, TbPerm::Active));
+
+        tree.foreign_read_epoch = tree.foreign_read_epoch.saturating_add(1);
+        tb_sync_node_lazy_reads(&mut tree, tag);
+
+        let node = tree.nodes.get(&tag).expect("test node exists");
+        assert_eq!(node.perm, TbPerm::Active);
+        assert_eq!(node.lazy_perm, TbPerm::Frozen);
+        assert_eq!(node.lazy_read_epoch, tree.foreign_read_epoch);
     }
 
     #[test]
