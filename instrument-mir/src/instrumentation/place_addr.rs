@@ -497,7 +497,7 @@ impl MyOptimizationPass {
         is_mut: bool,
     ) -> Option<(Statement<'tcx>, Statement<'tcx>)> {
         let place_ty = place.ty(&body.local_decls, tcx).ty;
-        if !place_ty.is_sized(tcx, body.typing_env(tcx)) {
+        if !self.ty_has_runtime_stack_slot_extent(tcx, body, place_ty) {
             return None;
         }
 
@@ -506,7 +506,9 @@ impl MyOptimizationPass {
         } else {
             Ty::new_imm_ptr(tcx, place_ty)
         };
-        if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty) {
+        if !self.is_addr_exposable_ptr_ty(tcx, body, raw_ptr_ty)
+            && !self.ty_is_opaque_for_shadow_range(place_ty)
+        {
             return None;
         }
 

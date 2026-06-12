@@ -1255,6 +1255,8 @@ impl MyOptimizationPass {
                     if src_place.ty(&body.local_decls, tcx).ty == lhs_ty {
                         let lhs_has_ptr_fields =
                             self.ty_contains_pointer_fields(tcx, body, lhs_ty, 3);
+                        let lhs_needs_range_shadow =
+                            lhs_has_ptr_fields || self.ty_is_opaque_for_shadow_range(lhs_ty);
                         let dst_leafs = self
                             .shadowable_leaf_ptr_specs_from_place(tcx, body, *lhs_place, lhs_ty);
                         let src_leafs = self
@@ -1299,7 +1301,7 @@ impl MyOptimizationPass {
                             }
                             return;
                         }
-                        if lhs_has_ptr_fields && lhs_ty.is_sized(tcx, body.typing_env(tcx)) {
+                        if lhs_needs_range_shadow && lhs_ty.is_sized(tcx, body.typing_env(tcx)) {
                             rz_pass_trace!(
                                 self,
                                 "[rusteze][ptr-shadow] Projected Aggregate ShadowCopyRange dst={:?} src={:?}",
@@ -1314,12 +1316,21 @@ impl MyOptimizationPass {
                                 place: lhs_place.clone(),
                                 kind: InstrKind::ShadowCopyRange {
                                     src_place: *src_place,
-                                    size_op: self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        lhs_ty,
-                                        stmt.source_info.span,
-                                    ),
+                                    size_op: if self.ty_is_opaque_for_shadow_range(lhs_ty) {
+                                        self.size_operand_for_stack_local_ty(
+                                            tcx,
+                                            body,
+                                            lhs_ty,
+                                            stmt.source_info.span,
+                                        )
+                                    } else {
+                                        self.size_operand_for_ty(
+                                            tcx,
+                                            body,
+                                            lhs_ty,
+                                            stmt.source_info.span,
+                                        )
+                                    },
                                 },
                             });
                             return;
@@ -1509,6 +1520,8 @@ impl MyOptimizationPass {
                     {
                         let dst_has_ptr_fields =
                             self.ty_contains_pointer_fields(tcx, body, dst_ty, 3);
+                        let dst_needs_range_shadow =
+                            dst_has_ptr_fields || self.ty_is_opaque_for_shadow_range(dst_ty);
                         let dst_leafs = self.shadowable_leaf_ptr_specs_from_place(
                             tcx,
                             body,
@@ -1543,7 +1556,9 @@ impl MyOptimizationPass {
                                     kind,
                                 });
                             }
-                        } else if dst_has_ptr_fields && dst_ty.is_sized(tcx, body.typing_env(tcx)) {
+                        } else if dst_needs_range_shadow
+                            && dst_ty.is_sized(tcx, body.typing_env(tcx))
+                        {
                             insert_points.push(InsertPoint {
                                 bb,
                                 stmt_idx,
@@ -1552,12 +1567,21 @@ impl MyOptimizationPass {
                                 place: Place::from(dst_local),
                                 kind: InstrKind::ShadowCopyRange {
                                     src_place: *src_place,
-                                    size_op: self.size_operand_for_ty(
-                                        tcx,
-                                        body,
-                                        dst_ty,
-                                        stmt.source_info.span,
-                                    ),
+                                    size_op: if self.ty_is_opaque_for_shadow_range(dst_ty) {
+                                        self.size_operand_for_stack_local_ty(
+                                            tcx,
+                                            body,
+                                            dst_ty,
+                                            stmt.source_info.span,
+                                        )
+                                    } else {
+                                        self.size_operand_for_ty(
+                                            tcx,
+                                            body,
+                                            dst_ty,
+                                            stmt.source_info.span,
+                                        )
+                                    },
                                 },
                             });
                         } else {

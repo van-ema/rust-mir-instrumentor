@@ -43,6 +43,13 @@ enum TbPerm {
     Disabled,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct TbRangePerm {
+    start: usize,
+    len: usize,
+    perm: TbPerm,
+}
+
 #[derive(Clone, Debug)]
 struct TbNode {
     tag: u64,
@@ -57,10 +64,25 @@ struct TbNode {
     start: usize,
     len: usize,
     extra_ranges: Vec<(usize, usize)>,
+    range_perms: Vec<TbRangePerm>,
     alive: bool,
     protected: bool,
     protector_shadow_depth: u32,
     poisoned_by_protector_end: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum TbPermUpdateTarget {
+    Covered,
+    Lazy,
+    Range { start: usize, len: usize },
+}
+
+#[derive(Copy, Clone, Debug)]
+struct TbPermUpdate {
+    tag: u64,
+    next: TbPerm,
+    target: TbPermUpdateTarget,
 }
 
 #[derive(Default)]
@@ -997,6 +1019,7 @@ fn tb_lite_insert_tag_node(
         start: tmeta.pointee_addr,
         len: tb_node_len_for_meta(tmeta),
         extra_ranges: Vec::new(),
+        range_perms: Vec::new(),
         alive: true,
         protected,
         protector_shadow_depth: 0,
@@ -1869,8 +1892,8 @@ fn tb_lite_check(
     #[cfg(feature = "runtime_tb_compaction")]
     let compact_invalidated = rz_tb_compact_invalidated_enabled();
 
-    let base = tb_base_for_addr(addr);
     let mut all = tb_state().lock().unwrap();
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, sb_tag], addr);
     let Some(tree) = all.get_mut(&base) else {
         #[cfg(feature = "runtime_tb_compaction")]
         {
@@ -1978,7 +2001,7 @@ fn tb_lite_check(
             tmeta.alloc_epoch == 0 || n.alloc_epoch == 0 || n.alloc_epoch == tmeta.alloc_epoch
         }) {
             eprintln!(
-                "[tb-trace]   node tag={} parent={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x}) extras={:?}",
+                "[tb-trace]   node tag={} parent={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x}) extras={:?} range_perms={:?}",
                 traced.tag,
                 traced.parent,
                 traced.kind,
@@ -1989,7 +2012,8 @@ fn tb_lite_check(
                 traced.protector_shadow_depth,
                 traced.start,
                 traced.start.saturating_add(traced.len),
-                traced.extra_ranges
+                traced.extra_ranges,
+                traced.range_perms
             );
         }
     }
@@ -2038,7 +2062,7 @@ fn tb_lite_check(
         tb_full_transition_candidate_tags(tree, access_tag, tmeta, access)
     };
 
-    let mut updates: Vec<(u64, TbPerm, bool)> = Vec::new();
+    let mut updates: Vec<TbPermUpdate> = Vec::new();
     let mut newly_accessed_ranges: Vec<u64> = Vec::new();
     for tag in candidate_tags.iter().copied() {
         tb_sync_node_lazy_reads(tree, tag);
@@ -2050,7 +2074,12 @@ fn tb_lite_check(
         // `perm` is for ranges this node already covers. `lazy_perm` is the
         // node's default permission for same-allocation bytes that have not
         // been materialized into this node's range yet.
-        let old_perm = if covered { n.perm } else { n.lazy_perm };
+        let base_perm = if covered { n.perm } else { n.lazy_perm };
+        let old_perm = if covered {
+            tb_effective_node_perm_for_access(&n, addr, size, base_perm)
+        } else {
+            base_perm
+        };
 
         let next = match (access, child, old_perm, tb_protector_active(&n)) {
             // Child/local read: everything except Disabled is unchanged.
@@ -2187,11 +2216,28 @@ fn tb_lite_check(
             newly_accessed_ranges.push(tag);
         }
         if covered {
-            if next != n.perm {
-                updates.push((tag, next, true));
+            if tb_should_store_access_range_perm(&n, access, child, next, addr, size) {
+                updates.push(TbPermUpdate {
+                    tag,
+                    next,
+                    target: TbPermUpdateTarget::Range {
+                        start: addr,
+                        len: tb_effective_access_len(size),
+                    },
+                });
+            } else if next != n.perm {
+                updates.push(TbPermUpdate {
+                    tag,
+                    next,
+                    target: TbPermUpdateTarget::Covered,
+                });
             }
         } else if next != n.lazy_perm {
-            updates.push((tag, next, false));
+            updates.push(TbPermUpdate {
+                tag,
+                next,
+                target: TbPermUpdateTarget::Lazy,
+            });
         }
     }
 
@@ -2241,8 +2287,10 @@ fn tb_lite_check(
         if !protected_nodes.is_empty() {
             let tmap = tags().lock().unwrap();
             for protected in protected_nodes {
-                let touched_protected = updates.iter().any(|(t, next, covered)| {
-                    *covered && *t == protected.tag && *next == TbPerm::Disabled
+                let touched_protected = updates.iter().any(|update| {
+                    matches!(update.target, TbPermUpdateTarget::Covered)
+                        && update.tag == protected.tag
+                        && update.next == TbPerm::Disabled
                 });
                 if !touched_protected {
                     continue;
@@ -2288,22 +2336,30 @@ fn tb_lite_check(
         None
     };
     let current_read_epoch = tree.foreign_read_epoch;
-    for (tag, next, covered) in updates {
-        if let Some(n) = tree.nodes.get_mut(&tag) {
-            if covered {
-                n.perm = next;
-                n.alive = next != TbPerm::Disabled;
-                if next != TbPerm::Disabled {
-                    n.poisoned_by_protector_end = false;
-                }
-                #[cfg(feature = "runtime_tb_compaction")]
-                if next == TbPerm::Disabled {
-                    if let Some(roots) = compact_roots.as_mut() {
-                        roots.push(tag);
+    for update in updates {
+        if let Some(n) = tree.nodes.get_mut(&update.tag) {
+            match update.target {
+                TbPermUpdateTarget::Covered => {
+                    let next = update.next;
+                    n.range_perms.clear();
+                    n.perm = next;
+                    n.alive = next != TbPerm::Disabled;
+                    if next != TbPerm::Disabled {
+                        n.poisoned_by_protector_end = false;
+                    }
+                    #[cfg(feature = "runtime_tb_compaction")]
+                    if next == TbPerm::Disabled {
+                        if let Some(roots) = compact_roots.as_mut() {
+                            roots.push(update.tag);
+                        }
                     }
                 }
-            } else {
-                tb_set_lazy_perm(n, next, current_read_epoch);
+                TbPermUpdateTarget::Lazy => {
+                    tb_set_lazy_perm(n, update.next, current_read_epoch);
+                }
+                TbPermUpdateTarget::Range { start, len } => {
+                    tb_set_node_range_perm(n, start, len, update.next);
+                }
             }
         }
     }
@@ -2417,7 +2473,7 @@ fn tb_dump(
     nodes.sort_by_key(|n| n.tag);
     for n in nodes {
         out.push_str(&format!(
-            "  tag={} parent={} epoch={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x})\n",
+            "  tag={} parent={} epoch={} kind={:?} perm={:?} lazy_perm={:?} alive={} protected={} shadowed={} range=[0x{:x},0x{:x}) range_perms={:?}\n",
             n.tag,
             n.parent,
             n.alloc_epoch,
@@ -2428,7 +2484,8 @@ fn tb_dump(
             n.protected,
             n.protector_shadow_depth,
             n.start,
-            n.start.saturating_add(n.len)
+            n.start.saturating_add(n.len),
+            n.range_perms
         ));
     }
     out.push_str("-- end tb-lite dump --\n");
@@ -2461,6 +2518,19 @@ fn tb_base_for_addr(addr: usize) -> usize {
     find_alloc_containing(&amap, addr)
         .map(|(base, _)| base)
         .unwrap_or(addr)
+}
+
+fn tb_base_for_existing_tags_or_addr(
+    all: &HashMap<usize, TbAllocState>,
+    tags: &[u64],
+    addr: usize,
+) -> usize {
+    for tag in tags.iter().copied().filter(|tag| *tag != 0) {
+        if let Some((base, _)) = all.iter().find(|(_, tree)| tree.nodes.contains_key(&tag)) {
+            return *base;
+        }
+    }
+    tb_base_for_addr(addr)
 }
 
 fn tb_range_index_keys(start: usize, len: usize) -> Vec<usize> {
@@ -2496,6 +2566,71 @@ fn tb_range_covers(cover_start: usize, cover_len: usize, addr: usize, size: usiz
     let cover_end = cover_start.saturating_add(cover_len);
     let access_end = addr.saturating_add(size);
     cover_start <= addr && access_end <= cover_end
+}
+
+#[inline]
+fn tb_access_is_strict_node_subrange(node: &TbNode, addr: usize, size: usize) -> bool {
+    let access_len = tb_effective_access_len(size);
+    tb_range_covers(node.start, node.len, addr, access_len)
+        && (node.start != addr || node.len != access_len)
+}
+
+#[inline]
+fn tb_perm_rank(perm: TbPerm) -> u8 {
+    match perm {
+        TbPerm::Reserved { conflicted: false } => 0,
+        TbPerm::Active => 1,
+        TbPerm::ShadowedLocal => 2,
+        TbPerm::Reserved { conflicted: true } => 3,
+        TbPerm::Frozen => 4,
+        TbPerm::Disabled => 5,
+    }
+}
+
+#[inline]
+fn tb_stricter_perm(a: TbPerm, b: TbPerm) -> TbPerm {
+    if tb_perm_rank(a) >= tb_perm_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn tb_effective_node_perm_for_access(
+    node: &TbNode,
+    addr: usize,
+    size: usize,
+    default_perm: TbPerm,
+) -> TbPerm {
+    let access_len = tb_effective_access_len(size);
+    node.range_perms
+        .iter()
+        .filter(|range| tb_ranges_overlap(addr, access_len, range.start, range.len))
+        .fold(default_perm, |perm, range| {
+            tb_stricter_perm(perm, range.perm)
+        })
+}
+
+fn tb_should_store_access_range_perm(
+    node: &TbNode,
+    access: AliasAccessKind,
+    child: bool,
+    next: TbPerm,
+    addr: usize,
+    size: usize,
+) -> bool {
+    !child
+        && matches!(node.kind, BorrowKind::Unique)
+        && !tb_protector_active(node)
+        && matches!(access, AliasAccessKind::Read | AliasAccessKind::Write)
+        && matches!(next, TbPerm::Frozen | TbPerm::Disabled)
+        && tb_access_is_strict_node_subrange(node, addr, size)
+}
+
+fn tb_set_node_range_perm(node: &mut TbNode, start: usize, len: usize, perm: TbPerm) {
+    node.range_perms
+        .retain(|range| !(range.start == start && range.len == len));
+    node.range_perms.push(TbRangePerm { start, len, perm });
 }
 
 #[inline]
@@ -2574,6 +2709,7 @@ fn tb_sync_node_lazy_reads(tree: &mut TbAllocState, tag: u64) {
 
 #[inline]
 fn tb_shadow_local_node(n: &mut TbNode, read_epoch: u64) {
+    n.range_perms.clear();
     n.perm = TbPerm::ShadowedLocal;
     tb_set_lazy_perm(n, TbPerm::ShadowedLocal, read_epoch);
     n.alive = true;
@@ -2582,6 +2718,7 @@ fn tb_shadow_local_node(n: &mut TbNode, read_epoch: u64) {
 
 #[inline]
 fn tb_disable_node(n: &mut TbNode) {
+    n.range_perms.clear();
     n.perm = TbPerm::Disabled;
     n.alive = false;
     n.poisoned_by_protector_end = false;
@@ -2589,6 +2726,7 @@ fn tb_disable_node(n: &mut TbNode) {
 
 #[inline]
 fn tb_disable_node_for_protector_end(n: &mut TbNode) {
+    n.range_perms.clear();
     n.perm = TbPerm::Disabled;
     n.alive = false;
     n.poisoned_by_protector_end = true;
@@ -3145,6 +3283,7 @@ mod tests {
             start: addr,
             len: 1,
             extra_ranges: Vec::new(),
+            range_perms: Vec::new(),
             alive: perm != TbPerm::Disabled,
             protected: false,
             protector_shadow_depth: 0,
@@ -3317,6 +3456,36 @@ mod tests {
         assert_eq!(node.perm, TbPerm::Active);
         assert_eq!(node.lazy_perm, TbPerm::Frozen);
         assert_eq!(node.lazy_read_epoch, tree.foreign_read_epoch);
+    }
+
+    #[test]
+    fn foreign_subrange_read_does_not_freeze_disjoint_unique_bytes() {
+        let tag = next_test_tag();
+        let addr = test_addr(tag);
+        let suffix = addr + 8;
+
+        let mut node = test_node(tag, 0, addr, BorrowKind::Unique, TbPerm::Active);
+        node.len = 16;
+
+        assert!(tb_should_store_access_range_perm(
+            &node,
+            AliasAccessKind::Read,
+            false,
+            TbPerm::Frozen,
+            suffix,
+            8
+        ));
+
+        tb_set_node_range_perm(&mut node, suffix, 8, TbPerm::Frozen);
+
+        assert_eq!(
+            tb_effective_node_perm_for_access(&node, addr, 8, node.perm),
+            TbPerm::Active
+        );
+        assert_eq!(
+            tb_effective_node_perm_for_access(&node, suffix, 8, node.perm),
+            TbPerm::Frozen
+        );
     }
 
     #[test]

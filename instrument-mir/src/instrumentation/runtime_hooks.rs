@@ -74,20 +74,27 @@ impl MyOptimizationPass {
             InstrKind::IndirectCallArgLeafPush { .. } => {
                 hooks.def_id_push_indirect_call_arg_leaf_shadow
             }
+            InstrKind::IndirectCallArgShadowRangePush { .. } => {
+                hooks.def_id_push_indirect_call_arg_shadow_range
+            }
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
             InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
+            InstrKind::CallArgShadowRangePush { .. } => hooks.def_id_push_call_arg_shadow_range,
             InstrKind::CallArgLeafClear { .. } => hooks.def_id_clear_call_arg_leaf_shadows,
             InstrKind::ArgRetag { .. } | InstrKind::ArgAnchorTake { .. } => {
                 hooks.def_id_take_call_arg_tag
             }
             InstrKind::ArgAnchorSeedFromShadow { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
+            InstrKind::ArgShadowRangeTake { .. } => hooks.def_id_take_call_arg_shadow_range,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
             InstrKind::RetLeafPush { .. } => hooks.def_id_push_ret_leaf_shadow,
+            InstrKind::RetShadowRangePush { .. } => hooks.def_id_push_ret_shadow_range,
             InstrKind::RetAnchorPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetPush { .. } => hooks.def_id_push_ret_tag,
             InstrKind::RetAnchorTake { .. } => hooks.def_id_take_ret_tag,
             InstrKind::RetLeafTake { .. } => hooks.def_id_take_ret_leaf_shadow,
+            InstrKind::RetShadowRangeTake { .. } => hooks.def_id_take_ret_shadow_range,
             InstrKind::RetAnchorRoot { .. } => hooks.def_id_raw,
             InstrKind::RetTake { .. } => hooks.def_id_take_ret_tag_or_root,
             InstrKind::MutArgRetPush { .. } => hooks.def_id_push_mut_arg_ret_tag,
@@ -292,6 +299,9 @@ impl MyOptimizationPass {
         let def_id_push_indirect_call_arg_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_leaf_shadow", 3)
             .expect("missing '__rz_push_indirect_call_arg_leaf_shadow' definition");
+        let def_id_push_indirect_call_arg_shadow_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_indirect_call_arg_shadow_range", 3)
+            .expect("missing '__rz_push_indirect_call_arg_shadow_range' definition");
         let def_id_validate_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
             .expect("missing '__rz_validate_call_arg_tag' definition");
@@ -307,6 +317,12 @@ impl MyOptimizationPass {
         let def_id_take_call_arg_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_leaf_shadow", 4)
             .expect("missing '__rz_take_call_arg_leaf_shadow' definition");
+        let def_id_push_call_arg_shadow_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_call_arg_shadow_range", 4)
+            .expect("missing '__rz_push_call_arg_shadow_range' definition");
+        let def_id_take_call_arg_shadow_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_shadow_range", 4)
+            .expect("missing '__rz_take_call_arg_shadow_range' definition");
         let def_id_clear_call_arg_leaf_shadows = self
             .find_runtime_fn_def_id(tcx, "__rz_clear_call_arg_leaf_shadows", 1)
             .expect("missing '__rz_clear_call_arg_leaf_shadows' definition");
@@ -325,6 +341,12 @@ impl MyOptimizationPass {
         let def_id_take_ret_leaf_shadow = self
             .find_runtime_fn_def_id(tcx, "__rz_take_ret_leaf_shadow", 3)
             .expect("missing '__rz_take_ret_leaf_shadow' definition");
+        let def_id_push_ret_shadow_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_push_ret_shadow_range", 3)
+            .expect("missing '__rz_push_ret_shadow_range' definition");
+        let def_id_take_ret_shadow_range = self
+            .find_runtime_fn_def_id(tcx, "__rz_take_ret_shadow_range", 3)
+            .expect("missing '__rz_take_ret_shadow_range' definition");
         let def_id_validate_loaded_ref_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_loaded_ref_tag", 4)
             .expect("missing '__rz_validate_loaded_ref_tag' definition");
@@ -428,17 +450,22 @@ impl MyOptimizationPass {
             def_id_push_indirect_call_arg_tag,
             def_id_push_indirect_call_arg_shadow_tag,
             def_id_push_indirect_call_arg_leaf_shadow,
+            def_id_push_indirect_call_arg_shadow_range,
             def_id_validate_call_arg_tag,
             def_id_take_call_arg_tag,
             def_id_take_call_arg_tag_anchor,
             def_id_push_call_arg_leaf_shadow,
             def_id_take_call_arg_leaf_shadow,
+            def_id_push_call_arg_shadow_range,
+            def_id_take_call_arg_shadow_range,
             def_id_clear_call_arg_leaf_shadows,
             def_id_push_ret_tag,
             def_id_validate_ret_tag,
             def_id_take_ret_tag,
             def_id_push_ret_leaf_shadow,
             def_id_take_ret_leaf_shadow,
+            def_id_push_ret_shadow_range,
+            def_id_take_ret_shadow_range,
             def_id_validate_loaded_ref_tag,
             def_id_require_loaded_ptr_tag,
             def_id_take_ret_tag_or_root,

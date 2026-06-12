@@ -3,6 +3,19 @@
 use super::super::*;
 
 impl MyOptimizationPass {
+    pub(in crate::instrumentation) fn ty_has_runtime_stack_slot_extent<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        match ty.kind() {
+            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) | TyKind::Foreign(..) => false,
+            _ if self.ty_is_opaque_for_shadow_range(ty) => true,
+            _ => ty.is_sized(tcx, body.typing_env(tcx)),
+        }
+    }
+
     pub(in crate::instrumentation) fn layout_size_bytes<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -89,11 +102,10 @@ impl MyOptimizationPass {
         ty: Ty<'tcx>,
         span: Span,
     ) -> SizeOperand<'tcx> {
-        match ty.kind() {
-            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..) | TyKind::Foreign(..) => {
-                SizeOperand::Const(self.const_usize(tcx, span, 0))
-            }
-            _ => self.size_operand_for_ty(tcx, body, ty, span),
+        if self.ty_has_runtime_stack_slot_extent(tcx, body, ty) {
+            SizeOperand::SizeOf(ty)
+        } else {
+            SizeOperand::Const(self.const_usize(tcx, span, 0))
         }
     }
 
