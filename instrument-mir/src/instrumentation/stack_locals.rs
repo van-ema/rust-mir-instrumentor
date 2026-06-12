@@ -324,6 +324,77 @@ impl MyOptimizationPass {
         Some(local)
     }
 
+    pub(in crate::instrumentation) fn compute_call_only_reborrow_forward_sources<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local_ref_use_stats: &HashMap<Local, LocalRefUseStats>,
+    ) -> HashMap<Local, Local> {
+        let mut def_src_by_local: HashMap<Local, Local> = HashMap::new();
+
+        for block_data in body.basic_blocks.iter() {
+            for stmt in &block_data.statements {
+                let StatementKind::Assign(box (lhs, Rvalue::Ref(_, borrow_kind, src_place))) =
+                    &stmt.kind
+                else {
+                    continue;
+                };
+                if !matches!(borrow_kind, BorrowKind::Shared | BorrowKind::Mut { .. }) {
+                    continue;
+                }
+                let Some(local) = lhs.as_local() else {
+                    continue;
+                };
+                let local_ty = body.local_decls[local].ty;
+                if !matches!(local_ty.kind(), TyKind::Ref(..)) {
+                    continue;
+                }
+                if !matches!(src_place.projection.as_slice(), [ProjectionElem::Deref]) {
+                    continue;
+                }
+                if !matches!(body.local_decls[src_place.local].ty.kind(), TyKind::Ref(..)) {
+                    continue;
+                }
+                if local_ref_use_stats
+                    .get(&local)
+                    .is_none_or(|stat| stat.defs != 1 || stat.uses != 1)
+                {
+                    continue;
+                }
+                def_src_by_local.insert(local, src_place.local);
+            }
+        }
+
+        let mut forward_sources = HashMap::new();
+        for block_data in body.basic_blocks.iter() {
+            let Some(term) = &block_data.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call { func, args, .. } = &term.kind else {
+                continue;
+            };
+            let Some((callee_did, _)) = self.direct_callee(tcx, body, block_data, func) else {
+                continue;
+            };
+            if !self.is_instrumented_callee(tcx, callee_did) {
+                continue;
+            }
+            for arg in args.iter() {
+                let Some(place) = self.place_from_operand(&arg.node) else {
+                    continue;
+                };
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                if let Some(src_local) = def_src_by_local.get(&place.local).copied() {
+                    forward_sources.insert(place.local, src_local);
+                }
+            }
+        }
+
+        forward_sources
+    }
+
     pub(in crate::instrumentation) fn compute_interesting_stack_locals<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,

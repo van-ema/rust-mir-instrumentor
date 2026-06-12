@@ -245,6 +245,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
         summary_elidable_shared_call_ref_locals: &HashSet<Local>,
+        call_only_reborrow_forward_sources: &HashMap<Local, Local>,
         interesting_stack_locals: &HashSet<Local>,
         track_all_stack_allocs: bool,
     ) -> HashMap<BasicBlock, SsaAnchorMap> {
@@ -294,6 +295,7 @@ impl MyOptimizationPass {
                     &mut boundary_recovered_ptr_locals,
                     ptr_locals_with_tag_sources,
                     summary_elidable_shared_call_ref_locals,
+                    call_only_reborrow_forward_sources,
                     interesting_stack_locals,
                     track_all_stack_allocs,
                     false,

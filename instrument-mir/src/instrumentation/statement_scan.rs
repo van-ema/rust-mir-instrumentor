@@ -120,6 +120,7 @@ impl MyOptimizationPass {
         boundary_recovered_ptr_locals: &mut HashSet<Local>,
         ptr_locals_with_tag_sources: &HashSet<Local>,
         summary_elidable_shared_call_ref_locals: &HashSet<Local>,
+        call_only_reborrow_forward_sources: &HashMap<Local, Local>,
         interesting_stack_locals: &HashSet<Local>,
         track_all_stack_allocs: bool,
         trace_ssa_anchor: bool,
@@ -1982,6 +1983,7 @@ impl MyOptimizationPass {
                 };
                 if self.is_pointer_ty(lhs_ty)
                     && !summary_elidable_shared_call_ref_locals.contains(&lhs_local)
+                    && !call_only_reborrow_forward_sources.contains_key(&lhs_local)
                     && !black_box_sink_ref_temp
                 {
                     let allow_projected_anchor =

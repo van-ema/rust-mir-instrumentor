@@ -281,6 +281,19 @@ impl MyOptimizationPass {
         let ptr_locals_with_tag_sources = self.collect_ptr_locals_with_tag_sources(tcx, body);
         let summary_elidable_shared_call_ref_locals =
             self.compute_summary_elidable_shared_call_ref_locals(tcx, body);
+        let call_only_reborrow_forward_sources =
+            self.compute_call_only_reborrow_forward_sources(tcx, body, &local_ref_use_stats);
+        if std::env::var("RZ_CALL_ONLY_REBORROW_STATS")
+            .ok()
+            .is_some_and(|v| v != "0" && v.to_ascii_lowercase() != "false")
+            && !call_only_reborrow_forward_sources.is_empty()
+        {
+            eprintln!(
+                "[rusteze][call-only-reborrow] fn={} forwarded_temps={}",
+                tcx.def_path_str(body.source.def_id()),
+                call_only_reborrow_forward_sources.len()
+            );
+        }
         let mut explicitly_tracked: HashSet<Local> = HashSet::new();
         for block_data in body.basic_blocks.iter() {
             for stmt in block_data.statements.iter() {
@@ -411,6 +424,7 @@ impl MyOptimizationPass {
             body,
             &ptr_locals_with_tag_sources,
             &summary_elidable_shared_call_ref_locals,
+            &call_only_reborrow_forward_sources,
             &interesting_stack_locals,
             track_all_stack_allocs,
         );
@@ -447,6 +461,7 @@ impl MyOptimizationPass {
                     &mut boundary_recovered_ptr_locals,
                     &ptr_locals_with_tag_sources,
                     &summary_elidable_shared_call_ref_locals,
+                    &call_only_reborrow_forward_sources,
                     &interesting_stack_locals,
                     track_all_stack_allocs,
                     true,
@@ -482,6 +497,7 @@ impl MyOptimizationPass {
                         &interesting_stack_locals,
                         &mut local_slot_shadow_store_locals,
                         &local_ref_use_stats,
+                        &call_only_reborrow_forward_sources,
                     );
                     self.invalidate_ssa_anchors_for_call(
                         body,

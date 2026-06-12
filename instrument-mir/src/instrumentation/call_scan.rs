@@ -1414,6 +1414,7 @@ impl MyOptimizationPass {
         interesting_stack_locals: &HashSet<Local>,
         local_slot_shadow_store_locals: &mut HashSet<Local>,
         local_ref_use_stats: &HashMap<Local, LocalRefUseStats>,
+        call_only_reborrow_forward_sources: &HashMap<Local, Local>,
     ) {
         let callee_opt = self.direct_callee(tcx, body, block_data, func);
         let callee_id_opt = callee_opt.map(|(_did, cid)| cid);
@@ -1528,7 +1529,9 @@ impl MyOptimizationPass {
                 arg,
             ) {
                 noescape_reborrow_call_temps.insert(local);
-                local_slot_shadow_store_locals.insert(local);
+                if !call_only_reborrow_forward_sources.contains_key(&local) {
+                    local_slot_shadow_store_locals.insert(local);
+                }
             }
         }
         let call_is_black_box = callee_path_opt
@@ -2591,14 +2594,16 @@ impl MyOptimizationPass {
 
             // Inter-procedural: push argument tag to callee if instrumented.
             if direct_call_arg_callee_id.is_some() || unresolved_indirect_call {
-                ptr_locals_needing_tag.insert(p.local);
+                let forwarded_src_local = call_only_reborrow_forward_sources.get(&p.local).copied();
+                let push_ptr_local = forwarded_src_local.unwrap_or(p.local);
+                ptr_locals_needing_tag.insert(push_ptr_local);
                 let suppress_protector =
                     !self.tb_call_arg_protector_supported_for_ty(tcx, body, ty);
                 let flags = self.call_arg_push_flags(false, suppress_protector);
-                let from_shadow = !p.projection.is_empty();
+                let from_shadow = forwarded_src_local.is_none() && !p.projection.is_empty();
                 if self.trace_call_boundary_scan_enabled() {
                     eprintln!(
-                        "[rusteze][call-boundary-scan] caller={} callee_id={:?} callee={:?} arg={} place={:?} ty={:?} was_tagged={} from_shadow={} flags=0x{:x}",
+                        "[rusteze][call-boundary-scan] caller={} callee_id={:?} callee={:?} arg={} place={:?} ty={:?} was_tagged={} from_shadow={} forwarded_src={:?} flags=0x{:x}",
                         tcx.def_path_str(body.source.def_id()),
                         direct_call_arg_callee_id,
                         callee_path_opt.as_deref(),
@@ -2607,6 +2612,7 @@ impl MyOptimizationPass {
                         ty,
                         was_tagged,
                         from_shadow,
+                        forwarded_src_local,
                         flags
                     );
                 }
@@ -2614,7 +2620,7 @@ impl MyOptimizationPass {
                     InstrKind::CallArgPush {
                         callee_id,
                         arg_index: arg_index as u64,
-                        ptr_local: p.local,
+                        ptr_local: push_ptr_local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
                         from_shadow,
                         flags,
@@ -2622,7 +2628,7 @@ impl MyOptimizationPass {
                 } else {
                     InstrKind::IndirectCallArgPush {
                         arg_index: arg_index as u64,
-                        ptr_local: p.local,
+                        ptr_local: push_ptr_local,
                         parent_mode: ParentSelectionMode::PointeeFamily,
                         from_shadow,
                         flags,
@@ -2699,7 +2705,12 @@ impl MyOptimizationPass {
             let projected_carrier_raw_ptr_use = self.is_raw_pointer_ty(ty)
                 && self.raw_creation_allows_no_provenance_transport(tcx, body, p);
             let noescape_reborrow_temp = noescape_reborrow_call_temps.contains(&p.local);
-            if !projected_carrier_raw_ptr_use && !noescape_reborrow_temp {
+            let source_forwarded_reborrow_temp =
+                call_only_reborrow_forward_sources.contains_key(&p.local);
+            if !projected_carrier_raw_ptr_use
+                && !noescape_reborrow_temp
+                && !source_forwarded_reborrow_temp
+            {
                 ptr_locals_needing_tag.insert(p.local);
                 insert_points.push(InsertPoint {
                     bb,
@@ -3257,6 +3268,9 @@ impl MyOptimizationPass {
                     continue;
                 }
                 if noescape_reborrow_call_temps.contains(&arg_place.local) {
+                    if call_only_reborrow_forward_sources.contains_key(&arg_place.local) {
+                        continue;
+                    }
                     kill_locals.insert(arg_place.local);
                 }
             }
