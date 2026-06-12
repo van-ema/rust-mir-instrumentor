@@ -151,12 +151,13 @@ fn remove_shard_entry_and_bump(tag: u64) {
 #[inline]
 pub(crate) fn get(tag: u64) -> Option<TagMeta> {
     let idx = shard_index(tag);
-    if let Some(meta) = shards()[idx].map.lock().unwrap().get(&tag).copied() {
+    let cached = { shards()[idx].map.lock().unwrap().get(&tag).copied() };
+    if let Some(meta) = cached {
         return Some(meta);
     }
 
     // Fallback to authoritative global map and backfill shard.
-    let meta = tags().lock().unwrap().get(&tag).copied();
+    let meta = { tags().lock().unwrap().get(&tag).copied() };
     if let Some(m) = meta {
         let mut smap = shards()[idx].map.lock().unwrap();
         smap.insert(tag, m);

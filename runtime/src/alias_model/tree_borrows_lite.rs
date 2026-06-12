@@ -1323,11 +1323,7 @@ fn tb_lite_on_tag_killed(tag: u64) {
         return;
     }
 
-    let frame_tags = if rz_tb_compact_invalidated_enabled() {
-        tb_protector_frame_tag_snapshot()
-    } else {
-        Vec::new()
-    };
+    let compact_invalidated = rz_tb_compact_invalidated_enabled();
     let Some(tmeta) = tags().lock().unwrap().get(&tag).copied() else {
         return;
     };
@@ -1350,7 +1346,7 @@ fn tb_lite_on_tag_killed(tag: u64) {
     if killed_readonly {
         tb_reactivate_frozen_unique_ancestors_without_readers(tree, parent);
     }
-    let _ = tb_compact_unreachable_invalidated_subtree(tree, tag, &frame_tags);
+    let _ = tb_compact_invalidated_roots(tree, &[tag], compact_invalidated);
 }
 
 fn tb_compacted_invalidated_hit(tags: &[u64]) -> Option<TbCompactedNode> {
@@ -1533,13 +1529,39 @@ fn tb_node_can_compact_invalidated(node: &TbNode, frame_tags: &[u64]) -> bool {
     if frame_tags.iter().any(|tag| *tag == node.tag) {
         return false;
     }
-    if tag_store::active_tag_has_local_holder(node.tag) || tag_store::active_tag_escaped(node.tag) {
-        return false;
-    }
+    // A local holder or escaped copy is not a reason to keep a disabled shared node in the active
+    // tree. Future exact use of that tag must report stale provenance, and the tombstone preserves
+    // enough metadata for that diagnostic without making every later access scan this node.
     matches!(
         tag_store::tag_lifecycle_state(node.tag),
         tag_store::TagLifecycleState::Active | tag_store::TagLifecycleState::HistoricalLive
     )
+}
+
+fn tb_compact_invalidated_roots(
+    tree: &mut TbAllocState,
+    roots: &[u64],
+    compact_invalidated: bool,
+) -> usize {
+    if !compact_invalidated || roots.is_empty() {
+        return 0;
+    }
+
+    let frame_tags = tb_protector_frame_tag_snapshot();
+    let mut seen = Vec::new();
+    let mut removed = 0usize;
+    for root in roots.iter().copied().filter(|root| *root != 0) {
+        if seen.iter().any(|seen_root| *seen_root == root) {
+            continue;
+        }
+        seen.push(root);
+        removed = removed.saturating_add(tb_compact_unreachable_invalidated_subtree(
+            tree,
+            root,
+            &frame_tags,
+        ));
+    }
+    removed
 }
 
 fn tb_compact_unreachable_invalidated_subtree(
@@ -1547,7 +1569,7 @@ fn tb_compact_unreachable_invalidated_subtree(
     root: u64,
     frame_tags: &[u64],
 ) -> usize {
-    if !rz_tb_compact_invalidated_enabled() || root == 0 {
+    if root == 0 {
         return 0;
     }
 
@@ -1625,6 +1647,10 @@ fn tb_lite_check(
             compacted, tmeta, addr, size, access,
         ));
     }
+
+    // The env-gate cache may allocate on first use. Initialize it before holding TB_STATE so
+    // allocation bookkeeping cannot re-enter this alias model while the tree mutex is held.
+    let compact_invalidated = rz_tb_compact_invalidated_enabled();
 
     let base = tb_base_for_addr(addr);
     let mut all = tb_state().lock().unwrap();
@@ -1768,6 +1794,7 @@ fn tb_lite_check(
             addr,
             size,
             tmeta.alloc_epoch,
+            compact_invalidated,
         );
         if let Some(prepared_node) = tree.nodes.get(&access_tag).cloned() {
             node = prepared_node;
@@ -2034,6 +2061,7 @@ fn tb_lite_check(
     }
 
     let access_len = tb_effective_access_len(size);
+    let mut compact_roots = Vec::new();
     for (tag, next, covered) in updates {
         if let Some(n) = tree.nodes.get_mut(&tag) {
             if covered {
@@ -2041,6 +2069,8 @@ fn tb_lite_check(
                 n.alive = next != TbPerm::Disabled;
                 if next != TbPerm::Disabled {
                     n.poisoned_by_protector_end = false;
+                } else {
+                    compact_roots.push(tag);
                 }
             } else {
                 n.lazy_perm = next;
@@ -2058,9 +2088,13 @@ fn tb_lite_check(
                 n.extra_ranges.push((addr, access_len));
                 n.perm = n.lazy_perm;
                 n.alive = n.perm != TbPerm::Disabled;
+                if !n.alive {
+                    compact_roots.push(tag);
+                }
             }
         }
     }
+    let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
 
     None
 }
@@ -2320,6 +2354,7 @@ fn tb_lite_prepare_local_write(
     addr: usize,
     size: usize,
     alloc_epoch: u64,
+    compact_invalidated: bool,
 ) {
     let Some(access_node) = tree.nodes.get(&access_tag) else {
         return;
@@ -2362,13 +2397,13 @@ fn tb_lite_prepare_local_write(
     };
     let retired_helper = !readonly_blockers.is_empty() || !raw_lineage_helpers.is_empty();
 
-    for tag in readonly_blockers {
-        if let Some(node) = tree.nodes.get_mut(&tag) {
+    for tag in &readonly_blockers {
+        if let Some(node) = tree.nodes.get_mut(tag) {
             tb_disable_node(node);
         }
     }
-    for tag in raw_lineage_helpers {
-        if let Some(node) = tree.nodes.get_mut(&tag) {
+    for tag in &raw_lineage_helpers {
+        if let Some(node) = tree.nodes.get_mut(tag) {
             tb_disable_node(node);
         }
     }
@@ -2377,6 +2412,9 @@ fn tb_lite_prepare_local_write(
         tb_reactivate_frozen_unique_ancestors_without_readers_for_access(
             tree, access_tag, addr, size,
         );
+        let mut compact_roots = readonly_blockers.clone();
+        compact_roots.extend(raw_lineage_helpers.iter().copied());
+        let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
     }
 }
 
@@ -2887,6 +2925,52 @@ mod tests {
             tag_store::tag_lifecycle_state(parent),
             tag_store::TagLifecycleState::Active
         );
+    }
+
+    #[test]
+    fn compaction_dispatcher_prunes_dead_shared_sibling() {
+        std::env::set_var("RZ_TB_COMPACT_INVALIDATED_TAGS", "1");
+
+        let unique = next_test_tag();
+        let shared = next_test_tag();
+        let addr = test_addr(unique);
+        tag_store::insert(unique, test_meta(addr, PtrKind::RefMut, 0));
+        tag_store::insert(shared, test_meta(addr, PtrKind::RefShared, 0));
+        tag_store::retain_local_holder(shared);
+        tag_store::mark_escaped(shared);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(test_node(
+            unique,
+            0,
+            addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+        tree.insert_node(test_node(
+            shared,
+            0,
+            addr,
+            BorrowKind::Shared,
+            TbPerm::Disabled,
+        ));
+
+        let removed = tb_compact_invalidated_roots(&mut tree, &[shared], true);
+        assert_eq!(removed, 1);
+
+        assert!(tree.nodes.contains_key(&unique));
+        assert!(!tree.nodes.contains_key(&shared));
+        assert_eq!(
+            tag_store::tag_lifecycle_state(shared),
+            tag_store::TagLifecycleState::Invalidated
+        );
+
+        let shared_meta = tag_store::get(shared).expect("compacted shared tag metadata is kept");
+        let msg = tb_lite_check(shared, shared, &shared_meta, addr, 1, AliasAccessKind::Read)
+            .expect("exact stale shared tag should still report");
+        assert!(msg.contains("reason=TB_LITE_INVALIDATED"));
+        assert!(msg.contains(&format!("tag={shared}")));
+        assert!(tag_store::release_local_holder(shared));
     }
 
     #[test]
