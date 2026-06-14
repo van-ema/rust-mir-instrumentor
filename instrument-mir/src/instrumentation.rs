@@ -198,7 +198,7 @@ impl MyOptimizationPass {
                         kind: InstrKind::ArgLeafTake {
                             callee_id,
                             arg_index: arg_index as u64,
-                            leaf_key: leaf_spec.transport_key(),
+                            leaf_key: leaf_spec.call_boundary_key(),
                         },
                     });
                 }
@@ -237,7 +237,7 @@ impl MyOptimizationPass {
                             kind: InstrKind::ArgLeafTake {
                                 callee_id,
                                 arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
+                                leaf_key: leaf_spec.call_boundary_key(),
                             },
                         });
                     }
