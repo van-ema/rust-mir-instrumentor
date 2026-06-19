@@ -198,7 +198,7 @@ impl MyOptimizationPass {
                         kind: InstrKind::ArgLeafTake {
                             callee_id,
                             arg_index: arg_index as u64,
-                            leaf_key: leaf_spec.transport_key(),
+                            leaf_key: leaf_spec.call_boundary_key(),
                         },
                     });
                 }
@@ -237,10 +237,29 @@ impl MyOptimizationPass {
                             kind: InstrKind::ArgLeafTake {
                                 callee_id,
                                 arg_index: arg_index as u64,
-                                leaf_key: leaf_spec.transport_key(),
+                                leaf_key: leaf_spec.call_boundary_key(),
                             },
                         });
                     }
+                }
+                if self.supports_call_boundary_shadow_range_take_local(tcx, body, arg_local) {
+                    insert_points.push(InsertPoint {
+                        bb: entry_bb,
+                        stmt_idx: entry_stmt_idx,
+                        insert_before: false,
+                        source_info: entry_source_info,
+                        place: Place::from(arg_local),
+                        kind: InstrKind::ArgShadowRangeTake {
+                            callee_id,
+                            arg_index: arg_index as u64,
+                            size_op: self.size_operand_for_stack_local_ty(
+                                tcx,
+                                body,
+                                arg_ty,
+                                entry_source_info.span,
+                            ),
+                        },
+                    });
                 }
                 if leaf_seeded_anchor {
                     projectionless_anchor_suppressed_locals.insert(arg_local);
@@ -577,11 +596,29 @@ impl MyOptimizationPass {
                                 place: leaf_spec.place,
                                 kind: InstrKind::RetLeafPush {
                                     callee_id,
-                                    leaf_key: leaf_spec.transport_key(),
+                                    leaf_key: leaf_spec.call_boundary_key(),
                                     leaf_is_ref: matches!(leaf_spec.ty.kind(), TyKind::Ref(..)),
                                 },
                             });
                         }
+                    }
+                    if self.supports_call_boundary_shadow_range_return_ty(tcx, body, return_ty) {
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: Place::from(RETURN_PLACE),
+                            kind: InstrKind::RetShadowRangePush {
+                                callee_id,
+                                size_op: self.size_operand_for_stack_local_ty(
+                                    tcx,
+                                    body,
+                                    return_ty,
+                                    term.source_info.span,
+                                ),
+                            },
+                        });
                     }
                     for (arg_index, arg_local) in body.args_iter().enumerate() {
                         let arg_ty = body.local_decls[arg_local].ty;

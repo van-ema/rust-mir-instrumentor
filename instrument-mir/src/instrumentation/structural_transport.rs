@@ -116,6 +116,94 @@ impl MyOptimizationPass {
         self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, body.local_decls[local].ty)
     }
 
+    pub(in crate::instrumentation) fn ty_is_opaque_for_shadow_range<'tcx>(
+        &self,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        ty.has_param()
+            || ty.has_infer()
+            || ty.has_aliases()
+            || ty.has_opaque_types()
+            || ty.has_placeholders()
+    }
+
+    fn ty_has_known_shadow_range_shape<'tcx>(&self, ty: Ty<'tcx>) -> bool {
+        matches!(
+            ty.kind(),
+            TyKind::Bool
+                | TyKind::Char
+                | TyKind::Int(_)
+                | TyKind::Uint(_)
+                | TyKind::Float(_)
+                | TyKind::Never
+                | TyKind::Tuple(_)
+                | TyKind::Adt(..)
+                | TyKind::Array(..)
+                | TyKind::Slice(_)
+                | TyKind::Closure(..)
+                | TyKind::Coroutine(..)
+                | TyKind::CoroutineClosure(..)
+                | TyKind::FnDef(..)
+                | TyKind::FnPtr(..)
+        )
+    }
+
+    /// Return whether a caller should export shadow bytes for a by-value argument.
+    ///
+    /// Concrete callers may know that `T` is `SliceRead<'a>`, while the callee body only sees
+    /// generic `T`. Copying the shadow range lets hidden pointer fields move with the value.
+    pub(in crate::instrumentation) fn supports_call_boundary_shadow_range_push_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        !self.is_pointer_ty(ty)
+            && (self.ty_is_opaque_for_shadow_range(ty)
+                || self.ty_contains_pointer_fields(
+                    tcx,
+                    body,
+                    ty,
+                    SHADOWABLE_LEAF_PTR_RECURSION_DEPTH,
+                ))
+    }
+
+    /// Return whether a callee should import by-value shadow bytes for an opaque argument.
+    ///
+    /// For `fn f<T>(x: T)` or `fn f(x: impl FnMut(...))`, this MIR body may not be able to name
+    /// the fields/captures inside `x`. If the caller exported shadow bytes for `x`, import them
+    /// into the callee stack slot; if no export exists, the runtime take is a no-op.
+    pub(in crate::instrumentation) fn supports_call_boundary_shadow_range_take_local<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        local: Local,
+    ) -> bool {
+        let ty = body.local_decls[local].ty;
+        let exact_leaf_available =
+            self.supports_call_boundary_exact_leaf_shadow_local(tcx, body, local);
+        let has_pointer_fields =
+            self.ty_contains_pointer_fields(tcx, body, ty, SHADOWABLE_LEAF_PTR_RECURSION_DEPTH);
+        let take = !self.is_pointer_ty(ty)
+            && !exact_leaf_available
+            && (self.ty_is_opaque_for_shadow_range(ty)
+                || has_pointer_fields
+                || !self.ty_has_known_shadow_range_shape(ty));
+        take
+    }
+
+    /// Return whether a callee should export shadow bytes for an opaque/generic return slot.
+    pub(in crate::instrumentation) fn supports_call_boundary_shadow_range_return_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        !self.is_pointer_ty(ty)
+            && !self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, ty)
+            && self.ty_is_opaque_for_shadow_range(ty)
+    }
+
     /// Return exact pointer leaves stored inside the value referenced by `ptr_place`.
     ///
     /// Example: for `arg: &mut RecursionGuard`, return `(*arg).receiver` if it is a pointer field.

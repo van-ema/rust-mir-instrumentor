@@ -92,6 +92,7 @@ impl MyOptimizationPass {
         for (field_idx, field_ty) in field_specs.into_iter() {
             if !self.is_shadowable_ptr_ty(tcx, body, field_ty)
                 && !self.ty_contains_pointer_fields(tcx, body, field_ty, 3)
+                && !self.ty_is_opaque_for_shadow_range(field_ty)
             {
                 continue;
             }
@@ -105,6 +106,89 @@ impl MyOptimizationPass {
                 field_idx,
                 field_ty,
             );
+
+            if self.is_shadowable_ptr_ty(tcx, body, field_ty) {
+                if let Some(src_place) = self.place_from_operand(op) {
+                    let src_ty = src_place.ty(&body.local_decls, tcx).ty;
+                    if self.is_shadowable_ptr_ty(tcx, body, src_ty) {
+                        if src_place.projection.is_empty() {
+                            ptr_locals_needing_tag.insert(src_place.local);
+                            rz_pass_trace!(
+                                self,
+                                "[rusteze][ptr-shadow] Aggregate PointerField ShadowStore dst_field={:?} src_local={:?}",
+                                field_place,
+                                src_place.local
+                            );
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info,
+                                place: field_place,
+                                kind: InstrKind::ShadowStore {
+                                    src_local: src_place.local,
+                                },
+                            });
+                        } else {
+                            rz_pass_trace!(
+                                self,
+                                "[rusteze][ptr-shadow] Aggregate PointerField ShadowCopySlot dst_field={:?} src={:?}",
+                                field_place,
+                                src_place
+                            );
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx,
+                                insert_before: false,
+                                source_info,
+                                place: field_place,
+                                kind: InstrKind::ShadowCopySlot { src_place },
+                            });
+                        }
+                        continue;
+                    }
+                }
+                insert_points.push(InsertPoint {
+                    bb,
+                    stmt_idx,
+                    insert_before: false,
+                    source_info,
+                    place: field_place,
+                    kind: InstrKind::ShadowKill {
+                        size_op: self.size_operand_for_ty(tcx, body, field_ty, source_info.span),
+                    },
+                });
+                continue;
+            }
+
+            if self.ty_is_opaque_for_shadow_range(field_ty) {
+                if let Some(src_place) = self.place_from_operand(op) {
+                    rz_pass_trace!(
+                        self,
+                        "[rusteze][ptr-shadow] Aggregate OpaqueField ShadowCopyRange dst_field={:?} src={:?}",
+                        field_place,
+                        src_place
+                    );
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx,
+                        insert_before: false,
+                        source_info,
+                        place: field_place,
+                        kind: InstrKind::ShadowCopyRange {
+                            src_place,
+                            size_op: self.size_operand_for_stack_local_ty(
+                                tcx,
+                                body,
+                                field_ty,
+                                source_info.span,
+                            ),
+                        },
+                    });
+                }
+                continue;
+            }
+
             let dst_leafs =
                 self.shadowable_leaf_ptr_specs_from_place(tcx, body, field_place, field_ty);
             if dst_leafs.is_empty() {

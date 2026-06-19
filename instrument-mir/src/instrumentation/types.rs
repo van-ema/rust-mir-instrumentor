@@ -300,6 +300,15 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         arg_index: u64,
         leaf_key: u64,
     },
+    /// Caller-side pointer-shadow range export for an unresolved function-pointer/vtable call.
+    ///
+    /// Used when the caller sees an opaque callable receiver and cannot name its captured
+    /// pointer fields. The runtime stores each shadowed pointer slot by byte offset so the
+    /// closure body can import it using its exact leaf key.
+    IndirectCallArgShadowRangePush {
+        arg_index: u64,
+        size_op: SizeOperand<'tcx>,
+    },
     /// Caller-side validation for a by-value argument that is not itself pointer-typed,
     /// but carries a reference inside an aggregate/container.
     ///
@@ -321,6 +330,12 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         callee_id: u64,
         arg_index: u64,
         leaf_key: u64,
+    },
+    /// Caller-side: export pointer-shadow bytes for a by-value carrier whose callee type is opaque.
+    CallArgShadowRangePush {
+        callee_id: u64,
+        arg_index: u64,
+        size_op: SizeOperand<'tcx>,
     },
     /// Caller-side cleanup for closure captures sent through an uninstrumented helper.
     CallArgLeafClear {
@@ -356,6 +371,12 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         arg_index: u64,
         leaf_key: u64,
     },
+    /// Callee-side: import by-value carrier shadow bytes for an opaque/generic argument slot.
+    ArgShadowRangeTake {
+        callee_id: u64,
+        arg_index: u64,
+        size_op: SizeOperand<'tcx>,
+    },
     // Callee-side validation for a return value that is not itself pointer-typed,
     /// but carries a reference inside an aggregate/container.
     ///
@@ -377,6 +398,11 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
         callee_id: u64,
         leaf_key: u64,
         leaf_is_ref: bool,
+    },
+    /// Callee-side: export pointer-shadow bytes for an opaque/generic return carrier.
+    RetShadowRangePush {
+        callee_id: u64,
+        size_op: SizeOperand<'tcx>,
     },
     /// Callee-side: export a whole-slot return anchor when leaf transport is not enough.
     ///
@@ -406,6 +432,11 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     RetLeafTake {
         callee_id: u64,
         leaf_key: u64,
+    },
+    /// Caller-side: import pointer-shadow bytes for an opaque/generic return carrier.
+    RetShadowRangeTake {
+        callee_id: u64,
+        size_op: SizeOperand<'tcx>,
     },
     /// Caller-side: seed a fresh family for a returned owner/container carrier whose nested
     /// pointer fields are implementation detail rather than source-level borrow carriers.
@@ -520,6 +551,11 @@ impl<'tcx> ShadowableLeafPtrSpec<'tcx> {
         self.byte_offset
             .unwrap_or(Self::PATH_KEY_MARKER | (self.path_key & !Self::PATH_KEY_MARKER))
     }
+
+    /// Call boundaries match generic callees with concrete callers, so use field path, not offset.
+    pub(in crate::instrumentation) fn call_boundary_key(self) -> u64 {
+        Self::PATH_KEY_MARKER | (self.path_key & !Self::PATH_KEY_MARKER)
+    }
 }
 
 pub(in crate::instrumentation) const SHADOWABLE_LEAF_PTR_RECURSION_DEPTH: usize = 8;
@@ -585,17 +621,22 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_shadow_tag: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_leaf_shadow: DefId,
+    pub(in crate::instrumentation) def_id_push_indirect_call_arg_shadow_range: DefId,
     pub(in crate::instrumentation) def_id_validate_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag_anchor: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_leaf_shadow: DefId,
+    pub(in crate::instrumentation) def_id_push_call_arg_shadow_range: DefId,
+    pub(in crate::instrumentation) def_id_take_call_arg_shadow_range: DefId,
     pub(in crate::instrumentation) def_id_clear_call_arg_leaf_shadows: DefId,
     pub(in crate::instrumentation) def_id_push_ret_tag: DefId,
     pub(in crate::instrumentation) def_id_validate_ret_tag: DefId,
     pub(in crate::instrumentation) def_id_take_ret_tag: DefId,
     pub(in crate::instrumentation) def_id_push_ret_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_take_ret_leaf_shadow: DefId,
+    pub(in crate::instrumentation) def_id_push_ret_shadow_range: DefId,
+    pub(in crate::instrumentation) def_id_take_ret_shadow_range: DefId,
     pub(in crate::instrumentation) def_id_validate_loaded_ref_tag: DefId,
     pub(in crate::instrumentation) def_id_require_loaded_ptr_tag: DefId,
     pub(in crate::instrumentation) def_id_take_ret_tag_or_root: DefId,

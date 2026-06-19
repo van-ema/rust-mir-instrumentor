@@ -30,11 +30,12 @@ def extract_signature(log_path: Path) -> str | None:
             return 1
         return 0
 
-    blocks: list[tuple[int, int, str]] = []
+    blocks: list[tuple[int, int, int, str]] = []
     kind = None
     access = None
     size = None
     pkind = None
+    detail_priority = 0
     in_block = False
 
     try:
@@ -52,6 +53,9 @@ def extract_signature(log_path: Path) -> str | None:
             kind = trim(line)
             continue
 
+        if "LOAD invalid ref" in line:
+            detail_priority = max(detail_priority, 1)
+
         parts = line.split()
         if parts and parts[0] in ("READ", "WRITE"):
             access = parts[0]
@@ -65,20 +69,27 @@ def extract_signature(log_path: Path) -> str | None:
 
         if line.lstrip().startswith("="):
             sig = f"{kind}|{access or 'UNKNOWN'}|{pkind or 'unknown'}|{size or 'unknown'}"
-            blocks.append((signature_priority(kind), len(blocks), sig))
+            blocks.append((signature_priority(kind), detail_priority, len(blocks), sig))
             kind = None
             access = None
             size = None
             pkind = None
+            detail_priority = 0
             in_block = False
 
     if not blocks:
         return None
-    max_priority = max(priority for priority, _idx, _sig in blocks)
-    candidates = [(idx, sig) for priority, idx, sig in blocks if priority == max_priority]
+    max_priority = max(priority for priority, _detail, _idx, _sig in blocks)
+    candidates = [
+        (detail, idx, sig)
+        for priority, detail, idx, sig in blocks
+        if priority == max_priority
+    ]
     if max_priority == signature_priority("OUT_OF_BOUNDS"):
-        return candidates[-1][1]
-    return candidates[0][1]
+        return candidates[-1][2]
+    max_detail = max(detail for detail, _idx, _sig in candidates)
+    detailed = [(idx, sig) for detail, idx, sig in candidates if detail == max_detail]
+    return detailed[0][1]
 
 
 def did_panic(log_path: Path) -> bool:

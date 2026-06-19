@@ -1261,6 +1261,7 @@ impl MyOptimizationPass {
                 | InstrKind::ArgRetag { .. }
                 | InstrKind::ArgAnchorTake { .. }
                 | InstrKind::ArgLeafTake { .. }
+                | InstrKind::ArgShadowRangeTake { .. }
                 | InstrKind::RetRoot { .. }
                 | InstrKind::PtrDerive { .. }
                 | InstrKind::PtrDeriveParent { .. } => 0,
@@ -1288,6 +1289,7 @@ impl MyOptimizationPass {
                 | InstrKind::RetAnchorPush { .. }
                 | InstrKind::RetPush { .. }
                 | InstrKind::RetLeafPush { .. }
+                | InstrKind::RetShadowRangePush { .. }
                 | InstrKind::RetAnchorRoot { .. }
                 | InstrKind::MutArgRetPush { .. }
                 | InstrKind::MutArgRetLeafPush { .. }
@@ -1300,17 +1302,23 @@ impl MyOptimizationPass {
                 | InstrKind::ShadowStoreBoxPointee { .. }
                 | InstrKind::ShadowCopySlot { .. }
                 | InstrKind::ShadowCopyRange { .. } => 3,
-                InstrKind::DirectCallScopeBegin { .. } | InstrKind::IndirectCallScopeBegin => 2,
+                InstrKind::DirectCallScopeBegin { .. } => 2,
+                // Dynamic calls use a stack-scoped side channel. Open that scope before
+                // pushing args, so nested function-trait calls do not write into an outer scope.
+                InstrKind::IndirectCallScopeBegin => 4,
                 InstrKind::CallArgPush { .. }
                 | InstrKind::IndirectCallArgPush { .. }
                 | InstrKind::CallArgValidate { .. }
                 | InstrKind::CallArgLeafPush { .. }
+                | InstrKind::CallArgShadowRangePush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
+                | InstrKind::IndirectCallArgShadowRangePush { .. }
                 | InstrKind::CallArgLeafClear { .. }
                 | InstrKind::PtrUse { .. }
                 | InstrKind::RetValidate { .. }
                 | InstrKind::RetAnchorTake { .. }
                 | InstrKind::RetLeafTake { .. }
+                | InstrKind::RetShadowRangeTake { .. }
                 | InstrKind::FnExit { .. }
                 | InstrKind::MutArgRetTake { .. }
                 | InstrKind::MutArgRetLeafTake { .. }
@@ -1336,6 +1344,7 @@ impl MyOptimizationPass {
                     | InstrKind::ArgAnchorTake { .. }
                     | InstrKind::ArgAnchorSeedFromShadow { .. }
                     | InstrKind::ArgLeafTake { .. }
+                    | InstrKind::ArgShadowRangeTake { .. }
             ) {
                 arg_retag_points.push((idx, ip));
             } else {
@@ -3072,6 +3081,98 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if let InstrKind::RetShadowRangeTake { callee_id, size_op } = creation_kind {
+                let (orig_target, call_source, fn_span) = {
+                    let term = body.basic_blocks_mut()[bb]
+                        .terminator
+                        .as_mut()
+                        .expect("missing terminator for RetShadowRangeTake");
+                    match &mut term.kind {
+                        TerminatorKind::Call {
+                            target,
+                            call_source,
+                            fn_span,
+                            ..
+                        } => {
+                            let tgt = target.expect("call without target for RetShadowRangeTake");
+                            (tgt, *call_source, *fn_span)
+                        }
+                        _ => panic!("RetShadowRangeTake expected a Call terminator"),
+                    }
+                };
+                let is_cleanup = body.basic_blocks[orig_target].is_cleanup;
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((addr_stmt1, addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+                let (range_size, mut size_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_take_ret_shadow_range,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, callee_id),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: Operand::Copy(Place::from(addr_local)),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: range_size,
+                                span: source_info.span,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        destination: Place::from(tmp_unit),
+                        target: Some(orig_target),
+                        unwind: UnwindAction::Continue,
+                        call_source,
+                        fn_span,
+                    },
+                };
+                let ret_take_bb = {
+                    let mut take_bd = BasicBlockData::new(Some(take_term), is_cleanup);
+                    take_bd.statements.append(&mut size_stmts);
+                    take_bd.statements.push(addr_stmt1);
+                    take_bd.statements.push(addr_stmt2);
+                    body.basic_blocks_mut().push(take_bd)
+                };
+                {
+                    let term = body.basic_blocks_mut()[bb]
+                        .terminator
+                        .as_mut()
+                        .expect("missing terminator while wiring RetShadowRangeTake");
+                    match &mut term.kind {
+                        TerminatorKind::Call { target, .. } => {
+                            *target = Some(ret_take_bb);
+                        }
+                        _ => panic!("RetShadowRangeTake expected a Call terminator"),
+                    }
+                }
+
+                continue;
+            }
+
             if let InstrKind::RetAnchorRoot { local } = creation_kind {
                 let slot_state = self
                     .carrier_slot_locals_for_local(
@@ -4485,6 +4586,73 @@ impl MyOptimizationPass {
                 continue;
             }
 
+            if let InstrKind::RetShadowRangePush { callee_id, size_op } = creation_kind {
+                let addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((addr_stmt1, addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+                let (range_size, mut size_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let push_func = Operand::function_handle(
+                    tcx,
+                    hooks.def_id_push_ret_shadow_range,
+                    std::iter::empty(),
+                    source_info.span,
+                );
+                let args_push: Box<[Spanned<Operand<'tcx>>]> = vec![
+                    Spanned {
+                        node: self.const_u64(tcx, source_info.span, callee_id),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    },
+                    Spanned {
+                        node: range_size,
+                        span: source_info.span,
+                    },
+                ]
+                .into_boxed_slice();
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    (bd.terminator.take(), bd.is_cleanup)
+                };
+                let cont_block = body
+                    .basic_blocks_mut()
+                    .push(BasicBlockData::new(orig_term, is_cleanup));
+                let call_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: push_func,
+                        args: args_push,
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let bd = &mut body.basic_blocks_mut()[bb];
+                bd.statements.append(&mut size_stmts);
+                bd.statements.push(addr_stmt1);
+                bd.statements.push(addr_stmt2);
+                bd.terminator = Some(call_term);
+                continue;
+            }
+
             if let InstrKind::TagProp {
                 dst,
                 src,
@@ -5024,17 +5192,23 @@ impl MyOptimizationPass {
                     .expect("missing tag local for ArgRetag");
 
                 // Take the caller-pushed tag first, then create a fresh tag for this argument.
-                let (record_def_id, is_mut_u8) = match body.local_decls[ptr_local].ty.kind() {
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                let (mut record_def_id, is_mut_u8, is_ref_arg) = match ptr_ty.kind() {
                     TyKind::Ref(_, _ty, mutbl) => {
                         let is_mut = matches!(mutbl, Mutability::Mut);
-                        (hooks.def_id_ref, if is_mut { 1 } else { 0 })
+                        (hooks.def_id_ref, if is_mut { 1 } else { 0 }, true)
                     }
                     TyKind::RawPtr(_ty, mutbl) => {
                         let is_mut = matches!(mutbl, Mutability::Mut);
-                        (hooks.def_id_raw, if is_mut { 1 } else { 0 })
+                        (hooks.def_id_raw, if is_mut { 1 } else { 0 }, false)
                     }
                     _ => panic!("ArgRetag on non-pointer local"),
                 };
+                let record_ref_with_extent =
+                    is_ref_arg && self.known_interior_mut_root_for_ptr_ty(tcx, body, ptr_ty);
+                if record_ref_with_extent {
+                    record_def_id = hooks.def_id_ref_with_extent;
+                }
                 let alias_exempt =
                     self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[ptr_local].ty);
                 let alias_flags = if alias_exempt {
@@ -5061,8 +5235,16 @@ impl MyOptimizationPass {
                     )
                     .expect("ArgRetag on non-pointer local");
 
-                let bounds_len_op =
-                    self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, source_info.span);
+                let bounds_len_op = if matches!(ptr_ty.kind(), TyKind::Ref(..)) {
+                    self.ref_creation_bounds_len_operand_for_ptr_local(
+                        tcx,
+                        body,
+                        ptr_local,
+                        source_info.span,
+                    )
+                } else {
+                    self.bounds_len_operand_for_ptr_local(tcx, body, ptr_local, source_info.span)
+                };
                 let (arg_bounds_len, mut bounds_len_stmts) =
                     self.materialize_size_operand(tcx, body, source_info, &bounds_len_op);
                 let align_op =
@@ -5094,7 +5276,8 @@ impl MyOptimizationPass {
                 ]
                 .into_boxed_slice();
 
-                let args_record: Box<[Spanned<Operand<'tcx>>]> = vec![
+                let arg_extent_len = arg_bounds_len.clone();
+                let mut args_record = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
                         span: source_info.span,
@@ -5119,8 +5302,18 @@ impl MyOptimizationPass {
                         node: arg_align,
                         span: source_info.span,
                     },
-                ]
-                .into_boxed_slice();
+                ];
+                if record_ref_with_extent {
+                    args_record.push(Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    });
+                    args_record.push(Spanned {
+                        node: arg_extent_len,
+                        span: source_info.span,
+                    });
+                }
+                let args_record: Box<[Spanned<Operand<'tcx>>]> = args_record.into_boxed_slice();
 
                 let (orig_term, is_cleanup) = {
                     let bd = &mut body.basic_blocks_mut()[bb];
@@ -5899,7 +6092,10 @@ impl MyOptimizationPass {
                 }
                 InstrKind::CallArgLeafPush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
-                | InstrKind::ArgLeafTake { .. } => {
+                | InstrKind::ArgLeafTake { .. }
+                | InstrKind::CallArgShadowRangePush { .. }
+                | InstrKind::IndirectCallArgShadowRangePush { .. }
+                | InstrKind::ArgShadowRangeTake { .. } => {
                     let Some((slot_stmt1, slot_stmt2)) = self.slot_addr_stmts_for_place(
                         tcx,
                         body,
@@ -6846,6 +7042,57 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
+                ref kind @ (InstrKind::CallArgShadowRangePush { .. }
+                | InstrKind::IndirectCallArgShadowRangePush { .. }
+                | InstrKind::ArgShadowRangeTake { .. }) => {
+                    let (callee_id_opt, arg_index, size_op) = match kind {
+                        InstrKind::CallArgShadowRangePush {
+                            callee_id,
+                            arg_index,
+                            size_op,
+                        } => (Some(*callee_id), *arg_index, size_op),
+                        InstrKind::IndirectCallArgShadowRangePush { arg_index, size_op } => {
+                            (None, *arg_index, size_op)
+                        }
+                        InstrKind::ArgShadowRangeTake {
+                            callee_id,
+                            arg_index,
+                            size_op,
+                        } => (Some(*callee_id), *arg_index, size_op),
+                        _ => unreachable!(),
+                    };
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let (arg_size, mut size_stmts) =
+                        self.materialize_size_operand(tcx, body, source_info, size_op);
+                    extra_stmts.append(&mut size_stmts);
+                    let mut arg_vec: Vec<Spanned<Operand<'tcx>>> = Vec::new();
+                    if let Some(callee_id) = callee_id_opt {
+                        arg_vec.push(Spanned {
+                            node: self.const_u64(tcx, source_info.span, callee_id),
+                            span: source_info.span,
+                        });
+                    }
+                    arg_vec.extend([
+                        Spanned {
+                            node: self.const_u64(tcx, source_info.span, arg_index),
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: arg_size,
+                            span: source_info.span,
+                        },
+                    ]);
+                    let args: Box<[Spanned<Operand<'tcx>>]> = arg_vec.into_boxed_slice();
+
+                    (args, Place::from(tmp_unit))
+                }
+
                 InstrKind::PtrUse { ptr_local } => {
                     let ptr_ty = body.local_decls[ptr_local].ty;
                     let tag_op: Operand<'tcx> = if place.projection.is_empty() {
@@ -7600,15 +7847,10 @@ impl MyOptimizationPass {
                     extra_stmts.append(&mut align_stmts);
 
                     let mut explicit_extent: Option<(Operand<'tcx>, Operand<'tcx>)> = None;
-                    if let InstrKind::Ref { bk, src, .. } = &creation_kind {
-                        if !matches!(bk, BorrowKind::Mut { .. }) {
+                    match &creation_kind {
+                        InstrKind::Ref { bk, src, .. } if !matches!(bk, BorrowKind::Mut { .. }) => {
                             if let Some((arg_extent_base, extent_len_op, mut extent_stmts)) = self
-                                .interior_mut_array_extent_for_source_place(
-                                    tcx,
-                                    body,
-                                    source_info,
-                                    *src,
-                                )
+                                .interior_mut_extent_for_source_place(tcx, body, source_info, *src)
                             {
                                 extra_stmts.append(&mut extent_stmts);
                                 let (arg_extent_len, mut extent_len_stmts) = self
@@ -7628,6 +7870,25 @@ impl MyOptimizationPass {
                                 explicit_extent = Some((arg_extent_base, arg_extent_len));
                             }
                         }
+                        InstrKind::RetRoot {
+                            dst_local,
+                            is_ref: true,
+                            ..
+                        } if self.known_interior_mut_root_for_ptr_ty(
+                            tcx,
+                            body,
+                            body.local_decls[*dst_local].ty,
+                        ) =>
+                        {
+                            func_operand = Operand::function_handle(
+                                tcx,
+                                hooks.def_id_ref_with_extent,
+                                std::iter::empty(),
+                                source_info.span,
+                            );
+                            explicit_extent = Some((arg_addr.clone(), arg_bounds_len.clone()));
+                        }
+                        _ => {}
                     }
 
                     let mut args = vec![
@@ -8837,17 +9098,23 @@ impl MyOptimizationPass {
                     .expect("missing tag local for ArgRetag");
 
                 // Take the caller-pushed tag first, then create a fresh tag for this argument.
-                let (record_def_id, is_mut_u8) = match body.local_decls[ptr_local].ty.kind() {
+                let ptr_ty = body.local_decls[ptr_local].ty;
+                let (mut record_def_id, is_mut_u8, is_ref_arg) = match ptr_ty.kind() {
                     TyKind::Ref(_, _ty, mutbl) => {
                         let is_mut = matches!(mutbl, Mutability::Mut);
-                        (hooks.def_id_ref, if is_mut { 1 } else { 0 })
+                        (hooks.def_id_ref, if is_mut { 1 } else { 0 }, true)
                     }
                     TyKind::RawPtr(_ty, mutbl) => {
                         let is_mut = matches!(mutbl, Mutability::Mut);
-                        (hooks.def_id_raw, if is_mut { 1 } else { 0 })
+                        (hooks.def_id_raw, if is_mut { 1 } else { 0 }, false)
                     }
                     _ => panic!("ArgRetag on non-pointer local"),
                 };
+                let record_ref_with_extent =
+                    is_ref_arg && self.known_interior_mut_root_for_ptr_ty(tcx, body, ptr_ty);
+                if record_ref_with_extent {
+                    record_def_id = hooks.def_id_ref_with_extent;
+                }
                 let alias_exempt =
                     self.alias_exempt_for_ptr_ty(tcx, body, body.local_decls[ptr_local].ty);
                 let alias_flags = if alias_exempt {
@@ -8874,7 +9141,6 @@ impl MyOptimizationPass {
                     )
                     .expect("ArgRetag on non-pointer local");
 
-                let ptr_ty = body.local_decls[ptr_local].ty;
                 let bounds_len_op = if matches!(ptr_ty.kind(), TyKind::Ref(..)) {
                     self.ref_creation_bounds_len_operand_for_ptr_local(
                         tcx,
@@ -8916,7 +9182,8 @@ impl MyOptimizationPass {
                 ]
                 .into_boxed_slice();
 
-                let args_record: Box<[Spanned<Operand<'tcx>>]> = vec![
+                let arg_extent_len = arg_bounds_len.clone();
+                let mut args_record = vec![
                     Spanned {
                         node: Operand::Copy(Place::from(addr_local)),
                         span: source_info.span,
@@ -8941,8 +9208,18 @@ impl MyOptimizationPass {
                         node: arg_align,
                         span: source_info.span,
                     },
-                ]
-                .into_boxed_slice();
+                ];
+                if record_ref_with_extent {
+                    args_record.push(Spanned {
+                        node: Operand::Copy(Place::from(addr_local)),
+                        span: source_info.span,
+                    });
+                    args_record.push(Spanned {
+                        node: arg_extent_len,
+                        span: source_info.span,
+                    });
+                }
+                let args_record: Box<[Spanned<Operand<'tcx>>]> = args_record.into_boxed_slice();
 
                 let (orig_term, is_cleanup) = {
                     let bd = &mut body.basic_blocks_mut()[bb];
@@ -9492,6 +9769,97 @@ impl MyOptimizationPass {
                     let rem = bd.statements.split_off(split_at);
                     bd.statements.push(addr_stmt1);
                     bd.statements.push(addr_stmt2);
+                    bd.terminator = Some(take_term);
+                    rem
+                };
+                body.basic_blocks_mut()[cont_block]
+                    .statements
+                    .extend(remaining_stmts);
+            }
+
+            if let InstrKind::ArgShadowRangeTake {
+                callee_id,
+                arg_index,
+                size_op,
+            } = creation_kind
+            {
+                let take_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let (addr_stmt1, addr_stmt2) = self
+                    .slot_addr_stmts_for_place(
+                        tcx,
+                        body,
+                        source_info,
+                        place,
+                        take_addr_local,
+                        false,
+                    )
+                    .expect("ArgShadowRangeTake on unsupported local slot");
+                let (arg_size, mut size_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let tmp_unit = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.unit, source_info.span));
+
+                let (orig_term, is_cleanup) = {
+                    let bd = &mut body.basic_blocks_mut()[bb];
+                    let term = bd.terminator.take();
+                    let cleanup = bd.is_cleanup;
+                    (term, cleanup)
+                };
+                let cont_block = {
+                    let cont_data = BasicBlockData::new(orig_term, is_cleanup);
+                    body.basic_blocks_mut().push(cont_data)
+                };
+                let take_term = Terminator {
+                    source_info,
+                    kind: TerminatorKind::Call {
+                        func: Operand::function_handle(
+                            tcx,
+                            hooks.def_id_take_call_arg_shadow_range,
+                            std::iter::empty(),
+                            source_info.span,
+                        ),
+                        args: vec![
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, callee_id),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: self.const_u64(tcx, source_info.span, arg_index),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: Operand::Copy(Place::from(take_addr_local)),
+                                span: source_info.span,
+                            },
+                            Spanned {
+                                node: arg_size,
+                                span: source_info.span,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        destination: Place::from(tmp_unit),
+                        target: Some(cont_block),
+                        unwind: UnwindAction::Continue,
+                        call_source: CallSource::Misc,
+                        fn_span: source_info.span,
+                    },
+                };
+                let remaining_stmts = {
+                    let bd: &mut BasicBlockData<'tcx> = &mut body.basic_blocks_mut()[bb];
+                    let split_at = if stmt_idx > bd.statements.len() {
+                        bd.statements.len()
+                    } else {
+                        stmt_idx
+                    };
+                    let rem = bd.statements.split_off(split_at);
+                    bd.statements.push(addr_stmt1);
+                    bd.statements.push(addr_stmt2);
+                    if !size_stmts.is_empty() {
+                        bd.statements.append(&mut size_stmts);
+                    }
                     bd.terminator = Some(take_term);
                     rem
                 };

@@ -382,6 +382,55 @@ pub(crate) fn store_ptr_local_slot(
 }
 
 #[inline]
+fn in_full_slot_range(slot_start: usize, start: usize, size: usize) -> bool {
+    let end = start.saturating_add(size);
+    slot_start >= start && slot_start.saturating_add(PTR_SLOT_BYTES) <= end
+}
+
+/// Return pointer-sized shadow slots fully covered by `addr..addr + size`.
+pub(crate) fn shadowed_slot_offsets_in_range(addr: usize, size: usize) -> Vec<usize> {
+    if addr == 0 || size == 0 {
+        return Vec::new();
+    }
+
+    let mut offsets = Vec::new();
+    match slot_loc(addr) {
+        SlotLoc::Alloc {
+            base,
+            epoch,
+            offset,
+            ..
+        } => {
+            if let Some(slots) = alloc_ptr_shadow().lock().unwrap().get(&(base, epoch)) {
+                for slot_start in overlapping_offsets(slots, offset, size) {
+                    if in_full_slot_range(slot_start, offset, size) {
+                        offsets.push(slot_start.saturating_sub(offset));
+                    }
+                }
+            }
+            let abs_addr = base.saturating_add(offset);
+            let abs_shadow = abs_ptr_shadow().lock().unwrap();
+            for slot_start in overlapping_offsets(&abs_shadow, abs_addr, size) {
+                if in_full_slot_range(slot_start, abs_addr, size) {
+                    offsets.push(slot_start.saturating_sub(abs_addr));
+                }
+            }
+        }
+        SlotLoc::Abs { addr } => {
+            let abs_shadow = abs_ptr_shadow().lock().unwrap();
+            for slot_start in overlapping_offsets(&abs_shadow, addr, size) {
+                if in_full_slot_range(slot_start, addr, size) {
+                    offsets.push(slot_start.saturating_sub(addr));
+                }
+            }
+        }
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+#[inline]
 fn abs_entry_matches(addr: usize, entry: PtrShadowEntry) -> bool {
     if entry.alloc_base == 0 && entry.alloc_epoch == 0 {
         return true;

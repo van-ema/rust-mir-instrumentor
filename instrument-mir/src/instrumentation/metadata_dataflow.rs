@@ -642,6 +642,10 @@ fn instr_priority(kind: &InstrKind<'_>) -> u8 {
         InstrKind::CallArgPush { .. }
         | InstrKind::IndirectCallArgPush { .. }
         | InstrKind::IndirectCallArgLeafPush { .. }
+        | InstrKind::IndirectCallArgShadowRangePush { .. }
+        | InstrKind::CallArgShadowRangePush { .. }
+        | InstrKind::RetShadowRangePush { .. }
+        | InstrKind::RetShadowRangeTake { .. }
         | InstrKind::PtrUse { .. }
         | InstrKind::FnExit { .. } => 3,
         InstrKind::DirectCallScopeEnd { .. } | InstrKind::IndirectCallScopeEnd => 4,

@@ -90,6 +90,55 @@ impl MyOptimizationPass {
         }
     }
 
+    fn is_interior_mut_root_adt_path(path: &str) -> bool {
+        path.contains("::cell::UnsafeCell")
+            || path.contains("::cell::SyncUnsafeCell")
+            || path.contains("::cell::Cell")
+            || path.contains("::cell::RefCell")
+            || path.contains("::pin::UnsafePinned")
+    }
+
+    pub(in crate::instrumentation) fn known_interior_mut_root_for_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> bool {
+        if matches!(ty.kind(), TyKind::Slice(_) | TyKind::Str) {
+            return false;
+        }
+
+        if let TyKind::Adt(adt, _) = ty.kind() {
+            return Self::is_interior_mut_root_adt_path(&tcx.def_path_str(adt.did()));
+        }
+
+        if ty.has_param()
+            || ty.has_infer()
+            || ty.has_aliases()
+            || ty.has_opaque_types()
+            || ty.has_placeholders()
+        {
+            return false;
+        }
+
+        let typing_env = body.typing_env(tcx);
+        !ty.is_freeze(tcx, typing_env)
+    }
+
+    pub(in crate::instrumentation) fn known_interior_mut_root_for_ptr_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        ptr_ty: Ty<'tcx>,
+    ) -> bool {
+        match ptr_ty.kind() {
+            TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
+                self.known_interior_mut_root_for_ty(tcx, body, *pointee)
+            }
+            _ => false,
+        }
+    }
+
     pub(in crate::instrumentation) fn alias_exempt_for_ptr_ty<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -109,7 +158,7 @@ impl MyOptimizationPass {
         }
     }
 
-    pub(in crate::instrumentation) fn interior_mut_array_extent_for_source_place<'tcx>(
+    pub(in crate::instrumentation) fn interior_mut_extent_for_source_place<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &mut Body<'tcx>,
@@ -117,40 +166,53 @@ impl MyOptimizationPass {
         src: Place<'tcx>,
     ) -> Option<(Operand<'tcx>, SizeOperand<'tcx>, Vec<Statement<'tcx>>)> {
         let src_ty = src.ty(&body.local_decls, tcx).ty;
-        if !self.alias_exempt_root_for_ty(tcx, body, src_ty) {
+        if !self.known_interior_mut_root_for_ty(tcx, body, src_ty) {
             return None;
         }
 
-        match src.projection.last()? {
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {}
-            _ => return None,
-        }
+        if matches!(
+            src.projection.last(),
+            Some(ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. })
+        ) {
+            let base_place = PlaceRef {
+                local: src.local,
+                projection: &src.projection[..src.projection.len() - 1],
+            }
+            .to_place(tcx);
+            let base_ty = base_place.ty(&body.local_decls, tcx).ty;
+            let TyKind::Array(elem_ty, _) = base_ty.kind() else {
+                return None;
+            };
+            if *elem_ty != src_ty {
+                return None;
+            }
 
-        let base_place = PlaceRef {
-            local: src.local,
-            projection: &src.projection[..src.projection.len() - 1],
-        }
-        .to_place(tcx);
-        let base_ty = base_place.ty(&body.local_decls, tcx).ty;
-        let TyKind::Array(elem_ty, _) = base_ty.kind() else {
-            return None;
-        };
-        if *elem_ty != src_ty {
-            return None;
+            let extent_addr_local = body
+                .local_decls
+                .push(LocalDecl::new(tcx.types.usize, source_info.span));
+            let (extent_addr_stmt1, extent_addr_stmt2) = self.slot_addr_stmts_for_place(
+                tcx,
+                body,
+                source_info,
+                base_place,
+                extent_addr_local,
+                false,
+            )?;
+            let extent_len = self.size_operand_for_ty(tcx, body, base_ty, source_info.span);
+
+            return Some((
+                Operand::Copy(Place::from(extent_addr_local)),
+                extent_len,
+                vec![extent_addr_stmt1, extent_addr_stmt2],
+            ));
         }
 
         let extent_addr_local = body
             .local_decls
             .push(LocalDecl::new(tcx.types.usize, source_info.span));
-        let (extent_addr_stmt1, extent_addr_stmt2) = self.slot_addr_stmts_for_place(
-            tcx,
-            body,
-            source_info,
-            base_place,
-            extent_addr_local,
-            false,
-        )?;
-        let extent_len = self.size_operand_for_ty(tcx, body, base_ty, source_info.span);
+        let (extent_addr_stmt1, extent_addr_stmt2) =
+            self.slot_addr_stmts_for_place(tcx, body, source_info, src, extent_addr_local, false)?;
+        let extent_len = self.size_operand_for_ty(tcx, body, src_ty, source_info.span);
 
         Some((
             Operand::Copy(Place::from(extent_addr_local)),
