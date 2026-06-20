@@ -2089,6 +2089,7 @@ fn rz_effective_ref_align_req(
     requested_align
 }
 
+#[cfg(not(feature = "runtime_no_alignment_checks"))]
 fn rz_check_alignment(
     access_name: &str,
     tag: u64,
@@ -2148,6 +2149,19 @@ fn rz_check_alignment(
         "MISALIGNED_ACCESS",
         append_location_if_enabled(msg, "RZ_LOG_LOC"),
     );
+}
+
+#[cfg(feature = "runtime_no_alignment_checks")]
+#[inline(always)]
+fn rz_check_alignment(
+    _access_name: &str,
+    _tag: u64,
+    _addr: usize,
+    _size: usize,
+    _guaranteed_align: usize,
+    _required_align: usize,
+    _tmeta: Option<&TagMeta>,
+) {
 }
 
 fn call_arg_tags() -> &'static Mutex<HashMap<(ThreadId, u64, u64, usize), CallArgTagEntry>> {
@@ -2781,6 +2795,7 @@ fn rz_dyn_ref_align_from_slot(slot_addr: usize) -> usize {
 }
 
 /// Check alignment for untagged reference uses, where provenance was missing but MIR still has a ref.
+#[cfg(not(feature = "runtime_no_alignment_checks"))]
 fn rz_check_tagless_ref_alignment(addr: usize, align_req: usize, kind: PtrKind) {
     if align_req <= 1 || addr == 0 || addr % align_req == 0 {
         return;
@@ -2797,38 +2812,50 @@ fn rz_check_tagless_ref_alignment(addr: usize, align_req: usize, kind: PtrKind) 
     );
 }
 
+#[cfg(feature = "runtime_no_alignment_checks")]
+#[inline(always)]
+fn rz_check_tagless_ref_alignment(_addr: usize, _align_req: usize, _kind: PtrKind) {}
+
 #[no_mangle]
 pub extern "C" fn __rz_promise_symbolic_alignment(ptr: *const (), align: usize) {
-    let _g = RzRuntimeGuard::enter();
-    if !align.is_power_of_two() {
-        let msg = append_location_if_enabled(
-            format!("alignment must be a power of 2\nalign={align}"),
-            "RZ_LOG_LOC",
-        );
-        rz_violation("MISALIGNED_ACCESS", msg);
+    #[cfg(feature = "runtime_no_alignment_checks")]
+    {
+        let _ = (ptr, align);
         return;
     }
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
+    {
+        let _g = RzRuntimeGuard::enter();
+        if !align.is_power_of_two() {
+            let msg = append_location_if_enabled(
+                format!("alignment must be a power of 2\nalign={align}"),
+                "RZ_LOG_LOC",
+            );
+            rz_violation("MISALIGNED_ACCESS", msg);
+            return;
+        }
 
-    let addr = ptr as usize;
-    if addr != 0 && addr % align != 0 {
-        let msg = append_location_if_enabled(
+        let addr = ptr as usize;
+        if addr != 0 && addr % align != 0 {
+            let msg = append_location_if_enabled(
             format!(
                 "pointer is not actually aligned\naddr=0x{addr:x} promised_alignment={align} found_alignment={}",
                 rz_addr_alignment(addr)
             ),
             "RZ_LOG_LOC",
         );
-        rz_violation("MISALIGNED_ACCESS", msg);
-        return;
-    }
+            rz_violation("MISALIGNED_ACCESS", msg);
+            return;
+        }
 
-    let alloc_epoch = lookup_alloc_snapshot(addr)
-        .map(|(_, meta)| meta.epoch)
-        .unwrap_or(0);
-    let mut map = promised_alignments().lock().unwrap();
-    map.entry((addr, alloc_epoch))
-        .and_modify(|prev| *prev = (*prev).max(align))
-        .or_insert(align);
+        let alloc_epoch = lookup_alloc_snapshot(addr)
+            .map(|(_, meta)| meta.epoch)
+            .unwrap_or(0);
+        let mut map = promised_alignments().lock().unwrap();
+        map.entry((addr, alloc_epoch))
+            .and_modify(|prev| *prev = (*prev).max(align))
+            .or_insert(align);
+    }
 }
 
 /// Find the allocation whose range [base, base+size) contains `addr`.
@@ -4916,23 +4943,26 @@ pub fn __rz_ptr_write(
     }
     tmeta.alias_exempt |= access_alias_exempt_for_tag(tag, &tmeta, addr, size, access_alias_exempt);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
-    let guaranteed_align = tmeta
-        .align_req
-        .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
-    let align_req = if align_req != 0 {
-        align_req
-    } else {
-        tmeta.align_req
-    };
-    rz_check_alignment(
-        "WRITE",
-        tag,
-        addr,
-        size,
-        guaranteed_align,
-        align_req,
-        Some(&tmeta),
-    );
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
+    {
+        let guaranteed_align = tmeta
+            .align_req
+            .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
+        let align_req = if align_req != 0 {
+            align_req
+        } else {
+            tmeta.align_req
+        };
+        rz_check_alignment(
+            "WRITE",
+            tag,
+            addr,
+            size,
+            guaranteed_align,
+            align_req,
+            Some(&tmeta),
+        );
+    }
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         match active_alias_model().name() {
             // Tree Borrows tracks raws as first-class nodes in the tree.
@@ -5380,11 +5410,14 @@ pub fn __rz_local_write_allow_untagged(tag: u64, addr: usize, size: usize) {
         Some(PtrKind::RefShared | PtrKind::RawConst) => 0,
         _ => tag,
     };
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
     // This is a concrete write to a real stack slot, not a dereference through the parent's
     // pointee type. Use the slot's runtime address alignment instead of inheriting the parent's
     // stronger alignment guarantee, otherwise short-lived scalar locals can spuriously reuse an
     // outer container's alignment (e.g. `u8` loop items inheriting `IntoIter`'s `align=8`).
     let slot_align = rz_addr_alignment(addr);
+    #[cfg(feature = "runtime_no_alignment_checks")]
+    let slot_align = 0;
     let write_tag = __record_ref_creation(addr, 1, parent_tag, 0, size, slot_align);
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_write(write_tag, addr, size, slot_align, 0);
@@ -5481,23 +5514,26 @@ pub fn __rz_ptr_read(
     }
     tmeta.alias_exempt |= access_alias_exempt_for_tag(tag, &tmeta, addr, size, access_alias_exempt);
     let (addr, size) = normalize_const_end_ref_access_addr(&tmeta, addr, size);
-    let guaranteed_align = tmeta
-        .align_req
-        .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
-    let align_req = if align_req != 0 {
-        align_req
-    } else {
-        tmeta.align_req
-    };
-    rz_check_alignment(
-        "READ",
-        tag,
-        addr,
-        size,
-        guaranteed_align,
-        align_req,
-        Some(&tmeta),
-    );
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
+    {
+        let guaranteed_align = tmeta
+            .align_req
+            .max(rz_promised_alignment_for_addr(addr, tmeta.alloc_epoch));
+        let align_req = if align_req != 0 {
+            align_req
+        } else {
+            tmeta.align_req
+        };
+        rz_check_alignment(
+            "READ",
+            tag,
+            addr,
+            size,
+            guaranteed_align,
+            align_req,
+            Some(&tmeta),
+        );
+    }
     let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
         match active_alias_model().name() {
             // Tree Borrows tracks raws as first-class nodes in the tree.
@@ -8057,26 +8093,33 @@ pub extern "C" fn __record_ref_creation_with_extent(
     // `alias_exempt` is a creation flag bitfield emitted by instrumentation.
     let alias_exempt_flag = (alias_exempt & CREATION_FLAG_ALIAS_EXEMPT) != 0;
     let dynamic_bounds = (alias_exempt & CREATION_FLAG_REF_DYNAMIC_BOUNDS) != 0;
-    let requested_align = align_req;
-    let promised_align = if bounds_len_is_zero_sized_known(bounds_len) {
-        0
-    } else {
-        rz_promised_alignment_for_addr(
-            pointee_addr,
-            lookup_alloc_snapshot(pointee_addr)
-                .map(|(_, meta)| meta.epoch)
-                .unwrap_or(0),
-        )
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
+    let (align_req, required_align) = {
+        let requested_align = align_req;
+        let promised_align = if bounds_len_is_zero_sized_known(bounds_len) {
+            0
+        } else {
+            rz_promised_alignment_for_addr(
+                pointee_addr,
+                lookup_alloc_snapshot(pointee_addr)
+                    .map(|(_, meta)| meta.epoch)
+                    .unwrap_or(0),
+            )
+        };
+        let align_req = rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr)
+            .max(promised_align);
+        let required_align = if requested_align != 0 {
+            requested_align
+        } else {
+            align_req
+        };
+        (align_req, required_align)
     };
-    let align_req =
-        rz_effective_ref_align_req(requested_align, parent_tag, pointee_addr).max(promised_align);
-    let required_align = if requested_align != 0 {
-        requested_align
-    } else {
-        align_req
-    };
+    #[cfg(feature = "runtime_no_alignment_checks")]
+    let align_req = 0;
 
     let validate_start = rz_profile_start!(profile);
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
     if required_align != 0 && align_req != 0 && align_req < required_align {
         rz_check_alignment(
             "REF_CREATE",
@@ -8356,6 +8399,7 @@ pub extern "C" fn __record_raw_ptr_creation(
     let _g = RzRuntimeGuard::enter();
     let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let alias_exempt_flag = (alias_exempt & CREATION_FLAG_ALIAS_EXEMPT) != 0;
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
     let align_req =
         rz_effective_align_req(align_req, derived_from).max(rz_promised_alignment_for_addr(
             pointee_addr,
@@ -8363,6 +8407,8 @@ pub extern "C" fn __record_raw_ptr_creation(
                 .map(|(_, meta)| meta.epoch)
                 .unwrap_or(0),
         ));
+    #[cfg(feature = "runtime_no_alignment_checks")]
+    let align_req = 0;
     let propagate_exposed_provenance =
         (alias_exempt & CREATION_FLAG_RAW_PROPAGATE_EXPOSED_PROVENANCE) != 0;
     let projected_helper_parent = (alias_exempt & CREATION_FLAG_PROJECTED_HELPER_PARENT) != 0;
@@ -8623,9 +8669,14 @@ pub extern "C" fn __rz_ptr_use(
     let profile = rz_profile_context!();
     let _profile_guard = rz_profile_guard!(profile, ptr_use);
     let _g = RzRuntimeGuard::enter();
+    #[cfg(feature = "runtime_no_alignment_checks")]
+    let _ = (align_req, is_mut, dyn_ref_slot_addr);
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
     let dyn_align = rz_dyn_ref_align_from_slot(dyn_ref_slot_addr);
+    #[cfg(not(feature = "runtime_no_alignment_checks"))]
     let required_ref_align = align_req.max(dyn_align);
     if tag == 0 {
+        #[cfg(not(feature = "runtime_no_alignment_checks"))]
         if dyn_ref_slot_addr != 0 {
             let kind = if is_mut != 0 {
                 PtrKind::RefMut
@@ -8651,6 +8702,7 @@ pub extern "C" fn __rz_ptr_use(
     };
 
     if let Some(tmeta) = tmeta_for_use {
+        #[cfg(not(feature = "runtime_no_alignment_checks"))]
         if matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut) {
             let promised_align = if bounds_len_is_zero_sized_known(tmeta.bounds_len) {
                 0

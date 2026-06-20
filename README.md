@@ -188,11 +188,20 @@ or experimental cleanup paths:
   `RZ_TRACE_PTR_SHADOW`.
 - `runtime_tb_compaction`: compiles in the experimental TB-lite invalidated-tag compaction
   path controlled by `RZ_TB_COMPACT_INVALIDATED_TAGS`.
+- `runtime_no_alignment_checks`: compiles out `MISALIGNED_ACCESS` checks and their supporting
+  runtime alignment lookups. This is a fuzz-throughput mode; it will not detect real misaligned
+  reference/access UB.
 
 Pass these through AFL builds with `RUNTIME_FEATURES`, for example:
 
 ```bash
 RUNTIME_FEATURES=runtime_tb_compaction TARGET=smallvec PROFILE=release ./scripts/afl_build.sh
+```
+
+For fuzzing where alignment reports are intentionally disabled:
+
+```bash
+RUNTIME_FEATURES=runtime_no_alignment_checks TARGET=toml PROFILE=release ./scripts/afl_build.sh
 ```
 
 - `RZ_LOG`: Runtime log level (`trace`, `info`, `warn`); default `warn`.
