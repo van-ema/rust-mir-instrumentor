@@ -656,13 +656,99 @@ impl MyOptimizationPass {
             && (def_path.ends_with("::add")
                 || def_path.ends_with("::sub")
                 || def_path.ends_with("::offset")
-                || def_path.ends_with("::wrapping_add")
+                || def_path.ends_with("::byte_add")
+                || def_path.ends_with("::byte_sub"))
+    }
+
+    pub(in crate::instrumentation) fn ptr_derive_call_is_wrapping(&self, def_path: &str) -> bool {
+        def_path.contains("::ptr::")
+            && (def_path.ends_with("::wrapping_add")
                 || def_path.ends_with("::wrapping_sub")
                 || def_path.ends_with("::wrapping_offset")
-                || def_path.ends_with("::byte_add")
-                || def_path.ends_with("::byte_sub")
                 || def_path.ends_with("::wrapping_byte_add")
                 || def_path.ends_with("::wrapping_byte_sub"))
+    }
+
+    fn place_is_deref_of_local<'tcx>(&self, place: Place<'tcx>, local: Local) -> bool {
+        place.local == local
+            && place
+                .projection
+                .first()
+                .is_some_and(|elem| matches!(elem, ProjectionElem::Deref))
+    }
+
+    fn stmt_uses_local_as_deref<'tcx>(&self, stmt: &Statement<'tcx>, local: Local) -> bool {
+        let StatementKind::Assign(box (lhs, rhs)) = &stmt.kind else {
+            return false;
+        };
+        if self.place_is_deref_of_local(*lhs, local) {
+            return true;
+        }
+        match rhs {
+            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) | Rvalue::CopyForDeref(p) => {
+                self.place_is_deref_of_local(*p, local)
+            }
+            _ => false,
+        }
+    }
+
+    fn stmt_overwrites_local<'tcx>(&self, stmt: &Statement<'tcx>, local: Local) -> bool {
+        match &stmt.kind {
+            StatementKind::Assign(box (place, _)) => {
+                place.local == local && place.projection.is_empty()
+            }
+            StatementKind::StorageDead(dead) => *dead == local,
+            _ => false,
+        }
+    }
+
+    fn target_path_forces_deref_of_local<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        start: BasicBlock,
+        local: Local,
+    ) -> bool {
+        let mut current = start;
+        for _ in 0..8 {
+            let block = &body.basic_blocks[current];
+            for stmt in &block.statements {
+                if self.stmt_uses_local_as_deref(stmt, local) {
+                    return true;
+                }
+                if self.stmt_overwrites_local(stmt, local) {
+                    return false;
+                }
+            }
+
+            let Some(term) = &block.terminator else {
+                return false;
+            };
+            current = match &term.kind {
+                TerminatorKind::Goto { target } => *target,
+                TerminatorKind::Assert { target, .. } => *target,
+                _ => return false,
+            };
+        }
+        false
+    }
+
+    fn ptr_derive_call_strict_at_destination<'tcx>(
+        &self,
+        body: &Body<'tcx>,
+        def_path: Option<&str>,
+        call_target_bb: Option<BasicBlock>,
+        dst_local: Local,
+    ) -> bool {
+        let Some(def_path) = def_path else {
+            return false;
+        };
+        if self.ptr_derive_call_requires_strict_validation(def_path) {
+            return true;
+        }
+        self.ptr_derive_call_is_wrapping(def_path)
+            && call_target_bb.is_some_and(|target| {
+                self.target_path_forces_deref_of_local(body, target, dst_local)
+            })
     }
 
     pub(in crate::instrumentation) fn local_is_temp_like<'tcx>(
@@ -2242,9 +2328,12 @@ impl MyOptimizationPass {
                                             term,
                                             dst_local,
                                             dst_ty,
-                                            callee_path_opt.as_deref().is_some_and(|p| {
-                                                self.ptr_derive_call_requires_strict_validation(p)
-                                            }),
+                                            self.ptr_derive_call_strict_at_destination(
+                                                body,
+                                                callee_path_opt.as_deref(),
+                                                call_target_bb,
+                                                dst_local,
+                                            ),
                                             insert_points,
                                             tagged_ptr_locals,
                                         );
@@ -2270,9 +2359,12 @@ impl MyOptimizationPass {
                                         dst_local,
                                         dst_ty,
                                         src_local,
-                                        callee_path_opt.as_deref().is_some_and(|p| {
-                                            self.ptr_derive_call_requires_strict_validation(p)
-                                        }),
+                                        self.ptr_derive_call_strict_at_destination(
+                                            body,
+                                            callee_path_opt.as_deref(),
+                                            call_target_bb,
+                                            dst_local,
+                                        ),
                                         insert_points,
                                         tagged_ptr_locals,
                                         &mut classified_derive_ptr_local,

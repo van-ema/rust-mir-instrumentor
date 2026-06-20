@@ -7763,16 +7763,18 @@ impl MyOptimizationPass {
                             // derived raw view so TB-lite keeps it as tag-store metadata until an
                             // actual raw write needs access-local raw state.
                             flags |= CREATION_FLAG_TB_RAW_REUSE_PARENT_FAMILY;
-                            // For projected raw sources (`(*p).field`, etc.), preserve the helper
-                            // parent shape and validate the derived address eagerly.
+                            // Projected raw sources preserve helper-parent lineage, but only an
+                            // actual deref projection has eager validity requirements. Plain
+                            // projections and wrapper views can carry one-past metadata until a
+                            // later access/ref creation needs memory.
                             if !src.projection.is_empty() {
                                 flags |= CREATION_FLAG_PROJECTED_HELPER_PARENT;
-                                flags |= CREATION_FLAG_STRICT_RAW_CREATION_CHECK;
                             }
                             if matches!(src.projection.first(), Some(ProjectionElem::Deref))
                                 && !self
                                     .raw_creation_allows_no_provenance_transport(tcx, body, *src)
                             {
+                                flags |= CREATION_FLAG_STRICT_RAW_CREATION_CHECK;
                                 flags |= CREATION_FLAG_DEREF_RAW_CREATION;
                             }
                             flags
