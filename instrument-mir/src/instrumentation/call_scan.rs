@@ -708,6 +708,9 @@ impl MyOptimizationPass {
         start: BasicBlock,
         local: Local,
     ) -> bool {
+        // Best-effort immediate-deref detector for wrapping pointer calls. Keep this narrow:
+        // statement-level `*p` uses force eager validation, while call terminators such as
+        // `ptr::read(p)` are modeled by their access/call effects and validate at the actual use.
         let mut current = start;
         for _ in 0..8 {
             let block = &body.basic_blocks[current];

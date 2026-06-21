@@ -1238,7 +1238,7 @@ fn rz_has_exposed_provenance_root(tag: u64, tmeta: &TagMeta) -> bool {
     false
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum StrictRawDeriveLiveAlloc {
     Allows,
     Rejects,
@@ -1250,8 +1250,16 @@ fn strict_raw_derive_live_alloc_status(
     parent_meta: &TagMeta,
     pointee_addr: usize,
 ) -> StrictRawDeriveLiveAlloc {
+    if !parent_meta.origin_known {
+        return StrictRawDeriveLiveAlloc::Unknown;
+    }
+
+    // A strict derive that escaped cached origin bounds may only be rescued by the exact
+    // allocation origin that minted the parent tag. A broader containing allocation can be an
+    // overlapping stack/local record and must not widen strict pointer arithmetic.
     let amap = allocs().lock().unwrap();
-    let Some((base, meta)) = find_alloc_containing(&amap, parent_meta.pointee_addr) else {
+    let base = parent_meta.origin_base;
+    let Some(meta) = amap.get(&base) else {
         return StrictRawDeriveLiveAlloc::Unknown;
     };
     if !meta.live {
@@ -1261,6 +1269,14 @@ fn strict_raw_derive_live_alloc_status(
         return StrictRawDeriveLiveAlloc::Rejects;
     }
     let alloc_end = base.saturating_add(meta.size);
+    let parent_matches_origin = if meta.size == 0 {
+        parent_meta.pointee_addr == base
+    } else {
+        parent_meta.pointee_addr >= base && parent_meta.pointee_addr <= alloc_end
+    };
+    if !parent_matches_origin {
+        return StrictRawDeriveLiveAlloc::Rejects;
+    }
     let allowed = if meta.size == 0 {
         pointee_addr == base
     } else {
@@ -1271,6 +1287,81 @@ fn strict_raw_derive_live_alloc_status(
         StrictRawDeriveLiveAlloc::Allows
     } else {
         StrictRawDeriveLiveAlloc::Rejects
+    }
+}
+
+#[cfg(test)]
+mod strict_raw_derive_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static TEST_ALLOC_LOCK: Mutex<()> = Mutex::new(());
+
+    fn raw_parent_meta(origin_base: usize, origin_size: usize, epoch: u64) -> TagMeta {
+        TagMeta {
+            pointee_addr: origin_base + 4,
+            kind: PtrKind::RawMut,
+            parent: 0,
+            escaped: false,
+            alloc_epoch: epoch,
+            alloc_live_at_creation: true,
+            alias_exempt: false,
+            lineage_hint: 0,
+            exposed_provenance_root: false,
+            bounds_len: BOUNDS_LEN_UNKNOWN,
+            interior_mut_extent_base: 0,
+            interior_mut_extent_len: 0,
+            align_req: 1,
+            origin_known: true,
+            origin_base,
+            origin_end: origin_base + origin_size,
+        }
+    }
+
+    #[test]
+    fn strict_derive_does_not_widen_to_overlapping_containing_alloc() {
+        let _guard = TEST_ALLOC_LOCK.lock().unwrap();
+        let origin_base = 0x10_0000usize;
+        let enclosing_base = origin_base - 0x10;
+        let epoch = 17;
+
+        {
+            let mut amap = allocs().lock().unwrap();
+            amap.insert(
+                enclosing_base,
+                AllocMeta {
+                    live: true,
+                    epoch,
+                    size: 0x40,
+                    is_stack: true,
+                    is_const: false,
+                },
+            );
+            amap.insert(
+                origin_base,
+                AllocMeta {
+                    live: true,
+                    epoch,
+                    size: 0x8,
+                    is_stack: true,
+                    is_const: false,
+                },
+            );
+        }
+
+        let parent = raw_parent_meta(origin_base, 0x8, epoch);
+        assert_eq!(
+            strict_raw_derive_live_alloc_status(&parent, origin_base + 0x8),
+            StrictRawDeriveLiveAlloc::Allows
+        );
+        assert_eq!(
+            strict_raw_derive_live_alloc_status(&parent, origin_base + 0x10),
+            StrictRawDeriveLiveAlloc::Rejects
+        );
+
+        let mut amap = allocs().lock().unwrap();
+        amap.remove(&origin_base);
+        amap.remove(&enclosing_base);
     }
 }
 
