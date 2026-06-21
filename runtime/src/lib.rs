@@ -3809,6 +3809,10 @@ fn shadow_slot_value_addr(slot_addr: usize) -> usize {
     unsafe { ptr::read_unaligned(slot_addr as *const usize) }
 }
 
+/// Return whether `meta` can still describe the allocation instance holding `value_addr`.
+///
+/// This rejects stale heap tags after address reuse, while keeping stack/TLS tags permissive
+/// because those slots are reused within one frame and are tracked less precisely.
 #[inline]
 fn shadow_tag_epoch_matches_value(meta: &TagMeta, value_addr: usize) -> bool {
     if meta.alloc_epoch == 0 {
@@ -3827,6 +3831,11 @@ fn shadow_tag_epoch_matches_value(meta: &TagMeta, value_addr: usize) -> bool {
     }
 }
 
+/// Check that the shadow entry's exact pointer tag still matches the slot's pointer bits.
+///
+/// Raw tags are exact: a raw tag for `base` must not be reused after the slot is overwritten with
+/// `base + 8`. Reference tags may still act as same-allocation family anchors, so they can match a
+/// different address inside the same live allocation.
 #[inline]
 fn shadow_exact_tag_matches_slot_value(tag: u64, value_addr: usize) -> bool {
     if tag == 0 || value_addr == 0 {
@@ -3857,6 +3866,10 @@ fn shadow_exact_tag_matches_slot_value(tag: u64, value_addr: usize) -> bool {
             || meta_alloc.epoch == 0)
 }
 
+/// Check that a boundary anchor is still compatible with the slot's pointer value.
+///
+/// `ref_ancestor` and `export_parent` are family anchors used at call boundaries. They do not have
+/// to equal the exact pointer bits, but they must still describe the same live allocation family.
 #[inline]
 fn shadow_boundary_anchor_matches_slot_value(tag: u64, value_addr: usize) -> bool {
     if tag == 0 || value_addr == 0 {
@@ -3885,6 +3898,11 @@ fn shadow_boundary_anchor_matches_slot_value(tag: u64, value_addr: usize) -> boo
             || meta_alloc.epoch == 0)
 }
 
+/// Drop pointer-shadow metadata if it no longer matches the concrete pointer stored in the slot.
+///
+/// Shadow hooks run after the MIR assignment, so `slot_addr` already contains the new pointer
+/// value. If an old exact raw tag or boundary anchor would describe a different/dead allocation,
+/// return zero metadata instead of transporting stale provenance.
 #[inline]
 fn sanitize_shadow_entry_for_slot_value(
     slot_addr: usize,
