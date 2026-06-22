@@ -73,6 +73,7 @@ impl RzRuntimeGuard {
         Self
     }
 }
+
 impl Drop for RzRuntimeGuard {
     #[inline]
     fn drop(&mut self) {
@@ -1088,17 +1089,15 @@ fn rz_validate_strict_raw_creation_addr(
     kind: PtrKind,
     parent_tag: u64,
     exposed_provenance_root: bool,
+    strict_creation_check: bool,
     strict_provenance: bool,
     deref_projection_check: bool,
     bounds_len: usize,
 ) -> Option<(&'static str, String)> {
-    // Raw-pointer creation should reject missing provenance, and should still catch the common
-    // case of deriving an out-of-bounds raw from an in-bounds parent. However, some libraries
-    // intentionally use already-out-of-bounds raw values as integer metadata carriers and later
-    // reverse the arithmetic before any dereference (for example, `bytes` stores small offsets
-    // in pointer-typed fields and reconstructs the real base pointer in `rebuild_vec`).
-    // In that shape, eager OOB-on-derive is too strong: once the parent is already outside its
-    // origin range, defer bounds enforcement to actual access / ref creation.
+    // Plain raw creation is metadata transport and may carry one-past or otherwise
+    // non-dereferenceable values. Only strict pointer operations (`offset`, `add`, etc.) and MIR
+    // deref projections like `(*p).field` get eager validation; wrapping/helper views defer to a
+    // later access or reference creation.
     let Some(mut parent_meta) = tag_store::get(parent_tag) else {
         if exposed_provenance_root && (strict_provenance || deref_projection_check) {
             return Some((
@@ -1144,10 +1143,9 @@ fn rz_validate_strict_raw_creation_addr(
     }
 
     // Parent tags cache allocation-origin bounds at creation time. For same-base realloc growth,
-    // that cached origin can become stale within the same allocation epoch (for example
-    // `BytesMut` growing from 8 to 16 bytes in place). Refresh the parent's origin from the live
-    // alloc map before classifying a raw derive as OOB so we do not reject valid derives against
-    // the resized allocation.
+    // that cache can become stale within the same allocation epoch (for example `BytesMut`
+    // growing from 8 to 16 bytes in place). Refresh before deref validation and before the child
+    // tag inherits origin metadata from the parent.
     if let Some((base, ameta)) = alloc_from_origin_base(&parent_meta) {
         let epoch_matches = parent_meta.alloc_epoch == 0
             || ameta.epoch == 0
@@ -1195,25 +1193,25 @@ fn rz_validate_strict_raw_creation_addr(
         }
     }
 
-    let parent_already_oob = parent_meta.origin_known
-        && parent_meta.origin_end > parent_meta.origin_base
-        && (parent_meta.pointee_addr < parent_meta.origin_base
-            || parent_meta.pointee_addr > parent_meta.origin_end);
-
-    if !parent_already_oob
+    if strict_creation_check
         && parent_meta.origin_known
         && parent_meta.origin_end > parent_meta.origin_base
         && (pointee_addr < parent_meta.origin_base || pointee_addr > parent_meta.origin_end)
     {
-        return Some((
-            "OUT_OF_BOUNDS",
-            format!(
-                "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=RAW_DERIVE_OOB origin_base=0x{:x} origin_end=0x{:x} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
-                parent_meta.origin_base,
-                parent_meta.origin_end,
-                parent_meta.pointee_addr
-            ),
-        ));
+        match strict_raw_derive_live_alloc_status(&parent_meta, pointee_addr) {
+            StrictRawDeriveLiveAlloc::Allows => {}
+            StrictRawDeriveLiveAlloc::Rejects | StrictRawDeriveLiveAlloc::Unknown => {
+                return Some((
+                    "OUT_OF_BOUNDS",
+                    format!(
+                        "READ via raw derive addr=0x{pointee_addr:x} size=1\nreason=RAW_DERIVE_OOB origin_base=0x{:x} origin_end=0x{:x} kind={kind:?} parent={parent_tag}\nparent_pointee=0x{:x}",
+                        parent_meta.origin_base,
+                        parent_meta.origin_end,
+                        parent_meta.pointee_addr
+                    ),
+                ));
+            }
+        }
     }
 
     None
@@ -1238,6 +1236,133 @@ fn rz_has_exposed_provenance_root(tag: u64, tmeta: &TagMeta) -> bool {
         depth += 1;
     }
     false
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StrictRawDeriveLiveAlloc {
+    Allows,
+    Rejects,
+    Unknown,
+}
+
+#[inline]
+fn strict_raw_derive_live_alloc_status(
+    parent_meta: &TagMeta,
+    pointee_addr: usize,
+) -> StrictRawDeriveLiveAlloc {
+    if !parent_meta.origin_known {
+        return StrictRawDeriveLiveAlloc::Unknown;
+    }
+
+    // A strict derive that escaped cached origin bounds may only be rescued by the exact
+    // allocation origin that minted the parent tag. A broader containing allocation can be an
+    // overlapping stack/local record and must not widen strict pointer arithmetic.
+    let amap = allocs().lock().unwrap();
+    let base = parent_meta.origin_base;
+    let Some(meta) = amap.get(&base) else {
+        return StrictRawDeriveLiveAlloc::Unknown;
+    };
+    if !meta.live {
+        return StrictRawDeriveLiveAlloc::Rejects;
+    }
+    if parent_meta.alloc_epoch != 0 && meta.epoch != 0 && parent_meta.alloc_epoch != meta.epoch {
+        return StrictRawDeriveLiveAlloc::Rejects;
+    }
+    let alloc_end = base.saturating_add(meta.size);
+    let parent_matches_origin = if meta.size == 0 {
+        parent_meta.pointee_addr == base
+    } else {
+        parent_meta.pointee_addr >= base && parent_meta.pointee_addr <= alloc_end
+    };
+    if !parent_matches_origin {
+        return StrictRawDeriveLiveAlloc::Rejects;
+    }
+    let allowed = if meta.size == 0 {
+        pointee_addr == base
+    } else {
+        // Strict pointer arithmetic may produce the one-past value, but not beyond it.
+        pointee_addr >= base && pointee_addr <= alloc_end
+    };
+    if allowed {
+        StrictRawDeriveLiveAlloc::Allows
+    } else {
+        StrictRawDeriveLiveAlloc::Rejects
+    }
+}
+
+#[cfg(test)]
+mod strict_raw_derive_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static TEST_ALLOC_LOCK: Mutex<()> = Mutex::new(());
+
+    fn raw_parent_meta(origin_base: usize, origin_size: usize, epoch: u64) -> TagMeta {
+        TagMeta {
+            pointee_addr: origin_base + 4,
+            kind: PtrKind::RawMut,
+            parent: 0,
+            escaped: false,
+            alloc_epoch: epoch,
+            alloc_live_at_creation: true,
+            alias_exempt: false,
+            lineage_hint: 0,
+            exposed_provenance_root: false,
+            bounds_len: BOUNDS_LEN_UNKNOWN,
+            interior_mut_extent_base: 0,
+            interior_mut_extent_len: 0,
+            align_req: 1,
+            origin_known: true,
+            origin_base,
+            origin_end: origin_base + origin_size,
+        }
+    }
+
+    #[test]
+    fn strict_derive_does_not_widen_to_overlapping_containing_alloc() {
+        let _guard = TEST_ALLOC_LOCK.lock().unwrap();
+        let origin_base = 0x10_0000usize;
+        let enclosing_base = origin_base - 0x10;
+        let epoch = 17;
+
+        {
+            let mut amap = allocs().lock().unwrap();
+            amap.insert(
+                enclosing_base,
+                AllocMeta {
+                    live: true,
+                    epoch,
+                    size: 0x40,
+                    is_stack: true,
+                    is_const: false,
+                },
+            );
+            amap.insert(
+                origin_base,
+                AllocMeta {
+                    live: true,
+                    epoch,
+                    size: 0x8,
+                    is_stack: true,
+                    is_const: false,
+                },
+            );
+        }
+
+        let parent = raw_parent_meta(origin_base, 0x8, epoch);
+        assert_eq!(
+            strict_raw_derive_live_alloc_status(&parent, origin_base + 0x8),
+            StrictRawDeriveLiveAlloc::Allows
+        );
+        assert_eq!(
+            strict_raw_derive_live_alloc_status(&parent, origin_base + 0x10),
+            StrictRawDeriveLiveAlloc::Rejects
+        );
+
+        let mut amap = allocs().lock().unwrap();
+        amap.remove(&origin_base);
+        amap.remove(&enclosing_base);
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -3775,8 +3900,69 @@ fn shadow_slot_value_addr(slot_addr: usize) -> usize {
     unsafe { ptr::read_unaligned(slot_addr as *const usize) }
 }
 
+/// Return whether `meta` can still describe the allocation instance holding `value_addr`.
+///
+/// This rejects stale heap tags after address reuse, while keeping stack/TLS tags permissive
+/// because those slots are reused within one frame and are tracked less precisely.
 #[inline]
-fn shadow_ref_lineage_matches_value(tag: u64, value_addr: usize) -> bool {
+fn shadow_tag_epoch_matches_value(meta: &TagMeta, value_addr: usize) -> bool {
+    if meta.alloc_epoch == 0 {
+        return true;
+    }
+    match lookup_alloc_origin_snapshot(value_addr) {
+        Some((_base, alloc)) => {
+            alloc.live
+                && (alloc.is_stack
+                    || rz_stack_addr_hint(value_addr)
+                    || rz_tls_addr_hint(value_addr)
+                    || alloc.epoch == 0
+                    || alloc.epoch == meta.alloc_epoch)
+        }
+        None => rz_stack_addr_hint(value_addr) || rz_tls_addr_hint(value_addr),
+    }
+}
+
+/// Check that the shadow entry's exact pointer tag still matches the slot's pointer bits.
+///
+/// Raw tags are exact: a raw tag for `base` must not be reused after the slot is overwritten with
+/// `base + 8`. Reference tags may still act as same-allocation family anchors, so they can match a
+/// different address inside the same live allocation.
+#[inline]
+fn shadow_exact_tag_matches_slot_value(tag: u64, value_addr: usize) -> bool {
+    if tag == 0 || value_addr == 0 {
+        return true;
+    }
+
+    let Some(meta) = tag_store::get(tag) else {
+        return true;
+    };
+    if !matches!(meta.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        return meta.pointee_addr == 0
+            || (meta.pointee_addr == value_addr
+                && shadow_tag_epoch_matches_value(&meta, value_addr));
+    }
+    if meta.pointee_addr == 0 || meta.pointee_addr == value_addr {
+        return true;
+    }
+
+    let Some((value_base, value_alloc)) = lookup_alloc_snapshot(value_addr) else {
+        return false;
+    };
+    let Some((meta_base, meta_alloc)) = lookup_alloc_snapshot(meta.pointee_addr) else {
+        return meta.align_req <= 1 || value_addr % meta.align_req == 0;
+    };
+    value_base == meta_base
+        && (value_alloc.epoch == meta_alloc.epoch
+            || value_alloc.epoch == 0
+            || meta_alloc.epoch == 0)
+}
+
+/// Check that a boundary anchor is still compatible with the slot's pointer value.
+///
+/// `ref_ancestor` and `export_parent` are family anchors used at call boundaries. They do not have
+/// to equal the exact pointer bits, but they must still describe the same live allocation family.
+#[inline]
+fn shadow_boundary_anchor_matches_slot_value(tag: u64, value_addr: usize) -> bool {
     if tag == 0 || value_addr == 0 {
         return true;
     }
@@ -3803,6 +3989,11 @@ fn shadow_ref_lineage_matches_value(tag: u64, value_addr: usize) -> bool {
             || meta_alloc.epoch == 0)
 }
 
+/// Drop pointer-shadow metadata if it no longer matches the concrete pointer stored in the slot.
+///
+/// Shadow hooks run after the MIR assignment, so `slot_addr` already contains the new pointer
+/// value. If an old exact raw tag or boundary anchor would describe a different/dead allocation,
+/// return zero metadata instead of transporting stale provenance.
 #[inline]
 fn sanitize_shadow_entry_for_slot_value(
     slot_addr: usize,
@@ -3812,9 +4003,9 @@ fn sanitize_shadow_entry_for_slot_value(
     export_parent_recovered: u8,
 ) -> PtrShadowTransport {
     let value_addr = shadow_slot_value_addr(slot_addr);
-    if shadow_ref_lineage_matches_value(tag, value_addr)
-        && shadow_ref_lineage_matches_value(ref_ancestor, value_addr)
-        && shadow_ref_lineage_matches_value(export_parent, value_addr)
+    if shadow_exact_tag_matches_slot_value(tag, value_addr)
+        && shadow_boundary_anchor_matches_slot_value(ref_ancestor, value_addr)
+        && shadow_boundary_anchor_matches_slot_value(export_parent, value_addr)
     {
         return (tag, ref_ancestor, export_parent, export_parent_recovered);
     }
@@ -8553,6 +8744,7 @@ pub extern "C" fn __record_raw_ptr_creation(
             kind,
             resolved_parent,
             exposed_provenance_root,
+            strict_creation_check,
             strict_provenance,
             deref_creation_check,
             if bounds_len_is_known(bounds_len) {
