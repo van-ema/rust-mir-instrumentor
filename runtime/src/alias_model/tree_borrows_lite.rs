@@ -2974,7 +2974,10 @@ fn tb_lite_prepare_local_write(
             .filter(|node| {
                 alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch
             })
-            .filter(|node| tb_lite_raw_transport_family_marked(&tmap, node.tag, node.kind))
+            .filter(|node| {
+                tb_lite_raw_transport_family_marked(&tmap, node.tag, node.kind)
+                    || tb_lite_stale_raw_lineage_state_for_unique_write(node, addr, size)
+            })
             .map(|node| node.tag)
             .collect()
     } else {
@@ -3004,6 +3007,37 @@ fn tb_lite_prepare_local_write(
             let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
         }
     }
+}
+
+// A local `&mut` write is governed by its Unique lineage. If an unprotected raw
+// ancestor is Frozen only for bytes outside its own raw range, that state came
+// from TB-lite lazy/extra-range transport and should not block the write.
+fn tb_lite_stale_raw_lineage_state_for_unique_write(
+    node: &TbNode,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut)
+        || node.protected
+        || node.protector_shadow_depth != 0
+        || node.poisoned_by_protector_end
+    {
+        return false;
+    }
+
+    let access_len = tb_effective_access_len(size);
+    if tb_ranges_overlap(addr, access_len, node.start, node.len) {
+        return false;
+    }
+
+    let covered = tb_node_overlaps(node, addr, access_len);
+    let base_perm = if covered { node.perm } else { node.lazy_perm };
+    let effective_perm = if covered {
+        tb_effective_node_perm_for_access(node, addr, access_len, base_perm)
+    } else {
+        base_perm
+    };
+    matches!(effective_perm, TbPerm::Frozen)
 }
 
 // Some raw helpers are emitted as RawRoot after their immediate source was a
@@ -3509,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_raw_lineage_extra_range_is_not_retired_as_transport() {
+    fn stale_raw_lineage_extra_range_is_retired_before_unique_write() {
         let raw = next_test_tag();
         let unique = next_test_tag();
         let raw_addr = test_addr(raw);
@@ -3532,6 +3566,34 @@ mod tests {
         ));
 
         prepare_local_write_for_test(&mut tree, unique, &[unique, raw], write_addr, 1);
+
+        let raw_node = tree.nodes.get(&raw).expect("raw node remains present");
+        assert_eq!(raw_node.perm, TbPerm::Disabled);
+        assert!(!tb_is_live_node(raw_node));
+    }
+
+    #[test]
+    fn same_byte_raw_lineage_state_is_not_retired_before_unique_write() {
+        let raw = next_test_tag();
+        let unique = next_test_tag();
+        let raw_addr = test_addr(raw);
+
+        tag_store::insert(raw, test_meta(raw_addr, PtrKind::RawMut, 0));
+        tag_store::insert(unique, test_meta(raw_addr, PtrKind::RefMut, raw));
+
+        let raw_node = test_node(raw, 0, raw_addr, BorrowKind::RawMut, TbPerm::Frozen);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(raw_node);
+        tree.insert_node(test_node(
+            unique,
+            raw,
+            raw_addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+
+        prepare_local_write_for_test(&mut tree, unique, &[unique, raw], raw_addr, 1);
 
         let raw_node = tree.nodes.get(&raw).expect("raw node remains present");
         assert!(tb_is_live_node(raw_node));
