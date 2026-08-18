@@ -6,7 +6,10 @@ from scripts.example_outcomes import (
     expectation_matches,
     semantic_agreement,
 )
-from scripts.run_miri_comparison import derive_rusteze_class
+from scripts.run_miri_comparison import (
+    derive_rusteze_class,
+    discover_comparison_tests,
+)
 
 
 class ExampleOutcomeTests(unittest.TestCase):
@@ -52,6 +55,17 @@ class ExampleOutcomeTests(unittest.TestCase):
         }
         self.assertEqual(derive_rusteze_class(row, panicked=False), "ok")
         self.assertEqual(derive_rusteze_class(row, panicked=True), "panic")
+
+    def test_comparison_discovery_includes_tree_variants(self) -> None:
+        tests = discover_comparison_tests()
+        labels = [test.comparison_label for test in tests]
+        self.assertEqual(len(labels), len(set(labels)))
+        self.assertIn("miri_sb_exact::pass_invalid_shr_tuple@sb_lite", labels)
+        self.assertIn("miri_sb_exact::pass_invalid_shr_tuple@tb_lite", labels)
+        self.assertIn("tb_miri_micro::parent_read_kills_raw_child@tb_lite", labels)
+        self.assertIn("sb_miri_micro::wrapper_reborrow_swap_ok@tb_lite", labels)
+        self.assertIn("copy_alias_violation@tb_lite", labels)
+        self.assertIn("ret_provenance_cases::strict_raw_add_oob_no_deref_ub@tb_lite", labels)
 
 
 if __name__ == "__main__":
