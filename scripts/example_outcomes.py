@@ -32,3 +32,12 @@ def expectation_matches(expected: str, signature: str | None, panicked: bool) ->
     if normalized in PANIC_EXPECTATIONS:
         return observed_class == "panic"
     return observed_class == "violation" and signature == expected
+
+
+def semantic_agreement(candidate: str, reference: str) -> bool:
+    """Compare pass-versus-reject behavior while preserving diagnostic classes."""
+    if reference == "ok":
+        return candidate == "ok"
+    if reference == "reject":
+        return candidate in ("panic", "violation")
+    return False

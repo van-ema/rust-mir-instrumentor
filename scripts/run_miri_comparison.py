@@ -9,6 +9,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from example_outcomes import (
+        classify_expected,
+        classify_observed,
+        semantic_agreement,
+    )
+except ModuleNotFoundError:
+    from scripts.example_outcomes import (
+        classify_expected,
+        classify_observed,
+        semantic_agreement,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
@@ -136,19 +149,10 @@ def did_panic(log: Path | None) -> bool:
 
 
 def derive_rusteze_class(row: dict[str, str], panicked: bool) -> str:
-    expected = row["expected"].strip().lower()
-    observed = row["observed"].strip().lower()
-    if observed not in ("", "-"):
-        return "violation"
-    if panicked:
-        return "panic"
-    if expected in ("ok", "pass", "none") and observed in ("", "-"):
-        return "ok"
-    if expected in ("panic", "panics") and observed == "panic":
-        return "panic"
-    if expected not in ("ok", "pass", "none", "panic", "panics", "-", ""):
-        return "violation"
-    return "other"
+    observed = row["observed"].strip()
+    observed_panic = panicked or observed.lower() == "panic"
+    signature = None if observed.lower() in ("", "-", "panic") else observed
+    return classify_observed(signature, observed_panic)
 
 
 def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
@@ -233,10 +237,13 @@ def main() -> int:
     summary_path = run_dir / "summary.tsv"
     with summary_path.open("w") as f:
         f.write(
-            "label\torigin\trz_model\trusteze_status\trusteze_expected\trusteze_observed\trusteze_class\tmiri_mode\tmiri_exit\tmiri_class\tagree\n"
+            "label\torigin\trz_model\trusteze_status\trusteze_expected\t"
+            "rusteze_observed\texpectation_class\trusteze_class\tmiri_mode\t"
+            "miri_exit\tmiri_class\texpectation_agrees\tbehavior_agrees\n"
         )
 
-    agree = 0
+    expectation_agree = 0
+    behavior_agree = 0
     total = 0
     for test in tests:
         total += 1
@@ -247,13 +254,14 @@ def main() -> int:
             row,
             did_panic(rusteze_run_logs.get(test.label)),
         )
+        expectation_class = classify_expected(row["expected"])
         miri_exit, miri_class = run_miri(test, miri_dir)
-        same = (
-            (miri_class == "ok" and rusteze_class == "ok")
-            or (miri_class == "reject" and rusteze_class != "ok")
-        )
-        if same:
-            agree += 1
+        expectation_same = semantic_agreement(expectation_class, miri_class)
+        behavior_same = semantic_agreement(rusteze_class, miri_class)
+        if expectation_same:
+            expectation_agree += 1
+        if behavior_same:
+            behavior_agree += 1
         with summary_path.open("a") as f:
             f.write(
                 "\t".join(
@@ -264,18 +272,27 @@ def main() -> int:
                         row["status"],
                         row["expected"],
                         row["observed"],
+                        expectation_class,
                         rusteze_class,
                         test.miri_mode,
                         str(miri_exit),
                         miri_class,
-                        "yes" if same else "no",
+                        "yes" if expectation_same else "no",
+                        "yes" if behavior_same else "no",
                     ]
                 )
                 + "\n"
             )
 
     print(f"ported tests: {total}")
-    print(f"agreement: {agree}/{total} = {agree / total:.1%}")
+    print(
+        f"expectation agreement: {expectation_agree}/{total} = "
+        f"{expectation_agree / total:.1%}"
+    )
+    print(
+        f"behavior agreement: {behavior_agree}/{total} = "
+        f"{behavior_agree / total:.1%}"
+    )
     print(f"summary: {summary_path}")
     return 0
 

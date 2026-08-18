@@ -4,7 +4,9 @@ from scripts.example_outcomes import (
     classify_expected,
     classify_observed,
     expectation_matches,
+    semantic_agreement,
 )
+from scripts.run_miri_comparison import derive_rusteze_class
 
 
 class ExampleOutcomeTests(unittest.TestCase):
@@ -35,6 +37,21 @@ class ExampleOutcomeTests(unittest.TestCase):
         self.assertEqual(classify_expected("pass"), "ok")
         self.assertEqual(classify_expected("panic"), "panic")
         self.assertEqual(classify_expected("TREE_BORROWS_VIOLATION|WRITE|RawMut|4"), "violation")
+
+    def test_semantic_agreement_compares_pass_versus_reject(self) -> None:
+        self.assertTrue(semantic_agreement("ok", "ok"))
+        self.assertTrue(semantic_agreement("panic", "reject"))
+        self.assertTrue(semantic_agreement("violation", "reject"))
+        self.assertFalse(semantic_agreement("violation", "ok"))
+        self.assertFalse(semantic_agreement("ok", "reject"))
+
+    def test_comparison_does_not_infer_observation_from_expectation(self) -> None:
+        row = {
+            "expected": "TREE_BORROWS_VIOLATION|READ|RawConst|4",
+            "observed": "-",
+        }
+        self.assertEqual(derive_rusteze_class(row, panicked=False), "ok")
+        self.assertEqual(derive_rusteze_class(row, panicked=True), "panic")
 
 
 if __name__ == "__main__":
