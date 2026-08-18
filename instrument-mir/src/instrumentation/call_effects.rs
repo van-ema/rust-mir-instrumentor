@@ -1067,6 +1067,15 @@ static CALL_EFFECT_RULES: &[EffectRule] = &[
         "::load",
         CallEffect::Load,
     ),
+    // `Cell::set` performs an interior write through its shared receiver. Core is not
+    // instrumented, so model the effect at the call boundary just like atomic stores.
+    EffectRule::two(
+        MatchKind::Contains,
+        "::cell::Cell",
+        MatchKind::EndsWith,
+        "::set",
+        CallEffect::Store,
+    ),
     EffectRule::two(
         MatchKind::Contains,
         "::sync::atomic::Atomic",
@@ -1559,6 +1568,10 @@ mod tests {
         );
         assert_eq!(
             effect_for("core::sync::atomic::AtomicUsize::compare_exchange"),
+            CallEffect::Store
+        );
+        assert_eq!(
+            effect_for("core::cell::Cell::<i32>::set"),
             CallEffect::Store
         );
         assert_eq!(

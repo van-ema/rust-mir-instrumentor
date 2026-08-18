@@ -83,6 +83,7 @@ impl MyOptimizationPass {
                     || path.contains("::cell::SyncUnsafeCell")
                     || path.contains("::cell::Cell")
                     || path.contains("::cell::RefCell")
+                    || path.contains("::sync::atomic::Atomic")
                     || path.contains("::pin::UnsafePinned")
             }
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) => false,
@@ -95,6 +96,7 @@ impl MyOptimizationPass {
             || path.contains("::cell::SyncUnsafeCell")
             || path.contains("::cell::Cell")
             || path.contains("::cell::RefCell")
+            || path.contains("::sync::atomic::Atomic")
             || path.contains("::pin::UnsafePinned")
     }
 

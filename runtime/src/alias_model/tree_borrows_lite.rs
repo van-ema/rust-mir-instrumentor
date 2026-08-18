@@ -1171,7 +1171,7 @@ fn tb_lite_insert_tag_node(
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
     let parent = tb_lite_resolve_parent_for_new_node(tree, tmeta, kind);
-    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
+    let protected = tb_lite_mark_protected_if_pending(tag, parent, tmeta.parent, kind);
     tb_lite_mark_inplace_protected_if_pending(tag, parent, tmeta.parent, tmeta.pointee_addr, kind);
     let node = TbNode {
         tag,
@@ -1366,8 +1366,15 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 ///
 /// For nested same-slot `&mut` calls we keep only the innermost protected Unique active; older
 /// protected Unique ancestors remain live but are shadowed until the inner call exits.
-fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) -> bool {
-    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique) || parent == 0 {
+fn tb_lite_mark_protected_if_pending(
+    tag: u64,
+    parent: u64,
+    transported_parent: u64,
+    kind: BorrowKind,
+) -> bool {
+    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+        || (parent == 0 && transported_parent == 0)
+    {
         return false;
     }
     let mut frames = tb_protector_frames().lock().unwrap();
@@ -1375,7 +1382,11 @@ fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) ->
     let Some(top) = frames.iter_mut().rfind(|f| f.thread_id == thread_id) else {
         return false;
     };
-    let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
+    let Some(pos) = top
+        .pending_parent_tags
+        .iter()
+        .position(|p| *p == parent || *p == transported_parent)
+    else {
         return false;
     };
     top.pending_parent_tags.swap_remove(pos);
@@ -2033,8 +2044,13 @@ fn tb_lite_check(
     size: usize,
     access: AliasAccessKind,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled() || rz_sb_suppressed() {
         return None;
+    }
+    if tmeta.alias_exempt {
+        return tb_lite_check_alias_exempt_protector_conflict(
+            sb_tag, orig_tag, tmeta, addr, size, access,
+        );
     }
     if !matches!(
         tmeta.kind,
@@ -2574,6 +2590,67 @@ fn tb_lite_check(
         let _ = tb_compact_invalidated_roots(tree, roots, compact_invalidated);
     }
 
+    None
+}
+
+/// Interior-mutable accesses normally bypass TB-lite transitions, but they are not allowed to
+/// disable an unrelated protected borrow whose pointee is not itself interior-mutable.
+fn tb_lite_check_alias_exempt_protector_conflict(
+    sb_tag: u64,
+    orig_tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+    access: AliasAccessKind,
+) -> Option<String> {
+    if !matches!(access, AliasAccessKind::Write) {
+        return None;
+    }
+
+    let all = tb_state().lock().unwrap();
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, sb_tag], addr);
+    let tree = all.get(&base)?;
+    let access_tag = if tree.nodes.contains_key(&sb_tag) {
+        sb_tag
+    } else if tree.nodes.contains_key(&orig_tag) {
+        orig_tag
+    } else {
+        return None;
+    };
+    let tmap = tags().lock().unwrap();
+    let mut protected_tags = tree.protected_tags.clone();
+    protected_tags.sort_unstable();
+    for protected_tag in protected_tags {
+        let Some(protected) = tree.nodes.get(&protected_tag) else {
+            continue;
+        };
+        if protected.tag == access_tag
+            || !tb_is_live_node(protected)
+            || !tb_protector_active(protected)
+            || !matches!(protected.kind, BorrowKind::Shared | BorrowKind::Unique)
+            || !tb_node_overlaps(protected, addr, size)
+            || tb_is_ancestor(&tree.nodes, protected.tag, access_tag)
+            || tmap.get(&protected.tag).is_some_and(|meta| {
+                meta.alias_exempt
+                    || tb_range_covers(
+                        meta.interior_mut_extent_base,
+                        meta.interior_mut_extent_len,
+                        addr,
+                        size,
+                    )
+            })
+            || (tmeta.alloc_epoch != 0
+                && protected.alloc_epoch != 0
+                && protected.alloc_epoch != tmeta.alloc_epoch)
+        {
+            continue;
+        }
+
+        return Some(format!(
+            "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+            access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+        ));
+    }
     None
 }
 
