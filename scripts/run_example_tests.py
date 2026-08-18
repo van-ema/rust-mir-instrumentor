@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from example_outcomes import classify_observed, expectation_matches
+
 
 def die(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -448,14 +450,10 @@ def main() -> int:
                     break
                 continue
 
-            expected_lower = (expected or "").lower()
-            matched = False
-            if expected_lower in ("ok", "pass", "none"):
-                matched = observed is None and not panicked
-            elif expected_lower in ("panic", "panics"):
-                matched = panicked and observed is None
-            elif expected is not None:
-                matched = observed == expected
+            matched = (
+                expected is not None
+                and expectation_matches(expected, observed, panicked)
+            )
             if matched:
                 break
 
@@ -477,37 +475,20 @@ def main() -> int:
 
         if expected is None:
             # Missing expectations are allowed; record what we saw and move on.
+            observed_text = observed or ("panic" if panicked else "-")
             with summary_file.open("a") as f:
-                f.write(f"{label}\tmissing\t-\t{observed or '-'}\n")
+                f.write(f"{label}\tmissing\t-\t{observed_text}\n")
             continue
 
-        expected_lower = expected.lower()
-        if expected_lower in ("ok", "pass", "none"):
-            if observed is None:
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tok\t{expected}\t-\n")
-            else:
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tmismatch\t{expected}\t{observed}\n")
-                failures += 1
-        elif expected_lower in ("panic", "panics"):
-            # "panic" means we expect a Rust panic/abort without a RUSTEZE violation signature.
-            if panicked and observed is None:
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tok\t{expected}\tpanic\n")
-            else:
-                observed_text = observed or ("-" if not panicked else "panic")
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tmismatch\t{expected}\t{observed_text}\n")
-                failures += 1
+        observed_class = classify_observed(observed, panicked)
+        observed_text = observed or ("panic" if observed_class == "panic" else "-")
+        if expectation_matches(expected, observed, panicked):
+            with summary_file.open("a") as f:
+                f.write(f"{label}\tok\t{expected}\t{observed_text}\n")
         else:
-            if observed == expected:
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tok\t{expected}\t{observed}\n")
-            else:
-                with summary_file.open("a") as f:
-                    f.write(f"{label}\tmismatch\t{expected}\t{observed or '-'}\n")
-                failures += 1
+            with summary_file.open("a") as f:
+                f.write(f"{label}\tmismatch\t{expected}\t{observed_text}\n")
+            failures += 1
 
     if ran == 0:
         die(f"No examples matched EXAMPLE_FILTER={example_filter!r}")
