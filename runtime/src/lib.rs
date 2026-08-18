@@ -8467,10 +8467,20 @@ pub extern "C" fn __record_ref_creation_with_extent(
     };
     let mut interior_mut_extent_base = interior_mut_extent_base;
     let mut interior_mut_extent_len = interior_mut_extent_len;
-    if interior_mut_extent_len == 0 && resolved_parent_tag != 0 {
+    if resolved_parent_tag != 0 {
         if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-            (interior_mut_extent_base, interior_mut_extent_len) =
+            let (parent_extent_base, parent_extent_len) =
                 tag_interior_mut_extent_from_self_or_parent(&parent_meta);
+            let extent_end = interior_mut_extent_base.saturating_add(interior_mut_extent_len);
+            let parent_extent_end = parent_extent_base.saturating_add(parent_extent_len);
+            if interior_mut_extent_len == 0
+                || (parent_extent_len != 0
+                    && interior_mut_extent_base >= parent_extent_base
+                    && extent_end <= parent_extent_end)
+            {
+                (interior_mut_extent_base, interior_mut_extent_len) =
+                    (parent_extent_base, parent_extent_len);
+            }
         }
     }
     let insert_start = rz_profile_start!(profile);

@@ -269,6 +269,13 @@ fn rz_tb_trace_enabled() -> bool {
 }
 
 #[inline]
+fn rz_tb_no_precise_interior_mut_enabled() -> bool {
+    std::env::var("RZ_TB_NO_PRECISE_INTERIOR_MUT")
+        .ok()
+        .is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+#[inline]
 #[cfg(feature = "runtime_tb_compaction")]
 fn rz_tb_compact_invalidated_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -2228,6 +2235,10 @@ fn tb_lite_check(
             continue;
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
+        let ancestor_read = matches!(access, AliasAccessKind::Read)
+            && access_tag != 0
+            && matches!(n.kind, BorrowKind::RawMut)
+            && tb_is_ancestor(&tree.nodes, access_tag, n.tag);
         let covered = tb_node_overlaps(&n, addr, size);
         // `perm` is for ranges this node already covers. `lazy_perm` is the
         // node's default permission for same-allocation bytes that have not
@@ -2250,6 +2261,11 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Read, true, perm, _) => perm,
+
+            // Reading through an ancestor does not act as a foreign access on
+            // its descendants. A direct/root-place read still has no ancestor
+            // tag and follows the normal foreign-read transition.
+            (AliasAccessKind::Read, false, perm, _) if ancestor_read => perm,
 
             // Foreign read:
             // - protected Reserved becomes conflicted
@@ -2807,6 +2823,9 @@ fn tb_raw_write_within_explicit_interior_mut_extent(
 ) -> bool {
     if !matches!(tmeta.kind, PtrKind::RawMut) {
         return false;
+    }
+    if rz_tb_no_precise_interior_mut_enabled() {
+        return true;
     }
     tb_range_covers(
         tmeta.interior_mut_extent_base,

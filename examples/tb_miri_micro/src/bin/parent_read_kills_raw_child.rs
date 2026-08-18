@@ -1,6 +1,7 @@
 // Inspired by miri/tests/fail/tree_borrows/parent_read_freezes_raw_mut.rs.
-// Tree Borrows rule: reading through the parent unique reference invalidates
-// descendant mutable/raw children for future writes.
+// Reading through the ancestor unique reference does not act as a foreign
+// access on its raw child. A direct access through the root place is different
+// and is covered by `miri_tb_exact::parent_read_freezes_raw_mut`.
 fn main() {
     let mut root = 6u8;
     let mref = &mut root;

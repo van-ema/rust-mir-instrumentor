@@ -1,8 +1,7 @@
 // Ported from miri/tests/pass/tree_borrows/cell-inside-struct.rs.
-//! Miri has a permissive variant of this test with precise interior-mutability
-//! tracking disabled. Rusteze now always uses the precise interior-mut extent
-//! model, so the write that escapes the `Cell` field's explicit extent remains
-//! a TB-lite frozen-write violation here.
+//! The same as Miri's fail test, but with precise interior-mutability tracking
+//! explicitly disabled. Rusteze honors that opt-in revision without changing
+//! the sound default model.
 //@compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-no-precise-interior-mut
 #[path = "../../utils/mod.rs"]
 #[macro_use]
@@ -34,8 +33,8 @@ pub fn main() {
         // Writing to `field2`, which is interior mutable, should be allowed.
         (*a).field2.set(10);
 
-        // Under rusteze's always-precise interior-mut model, this write is
-        // outside the `Cell` field's explicit writable extent and should fail.
+        // With precise tracking disabled, the surrounding allocation carries
+        // the Cell permission and this write is allowed.
         (*a).field1 = 88;
     }
 }
