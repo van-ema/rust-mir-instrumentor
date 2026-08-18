@@ -1,5 +1,6 @@
 // Ported from miri/tests/fail/both_borrows/pass_invalid_shr_tuple.rs.
-// Intent: passing invalidated shared refs through tuple should violate SB-lite.
+// Intent: passing invalidated shared refs through a tuple should be rejected by
+// both Stacked Borrows and Tree Borrows.
 fn foo(_: (&i32, &i32)) {}
 
 fn main() {

@@ -7364,6 +7364,16 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     validate_call_arg_boundary_tag(tag, 0);
 }
 
+/// Validate one statically projected reference leaf of a by-value call carrier.
+#[no_mangle]
+pub extern "C" fn __rz_validate_call_arg_ref_leaf(slot_addr: usize, ptr_addr: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_take);
+    let _g = RzRuntimeGuard::enter();
+    let tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
+    validate_call_arg_boundary_tag(tag, ptr_addr);
+}
+
 /// Push the exact shadow of one internal pointer leaf of a by-value aggregate argument.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_leaf_shadow(

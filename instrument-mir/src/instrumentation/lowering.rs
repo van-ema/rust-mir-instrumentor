@@ -6093,6 +6093,7 @@ impl MyOptimizationPass {
                 InstrKind::CallArgLeafPush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
                 | InstrKind::ArgLeafTake { .. }
+                | InstrKind::CallArgLeafValidate
                 | InstrKind::CallArgShadowRangePush { .. }
                 | InstrKind::IndirectCallArgShadowRangePush { .. }
                 | InstrKind::ArgShadowRangeTake { .. } => {
@@ -6990,6 +6991,36 @@ impl MyOptimizationPass {
                     .into_boxed_slice();
 
                     let _ = local;
+                    (args, Place::from(tmp_unit))
+                }
+
+                InstrKind::CallArgLeafValidate => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let ptr_addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let Some((ptr_addr_stmt1, ptr_addr_stmt2)) =
+                        self.addr_stmts_for_place(tcx, body, source_info, place, ptr_addr_local)
+                    else {
+                        continue;
+                    };
+                    if let Some(stmt) = ptr_addr_stmt1 {
+                        extra_stmts.push(stmt);
+                    }
+                    extra_stmts.push(ptr_addr_stmt2);
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: Operand::Copy(Place::from(ptr_addr_local)),
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
                     (args, Place::from(tmp_unit))
                 }
 

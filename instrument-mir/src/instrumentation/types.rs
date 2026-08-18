@@ -323,6 +323,9 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     CallArgValidate {
         local: Local,
     },
+    /// Caller-side validation for one statically projectable reference leaf in
+    /// a by-value aggregate such as `(&T, &U)`.
+    CallArgLeafValidate,
     /// Caller-side: export one exact pointer field from a by-value aggregate.
     ///
     /// Example: for `Source { input: &str }`, send `input`, not a borrow of `Source`.
@@ -623,6 +626,7 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_shadow_range: DefId,
     pub(in crate::instrumentation) def_id_validate_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_validate_call_arg_ref_leaf: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag_anchor: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_leaf_shadow: DefId,

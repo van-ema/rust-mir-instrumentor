@@ -2597,14 +2597,34 @@ impl MyOptimizationPass {
                 });
             }
             if !self.is_pointer_ty(ty) && self.ty_contains_direct_ref_fields(tcx, ty) {
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx: block_data.statements.len(),
-                    insert_before: false,
-                    source_info: term.source_info,
-                    place: p,
-                    kind: InstrKind::CallArgValidate { local: p.local },
-                });
+                let mut validated_leaf = false;
+                if matches!(ty.kind(), TyKind::Tuple(_)) {
+                    for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(tcx, body, p, ty)
+                    {
+                        if !matches!(leaf_spec.ty.kind(), TyKind::Ref(..)) {
+                            continue;
+                        }
+                        validated_leaf = true;
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: leaf_spec.place,
+                            kind: InstrKind::CallArgLeafValidate,
+                        });
+                    }
+                }
+                if !validated_leaf {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind: InstrKind::CallArgValidate { local: p.local },
+                    });
+                }
             }
             if !self.is_pointer_ty(ty) {
                 continue;

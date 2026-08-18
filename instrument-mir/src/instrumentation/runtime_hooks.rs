@@ -78,6 +78,7 @@ impl MyOptimizationPass {
                 hooks.def_id_push_indirect_call_arg_shadow_range
             }
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
+            InstrKind::CallArgLeafValidate => hooks.def_id_validate_call_arg_ref_leaf,
             InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
             InstrKind::CallArgShadowRangePush { .. } => hooks.def_id_push_call_arg_shadow_range,
             InstrKind::CallArgLeafClear { .. } => hooks.def_id_clear_call_arg_leaf_shadows,
@@ -305,6 +306,9 @@ impl MyOptimizationPass {
         let def_id_validate_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
             .expect("missing '__rz_validate_call_arg_tag' definition");
+        let def_id_validate_call_arg_ref_leaf = self
+            .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_ref_leaf", 2)
+            .expect("missing '__rz_validate_call_arg_ref_leaf' definition");
         let def_id_take_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag", 4)
             .expect("missing '__rz_take_call_arg_tag' definition");
@@ -452,6 +456,7 @@ impl MyOptimizationPass {
             def_id_push_indirect_call_arg_leaf_shadow,
             def_id_push_indirect_call_arg_shadow_range,
             def_id_validate_call_arg_tag,
+            def_id_validate_call_arg_ref_leaf,
             def_id_take_call_arg_tag,
             def_id_take_call_arg_tag_anchor,
             def_id_push_call_arg_leaf_shadow,
