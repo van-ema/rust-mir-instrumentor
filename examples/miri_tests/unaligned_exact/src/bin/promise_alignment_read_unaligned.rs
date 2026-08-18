@@ -28,12 +28,12 @@ fn main() {
     #[derive(Copy, Clone)]
     struct Align16(#[allow(dead_code)] u128);
 
-    let align16 = if align8.addr() % 16 == 0 {
+    let align8_not16 = if align8.addr() % 16 == 8 {
         align8
     } else {
         align8.wrapping_add(2)
     };
-    assert!(align16.addr() % 16 == 0);
+    assert_eq!(align8_not16.addr() % 16, 8);
 
-    let _val = unsafe { align8.cast::<Align16>().read() };
+    let _val = unsafe { align8_not16.cast::<Align16>().read() };
 }
