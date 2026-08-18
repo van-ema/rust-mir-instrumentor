@@ -667,10 +667,9 @@ fn tb_lite_validate_call_arg_boundary_parent(
             .as_ref()
             .is_some_and(|parent| matches!(parent.kind, PtrKind::RawConst | PtrKind::RawMut))
     {
-        // A raw-to-`&mut` call argument is not just exporting an existing ref family: this boundary
-        // materializes mutable reference authority from raw provenance. Keep the TB read-retag
-        // transition here so protector/lazy-interior-mutability cases observe the same state change
-        // they would get from a real retag, while ordinary ref-rooted arguments use the cheap path.
+        if tb_lite_raw_to_mut_call_arg_boundary_can_skip_read(tag, addr) {
+            return tb_lite_validate_raw_to_mut_call_arg_boundary(tag, tmeta, addr, size);
+        }
         return tb_lite_check(tag, tag, tmeta, addr, size, AliasAccessKind::Read);
     }
 
@@ -764,6 +763,165 @@ fn tb_lite_validate_call_arg_boundary_parent(
                 msg.push_str(&dump);
                 return Some(msg);
             }
+        }
+    }
+
+    None
+}
+
+fn tb_lite_raw_to_mut_call_arg_boundary_can_skip_read(tag: u64, addr: usize) -> bool {
+    if tb_lite_inplace_protected_tag(tag) {
+        return false;
+    }
+
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let Some(tree) = all.get(&base) else {
+        return true;
+    };
+    if !tree.nodes.contains_key(&tag) {
+        return true;
+    }
+    if tree.protected_tags.iter().any(|protected_tag| {
+        tree.nodes.get(protected_tag).is_some_and(|node| {
+            tb_protector_active(node)
+                || node.protector_shadow_depth != 0
+                || node.poisoned_by_protector_end
+        })
+    }) {
+        return false;
+    }
+
+    tb_collect_lineage(&tree.nodes, tag)
+        .iter()
+        .filter_map(|lineage_tag| tree.nodes.get(lineage_tag))
+        .all(|node| {
+            !node.protected && node.protector_shadow_depth == 0 && !node.poisoned_by_protector_end
+        })
+}
+
+/// Validate a raw-to-`&mut` call-argument retag without modeling a pointee read.
+///
+/// The boundary imports mutable reference authority from raw provenance, but no byte is loaded at
+/// the boundary itself. A full `Read` transition would materialize lazy lineage ranges and can make
+/// an old raw transport ancestor look like a real frozen same-byte reader before the callee's first
+/// write. Keep this check diagnostic-only; the actual callee read/write still goes through the
+/// normal access transition.
+fn tb_lite_validate_raw_to_mut_call_arg_boundary(
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+) -> Option<String> {
+    #[cfg(feature = "runtime_tb_compaction")]
+    {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+            return Some(tb_lite_invalidated_tombstone_msg(
+                compacted,
+                tmeta,
+                addr,
+                size,
+                AliasAccessKind::Read,
+            ));
+        }
+    }
+
+    let inplace_protected = tb_lite_inplace_protected_tag(tag);
+    let base = tb_base_for_addr(addr);
+    let all = tb_state().lock().unwrap();
+    let Some(tree) = all.get(&base) else {
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted,
+                    tmeta,
+                    addr,
+                    size,
+                    AliasAccessKind::Read,
+                ));
+            }
+        }
+        return None;
+    };
+
+    tb_lite_validate_raw_to_mut_call_arg_boundary_in_tree(
+        tree,
+        tag,
+        tmeta,
+        addr,
+        size,
+        inplace_protected,
+    )
+}
+
+fn tb_lite_validate_raw_to_mut_call_arg_boundary_in_tree(
+    tree: &TbAllocState,
+    tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+    inplace_protected: bool,
+) -> Option<String> {
+    let Some(node) = tree.nodes.get(&tag) else {
+        #[cfg(feature = "runtime_tb_compaction")]
+        {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[tag]) {
+                return Some(tb_lite_invalidated_tombstone_msg(
+                    compacted,
+                    tmeta,
+                    addr,
+                    size,
+                    AliasAccessKind::Read,
+                ));
+            }
+        }
+        return None;
+    };
+
+    if tmeta.alloc_epoch != 0 && node.alloc_epoch != 0 && node.alloc_epoch != tmeta.alloc_epoch {
+        return None;
+    }
+
+    let dump = if rz_tb_dump_enabled() {
+        tb_dump(tree, tag, addr, size, AliasAccessKind::Read)
+    } else {
+        String::new()
+    };
+    if inplace_protected {
+        let mut msg = format!(
+            "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INPLACE_CALL_ARG",
+            tag, addr, size, tmeta.kind
+        );
+        msg.push_str(&dump);
+        return Some(msg);
+    }
+    if !tb_is_live_node(node) {
+        let mut msg = format!(
+            "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_INVALIDATED",
+            tag, addr, size, tmeta.kind
+        );
+        msg.push_str(&dump);
+        return Some(msg);
+    }
+
+    for ancestor_tag in tb_collect_lineage(&tree.nodes, tag).iter().copied().skip(1) {
+        let Some(ancestor) = tree.nodes.get(&ancestor_tag) else {
+            continue;
+        };
+        if tmeta.alloc_epoch != 0
+            && ancestor.alloc_epoch != 0
+            && ancestor.alloc_epoch != tmeta.alloc_epoch
+        {
+            continue;
+        }
+        if !tb_is_live_node(ancestor) {
+            let mut msg = format!(
+                "READ via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_DISABLED_ANCESTOR ancestor_tag={}",
+                tag, addr, size, tmeta.kind, ancestor.tag
+            );
+            msg.push_str(&dump);
+            return Some(msg);
         }
     }
 
@@ -2816,7 +2974,10 @@ fn tb_lite_prepare_local_write(
             .filter(|node| {
                 alloc_epoch == 0 || node.alloc_epoch == 0 || node.alloc_epoch == alloc_epoch
             })
-            .filter(|node| tb_lite_raw_transport_family_marked(&tmap, node.tag, node.kind))
+            .filter(|node| {
+                tb_lite_raw_transport_family_marked(&tmap, node.tag, node.kind)
+                    || tb_lite_stale_raw_lineage_state_for_unique_write(node, addr, size)
+            })
             .map(|node| node.tag)
             .collect()
     } else {
@@ -2846,6 +3007,37 @@ fn tb_lite_prepare_local_write(
             let _ = tb_compact_invalidated_roots(tree, &compact_roots, compact_invalidated);
         }
     }
+}
+
+// A local `&mut` write is governed by its Unique lineage. If an unprotected raw
+// ancestor is Frozen only for bytes outside its own raw range, that state came
+// from TB-lite lazy/extra-range transport and should not block the write.
+fn tb_lite_stale_raw_lineage_state_for_unique_write(
+    node: &TbNode,
+    addr: usize,
+    size: usize,
+) -> bool {
+    if !matches!(node.kind, BorrowKind::RawConst | BorrowKind::RawMut)
+        || node.protected
+        || node.protector_shadow_depth != 0
+        || node.poisoned_by_protector_end
+    {
+        return false;
+    }
+
+    let access_len = tb_effective_access_len(size);
+    if tb_ranges_overlap(addr, access_len, node.start, node.len) {
+        return false;
+    }
+
+    let covered = tb_node_overlaps(node, addr, access_len);
+    let base_perm = if covered { node.perm } else { node.lazy_perm };
+    let effective_perm = if covered {
+        tb_effective_node_perm_for_access(node, addr, access_len, base_perm)
+    } else {
+        base_perm
+    };
+    matches!(effective_perm, TbPerm::Frozen)
 }
 
 // Some raw helpers are emitted as RawRoot after their immediate source was a
@@ -3289,6 +3481,163 @@ mod tests {
             protector_shadow_depth: 0,
             poisoned_by_protector_end: false,
         }
+    }
+
+    fn prepare_local_write_for_test(
+        tree: &mut TbAllocState,
+        access_tag: u64,
+        access_lineage: &[u64],
+        addr: usize,
+        size: usize,
+    ) {
+        tb_lite_prepare_local_write(
+            tree,
+            access_tag,
+            access_lineage,
+            addr,
+            size,
+            1,
+            #[cfg(feature = "runtime_tb_compaction")]
+            false,
+        );
+    }
+
+    #[test]
+    fn raw_to_mut_call_arg_boundary_does_not_materialize_raw_ranges() {
+        let raw = next_test_tag();
+        let unique = next_test_tag();
+        let raw_addr = test_addr(raw);
+        let write_addr = raw_addr + 8;
+
+        tag_store::insert(raw, test_meta(raw_addr, PtrKind::RawMut, 0));
+        let unique_meta = test_meta(write_addr, PtrKind::RefMut, raw);
+        tag_store::insert(unique, unique_meta);
+
+        let mut raw_node = test_node(raw, 0, raw_addr, BorrowKind::RawMut, TbPerm::Active);
+        raw_node.lazy_perm = TbPerm::Frozen;
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(raw_node);
+        tree.insert_node(test_node(
+            unique,
+            raw,
+            write_addr,
+            BorrowKind::Unique,
+            TbPerm::Reserved { conflicted: false },
+        ));
+
+        assert!(tb_lite_validate_raw_to_mut_call_arg_boundary_in_tree(
+            &tree,
+            unique,
+            &unique_meta,
+            write_addr,
+            1,
+            false,
+        )
+        .is_none());
+
+        let raw_node = tree.nodes.get(&raw).expect("raw node remains tracked");
+        assert!(raw_node.extra_ranges.is_empty());
+        assert_eq!(raw_node.perm, TbPerm::Active);
+        assert_eq!(raw_node.lazy_perm, TbPerm::Frozen);
+    }
+
+    #[test]
+    fn stale_raw_lineage_extra_range_is_retired_before_unique_write() {
+        let raw = next_test_tag();
+        let unique = next_test_tag();
+        let raw_addr = test_addr(raw);
+        let write_addr = raw_addr + 8;
+
+        tag_store::insert(raw, test_meta(raw_addr, PtrKind::RawMut, 0));
+        tag_store::insert(unique, test_meta(write_addr, PtrKind::RefMut, raw));
+
+        let mut raw_node = test_node(raw, 0, raw_addr, BorrowKind::RawMut, TbPerm::Frozen);
+        raw_node.extra_ranges.push((write_addr, 1));
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(raw_node);
+        tree.insert_node(test_node(
+            unique,
+            raw,
+            write_addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+
+        prepare_local_write_for_test(&mut tree, unique, &[unique, raw], write_addr, 1);
+
+        let raw_node = tree.nodes.get(&raw).expect("raw node remains present");
+        assert_eq!(raw_node.perm, TbPerm::Disabled);
+        assert!(!tb_is_live_node(raw_node));
+    }
+
+    #[test]
+    fn same_byte_raw_lineage_state_is_not_retired_before_unique_write() {
+        let raw = next_test_tag();
+        let unique = next_test_tag();
+        let raw_addr = test_addr(raw);
+
+        tag_store::insert(raw, test_meta(raw_addr, PtrKind::RawMut, 0));
+        tag_store::insert(unique, test_meta(raw_addr, PtrKind::RefMut, raw));
+
+        let raw_node = test_node(raw, 0, raw_addr, BorrowKind::RawMut, TbPerm::Frozen);
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(raw_node);
+        tree.insert_node(test_node(
+            unique,
+            raw,
+            raw_addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+
+        prepare_local_write_for_test(&mut tree, unique, &[unique, raw], raw_addr, 1);
+
+        let raw_node = tree.nodes.get(&raw).expect("raw node remains present");
+        assert!(tb_is_live_node(raw_node));
+        assert_eq!(raw_node.perm, TbPerm::Frozen);
+    }
+
+    #[test]
+    fn marked_raw_lineage_transport_is_retired_before_unique_write() {
+        let parent = next_test_tag();
+        let raw = next_test_tag();
+        let unique = next_test_tag();
+        let parent_addr = test_addr(parent);
+        let write_addr = parent_addr + 8;
+
+        tag_store::insert(parent, test_meta(parent_addr, PtrKind::RefMut, 0));
+        let mut raw_meta = test_meta(parent_addr, PtrKind::RawMut, parent);
+        raw_meta.lineage_hint = TB_LITE_HINT_RAW_REUSE_PARENT_FAMILY;
+        tag_store::insert(raw, raw_meta);
+        tag_store::insert(unique, test_meta(write_addr, PtrKind::RefMut, raw));
+
+        let mut parent_node = test_node(parent, 0, parent_addr, BorrowKind::Unique, TbPerm::Active);
+        parent_node.len = 16;
+        let mut raw_node = test_node(raw, parent, parent_addr, BorrowKind::RawMut, TbPerm::Frozen);
+        raw_node.extra_ranges.push((write_addr, 1));
+
+        let mut tree = TbAllocState::default();
+        tree.insert_node(parent_node);
+        tree.insert_node(raw_node);
+        tree.insert_node(test_node(
+            unique,
+            raw,
+            write_addr,
+            BorrowKind::Unique,
+            TbPerm::Active,
+        ));
+
+        prepare_local_write_for_test(&mut tree, unique, &[unique, raw, parent], write_addr, 1);
+
+        let raw_node = tree
+            .nodes
+            .get(&raw)
+            .expect("raw transport node remains present");
+        assert_eq!(raw_node.perm, TbPerm::Disabled);
+        assert!(!tb_is_live_node(raw_node));
     }
 
     #[test]
