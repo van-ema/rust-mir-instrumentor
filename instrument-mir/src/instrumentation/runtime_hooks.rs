@@ -36,7 +36,8 @@ impl MyOptimizationPass {
             InstrKind::PtrUse { .. } => hooks.def_id_use,
             InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
-            InstrKind::ShadowStoreAllocRoot { .. } => hooks.def_id_shadow_store_alloc_root,
+            InstrKind::BoxOwnerCreate { .. } => hooks.def_id_box_owner_create,
+            InstrKind::BoxOwnerIntoRaw { .. } => hooks.def_id_box_owner_into_raw,
             InstrKind::ShadowStoreExternalAllocRoot { .. } => {
                 hooks.def_id_shadow_store_external_alloc_root
             }
@@ -86,6 +87,8 @@ impl MyOptimizationPass {
                 hooks.def_id_take_call_arg_tag
             }
             InstrKind::ArgAnchorSeedFromShadow { .. } => hooks.def_id_shadow_load_tag,
+            InstrKind::ArgBoxOwnerRetag { .. } => hooks.def_id_box_owner_call_retag,
+            InstrKind::BoxOwnerAnchorSeed { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
             InstrKind::ArgShadowRangeTake { .. } => hooks.def_id_take_call_arg_shadow_range,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
@@ -387,9 +390,15 @@ impl MyOptimizationPass {
         let def_id_shadow_store_ptr_local = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr_local", 5)
             .expect("missing '__rz_shadow_store_ptr_local' definition");
-        let def_id_shadow_store_alloc_root = self
-            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_alloc_root", 5)
-            .expect("missing '__rz_shadow_store_alloc_root' definition");
+        let def_id_box_owner_create = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_create", 6)
+            .expect("missing '__rz_box_owner_create' definition");
+        let def_id_box_owner_call_retag = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_call_retag", 5)
+            .expect("missing '__rz_box_owner_call_retag' definition");
+        let def_id_box_owner_into_raw = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_into_raw", 5)
+            .expect("missing '__rz_box_owner_into_raw' definition");
         let def_id_shadow_store_external_alloc_root = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_store_external_alloc_root", 5)
             .expect("missing '__rz_shadow_store_external_alloc_root' definition");
@@ -483,7 +492,9 @@ impl MyOptimizationPass {
             def_id_exit_fn,
             def_id_shadow_store_ptr,
             def_id_shadow_store_ptr_local,
-            def_id_shadow_store_alloc_root,
+            def_id_box_owner_create,
+            def_id_box_owner_call_retag,
+            def_id_box_owner_into_raw,
             def_id_shadow_store_external_alloc_root,
             def_id_shadow_load_tag,
             def_id_shadow_load_tag_for_ptr,

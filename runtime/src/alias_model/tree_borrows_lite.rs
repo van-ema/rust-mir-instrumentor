@@ -981,7 +981,10 @@ fn tb_lite_validate_ref_creation(
     if !rz_tb_lite_enabled() || alias_exempt || rz_alias_suppressed() {
         return None;
     }
-    if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
+    if !matches!(
+        new_kind,
+        PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+    ) {
         return None;
     }
 
@@ -1017,7 +1020,7 @@ fn tb_lite_validate_ref_creation(
             && parent_node.poisoned_by_protector_end
         {
             let access_name = match new_kind {
-                PtrKind::RefMut => "WRITE",
+                PtrKind::RefMut | PtrKind::OwnedUnique => "WRITE",
                 PtrKind::RefShared => "READ",
                 _ => "READ",
             };
@@ -1040,7 +1043,7 @@ fn tb_lite_validate_ref_creation(
         return None;
     };
 
-    if !matches!(new_kind, PtrKind::RefMut) {
+    if !matches!(new_kind, PtrKind::RefMut | PtrKind::OwnedUnique) {
         // Shared reborrows still validate that the immediate parent tag itself is alive (above),
         // but they defer overlap/freeze behavior to access-time transitions.
         return None;
@@ -1260,7 +1263,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 
     let kind = match tmeta.kind {
         PtrKind::RefShared => BorrowKind::Shared,
-        PtrKind::RefMut => BorrowKind::Unique,
+        PtrKind::RefMut | PtrKind::OwnedUnique => BorrowKind::Unique,
         PtrKind::RawConst => BorrowKind::RawConst,
         PtrKind::RawMut => BorrowKind::RawMut,
         _ => return,
@@ -3318,7 +3321,10 @@ fn tb_lineage_contains(lineage: &[u64], tag: u64) -> bool {
 fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
         let t = tmap.get(&tag)?;
-        if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        if matches!(
+            t.kind,
+            PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+        ) {
             return Some(tag);
         }
         if t.parent == 0 {
@@ -3336,7 +3342,12 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
 ) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
         let t = tmap.get(&tag)?;
-        if nodes.contains_key(&tag) && matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        if nodes.contains_key(&tag)
+            && matches!(
+                t.kind,
+                PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+            )
+        {
             return Some(tag);
         }
         if t.parent == 0 {

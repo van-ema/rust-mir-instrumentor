@@ -270,13 +270,33 @@ impl MyOptimizationPass {
                         arg_ty,
                     );
                     if let [seed_spec] = seed_specs.as_slice() {
+                        let kind = if let Some(pointee_ty) = self.box_pointee_ty(tcx, arg_ty) {
+                            InstrKind::ArgBoxOwnerRetag {
+                                callee_id,
+                                local: arg_local,
+                                size_op: self.size_operand_for_ty(
+                                    tcx,
+                                    body,
+                                    pointee_ty,
+                                    entry_source_info.span,
+                                ),
+                                align_op: self.align_operand_for_ty(
+                                    tcx,
+                                    body,
+                                    pointee_ty,
+                                    entry_source_info.span,
+                                ),
+                            }
+                        } else {
+                            InstrKind::ArgAnchorSeedFromShadow { local: arg_local }
+                        };
                         insert_points.push(InsertPoint {
                             bb: entry_bb,
                             stmt_idx: entry_stmt_idx,
                             insert_before: false,
                             source_info: entry_source_info,
                             place: seed_spec.place,
-                            kind: InstrKind::ArgAnchorSeedFromShadow { local: arg_local },
+                            kind,
                         });
                     }
                 }

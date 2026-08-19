@@ -1895,6 +1895,8 @@ pub struct AllocMeta {
 pub enum PtrKind {
     RefShared,
     RefMut,
+    /// Owning unique authority carried by containers such as `Box<T>`.
+    OwnedUnique,
     RawConst,
     RawMut,
 }
@@ -4087,35 +4089,117 @@ pub extern "C" fn __rz_shadow_store_ptr_local(
     );
 }
 
+#[inline]
+fn rz_store_box_owner_shadow(slot_addr: usize, ptr_addr: usize, tag: u64) {
+    if slot_addr == 0 {
+        return;
+    }
+    if ptr_addr == 0 || tag == 0 {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+    ptr_shadow::store_ptr(slot_addr, tag, tag, tag, 0);
+}
+
+/// Create the owning unique authority stored in a newly-created `Box<T>`.
+///
+/// `require_parent` distinguishes `Box::from_raw` from allocation constructors. Missing raw
+/// metadata must not be replaced with a root owner because that would invent provenance.
 #[no_mangle]
-pub extern "C" fn __rz_shadow_store_alloc_root(
+pub extern "C" fn __rz_box_owner_create(
+    slot_addr: usize,
+    ptr_addr: usize,
+    parent_tag: u64,
+    require_parent: u8,
+    bounds_len: usize,
+    align_req: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    if slot_addr == 0 || ptr_addr == 0 {
+        rz_store_box_owner_shadow(slot_addr, ptr_addr, 0);
+        return 0;
+    }
+    if require_parent != 0
+        && (parent_tag == 0
+            || !tag_store::get(parent_tag)
+                .is_some_and(|meta| matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)))
+    {
+        rz_store_box_owner_shadow(slot_addr, ptr_addr, 0);
+        return 0;
+    }
+    let tag = record_ref_or_owner_creation_with_extent(
+        ptr_addr,
+        PtrKind::OwnedUnique,
+        parent_tag,
+        0,
+        bounds_len,
+        align_req,
+        0,
+        0,
+    );
+    rz_store_box_owner_shadow(slot_addr, ptr_addr, tag);
+    tag
+}
+
+/// Retag a by-value Box argument as a fresh protected owning unique authority.
+#[no_mangle]
+pub extern "C" fn __rz_box_owner_call_retag(
+    callee_id: u64,
+    slot_addr: usize,
+    ptr_addr: usize,
+    bounds_len: usize,
+    align_req: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let parent_tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
+    if parent_tag == 0
+        || !tag_store::get(parent_tag).is_some_and(|meta| {
+            matches!(meta.kind, PtrKind::OwnedUnique)
+                && active_alias_model().can_recover_parent_tag(parent_tag)
+        })
+    {
+        return 0;
+    }
+    let boundary_id = active_call_boundary_id(callee_id);
+    active_alias_model().on_call_arg_anchor_taken(boundary_id, parent_tag);
+    let tag = record_ref_or_owner_creation_with_extent(
+        ptr_addr,
+        PtrKind::OwnedUnique,
+        parent_tag,
+        0,
+        bounds_len,
+        align_req,
+        0,
+        0,
+    );
+    rz_store_box_owner_shadow(slot_addr, ptr_addr, tag);
+    tag
+}
+
+/// Convert a consumed Box owner into a raw child without changing allocation liveness.
+#[no_mangle]
+pub extern "C" fn __rz_box_owner_into_raw(
     slot_addr: usize,
     ptr_addr: usize,
     is_mut: u8,
     bounds_len: usize,
     align_req: usize,
-) {
-    let profile = rz_profile_context!();
-    let _profile_guard = rz_profile_guard!(profile, shadow_store);
+) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    if slot_addr == 0 {
-        return;
+    let parent_tag = current_slot_shadow(slot_addr)
+        .map(|shadow| shadow.0)
+        .filter(|tag| {
+            tag_store::get(*tag).is_some_and(|meta| {
+                matches!(meta.kind, PtrKind::OwnedUnique)
+                    && active_alias_model().can_recover_parent_tag(*tag)
+            })
+        })
+        .unwrap_or(0);
+    ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+    if parent_tag == 0 || ptr_addr == 0 {
+        return 0;
     }
-    if ptr_addr == 0 {
-        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
-        return;
-    }
-
-    // Allocation constructors produce a new owner pointer. Its provenance starts at the
-    // current allocation instance, even if the allocator reused an old numeric address.
-    let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
-    ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
-    if rz_trace_ptr_shadow_enabled() {
-        eprintln!(
-            "[rusteze-runtime][ptr-shadow] store_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
-            slot_addr, ptr_addr, tag
-        );
-    }
+    __record_raw_ptr_creation(ptr_addr, is_mut, parent_tag, 0, bounds_len, align_req)
 }
 
 #[no_mangle]
@@ -8246,15 +8330,37 @@ pub extern "C" fn __record_ref_creation_with_extent(
     interior_mut_extent_base: usize,
     interior_mut_extent_len: usize,
 ) -> u64 {
-    let profile = rz_profile_context!();
-    let _profile_guard = rz_profile_guard!(profile, ref_create);
-    let _g = RzRuntimeGuard::enter();
-    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 {
         PtrKind::RefMut
     } else {
         PtrKind::RefShared
     };
+    record_ref_or_owner_creation_with_extent(
+        pointee_addr,
+        kind,
+        parent_tag,
+        alias_exempt,
+        bounds_len,
+        align_req,
+        interior_mut_extent_base,
+        interior_mut_extent_len,
+    )
+}
+
+fn record_ref_or_owner_creation_with_extent(
+    pointee_addr: usize,
+    kind: PtrKind,
+    parent_tag: u64,
+    alias_exempt: u8,
+    bounds_len: usize,
+    align_req: usize,
+    interior_mut_extent_base: usize,
+    interior_mut_extent_len: usize,
+) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ref_create);
+    let _g = RzRuntimeGuard::enter();
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let normalized_const_end_ref = pointee_addr != 0
         && pointee_addr != normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
     let pointee_addr = normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
@@ -8299,7 +8405,11 @@ pub extern "C" fn __record_ref_creation_with_extent(
             None,
         );
     }
-    if !alias_exempt_flag {
+    // Creating an owner records authority; it is not itself a pointee access. In particular,
+    // `Box::from_raw` with a mismatched layout must remain observable at the later deallocation
+    // check instead of being reported early as a reference-creation OOB. Actual Box dereferences
+    // still go through the ordinary access checks below this metadata layer.
+    if !alias_exempt_flag && matches!(kind, PtrKind::RefShared | PtrKind::RefMut) {
         if let Some((vk, msg)) = rz_validate_ref_creation_addr(
             pointee_addr,
             kind,
@@ -8510,6 +8620,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
         PtrKind::RefMut => "mut",
+        PtrKind::OwnedUnique => "owned_unique",
         _ => "?",
     };
     rz_trace!(
@@ -8600,8 +8711,12 @@ pub extern "C" fn __record_raw_ptr_creation(
     // these casts do not freeze an otherwise-valid unique/raw-mutable lineage.
     let inherits_write_capability = derived_from != 0
         && projected_helper_parent
-        && tag_store::get(derived_from)
-            .is_some_and(|parent| matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut));
+        && tag_store::get(derived_from).is_some_and(|parent| {
+            matches!(
+                parent.kind,
+                PtrKind::RefMut | PtrKind::OwnedUnique | PtrKind::RawMut
+            )
+        });
     let kind = if is_mut != 0 || inherits_write_capability {
         PtrKind::RawMut
     } else {
