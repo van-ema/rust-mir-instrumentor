@@ -1629,58 +1629,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sb_lite_conflict"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_cross_lineage_fields_ok"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_parent_read_after_field_reborrow"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_raw_cast_from_ref"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_raw_from_ref_fn"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_raw_read_after_unique"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_raw_transmute"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_raw_write_after_unique"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_shared_after_unique_read"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_shared_live_then_write"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_shared_then_write_ok"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_two_mut"
-version = "0.1.0"
-
-[[package]]
-name = "sb_lite_unsafe_cell_raw_read_ok"
-version = "0.1.0"
-
-[[package]]
 name = "sb_miri_micro"
 version = "0.1.0"
 

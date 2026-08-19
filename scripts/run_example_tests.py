@@ -22,7 +22,7 @@ def trim(s: str) -> str:
 
 def extract_signature(log_path: Path) -> str | None:
     def signature_priority(kind: str) -> int:
-        if "TREE_BORROWS_VIOLATION" in kind or "STACKED_BORROWS_VIOLATION" in kind:
+        if "TREE_BORROWS_VIOLATION" in kind:
             return 4
         if kind == "USE_AFTER_DEAD" or kind == "STALE_POINTER_EPOCH_MISMATCH":
             return 3
@@ -106,9 +106,7 @@ def normalize_alias_model(raw: str | None) -> str:
     if not raw:
         return "tb_lite"
     model = raw.strip().lower()
-    if model in ("", "sb", "sb_lite", "stacked_borrows"):
-        return "sb_lite"
-    if model in ("tb", "tb_lite", "tree_borrows"):
+    if model in ("", "tb", "tb_lite", "tree_borrows"):
         return "tb_lite"
     if model in ("none", "off"):
         return "none"

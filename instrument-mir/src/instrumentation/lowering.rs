@@ -7629,8 +7629,7 @@ impl MyOptimizationPass {
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
                         InstrKind::Ref { bk, src, .. } => {
-                            let use_projectionless_anchor = matches!(bk, BorrowKind::Mut { .. })
-                                || self.compile_alias_model_is_sb_like();
+                            let use_projectionless_anchor = matches!(bk, BorrowKind::Mut { .. });
                             if let Some(local) =
                                 projected_ref_parent_local.or(projectionless_ref_parent_local)
                             {
@@ -8059,10 +8058,7 @@ impl MyOptimizationPass {
                             ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                         {
                             let use_projectionless_anchor = match &creation_kind {
-                                InstrKind::Ref { bk, .. } => {
-                                    matches!(bk, BorrowKind::Mut { .. })
-                                        || self.compile_alias_model_is_sb_like()
-                                }
+                                InstrKind::Ref { bk, .. } => matches!(bk, BorrowKind::Mut { .. }),
                                 _ => true,
                             };
                             let parent_op = if let Some(local) =

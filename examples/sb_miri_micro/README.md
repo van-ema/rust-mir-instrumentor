@@ -1,16 +1,13 @@
 # sb_miri_micro
 
-Small, deterministic micro-tests inspired by `miri/tests/fail/**` that exercise the
-SB-lite ("Stacked Borrows lite") checking in rusteze.
+Small, deterministic micro-tests inspired by `miri/tests/fail/**`, retained as
+Tree Borrows regression cases in rusteze.
 
 ## How it works
 
 - Each file in `src/bin/*.rs` is a standalone test program.
 - Expected outcomes live in `expected.<bin>.rz` and are compared by
   `scripts/run_example_tests.py`.
-  - Model-specific overrides are supported:
-    - `expected.<bin>.tb_lite.rz`
-    - `expected.<bin>.sb_lite.rz`
   - Use `ok` if no violation should be reported.
   - Otherwise use the signature format emitted by the test runner:
     `KIND|ACCESS|POINTER_KIND|SIZE`

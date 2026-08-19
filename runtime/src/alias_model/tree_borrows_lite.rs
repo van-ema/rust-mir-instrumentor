@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, boundary_survivor_tags_for_callee,
-    bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing, rz_sb_suppressed,
-    rz_violation, tag_store, tags, PtrKind, TagMeta,
+    bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing,
+    rz_alias_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 #[cfg(feature = "runtime_tb_compaction")]
@@ -384,14 +384,14 @@ impl AliasModel for TreeBorrowsLiteModel {
 
     fn check_access(
         &self,
-        sb_tag: u64,
+        access_tag: u64,
         orig_tag: u64,
         tmeta: &TagMeta,
         addr: usize,
         size: usize,
         access: AliasAccessKind,
     ) -> Option<String> {
-        tb_lite_check(sb_tag, orig_tag, tmeta, addr, size, access)
+        tb_lite_check(access_tag, orig_tag, tmeta, addr, size, access)
     }
 }
 
@@ -608,7 +608,7 @@ fn tb_lite_validate_ref_mut_boundary_retag(
 ) -> Option<String> {
     if !rz_tb_lite_enabled()
         || tmeta.alias_exempt
-        || rz_sb_suppressed()
+        || rz_alias_suppressed()
         || !matches!(tmeta.kind, PtrKind::RefMut)
     {
         return None;
@@ -662,7 +662,7 @@ fn tb_lite_validate_call_arg_boundary_parent(
 ) -> Option<String> {
     if !rz_tb_lite_enabled()
         || tmeta.alias_exempt
-        || rz_sb_suppressed()
+        || rz_alias_suppressed()
         || !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
     {
         return None;
@@ -978,7 +978,7 @@ fn tb_lite_validate_ref_creation(
     alias_exempt: bool,
     bounds_len: usize,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled() || alias_exempt || rz_alias_suppressed() {
         return None;
     }
     if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
@@ -2037,19 +2037,19 @@ fn tb_full_transition_candidate_tags(
 }
 
 fn tb_lite_check(
-    sb_tag: u64,
+    model_tag: u64,
     orig_tag: u64,
     tmeta: &TagMeta,
     addr: usize,
     size: usize,
     access: AliasAccessKind,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled() || rz_alias_suppressed() {
         return None;
     }
     if tmeta.alias_exempt {
         return tb_lite_check_alias_exempt_protector_conflict(
-            sb_tag, orig_tag, tmeta, addr, size, access,
+            model_tag, orig_tag, tmeta, addr, size, access,
         );
     }
     if !matches!(
@@ -2061,7 +2061,7 @@ fn tb_lite_check(
 
     #[cfg(feature = "runtime_tb_compaction")]
     {
-        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, model_tag]) {
             return Some(tb_lite_invalidated_tombstone_msg(
                 compacted, tmeta, addr, size, access,
             ));
@@ -2074,11 +2074,11 @@ fn tb_lite_check(
     let compact_invalidated = rz_tb_compact_invalidated_enabled();
 
     let mut all = tb_state().lock().unwrap();
-    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, sb_tag], addr);
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, model_tag], addr);
     let Some(tree) = all.get_mut(&base) else {
         #[cfg(feature = "runtime_tb_compaction")]
         {
-            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, model_tag]) {
                 return Some(tb_lite_invalidated_tombstone_msg(
                     compacted, tmeta, addr, size, access,
                 ));
@@ -2104,13 +2104,15 @@ fn tb_lite_check(
     let mut access_tag = if tree.nodes.contains_key(&orig_tag) {
         orig_tag
     } else {
-        sb_tag
+        model_tag
     };
 
     let Some(mut node) = tree.nodes.get(&access_tag).cloned() else {
         #[cfg(feature = "runtime_tb_compaction")]
         {
-            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag, access_tag]) {
+            if let Some(compacted) =
+                tb_compacted_invalidated_hit(&[orig_tag, model_tag, access_tag])
+            {
                 return Some(tb_lite_invalidated_tombstone_msg(
                     compacted, tmeta, addr, size, access,
                 ));
@@ -2596,7 +2598,7 @@ fn tb_lite_check(
 /// Interior-mutable accesses normally bypass TB-lite transitions, but they are not allowed to
 /// disable an unrelated protected borrow whose pointee is not itself interior-mutable.
 fn tb_lite_check_alias_exempt_protector_conflict(
-    sb_tag: u64,
+    model_tag: u64,
     orig_tag: u64,
     tmeta: &TagMeta,
     addr: usize,
@@ -2608,10 +2610,10 @@ fn tb_lite_check_alias_exempt_protector_conflict(
     }
 
     let all = tb_state().lock().unwrap();
-    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, sb_tag], addr);
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, model_tag], addr);
     let tree = all.get(&base)?;
-    let access_tag = if tree.nodes.contains_key(&sb_tag) {
-        sb_tag
+    let access_tag = if tree.nodes.contains_key(&model_tag) {
+        model_tag
     } else if tree.nodes.contains_key(&orig_tag) {
         orig_tag
     } else {
@@ -2708,7 +2710,7 @@ fn tb_access_name(access: AliasAccessKind) -> &'static str {
 
 fn tb_dump(
     tree: &TbAllocState,
-    sb_tag: u64,
+    access_tag: u64,
     addr: usize,
     size: usize,
     access: AliasAccessKind,
@@ -2717,7 +2719,7 @@ fn tb_dump(
     out.push_str("\n-- tb-lite dump --\n");
     out.push_str(&format!(
         "access={:?} tag={} addr=0x{:x} size={}\n",
-        access, sb_tag, addr, size
+        access, access_tag, addr, size
     ));
     out.push_str("nodes:\n");
     let mut nodes: Vec<&TbNode> = tree.nodes.values().collect();

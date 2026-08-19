@@ -13,8 +13,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
-        // SB-lite currently approximates Rust's aliasing rules using a per-allocation
-        // borrow stack, but it does **not** model interior mutability soundly.
+        // TB-lite does **not** model interior mutability soundly.
         //
         // In Rust, types that contain an `UnsafeCell` are *not* `Freeze`, meaning they
         // may be legally mutated through a shared reference (via `Cell`/`RefCell` or
@@ -24,7 +23,7 @@ impl MyOptimizationPass {
         //
         // Policy: if a pointee type is not `Freeze` (or we cannot reliably reason about
         // it in this typing context), mark derived tags as `alias_exempt` so the runtime
-        // skips SB-lite enforcement for that tag. This is a deliberate precision/soundness
+        // skips alias-model enforcement for that tag. This is a deliberate precision/soundness
         // trade-off: missing metadata is acceptable; incorrect metadata is not.
         // Keep alias checks enabled for slice/str pointees even in generic code:
         // `from_raw_parts_mut`-style wrappers are often generic and would otherwise

@@ -1,6 +1,0 @@
-[package]
-name = "sb_lite_raw_cast_from_ref"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]

@@ -16,7 +16,7 @@ fn main() {
         let s2: &mut [u8; 2] = &mut *p2;
 
         s2[0] = 10;
-        s1[0] = 11; // UB under SB-lite: older unique used after a newer unique
+        s1[0] = 11; // UB: older unique used after a newer unique
     }
 
     black_box(a);

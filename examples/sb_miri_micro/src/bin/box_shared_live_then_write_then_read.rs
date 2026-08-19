@@ -14,7 +14,7 @@ fn main() {
 
         black_box(*r_shared);
         *r_unique = 1;
-        // UB under SB-lite: read through shared after a conflicting write.
+        // UB: read through shared after a conflicting write.
         black_box(*r_shared);
         drop(Box::from_raw(p));
     }

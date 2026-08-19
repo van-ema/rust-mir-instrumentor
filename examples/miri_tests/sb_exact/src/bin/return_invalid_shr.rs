@@ -1,5 +1,5 @@
 // Ported from miri/tests/fail/both_borrows/return_invalid_shr.rs.
-// Intent: returning an invalidated shared ref should violate SB-lite.
+// Intent: returning an invalidated shared ref should violate the alias model.
 //
 // Current rusteze status: this is still `ok` (known gap).
 // Desired behavior: this should be caught at return-boundary retag time; at minimum,

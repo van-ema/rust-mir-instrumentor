@@ -60,7 +60,6 @@ class ExampleOutcomeTests(unittest.TestCase):
         tests = discover_comparison_tests()
         labels = [test.comparison_label for test in tests]
         self.assertEqual(len(labels), len(set(labels)))
-        self.assertIn("miri_sb_exact::pass_invalid_shr_tuple@sb_lite", labels)
         self.assertIn("miri_sb_exact::pass_invalid_shr_tuple@tb_lite", labels)
         self.assertIn("tb_miri_micro::parent_read_kills_raw_child@tb_lite", labels)
         self.assertIn("sb_miri_micro::wrapper_reborrow_swap_ok@tb_lite", labels)

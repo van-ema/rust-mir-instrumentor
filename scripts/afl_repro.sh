@@ -126,9 +126,8 @@ for f in "${files[@]}"; do
 
   echo "=== repro: $f ==="
   alias_model="${RZ_ALIAS_MODEL:-tb_lite}"
-  sb_lite="${RZ_SB_LITE:-1}"
-  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} RZ_SB_LITE=${sb_lite} \"$BIN_PATH\" \"$run_input\""
-  if ! RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL="${alias_model}" RZ_SB_LITE="${sb_lite}" "$BIN_PATH" "$run_input"; then
+  echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} \"$BIN_PATH\" \"$run_input\""
+  if ! RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL="${alias_model}" "$BIN_PATH" "$run_input"; then
     if [[ "${AFL_REPRO_STRICT:-0}" == "1" ]]; then
       exit 1
     fi

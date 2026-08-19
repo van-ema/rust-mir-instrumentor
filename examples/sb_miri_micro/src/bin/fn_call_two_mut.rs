@@ -19,5 +19,5 @@ fn main() {
     // Create a newer unique borrow, then use the older-derived raw pointer across a call.
     let r2: &mut u8 = &mut x;
     black_box(r2);
-    do_write_raw(raw); // UB under SB-lite: raw write after newer unique
+    do_write_raw(raw); // Raw write after newer unique.
 }

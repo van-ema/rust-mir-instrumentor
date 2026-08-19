@@ -1,7 +1,7 @@
 // Ported from Miri: tests/fail/both_borrows/buggy_as_mut_slice.rs
 //
 // The helper unsafely creates `&mut [T]` from `&Vec<T>`, so two mutable slices
-// alias the same backing storage. Index writes through both should violate SB-lite.
+// alias the same backing storage. Index writes through both should violate Tree Borrows.
 mod safe {
     use std::slice::from_raw_parts_mut;
 
@@ -17,4 +17,3 @@ fn main() {
     v1[1] = 5;
     v2[1] = 7;
 }
-

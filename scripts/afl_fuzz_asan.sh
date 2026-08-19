@@ -100,7 +100,6 @@ build_asan_target() {
   unset RZ_USE_UNSAFE_SUMMARIES
   unset RZ_INTERPROC_UNSAFE_SUMMARIES
   unset RZ_ALIAS_MODEL
-  unset RZ_SB_LITE
   local afl_cov_flags=(
     "-Cpasses=sancov-module"
     "-Cllvm-args=-sanitizer-coverage-level=3"

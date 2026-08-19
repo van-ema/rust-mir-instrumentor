@@ -29,7 +29,7 @@ REPORT_ROOT = REPO_ROOT / "reports" / "miri_compare"
 PORT_RE = re.compile(r"^\s*//\s*Ported from (miri/tests/(?:fail|pass)/[A-Za-z0-9_./-]+\.rs)\.")
 COMPILE_FLAGS_RE = re.compile(r"^\s*//@compile-flags:\s*(.*)$")
 EXACT_PACKAGES = {
-    "miri_sb_exact": (EXAMPLES_DIR / "miri_tests" / "sb_exact", "sb_lite", "stacked"),
+    "miri_sb_exact": (EXAMPLES_DIR / "miri_tests" / "sb_exact", "tb_lite", "tree"),
     "miri_tb_exact": (EXAMPLES_DIR / "miri_tests" / "tb_exact", "tb_lite", "tree"),
     "miri_tb_pass_exact": (EXAMPLES_DIR / "miri_tests" / "tb_pass_exact", "tb_lite", "tree"),
     "miri_mem_exact": (EXAMPLES_DIR / "miri_tests" / "memory_exact", "tb_lite", "default"),
@@ -123,17 +123,6 @@ def discover_comparison_tests() -> list[ComparisonTest]:
                         miri_mode=miri_mode,
                     )
                 )
-                if package == "miri_sb_exact":
-                    out.append(
-                        ComparisonTest(
-                            package=package,
-                            bin_name=src.stem,
-                            src=src,
-                            origin=m.group(1),
-                            rz_model="tb_lite",
-                            miri_mode="tree",
-                        )
-                    )
                 break
 
     for package, package_dir in TREE_MULTI_BIN_PACKAGES.items():
@@ -154,8 +143,7 @@ def discover_comparison_tests() -> list[ComparisonTest]:
         for package_dir in EXAMPLES_DIR.iterdir()
         if package_dir.is_dir()
         and (
-            package_dir.name.startswith("sb_lite_")
-            or package_dir.name.startswith("tb_lite_")
+            package_dir.name.startswith("tb_lite_")
             or package_dir.name == "copy_alias_violation"
         )
     )

@@ -1,5 +1,5 @@
 // Ported from miri/tests/fail/both_borrows/return_invalid_shr_tuple.rs.
-// Intent: returning an invalidated shared ref inside tuple should violate SB-lite.
+// Intent: returning an invalidated shared ref inside a tuple should violate the alias model.
 //
 // Current rusteze status: caught at the return boundary once by-value carrier anchor export is
 // enabled for tuple-wrapped shared refs.

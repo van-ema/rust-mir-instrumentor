@@ -58,8 +58,8 @@ const CREATION_RAW_LINEAGE_HINT_MASK: u8 =
     // Logging (println!/format!) can allocate while locks are held.
     static RZ_IN_RUNTIME_HOOK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
 
-    // Temporarily suppress SB-lite enforcement for coarse "unknown call" hooks.
-    static RZ_SB_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
+    // Temporarily suppress alias-model enforcement for coarse "unknown call" hooks.
+    static RZ_ALIAS_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
 
     // Temporarily relax epoch-mismatch checks for coarse allow-untagged hooks.
     static RZ_RELAX_EPOCH_CHECK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
@@ -81,13 +81,13 @@ impl Drop for RzRuntimeGuard {
     }
 }
 
-struct SbSuppressGuard {
+struct AliasSuppressGuard {
     prev: bool,
 }
-impl SbSuppressGuard {
+impl AliasSuppressGuard {
     #[inline]
     fn enter() -> Self {
-        let prev = RZ_SB_SUPPRESS.with(|c| {
+        let prev = RZ_ALIAS_SUPPRESS.with(|c| {
             let p = c.get();
             c.set(true);
             p
@@ -95,10 +95,10 @@ impl SbSuppressGuard {
         Self { prev }
     }
 }
-impl Drop for SbSuppressGuard {
+impl Drop for AliasSuppressGuard {
     #[inline]
     fn drop(&mut self) {
-        RZ_SB_SUPPRESS.with(|c| c.set(self.prev));
+        RZ_ALIAS_SUPPRESS.with(|c| c.set(self.prev));
     }
 }
 
@@ -799,8 +799,8 @@ fn rz_in_runtime_hook() -> bool {
 }
 
 #[inline]
-fn rz_sb_suppressed() -> bool {
-    RZ_SB_SUPPRESS.with(|c| c.get())
+fn rz_alias_suppressed() -> bool {
+    RZ_ALIAS_SUPPRESS.with(|c| c.get())
 }
 
 #[inline]
@@ -5154,41 +5154,26 @@ pub fn __rz_ptr_write(
             Some(&tmeta),
         );
     }
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        match active_alias_model().name() {
-            // Tree Borrows tracks raws as first-class nodes in the tree.
-            // Rewriting them to a reference ancestor skips state transitions
-            // that should happen on the raw itself.
-            "tb_lite" => {
-                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
-                    let tmap = tags().lock().unwrap();
-                    active_alias_model()
-                        .find_ref_ancestor_tag(&tmap, tag)
-                        .or(Some(tag))
-                } else {
-                    Some(tag)
-                }
-            }
-            "sb_lite" => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model()
-                    .find_ref_ancestor_tag(&tmap, tag)
-                    .or(Some(tag))
-            }
-            _ => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-            }
+    let access_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        // Tree Borrows tracks raws as first-class nodes in the tree. Rewriting them to a
+        // reference ancestor skips state transitions that should happen on the raw itself.
+        if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+            let tmap = tags().lock().unwrap();
+            active_alias_model()
+                .find_ref_ancestor_tag(&tmap, tag)
+                .or(Some(tag))
+        } else {
+            Some(tag)
         }
     } else {
         Some(tag)
     };
     rz_profile_add_opt_field!(profile, write_tag_lookup_ns, tag_lookup_start);
 
-    if let Some(sb_tag) = sb_tag_opt {
+    if let Some(access_tag) = access_tag_opt {
         let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
-            sb_tag,
+            access_tag,
             tag,
             &tmeta,
             addr,
@@ -5583,7 +5568,7 @@ pub fn __rz_ptr_write_allow_untagged(
     if tag == 0 {
         return;
     }
-    let _sb = SbSuppressGuard::enter();
+    let _alias = AliasSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_write(tag, addr, size, align_req, access_alias_exempt);
 }
@@ -5725,41 +5710,26 @@ pub fn __rz_ptr_read(
             Some(&tmeta),
         );
     }
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        match active_alias_model().name() {
-            // Tree Borrows tracks raws as first-class nodes in the tree.
-            // Rewriting them to a reference ancestor skips state transitions
-            // that should happen on the raw itself.
-            "tb_lite" => {
-                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
-                    let tmap = tags().lock().unwrap();
-                    active_alias_model()
-                        .find_ref_ancestor_tag(&tmap, tag)
-                        .or(Some(tag))
-                } else {
-                    Some(tag)
-                }
-            }
-            "sb_lite" => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model()
-                    .find_ref_ancestor_tag(&tmap, tag)
-                    .or(Some(tag))
-            }
-            _ => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-            }
+    let access_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        // Tree Borrows tracks raws as first-class nodes in the tree. Rewriting them to a
+        // reference ancestor skips state transitions that should happen on the raw itself.
+        if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+            let tmap = tags().lock().unwrap();
+            active_alias_model()
+                .find_ref_ancestor_tag(&tmap, tag)
+                .or(Some(tag))
+        } else {
+            Some(tag)
         }
     } else {
         Some(tag)
     };
     rz_profile_add_opt_field!(profile, read_tag_lookup_ns, tag_lookup_start);
 
-    if let Some(sb_tag) = sb_tag_opt {
+    if let Some(access_tag) = access_tag_opt {
         let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
-            sb_tag,
+            access_tag,
             tag,
             &tmeta,
             addr,
@@ -6095,7 +6065,7 @@ pub fn __rz_ptr_read_allow_untagged(
     if tag == 0 {
         return;
     }
-    let _sb = SbSuppressGuard::enter();
+    let _alias = AliasSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_read(tag, addr, size, align_req, access_alias_exempt);
 }
@@ -7851,9 +7821,6 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     else {
         return;
     };
-    if active_alias_model().name() == "sb_lite" {
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
     if tag != 0 {
         remember_mut_arg_ret_boundary_lineage(tag);
         apply_or_defer_boundary_survivor(boundary_id, tag, addr, BoundarySurvivorKind::MutArgRet);

@@ -13,8 +13,7 @@ fn main() {
         black_box(*r_shared);
         *r_unique = 3;
 
-        // UB under SB-lite: shared borrow read after write while still live.
+        // UB: shared borrow read after write while still live.
         black_box(*r_shared);
     }
 }
-

@@ -1,6 +1,0 @@
-[package]
-name = "sb_lite_shared_live_then_write"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]

@@ -147,8 +147,8 @@ impl MyOptimizationPass {
         src_place: Place<'tcx>,
     ) -> bool {
         // Reusing the last ref-created anchor for `&*raw` / `&mut *raw` turns repeated
-        // ref creation from the same raw pointer into a parent->child chain. For both SB-
-        // and TB-style models these refs should derive from the raw pointer lineage instead.
+        // ref creation from the same raw pointer into a parent->child chain. These refs should
+        // derive from the raw pointer lineage instead.
         if matches!(src_place.projection.first(), Some(ProjectionElem::Deref))
             && self.is_raw_pointer_ty(body.local_decls[src_place.local].ty)
         {
@@ -168,7 +168,7 @@ impl MyOptimizationPass {
         // In TB mode, repeating `&_1` should not silently chain the second shared ref off the
         // first one; that collapses independent shared-to-raw derivations into one lineage and
         // hides later mutable conflicts.
-        if !matches!(bk, BorrowKind::Mut { .. }) && !self.compile_alias_model_is_sb_like() {
+        if !matches!(bk, BorrowKind::Mut { .. }) {
             return false;
         }
 
