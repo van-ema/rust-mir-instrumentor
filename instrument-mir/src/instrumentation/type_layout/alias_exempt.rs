@@ -13,8 +13,7 @@ impl MyOptimizationPass {
         body: &Body<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
-        // SB-lite currently approximates Rust's aliasing rules using a per-allocation
-        // borrow stack, but it does **not** model interior mutability soundly.
+        // TB-lite does **not** model interior mutability soundly.
         //
         // In Rust, types that contain an `UnsafeCell` are *not* `Freeze`, meaning they
         // may be legally mutated through a shared reference (via `Cell`/`RefCell` or
@@ -24,7 +23,7 @@ impl MyOptimizationPass {
         //
         // Policy: if a pointee type is not `Freeze` (or we cannot reliably reason about
         // it in this typing context), mark derived tags as `alias_exempt` so the runtime
-        // skips SB-lite enforcement for that tag. This is a deliberate precision/soundness
+        // skips alias-model enforcement for that tag. This is a deliberate precision/soundness
         // trade-off: missing metadata is acceptable; incorrect metadata is not.
         // Keep alias checks enabled for slice/str pointees even in generic code:
         // `from_raw_parts_mut`-style wrappers are often generic and would otherwise
@@ -83,6 +82,7 @@ impl MyOptimizationPass {
                     || path.contains("::cell::SyncUnsafeCell")
                     || path.contains("::cell::Cell")
                     || path.contains("::cell::RefCell")
+                    || path.contains("::sync::atomic::Atomic")
                     || path.contains("::pin::UnsafePinned")
             }
             TyKind::Tuple(_) | TyKind::Array(..) | TyKind::Slice(_) => false,
@@ -95,6 +95,7 @@ impl MyOptimizationPass {
             || path.contains("::cell::SyncUnsafeCell")
             || path.contains("::cell::Cell")
             || path.contains("::cell::RefCell")
+            || path.contains("::sync::atomic::Atomic")
             || path.contains("::pin::UnsafePinned")
     }
 
@@ -187,6 +188,37 @@ impl MyOptimizationPass {
                 return None;
             }
 
+            let extent_addr_local = body
+                .local_decls
+                .push(LocalDecl::new(tcx.types.usize, source_info.span));
+            let (extent_addr_stmt1, extent_addr_stmt2) = self.slot_addr_stmts_for_place(
+                tcx,
+                body,
+                source_info,
+                base_place,
+                extent_addr_local,
+                false,
+            )?;
+            let extent_len = self.size_operand_for_ty(tcx, body, base_ty, source_info.span);
+
+            return Some((
+                Operand::Copy(Place::from(extent_addr_local)),
+                extent_len,
+                vec![extent_addr_stmt1, extent_addr_stmt2],
+            ));
+        }
+
+        // Tree Borrows grants a shared reference to an interior-mutable field
+        // permission for surrounding bytes in the containing aggregate. Carry
+        // that immediate aggregate extent just as we already do for an indexed
+        // interior-mutable array element.
+        if matches!(src.projection.last(), Some(ProjectionElem::Field(_, _))) {
+            let base_place = PlaceRef {
+                local: src.local,
+                projection: &src.projection[..src.projection.len() - 1],
+            }
+            .to_place(tcx);
+            let base_ty = base_place.ty(&body.local_decls, tcx).ty;
             let extent_addr_local = body
                 .local_decls
                 .push(LocalDecl::new(tcx.types.usize, source_info.span));

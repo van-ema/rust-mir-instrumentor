@@ -70,8 +70,19 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     /// Example: after `Box::new(x)`, the hidden Box pointer field owns the new heap allocation.
     /// Its shadow must describe that fresh allocation instance, not any old tag at the same
     /// numeric address.
-    ShadowStoreAllocRoot {
+    BoxOwnerCreate {
+        box_local: Local,
+        parent_raw_local: Option<Local>,
+        size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
+    },
+    /// Derive the raw result of `Box::into_raw` from the consumed Box owner.
+    BoxOwnerIntoRaw {
+        box_local: Local,
+        dst_local: Local,
         is_mut: bool,
+        size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
     },
     /// Store an allocation-root tag for an owner pointer returned by uninstrumented std code.
     ///
@@ -323,6 +334,9 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     CallArgValidate {
         local: Local,
     },
+    /// Caller-side validation for one statically projectable reference leaf in
+    /// a by-value aggregate such as `(&T, &U)`.
+    CallArgLeafValidate,
     /// Caller-side: export one exact pointer field from a by-value aggregate.
     ///
     /// Example: for `Source { input: &str }`, send `input`, not a borrow of `Source`.
@@ -363,6 +377,17 @@ pub(in crate::instrumentation) enum InstrKind<'tcx> {
     ///
     /// Example: a one-pointer owner can use that pointer as the slot-family seed.
     ArgAnchorSeedFromShadow {
+        local: Local,
+    },
+    /// Callee-side: create a fresh protected owning-unique tag for a by-value Box argument.
+    ArgBoxOwnerRetag {
+        callee_id: u64,
+        local: Local,
+        size_op: SizeOperand<'tcx>,
+        align_op: SizeOperand<'tcx>,
+    },
+    /// Seed a Box local's anchor from its restored owning-pointer leaf shadow.
+    BoxOwnerAnchorSeed {
         local: Local,
     },
     /// Callee-side: restore one exact pointer-leaf shadow into a by-value aggregate argument slot.
@@ -623,6 +648,7 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_leaf_shadow: DefId,
     pub(in crate::instrumentation) def_id_push_indirect_call_arg_shadow_range: DefId,
     pub(in crate::instrumentation) def_id_validate_call_arg_tag: DefId,
+    pub(in crate::instrumentation) def_id_validate_call_arg_ref_leaf: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag: DefId,
     pub(in crate::instrumentation) def_id_take_call_arg_tag_anchor: DefId,
     pub(in crate::instrumentation) def_id_push_call_arg_leaf_shadow: DefId,
@@ -649,7 +675,9 @@ pub(in crate::instrumentation) struct Hooks {
     pub(in crate::instrumentation) def_id_exit_fn: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_ptr: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_ptr_local: DefId,
-    pub(in crate::instrumentation) def_id_shadow_store_alloc_root: DefId,
+    pub(in crate::instrumentation) def_id_box_owner_create: DefId,
+    pub(in crate::instrumentation) def_id_box_owner_call_retag: DefId,
+    pub(in crate::instrumentation) def_id_box_owner_into_raw: DefId,
     pub(in crate::instrumentation) def_id_shadow_store_external_alloc_root: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag: DefId,
     pub(in crate::instrumentation) def_id_shadow_load_tag_for_ptr: DefId,

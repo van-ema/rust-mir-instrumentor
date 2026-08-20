@@ -1367,9 +1367,7 @@ impl MyOptimizationPass {
             reborrow_anchor_local_for_stack_local,
             projectionless_anchor_suppressed_locals,
             false,
-            matches!(borrow_kind, BorrowKind::Mut { .. })
-                || self.compile_alias_model_is_sb_like()
-                || !self.is_pointer_ty(src_ty),
+            matches!(borrow_kind, BorrowKind::Mut { .. }) || !self.is_pointer_ty(src_ty),
             self.parent_selection_mode_for_src_place(body, src_place),
         );
 

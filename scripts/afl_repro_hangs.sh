@@ -145,15 +145,13 @@ for f in "${files[@]}"; do
       "$BIN_PATH" "$f" || true
   else
     alias_model="${RZ_ALIAS_MODEL:-tb_lite}"
-    sb_lite="${RZ_SB_LITE:-1}"
-    echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} RZ_SB_LITE=${sb_lite} timeout --preserve-status -k ${KILL_AFTER_SECS}s ${TIMEOUT_SECS}s \"$BIN_PATH\" \"$f\""
+    echo "+ RUSTEZE_FAILFAST=1 RZ_ABORT_ON_VIOLATION=1 RZ_INSTRUMENT_ALL_DEPS=1 RZ_ALIAS_MODEL=${alias_model} timeout --preserve-status -k ${KILL_AFTER_SECS}s ${TIMEOUT_SECS}s \"$BIN_PATH\" \"$f\""
     /usr/bin/time -f 'exit=%x elapsed=%e sec maxrss=%M KB' \
       env \
       RUSTEZE_FAILFAST=1 \
       RZ_ABORT_ON_VIOLATION=1 \
       RZ_INSTRUMENT_ALL_DEPS=1 \
       RZ_ALIAS_MODEL="${alias_model}" \
-      RZ_SB_LITE="${sb_lite}" \
       timeout --preserve-status -k "${KILL_AFTER_SECS}s" "${TIMEOUT_SECS}s" \
       "$BIN_PATH" "$f" || true
   fi

@@ -1,7 +1,7 @@
 // Ported from Miri: tests/fail/both_borrows/buggy_split_at_mut.rs
 //
 // The buggy split computes the first slice length incorrectly, creating
-// overlapping mutable slices. Indexed writes through both should violate SB-lite.
+// overlapping mutable slices. Indexed writes through both should violate Tree Borrows.
 mod safe {
     use std::slice::from_raw_parts_mut;
 
@@ -25,4 +25,3 @@ fn main() {
     a[1] = 5;
     b[1] = 6;
 }
-

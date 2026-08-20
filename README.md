@@ -218,7 +218,7 @@ RUNTIME_FEATURES=runtime_no_alignment_checks TARGET=toml PROFILE=release ./scrip
 - `RZ_DUMP_ALLOC_ON_VIOLATION`: non-zero dumps allocation map on each violation (with `rz_alloc_dump` feature).
 - `RZ_DUMP_ALLOC_MATCH_ADDR`: non-zero narrows alloc dump to matching addresses (with `rz_alloc_dump` feature).
 - `RZ_DUMP_ALLOC_HEAP_ONLY`: non-zero limits alloc dump to heap allocations (with `rz_alloc_dump` feature).
-- `RZ_ALIAS_MODEL`: alias model selector: `tb_lite` (default), `sb_lite`, `none`.
+- `RZ_ALIAS_MODEL`: alias checking selector: `tb_lite` (default) or `none`.
 - `RZ_TB_LITE`: tree-borrows-lite on/off (`1` default, `0` disables checks inside `tb_lite` model).
 - `RZ_TB_DUMP`: `1/true` adds extra TB-lite diagnostic context.
 - `RZ_TB_TRACE`: `1/true` enables verbose TB-lite transition tracing.
@@ -227,8 +227,6 @@ RUNTIME_FEATURES=runtime_no_alignment_checks TARGET=toml PROFILE=release ./scrip
   unreachable invalidated helper tags into exact tombstones instead of keeping them in the active
   tree. Stale-tag diagnostics remain exact; this is currently a memory/metadata growth experiment,
   not a default performance optimization. Default builds compile this path out.
-- `RZ_SB_LITE`: stacked-borrows-lite on/off (`1` default when using `sb_lite` model).
-- `RZ_SB_DUMP`: `1/true` adds SB-lite stack/ancestry details in violation output.
 - `RZ_STACK_REF_OOB_NOISE`: stack-ref OOB-noise suppression (`1` default, set `0` for strict reporting).
 - `RZ_PROFILE_HOOKS`: `1/true` enables runtime hook profiling counters when the runtime is built
   with `--features runtime_hook_profile`. Default builds compile these counters out. The profile
@@ -315,7 +313,6 @@ RUNTIME_FEATURES=runtime_no_alignment_checks TARGET=toml PROFILE=release ./scrip
 - `RZ_VERIFY_HOOKS`: post-build hook-symbol verification in `afl_build.sh` (default `1`).
 - `RZ_VERIFY_HOOKS_STRICT`: strict hook verification mode in `afl_build.sh` (default `0`).
 - `RZ_ALIAS_MODEL`: alias model used by fuzz/repro scripts (default `tb_lite`).
-- `RZ_SB_LITE`: SB-lite runtime toggle passed by fuzz/repro scripts (default `1`).
 - `RZ_INSTRUMENT_ALL_DEPS`: forced to `1` by AFL scripts.
 - `RZ_INSTRUMENTED_CRATES`: optional allowlist used only when
   `RZ_INSTRUMENT_ALL_DEPS=0`.
@@ -492,9 +489,6 @@ RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE_UNKNOWN_TAG=1 ./target/release/hello
 
 # Include backtraces on any violation
 RZ_LOG=trace RZ_LOG_LOC=1 RZ_BACKTRACE=1 ./target/release/hello
-
-# Dump SB-lite stacks on SB violations
-RZ_LOG=trace RZ_LOG_LOC=1 RZ_SB_DUMP=1 ./target/release/hello
 
 # See instrumented vs dep crates during compilation
 RZ_PRINT_CRATES=1 cargo instrument-mir --runtime-path=target/debug -p hello --bin hello

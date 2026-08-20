@@ -325,13 +325,6 @@ impl MyOptimizationPass {
         }
     }
 
-    pub(in crate::instrumentation) fn compile_alias_model_is_sb_like(&self) -> bool {
-        std::env::var("RZ_ALIAS_MODEL")
-            .ok()
-            .map(|raw| raw.to_ascii_lowercase())
-            .is_some_and(|model| matches!(model.as_str(), "sb" | "sb_lite" | "stacked_borrows"))
-    }
-
     /// Best-effort detection of "vtable-like" structs: all fields are function pointers.
     pub(in crate::instrumentation) fn is_fn_table_adt_ty<'tcx>(
         &self,

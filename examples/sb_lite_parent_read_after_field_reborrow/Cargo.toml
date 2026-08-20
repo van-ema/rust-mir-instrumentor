@@ -1,6 +1,0 @@
-[package]
-name = "sb_lite_parent_read_after_field_reborrow"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]

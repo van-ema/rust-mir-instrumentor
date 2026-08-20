@@ -12,9 +12,8 @@ fn main() {
     unsafe {
         let r2: &mut u8 = &mut *p;
         *r2 = 1;
-        *mut_ref = 2; // UB under SB-lite: older unique used after a newer unique
+        *mut_ref = 2; // Older unique used after a newer unique.
     }
 
     black_box(x);
 }
-

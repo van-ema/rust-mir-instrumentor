@@ -36,7 +36,8 @@ impl MyOptimizationPass {
             InstrKind::PtrUse { .. } => hooks.def_id_use,
             InstrKind::ShadowLoad { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ShadowStore { .. } => hooks.def_id_shadow_store_ptr,
-            InstrKind::ShadowStoreAllocRoot { .. } => hooks.def_id_shadow_store_alloc_root,
+            InstrKind::BoxOwnerCreate { .. } => hooks.def_id_box_owner_create,
+            InstrKind::BoxOwnerIntoRaw { .. } => hooks.def_id_box_owner_into_raw,
             InstrKind::ShadowStoreExternalAllocRoot { .. } => {
                 hooks.def_id_shadow_store_external_alloc_root
             }
@@ -78,6 +79,7 @@ impl MyOptimizationPass {
                 hooks.def_id_push_indirect_call_arg_shadow_range
             }
             InstrKind::CallArgValidate { .. } => hooks.def_id_validate_call_arg_tag,
+            InstrKind::CallArgLeafValidate => hooks.def_id_validate_call_arg_ref_leaf,
             InstrKind::CallArgLeafPush { .. } => hooks.def_id_push_call_arg_leaf_shadow,
             InstrKind::CallArgShadowRangePush { .. } => hooks.def_id_push_call_arg_shadow_range,
             InstrKind::CallArgLeafClear { .. } => hooks.def_id_clear_call_arg_leaf_shadows,
@@ -85,6 +87,8 @@ impl MyOptimizationPass {
                 hooks.def_id_take_call_arg_tag
             }
             InstrKind::ArgAnchorSeedFromShadow { .. } => hooks.def_id_shadow_load_tag,
+            InstrKind::ArgBoxOwnerRetag { .. } => hooks.def_id_box_owner_call_retag,
+            InstrKind::BoxOwnerAnchorSeed { .. } => hooks.def_id_shadow_load_tag,
             InstrKind::ArgLeafTake { .. } => hooks.def_id_take_call_arg_leaf_shadow,
             InstrKind::ArgShadowRangeTake { .. } => hooks.def_id_take_call_arg_shadow_range,
             InstrKind::RetValidate { .. } => hooks.def_id_validate_ret_tag,
@@ -305,6 +309,9 @@ impl MyOptimizationPass {
         let def_id_validate_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_tag", 1)
             .expect("missing '__rz_validate_call_arg_tag' definition");
+        let def_id_validate_call_arg_ref_leaf = self
+            .find_runtime_fn_def_id(tcx, "__rz_validate_call_arg_ref_leaf", 2)
+            .expect("missing '__rz_validate_call_arg_ref_leaf' definition");
         let def_id_take_call_arg_tag = self
             .find_runtime_fn_def_id(tcx, "__rz_take_call_arg_tag", 4)
             .expect("missing '__rz_take_call_arg_tag' definition");
@@ -383,9 +390,15 @@ impl MyOptimizationPass {
         let def_id_shadow_store_ptr_local = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_store_ptr_local", 5)
             .expect("missing '__rz_shadow_store_ptr_local' definition");
-        let def_id_shadow_store_alloc_root = self
-            .find_runtime_fn_def_id(tcx, "__rz_shadow_store_alloc_root", 5)
-            .expect("missing '__rz_shadow_store_alloc_root' definition");
+        let def_id_box_owner_create = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_create", 6)
+            .expect("missing '__rz_box_owner_create' definition");
+        let def_id_box_owner_call_retag = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_call_retag", 5)
+            .expect("missing '__rz_box_owner_call_retag' definition");
+        let def_id_box_owner_into_raw = self
+            .find_runtime_fn_def_id(tcx, "__rz_box_owner_into_raw", 5)
+            .expect("missing '__rz_box_owner_into_raw' definition");
         let def_id_shadow_store_external_alloc_root = self
             .find_runtime_fn_def_id(tcx, "__rz_shadow_store_external_alloc_root", 5)
             .expect("missing '__rz_shadow_store_external_alloc_root' definition");
@@ -452,6 +465,7 @@ impl MyOptimizationPass {
             def_id_push_indirect_call_arg_leaf_shadow,
             def_id_push_indirect_call_arg_shadow_range,
             def_id_validate_call_arg_tag,
+            def_id_validate_call_arg_ref_leaf,
             def_id_take_call_arg_tag,
             def_id_take_call_arg_tag_anchor,
             def_id_push_call_arg_leaf_shadow,
@@ -478,7 +492,9 @@ impl MyOptimizationPass {
             def_id_exit_fn,
             def_id_shadow_store_ptr,
             def_id_shadow_store_ptr_local,
-            def_id_shadow_store_alloc_root,
+            def_id_box_owner_create,
+            def_id_box_owner_call_retag,
+            def_id_box_owner_into_raw,
             def_id_shadow_store_external_alloc_root,
             def_id_shadow_load_tag,
             def_id_shadow_load_tag_for_ptr,

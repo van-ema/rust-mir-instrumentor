@@ -199,6 +199,17 @@ impl MyOptimizationPass {
         }
     }
 
+    pub(in crate::instrumentation) fn box_pointee_ty<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        ty: Ty<'tcx>,
+    ) -> Option<Ty<'tcx>> {
+        let TyKind::Adt(_adt, args) = ty.kind() else {
+            return None;
+        };
+        self.is_box_ty(tcx, ty).then(|| args.type_at(0))
+    }
+
     pub(in crate::instrumentation) fn is_box_from_raw_wrapper(&self, def_path: &str) -> bool {
         (def_path.contains("::boxed::Box") || def_path.contains("boxed::Box"))
             && def_path.contains("::from_raw")
@@ -927,83 +938,56 @@ impl MyOptimizationPass {
         bb: BasicBlock,
         block_data: &BasicBlockData<'tcx>,
         term: &Terminator<'tcx>,
+        box_local: Local,
         dst_local: Local,
         dst_ty: Ty<'tcx>,
         insert_points: &mut Vec<InsertPoint<'tcx>>,
     ) {
-        // Special-case: Box::into_raw returns a thin pointer derived from a Box ADT argument.
-        // Since arg0 is not a thin pointer local, TagProp cannot apply; synthesize a root tag.
+        // Box::into_raw consumes the Box owner and returns a raw child of that authority.
         let is_mut = self.ptr_is_mut(dst_ty);
-
-        // Best-effort heap range recording for Box<T>: the raw pointer points to the T allocation.
-        // TODO: hook real allocator shims/drop glue to get exact layout/size in general.
         let size_op: SizeOperand<'tcx> = match dst_ty.kind() {
-            TyKind::RawPtr(pointee_ty, _) => {
-                self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
-            }
-            TyKind::Ref(_, pointee_ty, _) => {
+            TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
                 self.size_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
             }
             _ => SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0)),
         };
+        let align_op: SizeOperand<'tcx> = match dst_ty.kind() {
+            TyKind::RawPtr(pointee_ty, _) | TyKind::Ref(_, pointee_ty, _) => {
+                self.align_operand_for_ty(tcx, body, *pointee_ty, term.source_info.span)
+            }
+            _ => SizeOperand::Const(self.const_usize(tcx, term.source_info.span, 0)),
+        };
+        let owner_leafs = self.shadowable_leaf_ptr_specs_from_place(
+            tcx,
+            body,
+            Place::from(box_local),
+            body.local_decls[box_local].ty,
+        );
+        let [owner_leaf] = owner_leafs.as_slice() else {
+            return;
+        };
 
-        // Insert after the call returns (in the call target block), so dst has the real value.
         let call_target_bb: Option<BasicBlock> = match &term.kind {
             TerminatorKind::Call { target, .. } => *target,
             _ => None,
         };
-
-        if let Some(tgt_bb) = call_target_bb {
-            insert_points.push(InsertPoint {
-                bb: tgt_bb,
-                stmt_idx: 0,
-                insert_before: false,
-                source_info: term.source_info,
-                place: Place::from(dst_local),
-                kind: InstrKind::RawRoot {
-                    ptr_local: dst_local,
-                    is_mut,
-                    exposed_provenance: false,
-                },
-            });
-            insert_points.push(InsertPoint {
-                bb: tgt_bb,
-                stmt_idx: 0,
-                insert_before: false,
-                source_info: term.source_info,
-                place: Place::from(dst_local),
-                kind: InstrKind::HeapAlloc {
-                    ptr_local: dst_local,
-                    live: true,
-                    size_op: size_op.clone(),
-                },
-            });
-        } else {
-            insert_points.push(InsertPoint {
-                bb,
-                stmt_idx: block_data.statements.len(),
-                insert_before: false,
-                source_info: term.source_info,
-                place: Place::from(dst_local),
-                kind: InstrKind::RawRoot {
-                    ptr_local: dst_local,
-                    is_mut,
-                    exposed_provenance: false,
-                },
-            });
-            insert_points.push(InsertPoint {
-                bb,
-                stmt_idx: block_data.statements.len(),
-                insert_before: false,
-                source_info: term.source_info,
-                place: Place::from(dst_local),
-                kind: InstrKind::HeapAlloc {
-                    ptr_local: dst_local,
-                    live: true,
-                    size_op: size_op.clone(),
-                },
-            });
-        }
+        let (insert_bb, stmt_idx) = call_target_bb
+            .map(|target| (target, 0))
+            .unwrap_or((bb, block_data.statements.len()));
+        insert_points.push(InsertPoint {
+            bb: insert_bb,
+            stmt_idx,
+            insert_before: false,
+            source_info: term.source_info,
+            place: owner_leaf.place,
+            kind: InstrKind::BoxOwnerIntoRaw {
+                box_local,
+                dst_local,
+                is_mut,
+                size_op,
+                align_op,
+            },
+        });
     }
 
     pub(in crate::instrumentation) fn warn_unknown_call_if_needed<'tcx>(
@@ -2436,11 +2420,20 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::BoxIntoRaw => {
-                    // Box::into_raw boundary modeling: root-tag + HeapAlloc live.
+                    // Box::into_raw preserves allocation liveness and derives a raw child from
+                    // the consumed owning authority.
                     if !callee_instrumented {
-                        if let Some(dst_local) = destination.as_local() {
+                        if let (Some(dst_local), Some(box_local)) = (
+                            destination.as_local(),
+                            args.get(0)
+                                .and_then(|arg| self.place_from_operand(&arg.node))
+                                .filter(|place| place.projection.is_empty())
+                                .map(|place| place.local),
+                        ) {
                             let dst_ty = body.local_decls[dst_local].ty;
-                            if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty) {
+                            if self.is_addr_exposable_ptr_ty(tcx, body, dst_ty)
+                                && self.is_box_ty(tcx, body.local_decls[box_local].ty)
+                            {
                                 ptr_locals_needing_tag.insert(dst_local);
                                 self.push_box_into_raw_call(
                                     tcx,
@@ -2448,6 +2441,7 @@ impl MyOptimizationPass {
                                     bb,
                                     block_data,
                                     term,
+                                    box_local,
                                     dst_local,
                                     dst_ty,
                                     insert_points,
@@ -2458,9 +2452,75 @@ impl MyOptimizationPass {
                 }
 
                 CallEffect::BoxFromRaw => {
-                    // Box::from_raw only rewraps an existing allocation, so do not emit
-                    // any heap lifetime event here. Pointer argument tagging happens
-                    // through the regular call argument handling below.
+                    // Box::from_raw creates an owning unique child of the supplied raw pointer;
+                    // it does not change allocation liveness.
+                    if let (Some(target_bb), Some(box_local), Some(raw_place)) = (
+                        call_target_bb,
+                        destination.as_local(),
+                        args.get(0)
+                            .and_then(|arg| self.place_from_operand(&arg.node))
+                            .filter(|place| place.projection.is_empty()),
+                    ) {
+                        let box_ty = body.local_decls[box_local].ty;
+                        let raw_ty = body.local_decls[raw_place.local].ty;
+                        if self.is_box_ty(tcx, box_ty) && self.is_raw_pointer_ty(raw_ty) {
+                            ptr_locals_needing_tag.insert(raw_place.local);
+                            let owner_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                                tcx,
+                                body,
+                                Place::from(box_local),
+                                box_ty,
+                            );
+                            if let [owner_leaf] = owner_leafs.as_slice() {
+                                let pointee_ty = self.box_pointee_ty(tcx, box_ty);
+                                insert_points.push(InsertPoint {
+                                    bb: target_bb,
+                                    stmt_idx: 0,
+                                    insert_before: false,
+                                    source_info: term.source_info,
+                                    place: owner_leaf.place,
+                                    kind: InstrKind::BoxOwnerCreate {
+                                        box_local,
+                                        parent_raw_local: Some(raw_place.local),
+                                        size_op: pointee_ty.map_or_else(
+                                            || {
+                                                SizeOperand::Const(self.const_usize(
+                                                    tcx,
+                                                    term.source_info.span,
+                                                    0,
+                                                ))
+                                            },
+                                            |ty| {
+                                                self.size_operand_for_ty(
+                                                    tcx,
+                                                    body,
+                                                    ty,
+                                                    term.source_info.span,
+                                                )
+                                            },
+                                        ),
+                                        align_op: pointee_ty.map_or_else(
+                                            || {
+                                                SizeOperand::Const(self.const_usize(
+                                                    tcx,
+                                                    term.source_info.span,
+                                                    0,
+                                                ))
+                                            },
+                                            |ty| {
+                                                self.align_operand_for_ty(
+                                                    tcx,
+                                                    body,
+                                                    ty,
+                                                    term.source_info.span,
+                                                )
+                                            },
+                                        ),
+                                    },
+                                });
+                            }
+                        }
+                    }
                 }
 
                 CallEffect::Unknown => {
@@ -2536,13 +2596,39 @@ impl MyOptimizationPass {
                     dst_ty,
                 );
                 if owner_leafs.len() == 1 {
+                    let pointee_ty = self.box_pointee_ty(tcx, dst_ty);
                     insert_points.push(InsertPoint {
                         bb: tgt_bb,
                         stmt_idx: 0,
                         insert_before: true,
                         source_info: term.source_info,
                         place: owner_leafs[0].place,
-                        kind: InstrKind::ShadowStoreAllocRoot { is_mut: true },
+                        kind: InstrKind::BoxOwnerCreate {
+                            box_local: dst_local,
+                            parent_raw_local: None,
+                            size_op: pointee_ty.map_or_else(
+                                || {
+                                    SizeOperand::Const(self.const_usize(
+                                        tcx,
+                                        term.source_info.span,
+                                        0,
+                                    ))
+                                },
+                                |ty| self.size_operand_for_ty(tcx, body, ty, term.source_info.span),
+                            ),
+                            align_op: pointee_ty.map_or_else(
+                                || {
+                                    SizeOperand::Const(self.const_usize(
+                                        tcx,
+                                        term.source_info.span,
+                                        0,
+                                    ))
+                                },
+                                |ty| {
+                                    self.align_operand_for_ty(tcx, body, ty, term.source_info.span)
+                                },
+                            ),
+                        },
                     });
                 }
             }
@@ -2597,14 +2683,34 @@ impl MyOptimizationPass {
                 });
             }
             if !self.is_pointer_ty(ty) && self.ty_contains_direct_ref_fields(tcx, ty) {
-                insert_points.push(InsertPoint {
-                    bb,
-                    stmt_idx: block_data.statements.len(),
-                    insert_before: false,
-                    source_info: term.source_info,
-                    place: p,
-                    kind: InstrKind::CallArgValidate { local: p.local },
-                });
+                let mut validated_leaf = false;
+                if matches!(ty.kind(), TyKind::Tuple(_)) {
+                    for leaf_spec in self.call_boundary_leaf_ptr_specs_from_place(tcx, body, p, ty)
+                    {
+                        if !matches!(leaf_spec.ty.kind(), TyKind::Ref(..)) {
+                            continue;
+                        }
+                        validated_leaf = true;
+                        insert_points.push(InsertPoint {
+                            bb,
+                            stmt_idx: block_data.statements.len(),
+                            insert_before: false,
+                            source_info: term.source_info,
+                            place: leaf_spec.place,
+                            kind: InstrKind::CallArgLeafValidate,
+                        });
+                    }
+                }
+                if !validated_leaf {
+                    insert_points.push(InsertPoint {
+                        bb,
+                        stmt_idx: block_data.statements.len(),
+                        insert_before: false,
+                        source_info: term.source_info,
+                        place: p,
+                        kind: InstrKind::CallArgValidate { local: p.local },
+                    });
+                }
             }
             if !self.is_pointer_ty(ty) {
                 continue;
@@ -3414,6 +3520,7 @@ impl MyOptimizationPass {
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && callee_instrumented
+                && !matches!(call_effect_opt, Some(CallEffect::BoxFromRaw))
                 && self.supports_call_boundary_exact_leaf_shadow_ty(tcx, body, dst_ty)
             {
                 if let Some(callee_id) = callee_id_opt {
@@ -3429,6 +3536,25 @@ impl MyOptimizationPass {
                         dst_local,
                         dst_ty,
                     );
+                    if self.is_box_ty(tcx, dst_ty) {
+                        let owner_leafs = self.shadowable_leaf_ptr_specs_from_place(
+                            tcx,
+                            body,
+                            Place::from(dst_local),
+                            dst_ty,
+                        );
+                        if let [owner_leaf] = owner_leafs.as_slice() {
+                            projectionless_anchor_suppressed_locals.insert(dst_local);
+                            insert_points.push(InsertPoint {
+                                bb,
+                                stmt_idx: block_data.statements.len(),
+                                insert_before: false,
+                                source_info: term.source_info,
+                                place: owner_leaf.place,
+                                kind: InstrKind::BoxOwnerAnchorSeed { local: dst_local },
+                            });
+                        }
+                    }
                 }
             } else if !self.is_pointer_ty(dst_ty)
                 && self.supports_call_boundary_return_anchor_local(tcx, body, dst_local)

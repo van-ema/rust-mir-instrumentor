@@ -1276,7 +1276,8 @@ impl MyOptimizationPass {
                 | InstrKind::ReborrowAnchorSeed { .. }
                 | InstrKind::ReborrowAnchorZero { .. }
                 | InstrKind::ParentTagSnapshot { .. }
-                | InstrKind::ArgAnchorSeedFromShadow { .. } => 1,
+                | InstrKind::ArgAnchorSeedFromShadow { .. }
+                | InstrKind::ArgBoxOwnerRetag { .. } => 1,
                 InstrKind::ShadowLoad { .. } => 1,
                 // Debug ref activation may need the restored tag/ref_ancestor emitted by
                 // ShadowLoad or TagProp at the same definition site.
@@ -1326,7 +1327,9 @@ impl MyOptimizationPass {
                 // Exit-local cleanup is frame teardown. Boundary exports must read the locals
                 // first, then FnExit and the local tag kills can retire them.
                 InstrKind::ExitTagLocalKill { .. } => 4,
-                InstrKind::DirectCallScopeEnd { .. } | InstrKind::IndirectCallScopeEnd => 4,
+                InstrKind::DirectCallScopeEnd { .. }
+                | InstrKind::IndirectCallScopeEnd
+                | InstrKind::BoxOwnerAnchorSeed { .. } => 4,
                 _ => 4,
             }
         }
@@ -1343,6 +1346,8 @@ impl MyOptimizationPass {
                     | InstrKind::ArgRetag { .. }
                     | InstrKind::ArgAnchorTake { .. }
                     | InstrKind::ArgAnchorSeedFromShadow { .. }
+                    | InstrKind::ArgBoxOwnerRetag { .. }
+                    | InstrKind::BoxOwnerAnchorSeed { .. }
                     | InstrKind::ArgLeafTake { .. }
                     | InstrKind::ArgShadowRangeTake { .. }
             ) {
@@ -1936,9 +1941,238 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::ShadowStoreAllocRoot { is_mut }
-            | InstrKind::ShadowStoreExternalAllocRoot { is_mut } = creation_kind.clone()
+            if let InstrKind::BoxOwnerCreate {
+                box_local,
+                parent_raw_local,
+                size_op,
+                align_op,
+            } = creation_kind.clone()
             {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&box_local)
+                    .expect("missing Box owner anchor local");
+                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
+                    .get(&box_local)
+                    .copied();
+                let slot_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((slot_addr_stmt1, slot_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    slot_addr_local,
+                    true,
+                ) else {
+                    continue;
+                };
+                let Some((data_ptr_stmt_opt, ptr_addr_stmt)) =
+                    self.addr_stmts_for_place(tcx, body, source_info, place, ptr_addr_local)
+                else {
+                    continue;
+                };
+                let parent_tag = parent_raw_local
+                    .and_then(|local| tag_local_for_ptr_local.get(&local).copied())
+                    .map(|local| Operand::Copy(Place::from(local)))
+                    .unwrap_or_else(|| self.const_u64(tcx, source_info.span, 0));
+                let require_parent = u8::from(parent_raw_local.is_some());
+                let (bounds_len, mut bounds_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let (align_req, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
+                let store_func = runtime_func(tcx, hooks.def_id_box_owner_create, source_info.span);
+                let store_args = lower_args(
+                    source_info.span,
+                    [
+                        copy_local(slot_addr_local),
+                        copy_local(ptr_addr_local),
+                        parent_tag,
+                        self.const_u8(tcx, source_info.span, require_parent),
+                        bounds_len,
+                        align_req,
+                    ],
+                );
+                let mut pre_call_stmts = vec![slot_addr_stmt1, slot_addr_stmt2];
+                if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
+                    pre_call_stmts.push(data_ptr_stmt);
+                }
+                pre_call_stmts.push(ptr_addr_stmt);
+                pre_call_stmts.append(&mut bounds_stmts);
+                pre_call_stmts.append(&mut align_stmts);
+                let cont_block = split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            store_func,
+                            store_args,
+                            Place::from(anchor_local),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
+                    },
+                );
+                if let Some(anchor_state_local) = anchor_state_local {
+                    let anchor_nonzero_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                    let anchor_state_u8_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u8, source_info.span));
+                    body.basic_blocks_mut()[cont_block].statements.splice(
+                        0..0,
+                        [
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_nonzero_local),
+                                    Rvalue::BinaryOp(
+                                        BinOp::Ne,
+                                        Box::new((
+                                            Operand::Copy(Place::from(anchor_local)),
+                                            self.const_u64(tcx, source_info.span, 0),
+                                        )),
+                                    ),
+                                ))),
+                            ),
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_state_u8_local),
+                                    Rvalue::Cast(
+                                        CastKind::IntToInt,
+                                        Operand::Copy(Place::from(anchor_nonzero_local)),
+                                        tcx.types.u8,
+                                    ),
+                                ))),
+                            ),
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_state_local),
+                                    Rvalue::Use(Operand::Copy(Place::from(anchor_state_u8_local))),
+                                ))),
+                            ),
+                        ],
+                    );
+                }
+                continue;
+            }
+
+            if let InstrKind::BoxOwnerIntoRaw {
+                box_local,
+                dst_local,
+                is_mut,
+                size_op,
+                align_op,
+            } = creation_kind.clone()
+            {
+                let dst_tag_local = *tag_local_for_ptr_local
+                    .get(&dst_local)
+                    .expect("missing Box::into_raw destination tag local");
+                let slot_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((slot_addr_stmt1, slot_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    slot_addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+                let Some((data_ptr_stmt_opt, ptr_addr_stmt)) = self.addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    Place::from(dst_local),
+                    ptr_addr_local,
+                ) else {
+                    continue;
+                };
+                let (bounds_len, mut bounds_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let (align_req, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
+                let into_raw_func =
+                    runtime_func(tcx, hooks.def_id_box_owner_into_raw, source_info.span);
+                let into_raw_args = lower_args(
+                    source_info.span,
+                    [
+                        copy_local(slot_addr_local),
+                        copy_local(ptr_addr_local),
+                        self.const_u8(tcx, source_info.span, u8::from(is_mut)),
+                        bounds_len,
+                        align_req,
+                    ],
+                );
+                let mut pre_call_stmts = vec![slot_addr_stmt1, slot_addr_stmt2];
+                if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
+                    pre_call_stmts.push(data_ptr_stmt);
+                }
+                pre_call_stmts.push(ptr_addr_stmt);
+                pre_call_stmts.append(&mut bounds_stmts);
+                pre_call_stmts.append(&mut align_stmts);
+                let cont_block = split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            into_raw_func,
+                            into_raw_args,
+                            Place::from(dst_tag_local),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
+                    },
+                );
+                if let Some(anchor_local) = reborrow_anchor_local_for_stack_local.get(&box_local) {
+                    body.basic_blocks_mut()[cont_block].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(*anchor_local),
+                                Rvalue::Use(self.const_u64(tcx, source_info.span, 0)),
+                            ))),
+                        ),
+                    );
+                }
+                if let Some(anchor_state_local) =
+                    anchor_is_slot_family_local_for_stack_local.get(&box_local)
+                {
+                    body.basic_blocks_mut()[cont_block].statements.insert(
+                        0,
+                        Statement::new(
+                            source_info,
+                            StatementKind::Assign(Box::new((
+                                Place::from(*anchor_state_local),
+                                Rvalue::Use(self.const_u8(tcx, source_info.span, 0)),
+                            ))),
+                        ),
+                    );
+                }
+                continue;
+            }
+
+            if let InstrKind::ShadowStoreExternalAllocRoot { is_mut } = creation_kind.clone() {
                 let slot_addr_local = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.usize, source_info.span));
@@ -1964,13 +2198,11 @@ impl MyOptimizationPass {
                 let tmp_unit = body
                     .local_decls
                     .push(LocalDecl::new(tcx.types.unit, source_info.span));
-                let store_def_id = match creation_kind {
-                    InstrKind::ShadowStoreExternalAllocRoot { .. } => {
-                        hooks.def_id_shadow_store_external_alloc_root
-                    }
-                    _ => hooks.def_id_shadow_store_alloc_root,
-                };
-                let store_func = runtime_func(tcx, store_def_id, source_info.span);
+                let store_func = runtime_func(
+                    tcx,
+                    hooks.def_id_shadow_store_external_alloc_root,
+                    source_info.span,
+                );
                 let store_args = lower_args(
                     source_info.span,
                     [
@@ -6093,6 +6325,7 @@ impl MyOptimizationPass {
                 InstrKind::CallArgLeafPush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
                 | InstrKind::ArgLeafTake { .. }
+                | InstrKind::CallArgLeafValidate
                 | InstrKind::CallArgShadowRangePush { .. }
                 | InstrKind::IndirectCallArgShadowRangePush { .. }
                 | InstrKind::ArgShadowRangeTake { .. } => {
@@ -6993,6 +7226,36 @@ impl MyOptimizationPass {
                     (args, Place::from(tmp_unit))
                 }
 
+                InstrKind::CallArgLeafValidate => {
+                    let tmp_unit = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.unit, source_info.span));
+                    let ptr_addr_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                    let Some((ptr_addr_stmt1, ptr_addr_stmt2)) =
+                        self.addr_stmts_for_place(tcx, body, source_info, place, ptr_addr_local)
+                    else {
+                        continue;
+                    };
+                    if let Some(stmt) = ptr_addr_stmt1 {
+                        extra_stmts.push(stmt);
+                    }
+                    extra_stmts.push(ptr_addr_stmt2);
+                    let args: Box<[Spanned<Operand<'tcx>>]> = vec![
+                        Spanned {
+                            node: arg_addr,
+                            span: source_info.span,
+                        },
+                        Spanned {
+                            node: Operand::Copy(Place::from(ptr_addr_local)),
+                            span: source_info.span,
+                        },
+                    ]
+                    .into_boxed_slice();
+                    (args, Place::from(tmp_unit))
+                }
+
                 ref kind @ (InstrKind::CallArgLeafPush { .. }
                 | InstrKind::IndirectCallArgLeafPush { .. }
                 | InstrKind::ArgLeafTake { .. }) => {
@@ -7598,8 +7861,7 @@ impl MyOptimizationPass {
 
                     let arg_parent: Operand<'tcx> = match &creation_kind {
                         InstrKind::Ref { bk, src, .. } => {
-                            let use_projectionless_anchor = matches!(bk, BorrowKind::Mut { .. })
-                                || self.compile_alias_model_is_sb_like();
+                            let use_projectionless_anchor = matches!(bk, BorrowKind::Mut { .. });
                             if let Some(local) =
                                 projected_ref_parent_local.or(projectionless_ref_parent_local)
                             {
@@ -8028,10 +8290,7 @@ impl MyOptimizationPass {
                             ref_ancestor_local_for_ptr_local.get(&dst_local).copied()
                         {
                             let use_projectionless_anchor = match &creation_kind {
-                                InstrKind::Ref { bk, .. } => {
-                                    matches!(bk, BorrowKind::Mut { .. })
-                                        || self.compile_alias_model_is_sb_like()
-                                }
+                                InstrKind::Ref { bk, .. } => matches!(bk, BorrowKind::Mut { .. }),
                                 _ => true,
                             };
                             let parent_op = if let Some(local) =
@@ -8961,7 +9220,133 @@ impl MyOptimizationPass {
                 continue;
             }
 
-            if let InstrKind::ArgAnchorSeedFromShadow { local } = creation_kind {
+            if let InstrKind::ArgBoxOwnerRetag {
+                callee_id,
+                local,
+                size_op,
+                align_op,
+            } = creation_kind.clone()
+            {
+                let anchor_local = *reborrow_anchor_local_for_stack_local
+                    .get(&local)
+                    .expect("missing anchor local for ArgBoxOwnerRetag");
+                let anchor_state_local = anchor_is_slot_family_local_for_stack_local
+                    .get(&local)
+                    .copied();
+                let slot_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let ptr_addr_local = body
+                    .local_decls
+                    .push(LocalDecl::new(tcx.types.usize, source_info.span));
+                let Some((slot_addr_stmt1, slot_addr_stmt2)) = self.slot_addr_stmts_for_place(
+                    tcx,
+                    body,
+                    source_info,
+                    place,
+                    slot_addr_local,
+                    false,
+                ) else {
+                    continue;
+                };
+                let Some((data_ptr_stmt_opt, ptr_addr_stmt)) =
+                    self.addr_stmts_for_place(tcx, body, source_info, place, ptr_addr_local)
+                else {
+                    continue;
+                };
+                let (bounds_len, mut bounds_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &size_op);
+                let (align_req, mut align_stmts) =
+                    self.materialize_size_operand(tcx, body, source_info, &align_op);
+                let retag_func =
+                    runtime_func(tcx, hooks.def_id_box_owner_call_retag, source_info.span);
+                let retag_args = lower_args(
+                    source_info.span,
+                    [
+                        self.const_u64(tcx, source_info.span, callee_id),
+                        copy_local(slot_addr_local),
+                        copy_local(ptr_addr_local),
+                        bounds_len,
+                        align_req,
+                    ],
+                );
+                let mut pre_call_stmts = vec![slot_addr_stmt1, slot_addr_stmt2];
+                if let Some(data_ptr_stmt) = data_ptr_stmt_opt {
+                    pre_call_stmts.push(data_ptr_stmt);
+                }
+                pre_call_stmts.push(ptr_addr_stmt);
+                pre_call_stmts.append(&mut bounds_stmts);
+                pre_call_stmts.append(&mut align_stmts);
+                let cont_block = split_block_with_runtime_call(
+                    body,
+                    bb,
+                    stmt_idx,
+                    ip.insert_before,
+                    pre_call_stmts,
+                    |cont_block| {
+                        runtime_call_term(
+                            source_info,
+                            retag_func,
+                            retag_args,
+                            Place::from(anchor_local),
+                            Some(cont_block),
+                            CallSource::Misc,
+                        )
+                    },
+                );
+                if let Some(anchor_state_local) = anchor_state_local {
+                    let anchor_nonzero_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.bool, source_info.span));
+                    let anchor_state_u8_local = body
+                        .local_decls
+                        .push(LocalDecl::new(tcx.types.u8, source_info.span));
+                    body.basic_blocks_mut()[cont_block].statements.splice(
+                        0..0,
+                        [
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_nonzero_local),
+                                    Rvalue::BinaryOp(
+                                        BinOp::Ne,
+                                        Box::new((
+                                            Operand::Copy(Place::from(anchor_local)),
+                                            self.const_u64(tcx, source_info.span, 0),
+                                        )),
+                                    ),
+                                ))),
+                            ),
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_state_u8_local),
+                                    Rvalue::Cast(
+                                        CastKind::IntToInt,
+                                        Operand::Copy(Place::from(anchor_nonzero_local)),
+                                        tcx.types.u8,
+                                    ),
+                                ))),
+                            ),
+                            Statement::new(
+                                source_info,
+                                StatementKind::Assign(Box::new((
+                                    Place::from(anchor_state_local),
+                                    Rvalue::Use(Operand::Copy(Place::from(anchor_state_u8_local))),
+                                ))),
+                            ),
+                        ],
+                    );
+                }
+                continue;
+            }
+
+            let shadow_seed_local = match creation_kind {
+                InstrKind::ArgAnchorSeedFromShadow { local }
+                | InstrKind::BoxOwnerAnchorSeed { local } => Some(local),
+                _ => None,
+            };
+            if let Some(local) = shadow_seed_local {
                 let anchor_local = *reborrow_anchor_local_for_stack_local
                     .get(&local)
                     .expect("missing anchor local for ArgAnchorSeedFromShadow");

@@ -15,8 +15,7 @@ fn main() {
     foo(&arr[0]);
 
     let pair = (Cell::new(1), 1);
-    // Principled TB-lite now rejects this: `&pair.0` does not carry any
-    // writable surrounding extent for `pair.1`, so the raw write remains
-    // frozen outside the interior-mutable root.
+    // The shared reference to the interior-mutable field carries permission
+    // for the surrounding aggregate, matching Tree Borrows.
     foo(&pair.0);
 }

@@ -58,8 +58,8 @@ const CREATION_RAW_LINEAGE_HINT_MASK: u8 =
     // Logging (println!/format!) can allocate while locks are held.
     static RZ_IN_RUNTIME_HOOK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
 
-    // Temporarily suppress SB-lite enforcement for coarse "unknown call" hooks.
-    static RZ_SB_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
+    // Temporarily suppress alias-model enforcement for coarse "unknown call" hooks.
+    static RZ_ALIAS_SUPPRESS: ::std::cell::Cell<bool> = ::std::cell::Cell::new(false);
 
     // Temporarily relax epoch-mismatch checks for coarse allow-untagged hooks.
     static RZ_RELAX_EPOCH_CHECK: ::std::cell::Cell<u32> = ::std::cell::Cell::new(0);
@@ -81,13 +81,13 @@ impl Drop for RzRuntimeGuard {
     }
 }
 
-struct SbSuppressGuard {
+struct AliasSuppressGuard {
     prev: bool,
 }
-impl SbSuppressGuard {
+impl AliasSuppressGuard {
     #[inline]
     fn enter() -> Self {
-        let prev = RZ_SB_SUPPRESS.with(|c| {
+        let prev = RZ_ALIAS_SUPPRESS.with(|c| {
             let p = c.get();
             c.set(true);
             p
@@ -95,10 +95,10 @@ impl SbSuppressGuard {
         Self { prev }
     }
 }
-impl Drop for SbSuppressGuard {
+impl Drop for AliasSuppressGuard {
     #[inline]
     fn drop(&mut self) {
-        RZ_SB_SUPPRESS.with(|c| c.set(self.prev));
+        RZ_ALIAS_SUPPRESS.with(|c| c.set(self.prev));
     }
 }
 
@@ -799,8 +799,8 @@ fn rz_in_runtime_hook() -> bool {
 }
 
 #[inline]
-fn rz_sb_suppressed() -> bool {
-    RZ_SB_SUPPRESS.with(|c| c.get())
+fn rz_alias_suppressed() -> bool {
+    RZ_ALIAS_SUPPRESS.with(|c| c.get())
 }
 
 #[inline]
@@ -1895,6 +1895,8 @@ pub struct AllocMeta {
 pub enum PtrKind {
     RefShared,
     RefMut,
+    /// Owning unique authority carried by containers such as `Box<T>`.
+    OwnedUnique,
     RawConst,
     RawMut,
 }
@@ -4087,35 +4089,117 @@ pub extern "C" fn __rz_shadow_store_ptr_local(
     );
 }
 
+#[inline]
+fn rz_store_box_owner_shadow(slot_addr: usize, ptr_addr: usize, tag: u64) {
+    if slot_addr == 0 {
+        return;
+    }
+    if ptr_addr == 0 || tag == 0 {
+        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+        return;
+    }
+    ptr_shadow::store_ptr(slot_addr, tag, tag, tag, 0);
+}
+
+/// Create the owning unique authority stored in a newly-created `Box<T>`.
+///
+/// `require_parent` distinguishes `Box::from_raw` from allocation constructors. Missing raw
+/// metadata must not be replaced with a root owner because that would invent provenance.
 #[no_mangle]
-pub extern "C" fn __rz_shadow_store_alloc_root(
+pub extern "C" fn __rz_box_owner_create(
+    slot_addr: usize,
+    ptr_addr: usize,
+    parent_tag: u64,
+    require_parent: u8,
+    bounds_len: usize,
+    align_req: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    if slot_addr == 0 || ptr_addr == 0 {
+        rz_store_box_owner_shadow(slot_addr, ptr_addr, 0);
+        return 0;
+    }
+    if require_parent != 0
+        && (parent_tag == 0
+            || !tag_store::get(parent_tag)
+                .is_some_and(|meta| matches!(meta.kind, PtrKind::RawConst | PtrKind::RawMut)))
+    {
+        rz_store_box_owner_shadow(slot_addr, ptr_addr, 0);
+        return 0;
+    }
+    let tag = record_ref_or_owner_creation_with_extent(
+        ptr_addr,
+        PtrKind::OwnedUnique,
+        parent_tag,
+        0,
+        bounds_len,
+        align_req,
+        0,
+        0,
+    );
+    rz_store_box_owner_shadow(slot_addr, ptr_addr, tag);
+    tag
+}
+
+/// Retag a by-value Box argument as a fresh protected owning unique authority.
+#[no_mangle]
+pub extern "C" fn __rz_box_owner_call_retag(
+    callee_id: u64,
+    slot_addr: usize,
+    ptr_addr: usize,
+    bounds_len: usize,
+    align_req: usize,
+) -> u64 {
+    let _g = RzRuntimeGuard::enter();
+    let parent_tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
+    if parent_tag == 0
+        || !tag_store::get(parent_tag).is_some_and(|meta| {
+            matches!(meta.kind, PtrKind::OwnedUnique)
+                && active_alias_model().can_recover_parent_tag(parent_tag)
+        })
+    {
+        return 0;
+    }
+    let boundary_id = active_call_boundary_id(callee_id);
+    active_alias_model().on_call_arg_anchor_taken(boundary_id, parent_tag);
+    let tag = record_ref_or_owner_creation_with_extent(
+        ptr_addr,
+        PtrKind::OwnedUnique,
+        parent_tag,
+        0,
+        bounds_len,
+        align_req,
+        0,
+        0,
+    );
+    rz_store_box_owner_shadow(slot_addr, ptr_addr, tag);
+    tag
+}
+
+/// Convert a consumed Box owner into a raw child without changing allocation liveness.
+#[no_mangle]
+pub extern "C" fn __rz_box_owner_into_raw(
     slot_addr: usize,
     ptr_addr: usize,
     is_mut: u8,
     bounds_len: usize,
     align_req: usize,
-) {
-    let profile = rz_profile_context!();
-    let _profile_guard = rz_profile_guard!(profile, shadow_store);
+) -> u64 {
     let _g = RzRuntimeGuard::enter();
-    if slot_addr == 0 {
-        return;
+    let parent_tag = current_slot_shadow(slot_addr)
+        .map(|shadow| shadow.0)
+        .filter(|tag| {
+            tag_store::get(*tag).is_some_and(|meta| {
+                matches!(meta.kind, PtrKind::OwnedUnique)
+                    && active_alias_model().can_recover_parent_tag(*tag)
+            })
+        })
+        .unwrap_or(0);
+    ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
+    if parent_tag == 0 || ptr_addr == 0 {
+        return 0;
     }
-    if ptr_addr == 0 {
-        ptr_shadow::store_ptr(slot_addr, 0, 0, 0, 0);
-        return;
-    }
-
-    // Allocation constructors produce a new owner pointer. Its provenance starts at the
-    // current allocation instance, even if the allocator reused an old numeric address.
-    let tag = __record_raw_ptr_creation(ptr_addr, is_mut, 0, 0, bounds_len, align_req);
-    ptr_shadow::store_ptr(slot_addr, tag, 0, tag, 0);
-    if rz_trace_ptr_shadow_enabled() {
-        eprintln!(
-            "[rusteze-runtime][ptr-shadow] store_alloc_root slot=0x{:x} ptr=0x{:x} tag={}",
-            slot_addr, ptr_addr, tag
-        );
-    }
+    __record_raw_ptr_creation(ptr_addr, is_mut, parent_tag, 0, bounds_len, align_req)
 }
 
 #[no_mangle]
@@ -5154,41 +5238,26 @@ pub fn __rz_ptr_write(
             Some(&tmeta),
         );
     }
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        match active_alias_model().name() {
-            // Tree Borrows tracks raws as first-class nodes in the tree.
-            // Rewriting them to a reference ancestor skips state transitions
-            // that should happen on the raw itself.
-            "tb_lite" => {
-                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
-                    let tmap = tags().lock().unwrap();
-                    active_alias_model()
-                        .find_ref_ancestor_tag(&tmap, tag)
-                        .or(Some(tag))
-                } else {
-                    Some(tag)
-                }
-            }
-            "sb_lite" => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model()
-                    .find_ref_ancestor_tag(&tmap, tag)
-                    .or(Some(tag))
-            }
-            _ => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-            }
+    let access_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        // Tree Borrows tracks raws as first-class nodes in the tree. Rewriting them to a
+        // reference ancestor skips state transitions that should happen on the raw itself.
+        if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+            let tmap = tags().lock().unwrap();
+            active_alias_model()
+                .find_ref_ancestor_tag(&tmap, tag)
+                .or(Some(tag))
+        } else {
+            Some(tag)
         }
     } else {
         Some(tag)
     };
     rz_profile_add_opt_field!(profile, write_tag_lookup_ns, tag_lookup_start);
 
-    if let Some(sb_tag) = sb_tag_opt {
+    if let Some(access_tag) = access_tag_opt {
         let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
-            sb_tag,
+            access_tag,
             tag,
             &tmeta,
             addr,
@@ -5583,7 +5652,7 @@ pub fn __rz_ptr_write_allow_untagged(
     if tag == 0 {
         return;
     }
-    let _sb = SbSuppressGuard::enter();
+    let _alias = AliasSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_write(tag, addr, size, align_req, access_alias_exempt);
 }
@@ -5725,41 +5794,26 @@ pub fn __rz_ptr_read(
             Some(&tmeta),
         );
     }
-    let sb_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
-        match active_alias_model().name() {
-            // Tree Borrows tracks raws as first-class nodes in the tree.
-            // Rewriting them to a reference ancestor skips state transitions
-            // that should happen on the raw itself.
-            "tb_lite" => {
-                if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
-                    let tmap = tags().lock().unwrap();
-                    active_alias_model()
-                        .find_ref_ancestor_tag(&tmap, tag)
-                        .or(Some(tag))
-                } else {
-                    Some(tag)
-                }
-            }
-            "sb_lite" => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model()
-                    .find_ref_ancestor_tag(&tmap, tag)
-                    .or(Some(tag))
-            }
-            _ => {
-                let tmap = tags().lock().unwrap();
-                active_alias_model().find_ref_ancestor_tag(&tmap, tag)
-            }
+    let access_tag_opt = if matches!(tmeta.kind, PtrKind::RawConst | PtrKind::RawMut) {
+        // Tree Borrows tracks raws as first-class nodes in the tree. Rewriting them to a
+        // reference ancestor skips state transitions that should happen on the raw itself.
+        if (tmeta.lineage_hint & LINEAGE_HINT_TB_RAW_REUSE_PARENT_FAMILY) != 0 {
+            let tmap = tags().lock().unwrap();
+            active_alias_model()
+                .find_ref_ancestor_tag(&tmap, tag)
+                .or(Some(tag))
+        } else {
+            Some(tag)
         }
     } else {
         Some(tag)
     };
     rz_profile_add_opt_field!(profile, read_tag_lookup_ns, tag_lookup_start);
 
-    if let Some(sb_tag) = sb_tag_opt {
+    if let Some(access_tag) = access_tag_opt {
         let alias_check_start = rz_profile_start!(profile);
         let alias_violation = active_alias_model().check_access(
-            sb_tag,
+            access_tag,
             tag,
             &tmeta,
             addr,
@@ -6095,7 +6149,7 @@ pub fn __rz_ptr_read_allow_untagged(
     if tag == 0 {
         return;
     }
-    let _sb = SbSuppressGuard::enter();
+    let _alias = AliasSuppressGuard::enter();
     let _relax = RelaxEpochGuard::enter();
     __rz_ptr_read(tag, addr, size, align_req, access_alias_exempt);
 }
@@ -7364,6 +7418,16 @@ pub extern "C" fn __rz_validate_call_arg_tag(tag: u64) {
     validate_call_arg_boundary_tag(tag, 0);
 }
 
+/// Validate one statically projected reference leaf of a by-value call carrier.
+#[no_mangle]
+pub extern "C" fn __rz_validate_call_arg_ref_leaf(slot_addr: usize, ptr_addr: usize) {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, call_arg_take);
+    let _g = RzRuntimeGuard::enter();
+    let tag = ptr_shadow::load_tag_for_ptr_value(slot_addr, ptr_addr);
+    validate_call_arg_boundary_tag(tag, ptr_addr);
+}
+
 /// Push the exact shadow of one internal pointer leaf of a by-value aggregate argument.
 #[no_mangle]
 pub extern "C" fn __rz_push_call_arg_leaf_shadow(
@@ -7841,9 +7905,6 @@ pub extern "C" fn __rz_push_mut_arg_ret_leaf_shadow(
     else {
         return;
     };
-    if active_alias_model().name() == "sb_lite" {
-        rz_validate_ref_boundary_use(tag, "RET");
-    }
     if tag != 0 {
         remember_mut_arg_ret_boundary_lineage(tag);
         apply_or_defer_boundary_survivor(boundary_id, tag, addr, BoundarySurvivorKind::MutArgRet);
@@ -8269,15 +8330,37 @@ pub extern "C" fn __record_ref_creation_with_extent(
     interior_mut_extent_base: usize,
     interior_mut_extent_len: usize,
 ) -> u64 {
-    let profile = rz_profile_context!();
-    let _profile_guard = rz_profile_guard!(profile, ref_create);
-    let _g = RzRuntimeGuard::enter();
-    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let kind = if is_mut != 0 {
         PtrKind::RefMut
     } else {
         PtrKind::RefShared
     };
+    record_ref_or_owner_creation_with_extent(
+        pointee_addr,
+        kind,
+        parent_tag,
+        alias_exempt,
+        bounds_len,
+        align_req,
+        interior_mut_extent_base,
+        interior_mut_extent_len,
+    )
+}
+
+fn record_ref_or_owner_creation_with_extent(
+    pointee_addr: usize,
+    kind: PtrKind,
+    parent_tag: u64,
+    alias_exempt: u8,
+    bounds_len: usize,
+    align_req: usize,
+    interior_mut_extent_base: usize,
+    interior_mut_extent_len: usize,
+) -> u64 {
+    let profile = rz_profile_context!();
+    let _profile_guard = rz_profile_guard!(profile, ref_create);
+    let _g = RzRuntimeGuard::enter();
+    let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
     let normalized_const_end_ref = pointee_addr != 0
         && pointee_addr != normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
     let pointee_addr = normalize_const_end_ref_pointee(pointee_addr, parent_tag, bounds_len);
@@ -8322,7 +8405,11 @@ pub extern "C" fn __record_ref_creation_with_extent(
             None,
         );
     }
-    if !alias_exempt_flag {
+    // Creating an owner records authority; it is not itself a pointee access. In particular,
+    // `Box::from_raw` with a mismatched layout must remain observable at the later deallocation
+    // check instead of being reported early as a reference-creation OOB. Actual Box dereferences
+    // still go through the ordinary access checks below this metadata layer.
+    if !alias_exempt_flag && matches!(kind, PtrKind::RefShared | PtrKind::RefMut) {
         if let Some((vk, msg)) = rz_validate_ref_creation_addr(
             pointee_addr,
             kind,
@@ -8467,10 +8554,20 @@ pub extern "C" fn __record_ref_creation_with_extent(
     };
     let mut interior_mut_extent_base = interior_mut_extent_base;
     let mut interior_mut_extent_len = interior_mut_extent_len;
-    if interior_mut_extent_len == 0 && resolved_parent_tag != 0 {
+    if resolved_parent_tag != 0 {
         if let Some(parent_meta) = tag_store::get(resolved_parent_tag) {
-            (interior_mut_extent_base, interior_mut_extent_len) =
+            let (parent_extent_base, parent_extent_len) =
                 tag_interior_mut_extent_from_self_or_parent(&parent_meta);
+            let extent_end = interior_mut_extent_base.saturating_add(interior_mut_extent_len);
+            let parent_extent_end = parent_extent_base.saturating_add(parent_extent_len);
+            if interior_mut_extent_len == 0
+                || (parent_extent_len != 0
+                    && interior_mut_extent_base >= parent_extent_base
+                    && extent_end <= parent_extent_end)
+            {
+                (interior_mut_extent_base, interior_mut_extent_len) =
+                    (parent_extent_base, parent_extent_len);
+            }
         }
     }
     let insert_start = rz_profile_start!(profile);
@@ -8523,6 +8620,7 @@ pub extern "C" fn __record_ref_creation_with_extent(
     let kind_str = match kind {
         PtrKind::RefShared => "shared",
         PtrKind::RefMut => "mut",
+        PtrKind::OwnedUnique => "owned_unique",
         _ => "?",
     };
     rz_trace!(
@@ -8613,8 +8711,12 @@ pub extern "C" fn __record_raw_ptr_creation(
     // these casts do not freeze an otherwise-valid unique/raw-mutable lineage.
     let inherits_write_capability = derived_from != 0
         && projected_helper_parent
-        && tag_store::get(derived_from)
-            .is_some_and(|parent| matches!(parent.kind, PtrKind::RefMut | PtrKind::RawMut));
+        && tag_store::get(derived_from).is_some_and(|parent| {
+            matches!(
+                parent.kind,
+                PtrKind::RefMut | PtrKind::OwnedUnique | PtrKind::RawMut
+            )
+        });
     let kind = if is_mut != 0 || inherits_write_capability {
         PtrKind::RawMut
     } else {

@@ -20,6 +20,5 @@ fn main() {
 
     // Mutate through the unique borrow, then read through the shared alias.
     *target = 13;
-    black_box(*target_alias); // UB under SB-lite: read via invalidated shared ref
+    black_box(*target_alias); // UB: read via invalidated shared ref
 }
-

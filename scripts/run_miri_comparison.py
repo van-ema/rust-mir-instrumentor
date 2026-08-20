@@ -9,47 +9,81 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from example_outcomes import (
+        classify_expected,
+        classify_observed,
+        semantic_agreement,
+    )
+except ModuleNotFoundError:
+    from scripts.example_outcomes import (
+        classify_expected,
+        classify_observed,
+        semantic_agreement,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 REPORT_ROOT = REPO_ROOT / "reports" / "miri_compare"
 PORT_RE = re.compile(r"^\s*//\s*Ported from (miri/tests/(?:fail|pass)/[A-Za-z0-9_./-]+\.rs)\.")
 COMPILE_FLAGS_RE = re.compile(r"^\s*//@compile-flags:\s*(.*)$")
-PACKAGE_DIRS = {
-    "miri_sb_exact": EXAMPLES_DIR / "miri_tests" / "sb_exact",
-    "miri_tb_exact": EXAMPLES_DIR / "miri_tests" / "tb_exact",
-    "miri_tb_pass_exact": EXAMPLES_DIR / "miri_tests" / "tb_pass_exact",
-    "miri_mem_exact": EXAMPLES_DIR / "miri_tests" / "memory_exact",
-    "miri_function_calls_exact": EXAMPLES_DIR / "miri_tests" / "function_calls_exact",
-    "miri_provenance_exact": EXAMPLES_DIR / "miri_tests" / "provenance_exact",
-    "miri_unaligned_exact": EXAMPLES_DIR / "miri_tests" / "unaligned_exact",
+EXACT_PACKAGES = {
+    "miri_sb_exact": (EXAMPLES_DIR / "miri_tests" / "sb_exact", "tb_lite", "tree"),
+    "miri_tb_exact": (EXAMPLES_DIR / "miri_tests" / "tb_exact", "tb_lite", "tree"),
+    "miri_tb_pass_exact": (EXAMPLES_DIR / "miri_tests" / "tb_pass_exact", "tb_lite", "tree"),
+    "miri_mem_exact": (EXAMPLES_DIR / "miri_tests" / "memory_exact", "tb_lite", "default"),
+    "miri_function_calls_exact": (
+        EXAMPLES_DIR / "miri_tests" / "function_calls_exact",
+        "tb_lite",
+        "tree",
+    ),
+    "miri_provenance_exact": (
+        EXAMPLES_DIR / "miri_tests" / "provenance_exact",
+        "tb_lite",
+        "default",
+    ),
+    "miri_unaligned_exact": (
+        EXAMPLES_DIR / "miri_tests" / "unaligned_exact",
+        "tb_lite",
+        "default",
+    ),
+}
+TREE_MULTI_BIN_PACKAGES = {
+    "tb_miri_micro": EXAMPLES_DIR / "tb_miri_micro",
+    "sb_miri_micro": EXAMPLES_DIR / "sb_miri_micro",
+    "ret_provenance_cases": EXAMPLES_DIR / "ret_provenance_cases",
 }
 
 
 @dataclass
-class PortedTest:
+class ComparisonTest:
     package: str
     bin_name: str
     src: Path
     origin: str
+    rz_model: str
+    miri_mode: str
 
     @property
     def label(self) -> str:
+        if self.package == self.bin_name:
+            return self.package
         return f"{self.package}::{self.bin_name}"
 
     @property
-    def rz_model(self) -> str:
-        if self.package == "miri_sb_exact":
-            return "sb_lite"
-        return "tb_lite"
+    def comparison_label(self) -> str:
+        return f"{self.label}@{self.rz_model}"
 
     @property
-    def miri_mode(self) -> str:
-        if self.package == "miri_sb_exact":
-            return "stacked"
-        if self.package in ("miri_tb_exact", "miri_tb_pass_exact", "miri_function_calls_exact"):
-            return "tree"
-        return "default"
+    def report_name(self) -> str:
+        return f"{self.package}__{self.bin_name}__{self.rz_model}"
+
+    @property
+    def run_log_dir_name(self) -> str:
+        if self.package == self.bin_name:
+            return self.package
+        return f"{self.package}__{self.bin_name}"
 
     @property
     def miri_compile_flags(self) -> list[str]:
@@ -66,9 +100,13 @@ def die(msg: str) -> None:
     raise SystemExit(1)
 
 
-def discover_ported_tests() -> list[PortedTest]:
-    out: list[PortedTest] = []
-    for package, package_dir in PACKAGE_DIRS.items():
+def local_origin(src: Path) -> str:
+    return str(src.relative_to(REPO_ROOT))
+
+
+def discover_comparison_tests() -> list[ComparisonTest]:
+    out: list[ComparisonTest] = []
+    for package, (package_dir, rz_model, miri_mode) in EXACT_PACKAGES.items():
         for src in sorted((package_dir / "src" / "bin").glob("*.rs")):
             head = src.read_text(errors="replace").splitlines()[:3]
             for line in head:
@@ -76,15 +114,55 @@ def discover_ported_tests() -> list[PortedTest]:
                 if not m:
                     continue
                 out.append(
-                    PortedTest(
+                    ComparisonTest(
                         package=package,
                         bin_name=src.stem,
                         src=src,
                         origin=m.group(1),
+                        rz_model=rz_model,
+                        miri_mode=miri_mode,
                     )
                 )
                 break
-    return out
+
+    for package, package_dir in TREE_MULTI_BIN_PACKAGES.items():
+        for src in sorted((package_dir / "src" / "bin").glob("*.rs")):
+            out.append(
+                ComparisonTest(
+                    package=package,
+                    bin_name=src.stem,
+                    src=src,
+                    origin=local_origin(src),
+                    rz_model="tb_lite",
+                    miri_mode="tree",
+                )
+            )
+
+    standalone_dirs = sorted(
+        package_dir
+        for package_dir in EXAMPLES_DIR.iterdir()
+        if package_dir.is_dir()
+        and (
+            package_dir.name.startswith("tb_lite_")
+            or package_dir.name == "copy_alias_violation"
+        )
+    )
+    for package_dir in standalone_dirs:
+        src = package_dir / "src" / "main.rs"
+        if not src.is_file():
+            continue
+        out.append(
+            ComparisonTest(
+                package=package_dir.name,
+                bin_name=package_dir.name,
+                src=src,
+                origin=local_origin(src),
+                rz_model="tb_lite",
+                miri_mode="tree",
+            )
+        )
+
+    return sorted(out, key=lambda test: test.comparison_label)
 
 
 def run(
@@ -136,22 +214,13 @@ def did_panic(log: Path | None) -> bool:
 
 
 def derive_rusteze_class(row: dict[str, str], panicked: bool) -> str:
-    expected = row["expected"].strip().lower()
-    observed = row["observed"].strip().lower()
-    if observed not in ("", "-"):
-        return "violation"
-    if panicked:
-        return "panic"
-    if expected in ("ok", "pass", "none") and observed in ("", "-"):
-        return "ok"
-    if expected in ("panic", "panics") and observed == "panic":
-        return "panic"
-    if expected not in ("ok", "pass", "none", "panic", "panics", "-", ""):
-        return "violation"
-    return "other"
+    observed = row["observed"].strip()
+    observed_panic = panicked or observed.lower() == "panic"
+    signature = None if observed.lower() in ("", "-", "panic") else observed
+    return classify_observed(signature, observed_panic)
 
 
-def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
+def run_rusteze_test(test: ComparisonTest, report_dir: Path) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["EXAMPLE_FILTER"] = rf"^{re.escape(test.label)}$"
@@ -168,19 +237,19 @@ def run_rusteze_test(test: PortedTest, report_dir: Path) -> tuple[Path, Path]:
     if local_cargo_tool.exists() and local_inst_tool.exists():
         env["PATH"] = f"{tool_dir}{os.pathsep}{env.get('PATH', '')}"
     cmd = [sys.executable, "scripts/run_example_tests.py"]
-    log = report_dir / f"{test.package}__{test.bin_name}.{test.rz_model}.log"
+    log = report_dir / f"{test.report_name}.log"
     last_code = 0
     for _attempt in range(3):
         last_code = run(cmd, env, REPO_ROOT, log, timeout_s=60.0)
         summaries = sorted(report_dir.glob("*/summary.tsv"))
         if summaries:
             summary = summaries[-1]
-            run_log = summary.parent / f"{test.package}__{test.bin_name}" / "run.log"
+            run_log = summary.parent / test.run_log_dir_name / "run.log"
             return summary, run_log
     die(f"rusteze example run failed for {test.label} ({test.rz_model}); see {log}")
 
 
-def run_miri(test: PortedTest, report_dir: Path) -> tuple[int, str]:
+def run_miri(test: ComparisonTest, report_dir: Path) -> tuple[int, str]:
     env = os.environ.copy()
     miri_flags = env.get("MIRIFLAGS", "").split()
     if test.miri_mode == "tree":
@@ -188,7 +257,7 @@ def run_miri(test: PortedTest, report_dir: Path) -> tuple[int, str]:
     miri_flags.extend(test.miri_compile_flags)
     env["MIRIFLAGS"] = " ".join(miri_flags).strip()
     cmd = ["cargo", "miri", "run", "-q", "-p", test.package, "--bin", test.bin_name]
-    log = report_dir / f"{test.package}__{test.bin_name}.miri.log"
+    log = report_dir / f"{test.report_name}.miri.log"
     code = run(cmd, env, REPO_ROOT, log)
     text = log.read_text(errors="replace")
     if code == 0:
@@ -212,9 +281,16 @@ def main() -> int:
     except Exception:
         die("cargo miri not available")
 
-    tests = discover_ported_tests()
+    tests = discover_comparison_tests()
+    comparison_filter = os.environ.get("MIRI_COMPARE_FILTER", "").strip()
+    if comparison_filter:
+        tests = [
+            test
+            for test in tests
+            if re.search(comparison_filter, test.comparison_label)
+        ]
     if not tests:
-        die("no exact Miri ports found")
+        die(f"no Miri comparison tests found for filter {comparison_filter!r}")
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = REPORT_ROOT / timestamp
@@ -226,56 +302,75 @@ def main() -> int:
     rusteze_rows: dict[str, dict[str, str]] = {}
     rusteze_run_logs: dict[str, Path] = {}
     for test in tests:
-        summary, run_log = run_rusteze_test(test, rusteze_dir / test.package / test.bin_name)
-        rusteze_rows.update(parse_summary(summary))
-        rusteze_run_logs[test.label] = run_log
+        summary, run_log = run_rusteze_test(
+            test,
+            rusteze_dir / test.package / test.bin_name / test.rz_model,
+        )
+        row = parse_summary(summary).get(test.label)
+        if row is None:
+            die(f"missing rusteze row for {test.comparison_label}")
+        rusteze_rows[test.comparison_label] = row
+        rusteze_run_logs[test.comparison_label] = run_log
 
     summary_path = run_dir / "summary.tsv"
     with summary_path.open("w") as f:
         f.write(
-            "label\torigin\trz_model\trusteze_status\trusteze_expected\trusteze_observed\trusteze_class\tmiri_mode\tmiri_exit\tmiri_class\tagree\n"
+            "label\torigin\trz_model\trusteze_status\trusteze_expected\t"
+            "rusteze_observed\texpectation_class\trusteze_class\tmiri_mode\t"
+            "miri_exit\tmiri_class\texpectation_agrees\tbehavior_agrees\n"
         )
 
-    agree = 0
+    expectation_agree = 0
+    behavior_agree = 0
     total = 0
     for test in tests:
         total += 1
-        row = rusteze_rows.get(test.label)
+        row = rusteze_rows.get(test.comparison_label)
         if row is None:
-            die(f"missing rusteze row for {test.label}")
+            die(f"missing rusteze row for {test.comparison_label}")
         rusteze_class = derive_rusteze_class(
             row,
-            did_panic(rusteze_run_logs.get(test.label)),
+            did_panic(rusteze_run_logs.get(test.comparison_label)),
         )
+        expectation_class = classify_expected(row["expected"])
         miri_exit, miri_class = run_miri(test, miri_dir)
-        same = (
-            (miri_class == "ok" and rusteze_class == "ok")
-            or (miri_class == "reject" and rusteze_class != "ok")
-        )
-        if same:
-            agree += 1
+        expectation_same = semantic_agreement(expectation_class, miri_class)
+        behavior_same = semantic_agreement(rusteze_class, miri_class)
+        if expectation_same:
+            expectation_agree += 1
+        if behavior_same:
+            behavior_agree += 1
         with summary_path.open("a") as f:
             f.write(
                 "\t".join(
                     [
-                        test.label,
+                        test.comparison_label,
                         test.origin,
                         test.rz_model,
                         row["status"],
                         row["expected"],
                         row["observed"],
+                        expectation_class,
                         rusteze_class,
                         test.miri_mode,
                         str(miri_exit),
                         miri_class,
-                        "yes" if same else "no",
+                        "yes" if expectation_same else "no",
+                        "yes" if behavior_same else "no",
                     ]
                 )
                 + "\n"
             )
 
-    print(f"ported tests: {total}")
-    print(f"agreement: {agree}/{total} = {agree / total:.1%}")
+    print(f"comparison tests: {total}")
+    print(
+        f"expectation agreement: {expectation_agree}/{total} = "
+        f"{expectation_agree / total:.1%}"
+    )
+    print(
+        f"behavior agreement: {behavior_agree}/{total} = "
+        f"{behavior_agree / total:.1%}"
+    )
     print(f"summary: {summary_path}")
     return 0
 

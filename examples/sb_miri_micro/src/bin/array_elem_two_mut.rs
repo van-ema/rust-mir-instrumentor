@@ -10,9 +10,8 @@ fn main() {
         let r1: &mut u8 = &mut *p;
         let r2: &mut u8 = &mut *p;
         *r2 = 10;
-        *r1 = 11; // UB under SB-lite: older unique used after a newer unique
+        *r1 = 11; // UB: older unique used after a newer unique
     }
 
     black_box(a);
 }
-

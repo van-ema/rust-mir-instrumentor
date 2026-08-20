@@ -55,12 +55,6 @@ Two additional changes were tried and reverted after regression analysis:
 | Test | Note |
 |---|---|
 | `miri_sb_exact::invalidate_against_protector1` | SB-only test (lives under `miri/tests/fail/stacked_borrows/`, no tree rev). Not a TB UB; rusteze's `expected.*.tb_lite.rz` says TB violation — stale expectation. |
-| `sb_lite_raw_cast_from_ref` | Rusteze self-test. Pattern: ref→raw→new foreign mut→raw access. TB doesn't UB (foreign `&mut` creation doesn't invalidate existing raw descendants absent protector). SB-semantic expectation. |
-| `sb_lite_raw_from_ref_fn` | Same pattern. |
-| `sb_lite_raw_read_after_unique` | Same. |
-| `sb_lite_raw_transmute` | Same. |
-| `sb_lite_raw_write_after_unique` | Same. |
-| `sb_lite_conflict` | Overlapping shared + unique reborrow via raw. TB allows; only SB UB. |
 | `ret_provenance_cases::ret_alias_parent_raw_ub` | `bounce_raw(p)` returns same pointer; two writes through aliases. No TB UB. |
 | `ret_provenance_cases::ret_mut_reborrow_conflict_ub` | Callee returns `&mut *raw`; caller writes raw post-return. No protector-window conflict. No TB UB. |
 

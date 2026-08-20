@@ -2,11 +2,9 @@
 
 Small, deterministic micro-tests inspired by `miri/tests/fail/tree_borrows/**`.
 
-These tests are intended to be run in both alias models:
-- `RZ_ALIAS_MODEL=sb_lite`
-- `RZ_ALIAS_MODEL=tb_lite`
+These tests are intended to be run with `RZ_ALIAS_MODEL=tb_lite`.
 
-Per-model expectations are stored as `expected.<bin>.<model>.rz`.
+Expectations are stored as `expected.<bin>.rz`.
 
 Protector-focused bins:
 - `protected_raw_write`: raw write while argument protector is active.

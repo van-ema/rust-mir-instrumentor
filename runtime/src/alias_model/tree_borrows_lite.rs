@@ -4,8 +4,8 @@ use std::thread::ThreadId;
 
 use crate::{
     allocs, append_location_if_enabled, boundary_survivor_tags_for_callee,
-    bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing, rz_sb_suppressed,
-    rz_violation, tag_store, tags, PtrKind, TagMeta,
+    bounds_len_bytes_or_zero, bounds_len_is_precise_empty, find_alloc_containing,
+    rz_alias_suppressed, rz_violation, tag_store, tags, PtrKind, TagMeta,
 };
 
 #[cfg(feature = "runtime_tb_compaction")]
@@ -269,6 +269,13 @@ fn rz_tb_trace_enabled() -> bool {
 }
 
 #[inline]
+fn rz_tb_no_precise_interior_mut_enabled() -> bool {
+    std::env::var("RZ_TB_NO_PRECISE_INTERIOR_MUT")
+        .ok()
+        .is_some_and(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+#[inline]
 #[cfg(feature = "runtime_tb_compaction")]
 fn rz_tb_compact_invalidated_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -377,14 +384,14 @@ impl AliasModel for TreeBorrowsLiteModel {
 
     fn check_access(
         &self,
-        sb_tag: u64,
+        access_tag: u64,
         orig_tag: u64,
         tmeta: &TagMeta,
         addr: usize,
         size: usize,
         access: AliasAccessKind,
     ) -> Option<String> {
-        tb_lite_check(sb_tag, orig_tag, tmeta, addr, size, access)
+        tb_lite_check(access_tag, orig_tag, tmeta, addr, size, access)
     }
 }
 
@@ -601,7 +608,7 @@ fn tb_lite_validate_ref_mut_boundary_retag(
 ) -> Option<String> {
     if !rz_tb_lite_enabled()
         || tmeta.alias_exempt
-        || rz_sb_suppressed()
+        || rz_alias_suppressed()
         || !matches!(tmeta.kind, PtrKind::RefMut)
     {
         return None;
@@ -655,7 +662,7 @@ fn tb_lite_validate_call_arg_boundary_parent(
 ) -> Option<String> {
     if !rz_tb_lite_enabled()
         || tmeta.alias_exempt
-        || rz_sb_suppressed()
+        || rz_alias_suppressed()
         || !matches!(tmeta.kind, PtrKind::RefShared | PtrKind::RefMut)
     {
         return None;
@@ -971,10 +978,13 @@ fn tb_lite_validate_ref_creation(
     alias_exempt: bool,
     bounds_len: usize,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled() || alias_exempt || rz_alias_suppressed() {
         return None;
     }
-    if !matches!(new_kind, PtrKind::RefShared | PtrKind::RefMut) {
+    if !matches!(
+        new_kind,
+        PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+    ) {
         return None;
     }
 
@@ -1010,7 +1020,7 @@ fn tb_lite_validate_ref_creation(
             && parent_node.poisoned_by_protector_end
         {
             let access_name = match new_kind {
-                PtrKind::RefMut => "WRITE",
+                PtrKind::RefMut | PtrKind::OwnedUnique => "WRITE",
                 PtrKind::RefShared => "READ",
                 _ => "READ",
             };
@@ -1033,7 +1043,7 @@ fn tb_lite_validate_ref_creation(
         return None;
     };
 
-    if !matches!(new_kind, PtrKind::RefMut) {
+    if !matches!(new_kind, PtrKind::RefMut | PtrKind::OwnedUnique) {
         // Shared reborrows still validate that the immediate parent tag itself is alive (above),
         // but they defer overlap/freeze behavior to access-time transitions.
         return None;
@@ -1164,7 +1174,7 @@ fn tb_lite_insert_tag_node(
         BorrowKind::Shared | BorrowKind::RawConst => TbPerm::Frozen,
     };
     let parent = tb_lite_resolve_parent_for_new_node(tree, tmeta, kind);
-    let protected = tb_lite_mark_protected_if_pending(tag, parent, kind);
+    let protected = tb_lite_mark_protected_if_pending(tag, parent, tmeta.parent, kind);
     tb_lite_mark_inplace_protected_if_pending(tag, parent, tmeta.parent, tmeta.pointee_addr, kind);
     let node = TbNode {
         tag,
@@ -1253,7 +1263,7 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 
     let kind = match tmeta.kind {
         PtrKind::RefShared => BorrowKind::Shared,
-        PtrKind::RefMut => BorrowKind::Unique,
+        PtrKind::RefMut | PtrKind::OwnedUnique => BorrowKind::Unique,
         PtrKind::RawConst => BorrowKind::RawConst,
         PtrKind::RawMut => BorrowKind::RawMut,
         _ => return,
@@ -1359,8 +1369,15 @@ fn tb_lite_on_tag_created(tag: u64, tmeta: &TagMeta) {
 ///
 /// For nested same-slot `&mut` calls we keep only the innermost protected Unique active; older
 /// protected Unique ancestors remain live but are shadowed until the inner call exits.
-fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) -> bool {
-    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique) || parent == 0 {
+fn tb_lite_mark_protected_if_pending(
+    tag: u64,
+    parent: u64,
+    transported_parent: u64,
+    kind: BorrowKind,
+) -> bool {
+    if !matches!(kind, BorrowKind::Shared | BorrowKind::Unique)
+        || (parent == 0 && transported_parent == 0)
+    {
         return false;
     }
     let mut frames = tb_protector_frames().lock().unwrap();
@@ -1368,7 +1385,11 @@ fn tb_lite_mark_protected_if_pending(tag: u64, parent: u64, kind: BorrowKind) ->
     let Some(top) = frames.iter_mut().rfind(|f| f.thread_id == thread_id) else {
         return false;
     };
-    let Some(pos) = top.pending_parent_tags.iter().position(|p| *p == parent) else {
+    let Some(pos) = top
+        .pending_parent_tags
+        .iter()
+        .position(|p| *p == parent || *p == transported_parent)
+    else {
         return false;
     };
     top.pending_parent_tags.swap_remove(pos);
@@ -2019,15 +2040,20 @@ fn tb_full_transition_candidate_tags(
 }
 
 fn tb_lite_check(
-    sb_tag: u64,
+    model_tag: u64,
     orig_tag: u64,
     tmeta: &TagMeta,
     addr: usize,
     size: usize,
     access: AliasAccessKind,
 ) -> Option<String> {
-    if !rz_tb_lite_enabled() || tmeta.alias_exempt || rz_sb_suppressed() {
+    if !rz_tb_lite_enabled() || rz_alias_suppressed() {
         return None;
+    }
+    if tmeta.alias_exempt {
+        return tb_lite_check_alias_exempt_protector_conflict(
+            model_tag, orig_tag, tmeta, addr, size, access,
+        );
     }
     if !matches!(
         tmeta.kind,
@@ -2038,7 +2064,7 @@ fn tb_lite_check(
 
     #[cfg(feature = "runtime_tb_compaction")]
     {
-        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+        if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, model_tag]) {
             return Some(tb_lite_invalidated_tombstone_msg(
                 compacted, tmeta, addr, size, access,
             ));
@@ -2051,11 +2077,11 @@ fn tb_lite_check(
     let compact_invalidated = rz_tb_compact_invalidated_enabled();
 
     let mut all = tb_state().lock().unwrap();
-    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, sb_tag], addr);
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, model_tag], addr);
     let Some(tree) = all.get_mut(&base) else {
         #[cfg(feature = "runtime_tb_compaction")]
         {
-            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag]) {
+            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, model_tag]) {
                 return Some(tb_lite_invalidated_tombstone_msg(
                     compacted, tmeta, addr, size, access,
                 ));
@@ -2081,13 +2107,15 @@ fn tb_lite_check(
     let mut access_tag = if tree.nodes.contains_key(&orig_tag) {
         orig_tag
     } else {
-        sb_tag
+        model_tag
     };
 
     let Some(mut node) = tree.nodes.get(&access_tag).cloned() else {
         #[cfg(feature = "runtime_tb_compaction")]
         {
-            if let Some(compacted) = tb_compacted_invalidated_hit(&[orig_tag, sb_tag, access_tag]) {
+            if let Some(compacted) =
+                tb_compacted_invalidated_hit(&[orig_tag, model_tag, access_tag])
+            {
                 return Some(tb_lite_invalidated_tombstone_msg(
                     compacted, tmeta, addr, size, access,
                 ));
@@ -2228,6 +2256,10 @@ fn tb_lite_check(
             continue;
         };
         let child = tb_lineage_contains(&access_lineage, n.tag);
+        let ancestor_read = matches!(access, AliasAccessKind::Read)
+            && access_tag != 0
+            && matches!(n.kind, BorrowKind::RawMut)
+            && tb_is_ancestor(&tree.nodes, access_tag, n.tag);
         let covered = tb_node_overlaps(&n, addr, size);
         // `perm` is for ranges this node already covers. `lazy_perm` is the
         // node's default permission for same-allocation bytes that have not
@@ -2250,6 +2282,11 @@ fn tb_lite_check(
                 return Some(msg);
             }
             (AliasAccessKind::Read, true, perm, _) => perm,
+
+            // Reading through an ancestor does not act as a foreign access on
+            // its descendants. A direct/root-place read still has no ancestor
+            // tag and follows the normal foreign-read transition.
+            (AliasAccessKind::Read, false, perm, _) if ancestor_read => perm,
 
             // Foreign read:
             // - protected Reserved becomes conflicted
@@ -2561,6 +2598,67 @@ fn tb_lite_check(
     None
 }
 
+/// Interior-mutable accesses normally bypass TB-lite transitions, but they are not allowed to
+/// disable an unrelated protected borrow whose pointee is not itself interior-mutable.
+fn tb_lite_check_alias_exempt_protector_conflict(
+    model_tag: u64,
+    orig_tag: u64,
+    tmeta: &TagMeta,
+    addr: usize,
+    size: usize,
+    access: AliasAccessKind,
+) -> Option<String> {
+    if !matches!(access, AliasAccessKind::Write) {
+        return None;
+    }
+
+    let all = tb_state().lock().unwrap();
+    let base = tb_base_for_existing_tags_or_addr(&all, &[orig_tag, model_tag], addr);
+    let tree = all.get(&base)?;
+    let access_tag = if tree.nodes.contains_key(&model_tag) {
+        model_tag
+    } else if tree.nodes.contains_key(&orig_tag) {
+        orig_tag
+    } else {
+        return None;
+    };
+    let tmap = tags().lock().unwrap();
+    let mut protected_tags = tree.protected_tags.clone();
+    protected_tags.sort_unstable();
+    for protected_tag in protected_tags {
+        let Some(protected) = tree.nodes.get(&protected_tag) else {
+            continue;
+        };
+        if protected.tag == access_tag
+            || !tb_is_live_node(protected)
+            || !tb_protector_active(protected)
+            || !matches!(protected.kind, BorrowKind::Shared | BorrowKind::Unique)
+            || !tb_node_overlaps(protected, addr, size)
+            || tb_is_ancestor(&tree.nodes, protected.tag, access_tag)
+            || tmap.get(&protected.tag).is_some_and(|meta| {
+                meta.alias_exempt
+                    || tb_range_covers(
+                        meta.interior_mut_extent_base,
+                        meta.interior_mut_extent_len,
+                        addr,
+                        size,
+                    )
+            })
+            || (tmeta.alloc_epoch != 0
+                && protected.alloc_epoch != 0
+                && protected.alloc_epoch != tmeta.alloc_epoch)
+        {
+            continue;
+        }
+
+        return Some(format!(
+            "WRITE via tag={} addr=0x{:x} size={} kind={:?}\nreason=TB_LITE_PROTECTOR_CONFLICT protected_tag={} protected_kind={:?}",
+            access_tag, addr, size, tmeta.kind, protected.tag, protected.kind
+        ));
+    }
+    None
+}
+
 fn tb_lite_recover_root_raw_mut_sibling_for_const_write(
     tree: &TbAllocState,
     raw_const_tag: u64,
@@ -2615,7 +2713,7 @@ fn tb_access_name(access: AliasAccessKind) -> &'static str {
 
 fn tb_dump(
     tree: &TbAllocState,
-    sb_tag: u64,
+    access_tag: u64,
     addr: usize,
     size: usize,
     access: AliasAccessKind,
@@ -2624,7 +2722,7 @@ fn tb_dump(
     out.push_str("\n-- tb-lite dump --\n");
     out.push_str(&format!(
         "access={:?} tag={} addr=0x{:x} size={}\n",
-        access, sb_tag, addr, size
+        access, access_tag, addr, size
     ));
     out.push_str("nodes:\n");
     let mut nodes: Vec<&TbNode> = tree.nodes.values().collect();
@@ -2807,6 +2905,9 @@ fn tb_raw_write_within_explicit_interior_mut_extent(
 ) -> bool {
     if !matches!(tmeta.kind, PtrKind::RawMut) {
         return false;
+    }
+    if rz_tb_no_precise_interior_mut_enabled() {
+        return true;
     }
     tb_range_covers(
         tmeta.interior_mut_extent_base,
@@ -3220,7 +3321,10 @@ fn tb_lineage_contains(lineage: &[u64], tag: u64) -> bool {
 fn tb_lite_find_ref_ancestor_tag(tmap: &HashMap<u64, TagMeta>, mut tag: u64) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
         let t = tmap.get(&tag)?;
-        if matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        if matches!(
+            t.kind,
+            PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+        ) {
             return Some(tag);
         }
         if t.parent == 0 {
@@ -3238,7 +3342,12 @@ fn tb_lite_find_materialized_ref_ancestor_tag(
 ) -> Option<u64> {
     for _ in 0..tmap.len().saturating_add(1) {
         let t = tmap.get(&tag)?;
-        if nodes.contains_key(&tag) && matches!(t.kind, PtrKind::RefShared | PtrKind::RefMut) {
+        if nodes.contains_key(&tag)
+            && matches!(
+                t.kind,
+                PtrKind::RefShared | PtrKind::RefMut | PtrKind::OwnedUnique
+            )
+        {
             return Some(tag);
         }
         if t.parent == 0 {
